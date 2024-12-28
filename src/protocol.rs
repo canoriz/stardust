@@ -13,29 +13,8 @@ pub struct ReadStream<T> {
     inner: BufReader<T>,
 }
 
-impl<T> ReadStream<T>
-where
-    T: AsyncRead + Unpin,
-{
-    fn new(t: T) -> Self {
-        Self {
-            inner: BufReader::new(t),
-        }
-    }
-}
-
 pub struct WriteStream<T> {
     inner: BufWriter<T>,
-}
-impl<T> WriteStream<T>
-where
-    T: AsyncWrite + Unpin,
-{
-    fn new(t: T) -> Self {
-        Self {
-            inner: BufWriter::new(t),
-        }
-    }
 }
 
 impl<T> BTStream<T> {
@@ -56,38 +35,15 @@ impl BTStream<net::TcpStream> {
         WriteStream<net::tcp::OwnedWriteHalf>,
     ) {
         let (read_end, write_end) = self.inner.into_inner().into_split();
-        (ReadStream::new(read_end), WriteStream::new(write_end))
+        (
+            ReadStream {
+                inner: BufReader::new(read_end),
+            },
+            WriteStream {
+                inner: BufWriter::new(write_end),
+            },
+        )
     }
-}
-
-pub trait BTSend {
-    async fn send_handshake(&mut self, h: &Handshake) -> io::Result<()>;
-
-    async fn send_keepalive(&mut self) -> io::Result<()>;
-
-    async fn send_choke(&mut self) -> io::Result<()>;
-
-    async fn send_unchoke(&mut self) -> io::Result<()>;
-
-    async fn send_interested(&mut self) -> io::Result<()>;
-
-    async fn send_notinterested(&mut self) -> io::Result<()>;
-
-    async fn send_have(&mut self, index: u32) -> io::Result<()>;
-
-    async fn send_bitfield(&mut self, b: &BitField) -> io::Result<()>;
-
-    async fn send_request(&mut self, index: u32, begin: u32, len: u32) -> io::Result<()>;
-
-    async fn send_piece(&mut self, index: u32, begin: u32, piece: &[u8]) -> io::Result<()>;
-
-    async fn send_cancel(&mut self, index: u32, begin: u32, len: u32) -> io::Result<()>;
-}
-
-pub trait BTRecv {
-    async fn recv_msg(&mut self) -> io::Result<Message>;
-
-    async fn recv_handshake(&mut self) -> io::Result<Handshake>;
 }
 
 impl<T> BTStream<T>
@@ -95,89 +51,96 @@ where
     T: AsyncRead + AsyncWrite + Unpin,
 {
     pub async fn send_handshake(&mut self, h: &Handshake) -> io::Result<()> {
-        self.inner.write_u8(19).await?;
-        self.inner.write_all(b"BitTorrent protocol").await?;
-        self.inner.write_all(&h.reserved).await?;
-        self.inner.write_all(&h.torrent_hash).await?;
-        self.inner.write_all(&h.client_id).await?;
-        self.inner.flush().await
+        send_handshake(&mut self.inner, h).await
     }
 
     pub async fn send_keepalive(&mut self) -> io::Result<()> {
-        self.inner.write_u32(Message::KeepAlive.len()).await?;
-        self.inner.flush().await
+        send_keepalive(&mut self.inner).await
     }
 
     pub async fn send_choke(&mut self) -> io::Result<()> {
-        self.inner.write_u32(Message::Choke.len()).await?;
-        self.inner.write_u8(MsgTy::CHOKE).await?;
-        self.inner.flush().await
+        send_choke(&mut self.inner).await
     }
 
     pub async fn send_unchoke(&mut self) -> io::Result<()> {
-        self.inner.write_u32(Message::Unchoke.len()).await?;
-        self.inner.write_u8(MsgTy::UNCHOKE).await?;
-        self.inner.flush().await
+        send_unchoke(&mut self.inner).await
     }
 
     pub async fn send_interested(&mut self) -> io::Result<()> {
-        self.inner.write_u32(Message::Interested.len()).await?;
-        self.inner.write_u8(MsgTy::INTERESTED).await?;
-        self.inner.flush().await
+        send_interested(&mut self.inner).await
     }
 
     pub async fn send_notinterested(&mut self) -> io::Result<()> {
-        self.inner.write_u32(Message::NotInterested.len()).await?;
-        self.inner.write_u8(MsgTy::NOTINTERESTED).await?;
-        self.inner.flush().await
+        send_notinterested(&mut self.inner).await
     }
 
     pub async fn send_have(&mut self, index: u32) -> io::Result<()> {
-        self.inner.write_u32(Message::Have(index).len()).await?;
-        self.inner.write_u8(MsgTy::HAVE).await?;
-        self.inner.write_u32(index).await?;
-        self.inner.flush().await
+        send_have(&mut self.inner, index).await
     }
 
     pub async fn send_bitfield(&mut self, b: &BitField) -> io::Result<()> {
-        self.inner.write_u32(1 + b.u8_len()).await?;
-        self.inner.write_u8(BitField::TYPE).await?;
-        self.inner.write_all(&b.bitfield_bytes()).await?;
-        self.inner.flush().await
+        send_bitfield(&mut self.inner, b).await
     }
 
     pub async fn send_request(&mut self, index: u32, begin: u32, len: u32) -> io::Result<()> {
-        // TODO: len must be 16KiB unless end of file
-        self.inner
-            .write_u32(Message::Request(Request { index, begin, len }).len())
-            .await?; // length
-        self.inner.write_u8(MsgTy::REQUEST).await?;
-        self.inner.write_u32(index).await?;
-        self.inner.write_u32(begin).await?;
-        self.inner.write_u32(len).await?;
-        self.inner.flush().await
+        send_request(&mut self.inner, index, begin, len).await
     }
 
     pub async fn send_piece(&mut self, index: u32, begin: u32, piece: &[u8]) -> io::Result<()> {
-        // TODO: len must be 16KiB unless end of file
-        self.inner.write_u32(1 + 4 + 4 + piece.len() as u32).await?; // length
-        self.inner.write_u8(MsgTy::PIECE).await?;
-        self.inner.write_u32(index).await?;
-        self.inner.write_u32(begin).await?;
-        self.inner.write_all(piece).await?;
-        self.inner.flush().await
+        send_piece(&mut self.inner, index, begin, piece).await
     }
 
     pub async fn send_cancel(&mut self, index: u32, begin: u32, len: u32) -> io::Result<()> {
-        // TODO: len must be 16KiB unless end of file
-        self.inner
-            .write_u32(Message::Cancel(Request { index, begin, len }).len())
-            .await?; // length
-        self.inner.write_u8(MsgTy::CANCEL).await?;
-        self.inner.write_u32(index).await?;
-        self.inner.write_u32(begin).await?;
-        self.inner.write_u32(len).await?;
-        self.inner.flush().await
+        send_cancel(&mut self.inner, index, begin, len).await
+    }
+}
+
+impl<T> WriteStream<T>
+where
+    T: AsyncWrite + Unpin,
+{
+    pub async fn send_handshake(&mut self, h: &Handshake) -> io::Result<()> {
+        send_handshake(&mut self.inner, h).await
+    }
+
+    pub async fn send_keepalive(&mut self) -> io::Result<()> {
+        send_keepalive(&mut self.inner).await
+    }
+
+    pub async fn send_choke(&mut self) -> io::Result<()> {
+        send_choke(&mut self.inner).await
+    }
+
+    pub async fn send_unchoke(&mut self) -> io::Result<()> {
+        send_unchoke(&mut self.inner).await
+    }
+
+    pub async fn send_interested(&mut self) -> io::Result<()> {
+        send_interested(&mut self.inner).await
+    }
+
+    pub async fn send_notinterested(&mut self) -> io::Result<()> {
+        send_notinterested(&mut self.inner).await
+    }
+
+    pub async fn send_have(&mut self, index: u32) -> io::Result<()> {
+        send_have(&mut self.inner, index).await
+    }
+
+    pub async fn send_bitfield(&mut self, b: &BitField) -> io::Result<()> {
+        send_bitfield(&mut self.inner, b).await
+    }
+
+    pub async fn send_request(&mut self, index: u32, begin: u32, len: u32) -> io::Result<()> {
+        send_request(&mut self.inner, index, begin, len).await
+    }
+
+    pub async fn send_piece(&mut self, index: u32, begin: u32, piece: &[u8]) -> io::Result<()> {
+        send_piece(&mut self.inner, index, begin, piece).await
+    }
+
+    pub async fn send_cancel(&mut self, index: u32, begin: u32, len: u32) -> io::Result<()> {
+        send_cancel(&mut self.inner, index, begin, len).await
     }
 }
 
@@ -186,92 +149,24 @@ where
     T: AsyncRead + AsyncWrite + Unpin,
 {
     pub async fn recv_msg(&mut self) -> io::Result<Message> {
-        // TODO: what to do if some malicious peer sends a long len data
-        // and a lot of garbage data? use timeout
-        let len = self.inner.read_u32().await?;
-        if len == 0 {
-            return Ok(Message::KeepAlive);
-        }
-        let msg_ty = self.inner.read_u8().await?;
-        match msg_ty {
-            MsgTy::CHOKE => Ok(Message::Choke),
-            MsgTy::UNCHOKE => Ok(Message::Unchoke),
-            MsgTy::INTERESTED => Ok(Message::Interested),
-            MsgTy::NOTINTERESTED => Ok(Message::NotInterested),
-            MsgTy::HAVE => {
-                // TODO: check length match, absorb remain length in case
-                // unimplemented extension
-                let index = self.inner.read_u32().await?;
-                Ok(Message::Have(index))
-            }
-            MsgTy::BITFIELD => {
-                let capacity = (len - 1) as usize;
-                let mut bitfield: Vec<u8> = unsafe {
-                    let mut piece: Vec<MaybeUninit<u8>> = Vec::with_capacity(capacity);
-                    piece.set_len(capacity);
-                    std::mem::transmute(piece)
-                };
-                self.inner.read_exact(bitfield.as_mut_slice()).await?;
-                Ok(Message::BitField(BitField::new(bitfield)))
-            }
-            MsgTy::REQUEST => {
-                // TODO: check length match
-                let index = self.inner.read_u32().await?;
-                let begin = self.inner.read_u32().await?;
-                let len = self.inner.read_u32().await?;
-                Ok(Message::Request(Request { index, begin, len }))
-            }
-            MsgTy::PIECE => {
-                // TODO: check length match
-                let capacity = (len - 4 - 4 - 1) as usize;
-                let mut piece: Vec<u8> = unsafe {
-                    let mut piece: Vec<MaybeUninit<u8>> = Vec::with_capacity(capacity);
-                    piece.set_len(capacity);
-                    std::mem::transmute(piece)
-                };
-                let index = self.inner.read_u32().await?;
-                let begin = self.inner.read_u32().await?;
-                self.inner.read_exact(piece.as_mut_slice()).await?;
-                Ok(Message::Piece(Piece {
-                    index,
-                    begin,
-                    piece,
-                }))
-            }
-            MsgTy::CANCEL => {
-                // TODO: check length match
-                let index = self.inner.read_u32().await?;
-                let begin = self.inner.read_u32().await?;
-                let len = self.inner.read_u32().await?;
-                Ok(Message::Cancel(Request { index, begin, len }))
-            }
-            _ => {
-                panic!();
-            }
-        }
+        recv_msg(&mut self.inner).await
     }
 
     pub async fn recv_handshake(&mut self) -> io::Result<Handshake> {
-        let mut header = [0u8; 19];
-        let first = self.inner.read_u8().await?;
-        if first != 19 {
-            todo!();
-        }
-        self.inner.read_exact(&mut header).await?;
-        if header != *b"BitTorrent protocol" {
-            todo!();
-        }
-        let mut reserved = [0u8; 8];
-        let mut torrent_hash = [0u8; 20];
-        let mut client_id = [0u8; 20];
-        self.inner.read_exact(&mut reserved).await?;
-        self.inner.read_exact(&mut torrent_hash).await?;
-        self.inner.read_exact(&mut client_id).await?;
-        Ok(Handshake {
-            reserved,
-            torrent_hash,
-            client_id,
-        })
+        recv_handshake(&mut self.inner).await
+    }
+}
+
+impl<T> ReadStream<T>
+where
+    T: AsyncRead + Unpin,
+{
+    pub async fn recv_msg(&mut self) -> io::Result<Message> {
+        recv_msg(&mut self.inner).await
+    }
+
+    pub async fn recv_handshake(&mut self) -> io::Result<Handshake> {
+        recv_handshake(&mut self.inner).await
     }
 }
 
@@ -393,11 +288,200 @@ pub struct Piece {
     pub piece: Vec<u8>,
 }
 
+async fn send_handshake<T: AsyncWrite + Unpin>(handle: &mut T, h: &Handshake) -> io::Result<()> {
+    handle.write_u8(19).await?;
+    handle.write_all(b"BitTorrent protocol").await?;
+    handle.write_all(&h.reserved).await?;
+    handle.write_all(&h.torrent_hash).await?;
+    handle.write_all(&h.client_id).await?;
+    handle.flush().await
+}
+
+async fn send_keepalive<T: AsyncWrite + Unpin>(handle: &mut T) -> io::Result<()> {
+    handle.write_u32(Message::KeepAlive.len()).await?;
+    handle.flush().await
+}
+
+async fn send_choke<T: AsyncWrite + Unpin>(handle: &mut T) -> io::Result<()> {
+    handle.write_u32(Message::Choke.len()).await?;
+    handle.write_u8(MsgTy::CHOKE).await?;
+    handle.flush().await
+}
+
+async fn send_unchoke<T: AsyncWrite + Unpin>(handle: &mut T) -> io::Result<()> {
+    handle.write_u32(Message::Unchoke.len()).await?;
+    handle.write_u8(MsgTy::UNCHOKE).await?;
+    handle.flush().await
+}
+
+async fn send_interested<T: AsyncWrite + Unpin>(handle: &mut T) -> io::Result<()> {
+    handle.write_u32(Message::Interested.len()).await?;
+    handle.write_u8(MsgTy::INTERESTED).await?;
+    handle.flush().await
+}
+
+async fn send_notinterested<T: AsyncWrite + Unpin>(handle: &mut T) -> io::Result<()> {
+    handle.write_u32(Message::NotInterested.len()).await?;
+    handle.write_u8(MsgTy::NOTINTERESTED).await?;
+    handle.flush().await
+}
+
+async fn send_have<T: AsyncWrite + Unpin>(handle: &mut T, index: u32) -> io::Result<()> {
+    handle.write_u32(Message::Have(index).len()).await?;
+    handle.write_u8(MsgTy::HAVE).await?;
+    handle.write_u32(index).await?;
+    handle.flush().await
+}
+
+async fn send_bitfield<T: AsyncWrite + Unpin>(handle: &mut T, b: &BitField) -> io::Result<()> {
+    handle.write_u32(1 + b.u8_len()).await?;
+    handle.write_u8(BitField::TYPE).await?;
+    handle.write_all(b.bitfield_bytes()).await?;
+    handle.flush().await
+}
+
+async fn send_request<T: AsyncWrite + Unpin>(
+    handle: &mut T,
+    index: u32,
+    begin: u32,
+    len: u32,
+) -> io::Result<()> {
+    // TODO: len must be 16KiB unless end of file
+    handle
+        .write_u32(Message::Request(Request { index, begin, len }).len())
+        .await?; // length
+    handle.write_u8(MsgTy::REQUEST).await?;
+    handle.write_u32(index).await?;
+    handle.write_u32(begin).await?;
+    handle.write_u32(len).await?;
+    handle.flush().await
+}
+
+async fn send_piece<T: AsyncWrite + Unpin>(
+    handle: &mut T,
+    index: u32,
+    begin: u32,
+    piece: &[u8],
+) -> io::Result<()> {
+    // TODO: len must be 16KiB unless end of file
+    handle.write_u32(1 + 4 + 4 + piece.len() as u32).await?; // length
+    handle.write_u8(MsgTy::PIECE).await?;
+    handle.write_u32(index).await?;
+    handle.write_u32(begin).await?;
+    handle.write_all(piece).await?;
+    handle.flush().await
+}
+
+async fn send_cancel<T: AsyncWrite + Unpin>(
+    handle: &mut T,
+    index: u32,
+    begin: u32,
+    len: u32,
+) -> io::Result<()> {
+    // TODO: len must be 16KiB unless end of file
+    handle
+        .write_u32(Message::Cancel(Request { index, begin, len }).len())
+        .await?; // length
+    handle.write_u8(MsgTy::CANCEL).await?;
+    handle.write_u32(index).await?;
+    handle.write_u32(begin).await?;
+    handle.write_u32(len).await?;
+    handle.flush().await
+}
+
+async fn recv_msg<T: AsyncRead + Unpin>(handle: &mut T) -> io::Result<Message> {
+    // TODO: what to do if some malicious peer sends a long len data
+    // and a lot of garbage data? use timeout
+    let len = handle.read_u32().await?;
+    if len == 0 {
+        return Ok(Message::KeepAlive);
+    }
+    let msg_ty = handle.read_u8().await?;
+    match msg_ty {
+        MsgTy::CHOKE => Ok(Message::Choke),
+        MsgTy::UNCHOKE => Ok(Message::Unchoke),
+        MsgTy::INTERESTED => Ok(Message::Interested),
+        MsgTy::NOTINTERESTED => Ok(Message::NotInterested),
+        MsgTy::HAVE => {
+            // TODO: check length match, absorb remain length in case
+            // unimplemented extension
+            let index = handle.read_u32().await?;
+            Ok(Message::Have(index))
+        }
+        MsgTy::BITFIELD => {
+            let capacity = (len - 1) as usize;
+            let mut bitfield: Vec<u8> = unsafe {
+                let mut piece: Vec<MaybeUninit<u8>> = Vec::with_capacity(capacity);
+                piece.set_len(capacity);
+                std::mem::transmute(piece)
+            };
+            handle.read_exact(bitfield.as_mut_slice()).await?;
+            Ok(Message::BitField(BitField::new(bitfield)))
+        }
+        MsgTy::REQUEST => {
+            // TODO: check length match
+            let index = handle.read_u32().await?;
+            let begin = handle.read_u32().await?;
+            let len = handle.read_u32().await?;
+            Ok(Message::Request(Request { index, begin, len }))
+        }
+        MsgTy::PIECE => {
+            // TODO: check length match
+            let capacity = (len - 4 - 4 - 1) as usize;
+            let mut piece: Vec<u8> = unsafe {
+                let mut piece: Vec<MaybeUninit<u8>> = Vec::with_capacity(capacity);
+                piece.set_len(capacity);
+                std::mem::transmute(piece)
+            };
+            let index = handle.read_u32().await?;
+            let begin = handle.read_u32().await?;
+            handle.read_exact(piece.as_mut_slice()).await?;
+            Ok(Message::Piece(Piece {
+                index,
+                begin,
+                piece,
+            }))
+        }
+        MsgTy::CANCEL => {
+            // TODO: check length match
+            let index = handle.read_u32().await?;
+            let begin = handle.read_u32().await?;
+            let len = handle.read_u32().await?;
+            Ok(Message::Cancel(Request { index, begin, len }))
+        }
+        _ => {
+            panic!();
+        }
+    }
+}
+
+async fn recv_handshake<T: AsyncRead + Unpin>(handle: &mut T) -> io::Result<Handshake> {
+    let mut header = [0u8; 19];
+    let first = handle.read_u8().await?;
+    if first != 19 {
+        todo!();
+    }
+    handle.read_exact(&mut header).await?;
+    if header != *b"BitTorrent protocol" {
+        todo!();
+    }
+    let mut reserved = [0u8; 8];
+    let mut torrent_hash = [0u8; 20];
+    let mut client_id = [0u8; 20];
+    handle.read_exact(&mut reserved).await?;
+    handle.read_exact(&mut torrent_hash).await?;
+    handle.read_exact(&mut client_id).await?;
+    Ok(Handshake {
+        reserved,
+        torrent_hash,
+        client_id,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::Rng;
-    use tokio::io::{duplex, DuplexStream};
+    use tokio::io::{duplex, split, DuplexStream, ReadHalf, WriteHalf};
 
     fn make_ends() -> (BTStream<DuplexStream>, BTStream<DuplexStream>) {
         let (end1, end2) = duplex(1024 * 1024);
@@ -408,6 +492,47 @@ mod tests {
             BTStream::<DuplexStream> {
                 inner: tokio::io::BufStream::new(end2),
             },
+        )
+    }
+
+    impl BTStream<DuplexStream> {
+        pub fn into_split(
+            self,
+        ) -> (
+            ReadStream<ReadHalf<DuplexStream>>,
+            WriteStream<WriteHalf<DuplexStream>>,
+        ) {
+            let (read_end, write_end) = split(self.inner.into_inner());
+            (
+                ReadStream {
+                    inner: BufReader::new(read_end),
+                },
+                WriteStream {
+                    inner: BufWriter::new(write_end),
+                },
+            )
+        }
+    }
+    fn make_ends_split() -> (
+        (
+            ReadStream<ReadHalf<DuplexStream>>,
+            WriteStream<WriteHalf<DuplexStream>>,
+        ),
+        (
+            ReadStream<ReadHalf<DuplexStream>>,
+            WriteStream<WriteHalf<DuplexStream>>,
+        ),
+    ) {
+        let (end1, end2) = duplex(1024 * 1024);
+        (
+            BTStream::<DuplexStream> {
+                inner: tokio::io::BufStream::new(end1),
+            }
+            .into_split(),
+            BTStream::<DuplexStream> {
+                inner: tokio::io::BufStream::new(end2),
+            }
+            .into_split(),
         )
     }
 
@@ -429,6 +554,13 @@ mod tests {
             .expect("should send ok");
         let received = peer2.recv_handshake().await.expect("should recv ok");
         assert_eq!(received, HANDSHAKE);
+
+        let ((_, mut p1w), (mut p2r, _)) = make_ends_split();
+        p1w.send_handshake(&HANDSHAKE)
+            .await
+            .expect("should send ok");
+        let received = p2r.recv_handshake().await.expect("should recv ok");
+        assert_eq!(received, HANDSHAKE);
     }
 
     #[tokio::test]
@@ -436,6 +568,24 @@ mod tests {
         let (mut peer1, mut peer2) = make_ends();
         peer1.send_keepalive().await.expect("should send ok");
         let received = peer2.recv_msg().await.expect("should recv ok");
+        assert_eq!(received, Message::KeepAlive);
+
+        let ((_, mut p1w), (mut p2r, _)) = make_ends_split();
+        p1w.send_keepalive().await.expect("should send ok");
+        let received = p2r.recv_msg().await.expect("should recv ok");
+        assert_eq!(received, Message::KeepAlive);
+    }
+
+    #[tokio::test]
+    async fn keepalive_split() {
+        let (mut peer1, mut peer2) = make_ends();
+        peer1.send_keepalive().await.expect("should send ok");
+        let received = peer2.recv_msg().await.expect("should recv ok");
+        assert_eq!(received, Message::KeepAlive);
+
+        let ((_, mut p1w), (mut p2r, _)) = make_ends_split();
+        p1w.send_keepalive().await.expect("should send ok");
+        let received = p2r.recv_msg().await.expect("should recv ok");
         assert_eq!(received, Message::KeepAlive);
     }
 
@@ -445,6 +595,11 @@ mod tests {
         peer1.send_choke().await.expect("should send ok");
         let received = peer2.recv_msg().await.expect("should recv ok");
         assert_eq!(received, Message::Choke);
+
+        let ((_, mut p1w), (mut p2r, _)) = make_ends_split();
+        p1w.send_choke().await.expect("should send ok");
+        let received = p2r.recv_msg().await.expect("should recv ok");
+        assert_eq!(received, Message::Choke);
     }
 
     #[tokio::test]
@@ -452,6 +607,11 @@ mod tests {
         let (mut peer1, mut peer2) = make_ends();
         peer1.send_unchoke().await.expect("should send ok");
         let received = peer2.recv_msg().await.expect("should recv ok");
+        assert_eq!(received, Message::Unchoke);
+
+        let ((_, mut p1w), (mut p2r, _)) = make_ends_split();
+        p1w.send_unchoke().await.expect("should send ok");
+        let received = p2r.recv_msg().await.expect("should recv ok");
         assert_eq!(received, Message::Unchoke);
     }
 
@@ -461,6 +621,11 @@ mod tests {
         peer1.send_interested().await.expect("should send ok");
         let received = peer2.recv_msg().await.expect("should recv ok");
         assert_eq!(received, Message::Interested);
+
+        let ((_, mut p1w), (mut p2r, _)) = make_ends_split();
+        p1w.send_interested().await.expect("should send ok");
+        let received = p2r.recv_msg().await.expect("should recv ok");
+        assert_eq!(received, Message::Interested);
     }
 
     #[tokio::test]
@@ -469,6 +634,11 @@ mod tests {
         peer1.send_notinterested().await.expect("should send ok");
         let received = peer2.recv_msg().await.expect("should recv ok");
         assert_eq!(received, Message::NotInterested);
+
+        let ((_, mut p1w), (mut p2r, _)) = make_ends_split();
+        p1w.send_notinterested().await.expect("should send ok");
+        let received = p2r.recv_msg().await.expect("should recv ok");
+        assert_eq!(received, Message::NotInterested);
     }
 
     #[tokio::test]
@@ -476,6 +646,11 @@ mod tests {
         let (mut peer1, mut peer2) = make_ends();
         peer1.send_have(533).await.expect("should send ok");
         let received = peer2.recv_msg().await.expect("should recv ok");
+        assert_eq!(received, Message::Have(533));
+
+        let ((_, mut p1w), (mut p2r, _)) = make_ends_split();
+        p1w.send_have(533).await.expect("should send ok");
+        let received = p2r.recv_msg().await.expect("should recv ok");
         assert_eq!(received, Message::Have(533));
     }
 
@@ -489,6 +664,14 @@ mod tests {
             .expect("should send ok");
         let received = peer2.recv_msg().await.expect("should recv ok");
         assert_eq!(received, Message::BitField(BitField::new(fields.into())));
+
+        let ((_, mut p1w), (mut p2r, _)) = make_ends_split();
+        let fields = rand::random::<[u8; 143]>();
+        p1w.send_bitfield(&BitField::new(fields.clone().into()))
+            .await
+            .expect("should send ok");
+        let received = p2r.recv_msg().await.expect("should recv ok");
+        assert_eq!(received, Message::BitField(BitField::new(fields.into())));
     }
 
     #[tokio::test]
@@ -501,6 +684,21 @@ mod tests {
             .await
             .expect("should send ok");
         let received = peer2.recv_msg().await.expect("should recv ok");
+        assert_eq!(
+            received,
+            Message::Request(Request {
+                index: index,
+                begin: begin,
+                len: 4,
+            })
+        );
+        // TODO: test long request
+
+        let ((_, mut p1w), (mut p2r, _)) = make_ends_split();
+        p1w.send_request(index, begin, 4)
+            .await
+            .expect("should send ok");
+        let received = p2r.recv_msg().await.expect("should recv ok");
         assert_eq!(
             received,
             Message::Request(Request {
@@ -533,6 +731,23 @@ mod tests {
         );
 
         // TODO: test long piece are dropped
+
+        let ((_, mut p1w), (mut p2r, _)) = make_ends_split();
+        let random_bytes = rand::random::<[u8; 143]>();
+        p1w.send_piece(index, begin, &random_bytes)
+            .await
+            .expect("should send ok");
+        let received = p2r.recv_msg().await.expect("should recv ok");
+        assert_eq!(
+            received,
+            Message::Piece(Piece {
+                index,
+                begin,
+                piece: random_bytes.into(),
+            })
+        );
+
+        // TODO: test long piece are dropped
     }
 
     #[tokio::test]
@@ -554,5 +769,31 @@ mod tests {
             })
         );
         // TODO: test long request
+
+        let ((_, mut p1w), (mut p2r, _)) = make_ends_split();
+        p1w.send_cancel(index, begin, 4)
+            .await
+            .expect("should send ok");
+        let received = p2r.recv_msg().await.expect("should recv ok");
+        assert_eq!(
+            received,
+            Message::Cancel(Request {
+                index: index,
+                begin: begin,
+                len: 4,
+            })
+        );
+        // TODO: test long request
+    }
+
+    #[tokio::test]
+    async fn bi_direction() {
+        let ((mut p1r, mut p1w), (mut p2r, mut p2w)) = make_ends_split();
+        p1w.send_interested().await.expect("p1 should send ok");
+        let p2_recv = p2r.recv_msg().await.expect("p2 should recv ok");
+        p2w.send_choke().await.expect("p2 should send ok");
+        let p1_recv = p1r.recv_msg().await.expect("p1 should recv ok");
+        assert_eq!(p2_recv, Message::Interested,);
+        assert_eq!(p1_recv, Message::Choke,);
     }
 }
