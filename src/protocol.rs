@@ -27,6 +27,17 @@ impl<T> BTStream<T> {
     }
 }
 
+impl<T> From<T> for BTStream<T>
+where
+    T: AsyncRead + AsyncWrite,
+{
+    fn from(t: T) -> Self {
+        Self {
+            inner: BufStream::new(t),
+        }
+    }
+}
+
 impl BTStream<net::TcpStream> {
     pub fn into_split(
         self,
@@ -237,7 +248,7 @@ impl Message {
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct BitField {
-    bitfield: Vec<u8>,
+    bitfield: Vec<u8>, // use array?
 }
 
 impl BitField {
@@ -561,6 +572,22 @@ mod tests {
             .expect("should send ok");
         let received = p2r.recv_handshake().await.expect("should recv ok");
         assert_eq!(received, HANDSHAKE);
+    }
+
+    #[tokio::test]
+    async fn test_connect_real() {
+        let mut bstream = BTStream::<net::TcpStream>::connect_tcp("[::0]:35515".parse().unwrap())
+            .await
+            .unwrap();
+        bstream
+            .send_handshake(&Handshake {
+                reserved: [0; 8],
+                torrent_hash: [0; 20],
+                client_id: [0; 20],
+            })
+            .await;
+        let rcv = bstream.recv_handshake().await.unwrap();
+        dbg!(rcv);
     }
 
     #[tokio::test]

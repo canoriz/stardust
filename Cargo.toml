@@ -13,4 +13,7 @@ rand = { version = "0.8.5", features = ["min_const_gen"] }
 reqwest = "0.12.11"
 serde = { version = "1.0.217", features = ["derive"] }
 sha1 = { version = "0.10.6", features = ["asm"] }
+thiserror = "2.0.9"
 tokio = { version = "1", features = ["full"] }
+tracing = "0.1.41"
+tracing-subscriber = "0.3.19"

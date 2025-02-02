@@ -1,10 +1,13 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 pub use bt_bencode::ByteString;
 use serde::{Deserialize, Serialize};
+use tracing::{info, Level};
 mod workaround;
+use reqwest::Client;
 use sha1::{Digest, Sha1};
-use std::net::Ipv4Addr;
-use workaround::ByteParam;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::LazyLock;
+use thiserror::Error;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Metadata {
@@ -36,16 +39,14 @@ pub struct Info {
 
 #[derive(Serialize, Deserialize, Debug)]
 enum LenFiles {
-    // #[serde(untagged)]
     #[serde(rename = "length")]
     Length(usize),
-    // #[serde(untagged)]
     #[serde(rename = "files")]
     Files(Vec<File>),
 }
 
 impl Metadata {
-    fn load<T: AsRef<[u8]>>(input: T) -> anyhow::Result<Self> {
+    pub fn load<T: AsRef<[u8]>>(input: T) -> anyhow::Result<Self> {
         let mut torrent: Metadata = bt_bencode::from_slice(input.as_ref())?;
         let mut hasher = Sha1::new();
         bt_bencode::to_writer(&mut hasher, &torrent.info)?;
@@ -61,13 +62,13 @@ struct File {
 }
 
 #[derive(Debug)]
-struct TrackerGet<'a> {
-    peer_id: &'a str,
-    ip: Option<Ipv4Addr>,
-    port: u32,
-    uploaded: usize,
-    downloaded: usize,
-    left: usize,
+pub struct TrackerGet<'a> {
+    pub peer_id: &'a str,
+    pub ip: Option<Ipv4Addr>,
+    pub port: u32,
+    pub uploaded: usize,
+    pub downloaded: usize,
+    pub left: usize,
     // event: Option<Enum<...>>
 }
 
@@ -80,8 +81,8 @@ impl<'a> TrackerGet<'a> {
                 + &percent_encoding::percent_encode(v.as_ref(), percent_encoding::NON_ALPHANUMERIC)
                     .collect::<String>()
         }
-        let mut url: Vec<String> = if let Some(ref announce_list) = meta.announce_list {
-            announce_list.iter().flat_map(|url| url.clone()).collect()
+        let url: Vec<String> = if let Some(ref announce_list) = meta.announce_list {
+            announce_list.iter().flat_map(|url| url.clone()).collect() // TODO: tier
         } else {
             [meta.announce.clone()].into()
         };
@@ -103,6 +104,87 @@ impl<'a> TrackerGet<'a> {
     }
 }
 
+#[derive(Serialize, Deserialize, Debug)]
+pub enum TrackerResp {
+    #[serde(untagged)]
+    Failure(Failure),
+    #[serde(untagged)]
+    Success(AnnounceResp),
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct AnnounceResp {
+    pub interval: u32,
+    pub peers: Vec<Peer>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct Peer {
+    #[serde(rename = "peer id")]
+    pub peer_id: ByteString,
+    pub ip: String,
+    pub port: u32,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct Failure {
+    #[serde(rename = "failure reason")]
+    pub reason: String,
+}
+
+fn ipv6_client() -> Result<Client> {
+    const V6_ADDR: Ipv6Addr = Ipv6Addr::from_bits(0);
+    Client::builder()
+        .local_address(IpAddr::V6(V6_ADDR))
+        .build()
+        .map_err(|e| e.into())
+}
+
+fn ipv4_client() -> Result<Client> {
+    const V4_ADDR: Ipv4Addr = Ipv4Addr::from_bits(0);
+    let builder = Client::builder();
+    builder
+        .local_address(IpAddr::V4(V4_ADDR))
+        .build()
+        .map_err(|e| e.into())
+}
+
+static IPV4_CLIENT: LazyLock<Option<Client>> = LazyLock::new(|| ipv4_client().ok());
+static IPV6_CLIENT: LazyLock<Option<Client>> = LazyLock::new(|| ipv4_client().ok());
+
+pub enum AnnounceType {
+    V4,
+    V6,
+}
+
+#[derive(Error, Debug)]
+enum ClientErr {
+    #[error("Ipv4 client unavailable")]
+    Ipv4Err,
+    #[error("Ipv6 client unavailable")]
+    Ipv6Err,
+}
+
+pub async fn announce<'a>(
+    net_type: AnnounceType,
+    req: &TrackerGet<'a>,
+    torrent: &Metadata,
+) -> Result<TrackerResp> {
+    let request = match net_type {
+        AnnounceType::V4 => match *IPV4_CLIENT {
+            Some(ref client) => client.get(&req.url(torrent)[0]),
+            None => return Err(anyhow! {"ipv4 client unavailable"}),
+        },
+        AnnounceType::V6 => match *IPV6_CLIENT {
+            Some(ref client) => client.get(&req.url(torrent)[0]),
+            None => return Err(anyhow! {"ipv4 client unavailable"}),
+        },
+    }; // TODO: more url
+
+    let r = request.send().await?;
+    bt_bencode::from_slice(&r.bytes().await?).map_err(|e| e.into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,7 +195,7 @@ mod tests {
         let torrent = Metadata::load(torrent_f).unwrap();
 
         let announce_req = TrackerGet {
-            peer_id: "-qB0405-qwerasdfzxcv".into(),
+            peer_id: "-ZS0405-qwerasdfzxcv".into(),
             uploaded: 0,
             port: 35515,
             downloaded: 0,
@@ -121,15 +203,9 @@ mod tests {
             ip: None,
         };
 
-        use reqwest;
-        use std::net::{IpAddr, Ipv6Addr};
-        let builder = reqwest::Client::builder();
-        const V6_ADDR: Ipv6Addr = Ipv6Addr::from_bits(0);
-        let client = builder.local_address(IpAddr::V6(V6_ADDR)).build().unwrap();
-        let request = client.get(&announce_req.url(&torrent)[0]).build().unwrap();
-        dbg!(request.url());
-        let r = client.execute(request).await.unwrap();
-        let z: bt_bencode::Value = bt_bencode::from_slice(&r.bytes().await.unwrap()).unwrap();
+        let z = announce(AnnounceType::V4, &announce_req, &torrent)
+            .await
+            .unwrap();
         dbg!(z);
     }
 
