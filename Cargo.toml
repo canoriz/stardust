@@ -9,8 +9,11 @@ edition = "2021"
 anyhow = "1"
 bt_bencode = "0.8.1"
 percent-encoding = "2.3.1"
-rand = { version = "0.8.5", features = ["min_const_gen"] }
+rand = { version = "0.9.0", features = ["thread_rng"] }
 reqwest = "0.12.11"
 serde = { version = "1.0.217", features = ["derive"] }
 sha1 = { version = "0.10.6", features = ["asm"] }
+thiserror = "2.0.9"
 tokio = { version = "1", features = ["full"] }
+tracing = "0.1.41"
+tracing-subscriber = "0.3.19"

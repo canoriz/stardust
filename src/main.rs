@@ -1,24 +1,85 @@
 use std::net::SocketAddr;
 // use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use anyhow::{anyhow, Result};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net;
 use tokio::time::{sleep, Duration};
+use tracing::{info, Level};
 mod metadata;
+mod picker;
 mod protocol;
+use protocol::BTStream;
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Hello, world!");
-    let mut bstream =
-        protocol::BTStream::<net::TcpStream>::connect_tcp("192.168.71.36:57197".parse().unwrap())
-            .await
-            .unwrap();
-    bstream.send_handshake(&HANDSHAKE).await;
-    sleep(Duration::from_secs(1)).await;
-    bstream.send_interested().await;
-    sleep(Duration::from_secs(1)).await;
-    bstream.send_request(0, 0, 1 << 14).await;
-    sleep(Duration::from_secs(3)).await;
+    tracing_subscriber::fmt::init();
+    let torrent_f = include_bytes!("../ubuntu-24.10-desktop-amd64.iso.torrent");
+    let torrent = metadata::Metadata::load(torrent_f).unwrap();
+
+    let announce_req = metadata::TrackerGet {
+        peer_id: "-ZS0405-qwerasdfzxcv",
+        uploaded: 0,
+        port: 35515,
+        downloaded: 0,
+        left: 0,
+        ip: None,
+    };
+
+    let listener = net::TcpListener::bind("::0:35515").await?;
+    let server = tokio::spawn(async move {
+        let mut set = tokio::task::JoinSet::new();
+        loop {
+            let (bt_stream, addr) = match listener.accept().await {
+                Ok((stream, addr)) => {
+                    info!("input from addr {}", addr);
+                    (protocol::BTStream::from(stream), addr)
+                }
+                Err(e) => {
+                    info!("accept error {}", e);
+                    continue;
+                }
+            };
+            let handle = set.spawn(handle_income_connection(bt_stream, addr));
+        }
+        set.join_all().await;
+    });
+    let res = metadata::announce(metadata::AnnounceType::V6, &announce_req, &torrent).await?;
+    match res {
+        metadata::TrackerResp::Failure(f) => {
+            info!("announce failed with {}", f.reason);
+        }
+        metadata::TrackerResp::Success(s) => {
+            let list: Vec<String> = s
+                .peers
+                .iter()
+                .map(|p| format!("{}:{}", p.ip, p.port))
+                .collect();
+            info!("announce success with {:?}", list);
+        }
+    }
+    server.await;
+
+    Ok(())
 }
+
+async fn handle_income_connection<T: AsyncRead + AsyncWrite + Unpin>(
+    mut bt_stream: BTStream<T>,
+    addr: SocketAddr,
+) -> Result<()> {
+    let mut handshake = bt_stream.recv_handshake().await?;
+    info!("get handshake {:?}", handshake);
+    handshake.reserved = [0; 8];
+    handshake.client_id = *CLIENT_ID;
+    bt_stream.send_handshake(&handshake).await?;
+    bt_stream.send_choke().await?;
+    loop {
+        let msg = bt_stream.recv_msg().await?;
+        info!("received msg {:?} from {}", msg, addr);
+    }
+}
+
+const CLIENT_ID: &[u8; 20] = b"-ZS0405-qwerasdfzxcv";
 
 const HANDSHAKE: protocol::Handshake = protocol::Handshake {
     reserved: [0; 8],
