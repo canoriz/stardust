@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+// use anyhow::{anyhow, Result};
 pub use bt_bencode::ByteString;
 use serde::{Deserialize, Serialize};
 use tracing::{info, Level};
@@ -9,7 +9,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::LazyLock;
 use thiserror::Error;
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Metadata {
     announce: String,
     #[serde(rename = "announce-list")]
@@ -27,7 +27,7 @@ pub struct Metadata {
     creation_date: Option<u64>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Info {
     name: String,
     #[serde(rename = "piece length")]
@@ -37,7 +37,7 @@ pub struct Info {
     len_or_files: LenFiles,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 enum LenFiles {
     #[serde(rename = "length")]
     Length(usize),
@@ -55,7 +55,7 @@ impl Metadata {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 struct File {
     length: usize,
     path: String,
@@ -105,7 +105,7 @@ impl<'a> TrackerGet<'a> {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-pub enum TrackerResp {
+enum TrackerResp {
     #[serde(untagged)]
     Failure(Failure),
     #[serde(untagged)]
@@ -132,7 +132,7 @@ pub struct Failure {
     pub reason: String,
 }
 
-fn ipv6_client() -> Result<Client> {
+fn ipv6_client() -> Result<Client, reqwest::Error> {
     const V6_ADDR: Ipv6Addr = Ipv6Addr::from_bits(0);
     Client::builder()
         .local_address(IpAddr::V6(V6_ADDR))
@@ -140,7 +140,7 @@ fn ipv6_client() -> Result<Client> {
         .map_err(|e| e.into())
 }
 
-fn ipv4_client() -> Result<Client> {
+fn ipv4_client() -> Result<Client, reqwest::Error> {
     const V4_ADDR: Ipv4Addr = Ipv4Addr::from_bits(0);
     let builder = Client::builder();
     builder
@@ -158,31 +158,48 @@ pub enum AnnounceType {
 }
 
 #[derive(Error, Debug)]
-enum ClientErr {
+pub enum ClientErr {
     #[error("Ipv4 client unavailable")]
     Ipv4Err,
     #[error("Ipv6 client unavailable")]
     Ipv6Err,
 }
 
+#[derive(Error, Debug)]
+pub enum AnnounceError {
+    #[error("client error")]
+    ClientErr(#[from] ClientErr),
+    #[error("tracker failure")]
+    TrackerFailure(Failure),
+    #[error("request error")]
+    RequestErr(#[from] reqwest::Error),
+    #[error("bencode error")]
+    BencodeErr(#[from] bt_bencode::Error),
+}
+
 pub async fn announce<'a>(
     net_type: AnnounceType,
     req: &TrackerGet<'a>,
     torrent: &Metadata,
-) -> Result<TrackerResp> {
+) -> Result<AnnounceResp, AnnounceError> {
     let request = match net_type {
         AnnounceType::V4 => match *IPV4_CLIENT {
             Some(ref client) => client.get(&req.url(torrent)[0]),
-            None => return Err(anyhow! {"ipv4 client unavailable"}),
+            None => return Err(ClientErr::Ipv4Err.into()),
         },
         AnnounceType::V6 => match *IPV6_CLIENT {
             Some(ref client) => client.get(&req.url(torrent)[0]),
-            None => return Err(anyhow! {"ipv4 client unavailable"}),
+            None => return Err(ClientErr::Ipv6Err.into()),
         },
-    }; // TODO: more url
+    }; // TODO: request more tiers url
 
     let r = request.send().await?;
-    bt_bencode::from_slice(&r.bytes().await?).map_err(|e| e.into())
+    let decoded = bt_bencode::from_slice::<TrackerResp>(&r.bytes().await?);
+    match decoded {
+        Ok(TrackerResp::Success(s)) => Ok(s),
+        Ok(TrackerResp::Failure(f)) => Err(AnnounceError::TrackerFailure(f)),
+        Err(e) => Err(e.into()),
+    }
 }
 
 #[cfg(test)]

@@ -8,7 +8,10 @@ use tracing::{info, Level};
 mod metadata;
 mod picker;
 mod protocol;
+mod torrent_manager;
+
 use protocol::BTStream;
+use torrent_manager::TorrentManager;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -17,14 +20,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let torrent_f = include_bytes!("../ubuntu-24.10-desktop-amd64.iso.torrent");
     let torrent = metadata::Metadata::load(torrent_f).unwrap();
 
-    let announce_req = metadata::TrackerGet {
-        peer_id: "-ZS0405-qwerasdfzxcv",
-        uploaded: 0,
-        port: 35515,
-        downloaded: 0,
-        left: 0,
-        ip: None,
-    };
+    let mut tm = TorrentManager::new(torrent);
+    tm.start().await;
+
+    // let announce_req = metadata::TrackerGet {
+    //     peer_id: "-ZS0405-qwerasdfzxcv",
+    //     uploaded: 0,
+    //     port: 35515,
+    //     downloaded: 0,
+    //     left: 0,
+    //     ip: None,
+    // };
 
     let listener = net::TcpListener::bind("::0:35515").await?;
     let server = tokio::spawn(async move {
@@ -44,20 +50,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         set.join_all().await;
     });
-    let res = metadata::announce(metadata::AnnounceType::V6, &announce_req, &torrent).await?;
-    match res {
-        metadata::TrackerResp::Failure(f) => {
-            info!("announce failed with {}", f.reason);
-        }
-        metadata::TrackerResp::Success(s) => {
-            let list: Vec<String> = s
-                .peers
-                .iter()
-                .map(|p| format!("{}:{}", p.ip, p.port))
-                .collect();
-            info!("announce success with {:?}", list);
-        }
-    }
     server.await;
 
     Ok(())
