@@ -5,8 +5,11 @@ use tokio::io::{
 };
 use tokio::net;
 
+pub trait AsyncReadWrite: AsyncRead + AsyncWrite {}
+
 pub struct BTStream<T> {
-    inner: BufStream<T>,
+    // inner: BufStream<T>,
+    inner: dyn AsyncReadWrite,
 }
 
 pub struct ReadStream<T> {
@@ -17,9 +20,10 @@ pub struct WriteStream<T> {
     inner: BufWriter<T>,
 }
 
-impl<T> BTStream<T> {
+impl BTStream<net::TcpStream> {
     pub async fn connect_tcp(peer_addr: SocketAddr) -> io::Result<BTStream<net::TcpStream>> {
         // TODO: fix type of peer_addr
+        // TODO: add timeout
         let tcp_stream = net::TcpStream::connect(peer_addr).await?;
         Ok(BTStream::<net::TcpStream> {
             inner: BufStream::new(tcp_stream),

@@ -1,12 +1,16 @@
 use crate::metadata::{self, Metadata};
+use crate::protocol;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time;
 use tracing::{debug_span, info, Instrument, Level, Span};
 
 #[derive(Debug)]
+#[non_exhaustive]
 enum Msg {
     AnnounceFinish(Result<metadata::AnnounceResp, metadata::AnnounceError>),
+    NewPeer(protocol::BTStream),
 }
 
 pub struct TorrentManager {
@@ -39,8 +43,23 @@ impl TorrentManager {
             match self.change_rx.recv().await {
                 Some(msg) => {
                     info!("main received info {msg:?}");
+                    self.handle_msg(msg);
                 }
                 None => break {},
+            }
+        }
+    }
+
+    fn handle_msg(&mut self, m: Msg) {
+        match m {
+            Msg::AnnounceFinish(Ok(a)) => {
+                self.handle_announce(a);
+            }
+            Msg::AnnounceFinish(Err(e)) => {
+                info!("announce error {}", e);
+            }
+            other => {
+                info!("unhandled other {:?}", other);
             }
         }
     }
@@ -100,5 +119,18 @@ impl TorrentManager {
         cmd_tx
         // TODO: re-announce after period
         // TODO: update downloaded, port, etc
+    }
+}
+
+async fn handle_announce(mut main_tx: mpsc::Sender<Msg>, a: metadata::AnnounceResp) {
+    for p in a.peers {
+        if let Ok(ip) = p.ip.parse::<IpAddr>() {
+            // TODO: async connect peers
+            let mut conn =
+                protocol::BTStream::connect_tcp(SocketAddr::from((ip, p.port as u16))).await;
+            if let Err(e) = main_tx.send(Msg::NewPeer(conn)) {
+                info!("send new peer to main {e}");
+            }
+        }
     }
 }
