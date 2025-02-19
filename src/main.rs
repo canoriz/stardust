@@ -53,8 +53,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(server);
 
     let torrent_f = include_bytes!("../ubuntu-24.10-desktop-amd64.iso.torrent");
-    let torrent = metadata::Metadata::load(torrent_f).unwrap();
-    let mut tm = TorrentManager::new(torrent);
+    let torrent = metadata::FileMetadata::load(torrent_f).unwrap();
+
+    let (metadata, announce_list) = torrent.to_metadata();
+    info!("{:?}", &announce_list);
+    let mut tm = TorrentManager::new(metadata).with_announce_list(announce_list);
 
     wait_ready.notified().await;
     tm.start().await;

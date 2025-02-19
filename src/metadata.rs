@@ -9,8 +9,20 @@ use std::sync::LazyLock;
 use thiserror::Error;
 use tracing::{info, Level};
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+// Metadata is a universal structure
+#[derive(Debug, Clone)]
 pub struct Metadata {
+    info: Info,
+    info_hash: [u8; 20],
+
+    comment: Option<String>,
+    created_by: Option<String>,
+    creation_date: Option<u64>,
+}
+
+// FileMetadata is raw data from .torrent file
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct FileMetadata {
     announce: String,
     #[serde(rename = "announce-list")]
     announce_list: Option<Vec<Vec<String>>>,
@@ -45,14 +57,31 @@ enum LenFiles {
     Files(Vec<File>),
 }
 
-impl Metadata {
+impl FileMetadata {
     pub fn load<T: AsRef<[u8]>>(input: T) -> anyhow::Result<Self> {
-        let mut torrent: Metadata = bt_bencode::from_slice(input.as_ref())?;
+        let mut torrent: FileMetadata = bt_bencode::from_slice(input.as_ref())?;
         let mut hasher = Sha1::new();
         bt_bencode::to_writer(&mut hasher, &torrent.info)?;
         torrent.info_hash = hasher.finalize().into();
         Ok(torrent)
     }
+
+    pub fn to_metadata(self) -> (Metadata, Vec<Vec<String>>) {
+        (
+            Metadata {
+                info: self.info,
+                info_hash: self.info_hash,
+                comment: self.comment,
+                created_by: self.created_by,
+                creation_date: self.creation_date,
+            },
+            self.announce_list.unwrap_or(vec![vec![self.announce]]),
+        )
+    }
+}
+
+pub trait ToMetadata {
+    fn to_metadata(self) -> FileMetadata;
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -61,7 +90,7 @@ struct File {
     path: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TrackerGet<'a> {
     pub peer_id: &'a str,
     pub ip: Option<Ipv4Addr>,
@@ -73,7 +102,7 @@ pub struct TrackerGet<'a> {
 }
 
 impl<'a> TrackerGet<'a> {
-    pub fn url(&self, meta: &Metadata) -> Vec<String> {
+    pub fn url(&self, meta: &Metadata, url: String) -> String {
         fn percent_encoding_str<T: AsRef<[u8]>, P: AsRef<[u8]>>(k: &T, v: &P) -> String {
             percent_encoding::percent_encode(k.as_ref(), percent_encoding::NON_ALPHANUMERIC)
                 .collect::<String>()
@@ -81,11 +110,6 @@ impl<'a> TrackerGet<'a> {
                 + &percent_encoding::percent_encode(v.as_ref(), percent_encoding::NON_ALPHANUMERIC)
                     .collect::<String>()
         }
-        let url: Vec<String> = if let Some(ref announce_list) = meta.announce_list {
-            announce_list.iter().flat_map(|url| url.clone()).collect() // TODO: tier
-        } else {
-            [meta.announce.clone()].into()
-        };
 
         let mut query = [
             percent_encoding_str(&"info_hash", &meta.info_hash),
@@ -100,7 +124,7 @@ impl<'a> TrackerGet<'a> {
             query += &percent_encoding_str(&"ip", &ip.to_string());
         }
 
-        url.into_iter().map(|u| u + "?" + &query).collect()
+        url + "?" + &query
     }
 }
 
@@ -152,6 +176,7 @@ fn ipv4_client() -> Result<Client, reqwest::Error> {
 static IPV4_CLIENT: LazyLock<Option<Client>> = LazyLock::new(|| ipv4_client().ok());
 static IPV6_CLIENT: LazyLock<Option<Client>> = LazyLock::new(|| ipv4_client().ok());
 
+#[derive(Debug, Copy, Clone)]
 pub enum AnnounceType {
     V4,
     V6,
@@ -190,41 +215,42 @@ pub type AnnounceResult = Result<AnnounceResp, AnnounceError>;
 //     });
 
 pub trait Announce {
+    // TODO: maybe don't need announcer, just a function is enough
     fn announce_tier<'a>(
-        &self,
-        tier: u32,
         net_type: AnnounceType,
         req: &TrackerGet<'a>,
         torrent: &Metadata,
+        url: String,
     ) -> impl Future<Output = AnnounceResult> + Send;
 }
 
+#[derive(Clone)]
 pub struct Announcer {}
 
 impl Announce for Announcer {
     async fn announce_tier<'a>(
-        &self,
-        _tier: u32,
         net_type: AnnounceType,
         req: &TrackerGet<'a>,
         torrent: &Metadata,
+        url: String,
     ) -> AnnounceResult {
-        announce_tier_real(net_type, req, torrent).await
+        announce_one(net_type, req, torrent, url).await
     }
 }
 
-async fn announce_tier_real<'a>(
+async fn announce_one<'a>(
     net_type: AnnounceType,
     req: &TrackerGet<'a>,
     torrent: &Metadata,
+    url: String,
 ) -> AnnounceResult {
     let request = match net_type {
         AnnounceType::V4 => match *IPV4_CLIENT {
-            Some(ref client) => client.get(&req.url(torrent)[0]),
+            Some(ref client) => client.get(&req.url(torrent, url)),
             None => return Err(ClientErr::Ipv4Err.into()),
         },
         AnnounceType::V6 => match *IPV6_CLIENT {
-            Some(ref client) => client.get(&req.url(torrent)[0]),
+            Some(ref client) => client.get(&req.url(torrent, url)),
             None => return Err(ClientErr::Ipv6Err.into()),
         },
     }; // TODO: request more tiers url
@@ -245,7 +271,8 @@ mod tests {
     #[tokio::test]
     async fn test_real_torrent() {
         let torrent_f = include_bytes!("../ubuntu-24.10-desktop-amd64.iso.torrent");
-        let torrent = Metadata::load(torrent_f).unwrap();
+        let torrent = FileMetadata::load(torrent_f).unwrap();
+        let (metadata, announce_list) = torrent.to_metadata();
 
         let announce_req = TrackerGet {
             peer_id: "-ZS0405-qwerasdfzxcv".into(),
@@ -256,10 +283,14 @@ mod tests {
             ip: None,
         };
 
-        let z = Announcer {}
-            .announce_tier(0, AnnounceType::V4, &announce_req, &torrent)
-            .await
-            .unwrap();
+        let z = Announcer::announce_tier(
+            AnnounceType::V4,
+            &announce_req,
+            &metadata,
+            announce_list[0][0].clone(),
+        )
+        .await
+        .unwrap();
         dbg!(z);
     }
 
