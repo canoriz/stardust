@@ -1,10 +1,12 @@
 use std::net::SocketAddr;
 // use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use anyhow::{anyhow, Result};
+use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net;
 use tokio::time::{sleep, Duration};
 use tracing::{info, Level};
+mod announce;
 mod metadata;
 mod picker;
 mod protocol;
@@ -17,11 +19,6 @@ use torrent_manager::TorrentManager;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Hello, world!");
     tracing_subscriber::fmt::init();
-    let torrent_f = include_bytes!("../ubuntu-24.10-desktop-amd64.iso.torrent");
-    let torrent = metadata::Metadata::load(torrent_f).unwrap();
-
-    let mut tm = TorrentManager::new(torrent);
-    tm.start().await;
 
     // let announce_req = metadata::TrackerGet {
     //     peer_id: "-ZS0405-qwerasdfzxcv",
@@ -32,9 +29,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //     ip: None,
     // };
 
+    let ready = Arc::new(tokio::sync::Notify::new());
+    let wait_ready = ready.clone();
     let listener = net::TcpListener::bind("::0:35515").await?;
     let server = tokio::spawn(async move {
         let mut set = tokio::task::JoinSet::new();
+        ready.notify_one();
         loop {
             let (bt_stream, addr) = match listener.accept().await {
                 Ok((stream, addr)) => {
@@ -50,8 +50,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         set.join_all().await;
     });
-    server.await;
+    tokio::spawn(server);
 
+    let torrent_f = include_bytes!("../ubuntu-24.10-desktop-amd64.iso.torrent");
+    let torrent = metadata::Metadata::load(torrent_f).unwrap();
+    let mut tm = TorrentManager::new(torrent);
+
+    wait_ready.notified().await;
+    tm.start().await;
     Ok(())
 }
 

@@ -1,13 +1,13 @@
 // use anyhow::{anyhow, Result};
 pub use bt_bencode::ByteString;
-use serde::{Deserialize, Serialize};
-use tracing::{info, Level};
-mod workaround;
 use reqwest::Client;
+use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
+use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::LazyLock;
 use thiserror::Error;
+use tracing::{info, Level};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Metadata {
@@ -112,18 +112,18 @@ enum TrackerResp {
     Success(AnnounceResp),
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct AnnounceResp {
     pub interval: u32,
     pub peers: Vec<Peer>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Peer {
     #[serde(rename = "peer id")]
     pub peer_id: ByteString,
     pub ip: String,
-    pub port: u32,
+    pub port: u16,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -177,11 +177,47 @@ pub enum AnnounceError {
     BencodeErr(#[from] bt_bencode::Error),
 }
 
-pub async fn announce<'a>(
+pub type AnnounceResult = Result<AnnounceResp, AnnounceError>;
+
+// let res: Result<metadata::AnnounceResp, metadata::AnnounceError> =
+//     Ok(metadata::AnnounceResp {
+//         interval: 1800,
+//         peers: vec![metadata::Peer {
+//             peer_id: "1384".into(),
+//             ip: "127.0.0.1".into(),
+//             port: 35515,
+//         }],
+//     });
+
+pub trait Announce {
+    fn announce_tier<'a>(
+        &self,
+        tier: u32,
+        net_type: AnnounceType,
+        req: &TrackerGet<'a>,
+        torrent: &Metadata,
+    ) -> impl Future<Output = AnnounceResult> + Send;
+}
+
+pub struct Announcer {}
+
+impl Announce for Announcer {
+    async fn announce_tier<'a>(
+        &self,
+        _tier: u32,
+        net_type: AnnounceType,
+        req: &TrackerGet<'a>,
+        torrent: &Metadata,
+    ) -> AnnounceResult {
+        announce_tier_real(net_type, req, torrent).await
+    }
+}
+
+async fn announce_tier_real<'a>(
     net_type: AnnounceType,
     req: &TrackerGet<'a>,
     torrent: &Metadata,
-) -> Result<AnnounceResp, AnnounceError> {
+) -> AnnounceResult {
     let request = match net_type {
         AnnounceType::V4 => match *IPV4_CLIENT {
             Some(ref client) => client.get(&req.url(torrent)[0]),
@@ -198,7 +234,7 @@ pub async fn announce<'a>(
     match decoded {
         Ok(TrackerResp::Success(s)) => Ok(s),
         Ok(TrackerResp::Failure(f)) => Err(AnnounceError::TrackerFailure(f)),
-        Err(e) => Err(e.into()),
+        Err(e) => Err(AnnounceError::from(e)),
     }
 }
 
@@ -220,7 +256,8 @@ mod tests {
             ip: None,
         };
 
-        let z = announce(AnnounceType::V4, &announce_req, &torrent)
+        let z = Announcer {}
+            .announce_tier(0, AnnounceType::V4, &announce_req, &torrent)
             .await
             .unwrap();
         dbg!(z);

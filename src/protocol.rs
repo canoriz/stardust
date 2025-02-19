@@ -1,3 +1,5 @@
+use core::fmt;
+use std::fmt::Formatter;
 use std::mem::MaybeUninit;
 use std::net::SocketAddr;
 use tokio::io::{
@@ -8,8 +10,7 @@ use tokio::net;
 pub trait AsyncReadWrite: AsyncRead + AsyncWrite {}
 
 pub struct BTStream<T> {
-    // inner: BufStream<T>,
-    inner: dyn AsyncReadWrite,
+    inner: BufStream<T>,
 }
 
 pub struct ReadStream<T> {
@@ -28,6 +29,16 @@ impl BTStream<net::TcpStream> {
         Ok(BTStream::<net::TcpStream> {
             inner: BufStream::new(tcp_stream),
         })
+    }
+
+    pub fn peer_addr(&self) -> SocketAddr {
+        // TODO: is this possible to be error?
+        self.inner.get_ref().peer_addr().expect("expect ok")
+    }
+
+    pub fn local_addr(&self) -> SocketAddr {
+        // TODO: is this possible to be error?
+        self.inner.get_ref().local_addr().expect("expect ok")
     }
 }
 
@@ -58,6 +69,16 @@ impl BTStream<net::TcpStream> {
                 inner: BufWriter::new(write_end),
             },
         )
+    }
+}
+
+impl fmt::Debug for BTStream<net::TcpStream> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), std::fmt::Error> {
+        f.write_fmt(format_args!(
+            "tcp conn from {:?} to {:?}",
+            self.inner.get_ref().local_addr(),
+            self.inner.get_ref().peer_addr(),
+        ))
     }
 }
 

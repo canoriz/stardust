@@ -1,7 +1,12 @@
 use crate::metadata::{self, Metadata};
-use crate::protocol;
+use crate::protocol::{self, BTStream};
+use std::collections::HashMap;
+use std::future::Future;
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time;
 use tracing::{debug_span, info, Instrument, Level, Span};
@@ -10,7 +15,10 @@ use tracing::{debug_span, info, Instrument, Level, Span};
 #[non_exhaustive]
 enum Msg {
     AnnounceFinish(Result<metadata::AnnounceResp, metadata::AnnounceError>),
-    NewPeer(protocol::BTStream),
+
+    // TODO: support uTP/proxy
+    NewPeer(protocol::BTStream<TcpStream>),
+    NewIncomePeer(protocol::BTStream<TcpStream>),
 }
 
 pub struct TorrentManager {
@@ -20,6 +28,9 @@ pub struct TorrentManager {
     change_tx: mpsc::UnboundedSender<Msg>,
 
     announce_cmd_tx: Option<mpsc::Sender<u32>>,
+
+    // TODO: use a Map instead of Vec?
+    connected_peers: HashMap<SocketAddr, BTStream<TcpStream>>,
 }
 
 impl TorrentManager {
@@ -30,11 +41,13 @@ impl TorrentManager {
             change_rx: rx,
             change_tx: tx,
             announce_cmd_tx: None,
+
+            connected_peers: HashMap::new(),
         }
     }
 
     pub async fn start(&mut self) {
-        self.announce_cmd_tx = Some(self.start_announce_task());
+        self.announce_cmd_tx = Some(self.start_announce_task(FakeAnnouncer {}));
         self.main_loop().await;
     }
 
@@ -42,7 +55,7 @@ impl TorrentManager {
         loop {
             match self.change_rx.recv().await {
                 Some(msg) => {
-                    info!("main received info {msg:?}");
+                    info!("main received msg");
                     self.handle_msg(msg);
                 }
                 None => break {},
@@ -53,10 +66,19 @@ impl TorrentManager {
     fn handle_msg(&mut self, m: Msg) {
         match m {
             Msg::AnnounceFinish(Ok(a)) => {
-                self.handle_announce(a);
+                tokio::spawn(handle_announce(
+                    self.change_tx.clone(),
+                    a.peers
+                        .into_iter()
+                        .filter_map(|p| (p.ip).parse().map(|ip: IpAddr| (ip, p.port).into()).ok())
+                        .collect(),
+                ));
             }
             Msg::AnnounceFinish(Err(e)) => {
                 info!("announce error {}", e);
+            }
+            Msg::NewPeer(bt_conn) => {
+                info!("new outcome connection {:?}", bt_conn);
             }
             other => {
                 info!("unhandled other {:?}", other);
@@ -68,7 +90,10 @@ impl TorrentManager {
         todo!()
     }
 
-    pub fn start_announce_task(&self) -> mpsc::Sender<u32> {
+    pub fn start_announce_task(
+        &self,
+        announcer: impl metadata::Announce + Send + 'static,
+    ) -> mpsc::Sender<u32> {
         let announce_req = metadata::TrackerGet {
             peer_id: "-ZS0405-qwerasdfzxcv".into(),
             uploaded: 0,
@@ -87,8 +112,10 @@ impl TorrentManager {
                 let mut interval = Duration::from_secs(1);
 
                 loop {
-                    let res =
-                        metadata::announce(metadata::AnnounceType::V4, &announce_req, &m).await;
+                    // TODO: what if no announce url?
+                    let res = announcer
+                        .announce_tier(0, metadata::AnnounceType::V4, &announce_req, &m)
+                        .await;
                     // TODO: simplify macro inners
                     tokio::select! {
                         c = cmd_rx.recv() => {
@@ -122,15 +149,39 @@ impl TorrentManager {
     }
 }
 
-async fn handle_announce(mut main_tx: mpsc::Sender<Msg>, a: metadata::AnnounceResp) {
-    for p in a.peers {
-        if let Ok(ip) = p.ip.parse::<IpAddr>() {
-            // TODO: async connect peers
-            let mut conn =
-                protocol::BTStream::connect_tcp(SocketAddr::from((ip, p.port as u16))).await;
-            if let Err(e) = main_tx.send(Msg::NewPeer(conn)) {
-                info!("send new peer to main {e}");
+async fn handle_announce(main_tx: mpsc::UnboundedSender<Msg>, addrs: Vec<SocketAddr>) {
+    for addr in addrs {
+        // TODO: async connect peers
+        let conn = protocol::BTStream::connect_tcp(addr).await;
+        match conn {
+            Ok(c) => {
+                if let Err(e) = main_tx.send(Msg::NewPeer(c)) {
+                    info!("send new peer to main {e}");
+                }
+            }
+            Err(e) => {
+                info!("tcp handshake {addr} error {e}");
             }
         }
+    }
+}
+
+struct FakeAnnouncer {}
+impl metadata::Announce for FakeAnnouncer {
+    async fn announce_tier<'a>(
+        &self,
+        tier: u32,
+        net_type: metadata::AnnounceType,
+        req: &metadata::TrackerGet<'a>,
+        torrent: &Metadata,
+    ) -> metadata::AnnounceResult {
+        Ok(metadata::AnnounceResp {
+            interval: 1800,
+            peers: vec![metadata::Peer {
+                peer_id: "1384".into(),
+                ip: "127.0.0.1".into(),
+                port: 35515,
+            }],
+        })
     }
 }
