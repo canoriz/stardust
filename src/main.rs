@@ -3,22 +3,30 @@ use std::net::SocketAddr;
 use anyhow::{anyhow, Result};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net;
 use tokio::time::{sleep, Duration};
+use tokio::{net, time};
 use tracing::{info, Level};
-mod announce;
+mod announce_manager;
+mod connection;
 mod metadata;
 mod picker;
 mod protocol;
 mod torrent_manager;
+mod transmit_manager;
 
 use protocol::BTStream;
-use torrent_manager::TorrentManager;
+use torrent_manager::{TorrentManagerHandle, TransmitManager};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Hello, world!");
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt()
+        .event_format(
+            tracing_subscriber::fmt::format()
+                .with_file(true)
+                .with_line_number(true),
+        )
+        .init();
 
     // let announce_req = metadata::TrackerGet {
     //     peer_id: "-ZS0405-qwerasdfzxcv",
@@ -57,10 +65,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (metadata, announce_list) = torrent.to_metadata();
     info!("{:?}", &announce_list);
-    let mut tm = TorrentManager::new(metadata).with_announce_list(announce_list);
 
+    // let mut tm = TransmitManager::new(metadata).with_announce_list(announce_list);
+    let mut tm = TorrentManagerHandle::new(Arc::new(metadata));
+    tm.send_announce_msg(announce_manager::Msg::AddUrl(announce_list[0].clone()));
+    tm.send_announce_msg(announce_manager::Msg::AddUrl(announce_list[1].clone()));
     wait_ready.notified().await;
-    tm.start().await;
+
+    if let Ok(conn) = protocol::BTStream::connect_tcp("127.0.0.1:35515".parse().unwrap()).await {
+        tm.send_msg(transmit_manager::Msg::NewPeer(conn));
+    }
+    // tm.start().await;
+    time::sleep(Duration::from_secs(5)).await;
+    tm.send_announce_msg(announce_manager::Msg::RemoveUrl(
+        announce_list[0][0].clone(),
+    ));
+    tm.send_announce_msg(announce_manager::Msg::RemoveUrl(
+        announce_list[1][0].clone(),
+    ));
+    time::sleep(Duration::from_secs(1000)).await;
+    println!("before wait close");
+    tm.wait_close().await;
+    println!("after wait close");
     Ok(())
 }
 

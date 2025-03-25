@@ -471,6 +471,7 @@ async fn recv_msg<T: AsyncRead + Unpin>(handle: &mut T) -> io::Result<Message> {
             };
             let index = handle.read_u32().await?;
             let begin = handle.read_u32().await?;
+            // TODO: use BufMut to write directly to cache
             handle.read_exact(piece.as_mut_slice()).await?;
             Ok(Message::Piece(Piece {
                 index,
