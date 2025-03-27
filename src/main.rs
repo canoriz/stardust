@@ -7,7 +7,7 @@ use tokio::time::{sleep, Duration};
 use tokio::{net, time};
 use tracing::{info, Level};
 mod announce_manager;
-mod connection;
+mod connection_manager;
 mod metadata;
 mod picker;
 mod protocol;
@@ -68,21 +68,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // let mut tm = TransmitManager::new(metadata).with_announce_list(announce_list);
     let mut tm = TorrentManagerHandle::new(Arc::new(metadata));
-    tm.send_announce_msg(announce_manager::Msg::AddUrl(announce_list[0].clone()));
-    tm.send_announce_msg(announce_manager::Msg::AddUrl(announce_list[1].clone()));
+    // tm.send_announce_msg(announce_manager::Msg::AddUrl(announce_list[0].clone()));
+    // tm.send_announce_msg(announce_manager::Msg::AddUrl(announce_list[1].clone()));
     wait_ready.notified().await;
 
-    if let Ok(conn) = protocol::BTStream::connect_tcp("127.0.0.1:35515".parse().unwrap()).await {
+    if let Ok(mut conn) = protocol::BTStream::connect_tcp("127.0.0.1:35515".parse().unwrap()).await
+    {
+        conn.send_handshake(&HANDSHAKE).await?;
+        conn.recv_handshake().await?;
         tm.send_msg(transmit_manager::Msg::NewPeer(conn));
     }
     // tm.start().await;
     time::sleep(Duration::from_secs(5)).await;
-    tm.send_announce_msg(announce_manager::Msg::RemoveUrl(
-        announce_list[0][0].clone(),
-    ));
-    tm.send_announce_msg(announce_manager::Msg::RemoveUrl(
-        announce_list[1][0].clone(),
-    ));
+    // tm.send_announce_msg(announce_manager::Msg::RemoveUrl(
+    //     announce_list[0][0].clone(),
+    // ));
+    // tm.send_announce_msg(announce_manager::Msg::RemoveUrl(
+    //     announce_list[1][0].clone(),
+    // ));
     time::sleep(Duration::from_secs(1000)).await;
     println!("before wait close");
     tm.wait_close().await;
@@ -99,7 +102,12 @@ async fn handle_income_connection<T: AsyncRead + AsyncWrite + Unpin>(
     handshake.reserved = [0; 8];
     handshake.client_id = *CLIENT_ID;
     bt_stream.send_handshake(&handshake).await?;
+    info!("handshake sent");
     bt_stream.send_choke().await?;
+    bt_stream.send_keepalive().await?;
+    bt_stream.send_keepalive().await?;
+    bt_stream.send_keepalive().await?;
+    info!("all keep alive sent");
     loop {
         let msg = bt_stream.recv_msg().await?;
         info!("received msg {:?} from {}", msg, addr);

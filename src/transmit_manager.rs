@@ -1,4 +1,4 @@
-use crate::connection;
+use crate::connection_manager::ConnectionManagerHandle;
 use crate::metadata::{self, AnnounceType, Metadata, TrackerGet};
 use crate::protocol::{self, BTStream};
 use std::collections::HashMap;
@@ -42,7 +42,7 @@ pub struct TransmitManager {
 
     // TODO: use a Map instead of Vec?
     // TODO: change V type
-    connected_peers: HashMap<SocketAddr, ()>,
+    connected_peers: HashMap<SocketAddr, ConnectionManagerHandle>,
 }
 
 impl TransmitManager {
@@ -76,12 +76,13 @@ impl TransmitManager {
     fn handle_msg(&mut self, m: Msg) {
         match m {
             Msg::AnnounceFinish(Ok(a)) => {
-                self.handle_announce(
-                    a.peers
-                        .into_iter()
-                        .filter_map(|p| (p.ip).parse().map(|ip: IpAddr| (ip, p.port).into()).ok())
-                        .collect(),
-                );
+                // self.handle_announce(
+                //     a.peers
+                //         .into_iter()
+                //         .filter_map(|p| (p.ip).parse().map(|ip: IpAddr| (ip, p.port).into()).ok())
+                //         .collect(),
+                // );
+                // TODO
             }
             Msg::AnnounceFinish(Err(e)) => {
                 info!("announce error {}", e);
@@ -89,13 +90,14 @@ impl TransmitManager {
             Msg::NewPeer(bt_conn) => {
                 info!("new outward connection {:?}", bt_conn);
                 if self.connected_peers.get(&bt_conn.local_addr()).is_none() {
-                    self.connected_peers.insert(bt_conn.local_addr(), ());
+                    let peer_addr = bt_conn.peer_addr();
+                    let cm = ConnectionManagerHandle::new(bt_conn);
+                    self.connected_peers.insert(peer_addr, cm);
                 }
-
-                // TODO: start a task for new connection
             }
             other => {
                 info!("unhandled other {:?}", other);
+                todo!()
             }
         }
     }
@@ -136,12 +138,13 @@ impl TransmitManager {
     // }
 
     fn handle_announce(&mut self, addrs: Vec<SocketAddr>) {
-        for addr in addrs {
-            if self.connected_peers.get(&addr).is_none() {
-                self.connected_peers.insert(addr, ());
-                tokio::spawn(connect_peer(self.self_handle.clone(), addr));
-            }
-        }
+        todo!("use a connect tool to convert SocketAddr to BTConn");
+        // for addr in addrs {
+        //     if self.connected_peers.get(&addr).is_none() {
+        //         self.connected_peers.insert(addr, ());
+        //         tokio::spawn(connect_peer(self.self_handle.clone(), addr));
+        //     }
+        // }
     }
 }
 

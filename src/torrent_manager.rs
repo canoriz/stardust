@@ -1,5 +1,5 @@
 use crate::announce_manager::{self, AnnounceManagerHandle};
-use crate::connection;
+use crate::connection_manager;
 use crate::metadata::{self, AnnounceType, Metadata, TrackerGet};
 use crate::protocol::{self, BTStream};
 use crate::transmit_manager::{self, run_transmit_manager, TransmitManagerHandle};

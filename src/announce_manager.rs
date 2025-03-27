@@ -235,9 +235,9 @@ impl metadata::Announce for FakeAnnouncer {
         torrent: &Metadata,
         url: String,
     ) -> metadata::AnnounceResult {
-        return Err(metadata::AnnounceError::ClientErr(
-            metadata::ClientErr::Ipv4Err,
-        ));
+        // return Err(metadata::AnnounceError::ClientErr(
+        //     metadata::ClientErr::Ipv4Err,
+        // ));
         Ok(metadata::AnnounceResp {
             interval: 1800,
             peers: vec![metadata::Peer {

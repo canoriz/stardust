@@ -1,16 +1,43 @@
+use bytes::BufMut;
 use core::fmt;
 use std::fmt::Formatter;
 use std::mem::MaybeUninit;
 use std::net::SocketAddr;
 use tokio::io::{
     self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufStream, BufWriter,
+    ReadHalf, WriteHalf,
 };
 use tokio::net;
+use tokio::net::tcp;
 
-pub trait AsyncReadWrite: AsyncRead + AsyncWrite {}
+pub trait Split {
+    type R: AsyncRead + Send + Unpin + 'static;
+    type W: AsyncWrite + Send + Unpin + 'static;
+    fn split(self) -> (Self::R, Self::W);
+}
+
+impl Split for net::TcpStream {
+    type R = tcp::OwnedReadHalf;
+    type W = tcp::OwnedWriteHalf;
+
+    fn split(self) -> (Self::R, Self::W) {
+        self.into_split()
+    }
+}
+
+// non-blocking io
+pub trait TryRead {
+    fn try_read(&self, buf: &mut [u8]) -> io::Result<usize>;
+    fn try_read_buf<B: BufMut>(&self, buf: &mut B) -> io::Result<usize>;
+}
+
+pub trait TryWrite {
+    fn try_write(&self, buf: &[u8]) -> io::Result<usize>;
+}
 
 pub struct BTStream<T> {
-    inner: BufStream<T>,
+    // inner: BufStream<T>,
+    inner: T,
 }
 
 pub struct ReadStream<T> {
@@ -27,18 +54,21 @@ impl BTStream<net::TcpStream> {
         // TODO: add timeout
         let tcp_stream = net::TcpStream::connect(peer_addr).await?;
         Ok(BTStream::<net::TcpStream> {
-            inner: BufStream::new(tcp_stream),
+            // inner: BufStream::new(tcp_stream),
+            inner: tcp_stream,
         })
     }
 
     pub fn peer_addr(&self) -> SocketAddr {
         // TODO: is this possible to be error?
-        self.inner.get_ref().peer_addr().expect("expect ok")
+        // self.inner.get_ref().peer_addr().expect("expect ok")
+        self.inner.peer_addr().expect("expect ok")
     }
 
     pub fn local_addr(&self) -> SocketAddr {
         // TODO: is this possible to be error?
-        self.inner.get_ref().local_addr().expect("expect ok")
+        // self.inner.get_ref().local_addr().expect("expect ok")
+        self.inner.local_addr().expect("expect ok")
     }
 }
 
@@ -48,19 +78,18 @@ where
 {
     fn from(t: T) -> Self {
         Self {
-            inner: BufStream::new(t),
+            // inner: BufStream::new(t),
+            inner: t,
         }
     }
 }
 
-impl BTStream<net::TcpStream> {
-    pub fn into_split(
-        self,
-    ) -> (
-        ReadStream<net::tcp::OwnedReadHalf>,
-        WriteStream<net::tcp::OwnedWriteHalf>,
-    ) {
-        let (read_end, write_end) = self.inner.into_inner().into_split();
+impl<T> BTStream<T>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Split,
+{
+    pub fn split(self) -> (ReadStream<<T as Split>::R>, WriteStream<<T as Split>::W>) {
+        let (read_end, write_end) = self.inner.split();
         (
             ReadStream {
                 inner: BufReader::new(read_end),
@@ -76,8 +105,10 @@ impl fmt::Debug for BTStream<net::TcpStream> {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), std::fmt::Error> {
         f.write_fmt(format_args!(
             "tcp conn from {:?} to {:?}",
-            self.inner.get_ref().local_addr(),
-            self.inner.get_ref().peer_addr(),
+            // self.inner.get_ref().local_addr(),
+            // self.inner.get_ref().peer_addr(),
+            self.inner.local_addr(),
+            self.inner.peer_addr(),
         ))
     }
 }
@@ -524,10 +555,12 @@ mod tests {
         let (end1, end2) = duplex(1024 * 1024);
         (
             BTStream::<DuplexStream> {
-                inner: tokio::io::BufStream::new(end1),
+                // inner: tokio::io::BufStream::new(end1),
+                inner: end1,
             },
             BTStream::<DuplexStream> {
-                inner: tokio::io::BufStream::new(end2),
+                // inner: tokio::io::BufStream::new(end2),
+                inner: end2,
             },
         )
     }
@@ -539,7 +572,7 @@ mod tests {
             ReadStream<ReadHalf<DuplexStream>>,
             WriteStream<WriteHalf<DuplexStream>>,
         ) {
-            let (read_end, write_end) = split(self.inner.into_inner());
+            let (read_end, write_end) = split(self.inner);
             (
                 ReadStream {
                     inner: BufReader::new(read_end),
@@ -563,11 +596,13 @@ mod tests {
         let (end1, end2) = duplex(1024 * 1024);
         (
             BTStream::<DuplexStream> {
-                inner: tokio::io::BufStream::new(end1),
+                // inner: tokio::io::BufStream::new(end1),
+                inner: end1,
             }
             .into_split(),
             BTStream::<DuplexStream> {
-                inner: tokio::io::BufStream::new(end2),
+                // inner: tokio::io::BufStream::new(end2),
+                inner: end2,
             }
             .into_split(),
         )
