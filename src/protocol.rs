@@ -1,6 +1,9 @@
 use bytes::BufMut;
 use core::fmt;
+use sha1::digest::crypto_common::Key;
 use std::fmt::Formatter;
+use std::future::IntoFuture;
+use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::net::SocketAddr;
 use tokio::io::{
@@ -110,6 +113,46 @@ impl fmt::Debug for BTStream<net::TcpStream> {
             self.inner.local_addr(),
             self.inner.peer_addr(),
         ))
+    }
+}
+
+pub(crate) struct WriteHandle<'a, T>
+where
+    T: AsyncWrite + Unpin,
+{
+    wr: &'a mut WriteStream<T>,
+    flushed: bool,
+}
+
+impl<'a, T> Drop for WriteHandle<'a, T>
+where
+    T: AsyncWrite + Unpin,
+{
+    fn drop(&mut self) {
+        if !self.flushed {
+            panic!("write handle not flushed but dropped")
+        }
+    }
+}
+
+impl<'a, T> WriteHandle<'a, T>
+where
+    T: AsyncWrite + Unpin,
+{
+    async fn flush(&mut self) -> io::Result<()> {
+        self.wr.inner.flush().await
+    }
+}
+
+impl<T> WriteStream<T>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    fn write_handle(&mut self) -> WriteHandle<T> {
+        WriteHandle {
+            wr: self,
+            flushed: false,
+        }
     }
 }
 

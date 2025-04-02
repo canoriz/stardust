@@ -22,6 +22,11 @@ pub(crate) enum Msg {
     // TODO: support uTP/proxy
     NewPeer(protocol::BTStream<TcpStream>),
     NewIncomePeer(protocol::BTStream<TcpStream>),
+
+    PeerChoke,
+    PeerUnchoke,
+    PeerInterested,
+    PeerUninterested,
 }
 
 #[derive(Clone)]
@@ -91,13 +96,17 @@ impl TransmitManager {
                 info!("new outward connection {:?}", bt_conn);
                 if self.connected_peers.get(&bt_conn.local_addr()).is_none() {
                     let peer_addr = bt_conn.peer_addr();
-                    let cm = ConnectionManagerHandle::new(bt_conn);
+                    let cm = ConnectionManagerHandle::new(
+                        bt_conn,
+                        self.self_handle.clone(),
+                        self.metadata.clone(),
+                    );
                     self.connected_peers.insert(peer_addr, cm);
                 }
             }
             other => {
                 info!("unhandled other {:?}", other);
-                todo!()
+                // todo!()
             }
         }
     }
@@ -153,20 +162,30 @@ pub(crate) async fn run_transmit_manager(
     mut cancel: oneshot::Receiver<()>,
     done: oneshot::Sender<()>,
 ) {
+    let mut ticker =
+        tokio::time::interval(time::Duration::from_millis(500 + rand::random_range(0..50)));
     loop {
+        // TODO: lets use notify?
         tokio::select! {
             Some(msg) = transmit.receiver.recv() => {
                 info!("main received msg {msg:?}");
                 transmit.handle_msg(msg);
             }
+            _ = ticker.tick() => {
+                info!("transmit ticker tick");
+            }
             _ = &mut cancel => {
+                for (addr, handle) in transmit.connected_peers.drain() {
+                    info!("stopping connection to {addr}");
+                    handle.stop().await;
+                };
                 info!("transmit manager cancelled");
                 break;
             }
         };
     }
     let _ = done.send(());
-    println!("done done");
+    println!("transmit manager done");
 }
 
 async fn connect_peer(main_tx: TransmitManagerHandle, addr: SocketAddr) {

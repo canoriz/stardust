@@ -86,7 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // tm.send_announce_msg(announce_manager::Msg::RemoveUrl(
     //     announce_list[1][0].clone(),
     // ));
-    time::sleep(Duration::from_secs(1000)).await;
+    // time::sleep(Duration::from_secs(1000)).await;
     println!("before wait close");
     tm.wait_close().await;
     println!("after wait close");

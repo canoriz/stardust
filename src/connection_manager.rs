@@ -1,30 +1,13 @@
 use std::sync::{Arc, Mutex};
 use std::time;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use tracing::info;
 
-use crate::protocol::{self, BTStream, ReadStream, Split, WriteStream};
-
-// request a range from peer
-// from and to must be aligned with block size (except last block)
-// specified by BitTorrent protocol
-#[derive(Debug)]
-pub(crate) struct BlockRange {
-    // from and to are inclusive
-    from: protocol::Request,
-    to: protocol::Request,
-    piece_size: u32,
-}
-
-impl Iterator for BlockRange {
-    type Item = protocol::Request;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        None
-    }
-}
+use crate::metadata;
+use crate::protocol::{self, BTStream, Message, ReadStream, Split, WriteStream};
+use crate::transmit_manager::{self, TransmitManagerHandle};
 
 #[derive(Debug)]
 pub(crate) enum WakeUpOption {
@@ -41,74 +24,90 @@ pub(crate) enum Msg {
 }
 
 pub(crate) struct ConnectionManagerHandle {
-    sender: mpsc::UnboundedSender<Msg>,
-    cancel: oneshot::Sender<()>,
-    done: oneshot::Receiver<()>,
+    recv_stream: RecvStreamHandle,
+    send_stream: SendStreamHandle,
+    metadata: Arc<metadata::Metadata>,
 }
 
 impl ConnectionManagerHandle {
-    pub fn new<T>(conn: BTStream<T>) -> Self
+    pub fn new<T>(conn: BTStream<T>, trh: TransmitManagerHandle, m: Arc<metadata::Metadata>) -> Self
     where
         T: AsyncRead + AsyncWrite + Split + Unpin + Send + 'static,
     {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (read_stream, write_stream) = conn.split();
 
-        let (cancel_tx, cancel_rx) = oneshot::channel();
-        let (done_tx, done_rx) = oneshot::channel();
-        let cm = ConnectionManager::new(conn, rx);
-        tokio::spawn(run_connection_manager(cm, cancel_rx, done_tx));
+        let (recv_tx, recv_rx) = mpsc::unbounded_channel();
+        let (recv_cancel_tx, recv_cancel_rx) = oneshot::channel();
+        let (recv_done_tx, recv_done_rx) = oneshot::channel();
+        let recv_stream_handle = RecvStreamHandle {
+            sender: recv_tx,
+            cancel: recv_cancel_tx,
+            done: recv_done_rx,
+        };
+        let recv_stream: RecvStream<T> = RecvStream {
+            receiver: recv_rx,
+            read_stream: read_stream,
+            transmit_handle: trh,
+        };
+
+        let (send_tx, send_rx) = mpsc::unbounded_channel();
+        let (send_cancel_tx, send_cancel_rx) = oneshot::channel();
+        let (send_done_tx, send_done_rx) = oneshot::channel();
+        let send_stream_handle = SendStreamHandle {
+            sender: send_tx,
+            notify: Arc::new(Notify::new()),
+            cancel: send_cancel_tx,
+            done: send_done_rx,
+        };
+        let send_stream: SendStream<T> = SendStream {
+            receiver: send_rx,
+            write_stream: write_stream,
+        };
+        tokio::spawn(run_recv_stream(recv_stream, recv_cancel_rx, recv_done_tx));
+        tokio::spawn(run_send_stream(send_stream, send_cancel_rx, send_done_tx));
+
         Self {
-            sender: tx,
-            cancel: cancel_tx,
-            done: done_rx,
+            recv_stream: recv_stream_handle,
+            send_stream: send_stream_handle,
+            metadata: m,
         }
     }
 
-    pub fn send_cmd(&self, m: Msg) {
-        self.sender.send(m);
+    // fn handle_msg(&mut self, m: Msg) {
+    //     match m {
+    //         Msg::RequestBlocks(r) => {
+    //             const BLOCK_SIZE: usize = 16 * 1024;
+    //             for index in r.from.index..=r.to.index {
+    //                 for begin in (0..r.piece_size).step_by(BLOCK_SIZE) {
+    //                     todo!();
+    //                 }
+    //             }
+    //             // TODO: let send task to send data
+    //         }
+    //         Msg::SendBlocks(r) => {
+    //             todo!();
+    //         }
+    //         _ => {
+    //             todo!()
+    //         }
+    //     }
+    // }
+
+    fn send_stream_cmd(&self, m: Msg) {
+        self.send_stream.sender.send(m);
     }
-}
 
-pub(crate) struct ConnectionManager<T>
-where
-    T: Split,
-{
-    receiver: mpsc::UnboundedReceiver<Msg>,
-
-    read_stream: ReadStream<<T as Split>::R>,
-    write_stream: WriteStream<<T as Split>::W>,
-}
-
-impl<T> ConnectionManager<T>
-where
-    T: AsyncRead + AsyncWrite + Split + Unpin,
-{
-    fn new(conn: BTStream<T>, receiver: mpsc::UnboundedReceiver<Msg>) -> Self {
-        let (rd, wr) = conn.split();
-        ConnectionManager {
-            read_stream: rd,
-            write_stream: wr,
-            receiver,
-        }
+    pub fn request(&self, br: BlockRange) {
+        let piece_length = self.metadata.info.piece_length;
+        // send task notify
     }
-    fn handle_msg(&mut self, m: Msg) {
-        match m {
-            Msg::RequestBlocks(r) => {
-                const BLOCK_SIZE: usize = 16 * 1024;
-                for index in r.from.index..=r.to.index {
-                    for begin in (0..r.piece_size).step_by(BLOCK_SIZE) {
-                        todo!();
-                    }
-                }
-                // TODO: let send task to send data
-            }
-            Msg::SendBlocks(r) => {
-                todo!();
-            }
-            _ => {
-                todo!()
-            }
-        }
+
+    pub async fn stop(self) {
+        self.recv_stream.cancel.send(());
+        self.recv_stream.done.await;
+        self.send_stream.cancel.send(());
+        self.send_stream.done.await;
+        info!("connection manager cancelled");
     }
 }
 
@@ -123,58 +122,59 @@ where
 //     }
 // }
 
-pub(crate) async fn run_connection_manager<T>(
-    mut manager: ConnectionManager<T>,
-    mut cancel: oneshot::Receiver<()>,
-    done: oneshot::Sender<()>,
-) where
-    T: AsyncRead + AsyncWrite + Split + Unpin,
-{
-    let (recv_tx, recv_rx) = mpsc::unbounded_channel();
-    let (recv_cancel_tx, recv_cancel_rx) = oneshot::channel();
-    let (recv_done_tx, recv_done_rx) = oneshot::channel();
-    tokio::spawn(run_recv_stream(
-        manager.read_stream,
-        recv_rx,
-        recv_cancel_rx,
-        recv_done_tx,
-    ));
+struct RecvStreamHandle {
+    sender: mpsc::UnboundedSender<Msg>,
+    cancel: oneshot::Sender<()>,
+    done: oneshot::Receiver<()>,
+}
 
-    loop {
-        tokio::select! {
-            Some(msg) = manager.receiver.recv() => {
-                // info!("connection manager of {} received msg {msg:?}", manager.write_stream);
-                info!("connection manager received msg");
-                // manager.handle_msg(msg);
-            }
-            _ = &mut cancel => {
-                info!("connection manager cancelled");
-                break;
-            }
-        };
-    }
-    let _ = done.send(());
-    println!("connection manager done");
+struct RecvStream<T>
+where
+    T: Split,
+{
+    receiver: mpsc::UnboundedReceiver<Msg>,
+    read_stream: ReadStream<<T as Split>::R>,
+    transmit_handle: TransmitManagerHandle,
+}
+
+struct SendStreamHandle {
+    sender: mpsc::UnboundedSender<Msg>,
+    notify: Arc<Notify>,
+    cancel: oneshot::Sender<()>,
+    done: oneshot::Receiver<()>,
+}
+
+struct SendStream<T>
+where
+    T: Split,
+{
+    receiver: mpsc::UnboundedReceiver<Msg>,
+    write_stream: WriteStream<<T as Split>::W>,
 }
 
 async fn run_recv_stream<T>(
-    mut conn: ReadStream<T>,
-    mut receiver: mpsc::UnboundedReceiver<()>, // TODO
+    mut conn: RecvStream<T>,
     mut cancel: oneshot::Receiver<()>,
     done: oneshot::Sender<()>,
 ) where
-    T: AsyncRead + Unpin,
+    T: Split,
 {
     info!("in recv stream");
     loop {
         tokio::select! {
-            Some(msg) = receiver.recv() => {
+            _ = &mut cancel => {
+                info!("recv stream cancelled");
+                break;
+            }
+            Some(msg) = conn.receiver.recv() => {
+                // TODO: use buffer and tokio::Notify
                 // info!("connection manager of {} received msg {msg:?}", &manager.conn);
             }
-            r = conn.recv_msg() => {
+            r = conn.read_stream.recv_msg() => {
                 match r {
-                    Ok(m) => {
+                    Ok(ref m) => {
                         info!("received BT msg {m:?}");
+                        conn.handle_peer_msg(m).await;
                     }
                     Err(e) => {
                         info!("receive connection error {e}");
@@ -183,30 +183,98 @@ async fn run_recv_stream<T>(
                 }
 
             }
-            _ = &mut cancel => {
-                info!("recv stream cancelled");
-                break;
-            }
         };
     }
     let _ = done.send(());
     info!("done recv stream");
 }
 
-/*
+impl<T> RecvStream<T>
+where
+    T: Split,
+{
+    async fn handle_peer_msg(&mut self, m: &Message) {
+        // TODO: send statistics to transmit handle
+
+        // TODO: shall we use mpsc or just lock the manager and set it
+        // since this is generally a sync operation
+
+        // TODO: maybe use bounded channel?
+        match m {
+            Message::KeepAlive => {
+                // do nothing
+            }
+            Message::Choke => {
+                // TODO: drop all pending requests
+                // stop sending all requests
+                self.transmit_handle
+                    .0
+                    .send(transmit_manager::Msg::PeerChoke);
+            }
+            Message::Unchoke => {
+                self.transmit_handle
+                    .0
+                    .send(transmit_manager::Msg::PeerUnchoke);
+            }
+            Message::Interested => {
+                // TODO: update peer state
+                self.transmit_handle
+                    .0
+                    .send(transmit_manager::Msg::PeerInterested);
+            }
+            Message::NotInterested => {
+                // TODO: update peer state
+                self.transmit_handle
+                    .0
+                    .send(transmit_manager::Msg::PeerUninterested);
+            }
+            Message::Have(_) => {
+                // TODO: tell transmit manager
+                todo!();
+            }
+            Message::BitField(bit_field) => {
+                // TODO: tell transmit manager
+                todo!();
+            }
+            Message::Request(request) => {
+                // TODO:
+                // if in cache, mark cache in use
+                // add to send queue, wake sending task
+                // if not in cache, send to background fetch task
+                // when block fetched, wake sending task
+            }
+            Message::Piece(piece) => {
+                // TODO:
+                // if coming piece have cache, store it in cache
+                // if coming piece don't have cache, ???
+                // tell manager?
+                todo!();
+            }
+            Message::Cancel(request) => {
+                // TODO: cancel pending request/fetch task
+                todo!();
+            }
+        };
+    }
+}
+
 async fn run_send_stream<T>(
-    mut conn: WriteEnd<T>,
-    receiver: mpsc::UnboundedReceiver<()>, // TODO
+    mut conn: SendStream<T>,
     mut cancel: oneshot::Receiver<()>,
     done: oneshot::Sender<()>,
 ) where
-    T: AsyncWrite + Unpin,
+    T: Split,
 {
+    let mut interval = tokio::time::interval(time::Duration::from_secs(120));
     loop {
         tokio::select! {
-            Some(msg) = receiver.recv() => {
+            Some(msg) = conn.receiver.recv() => {
                 // info!("connection manager of {} received msg {msg:?}", &manager.conn);
-                conn.send_keepalive();
+                // use buffer and Notify
+                todo!();
+            }
+            _ = interval.tick() => {
+                conn.write_stream.send_keepalive();
             }
             _ = &mut cancel => {
                 info!("send stream cancelled");
@@ -218,6 +286,7 @@ async fn run_send_stream<T>(
     info!("done send stream");
 }
 
+/*
 struct WriteEnd<T> {
     inner: Arc<WriteEndInner<T>>,
 }

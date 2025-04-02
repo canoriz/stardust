@@ -12,7 +12,7 @@ use tracing::{info, Level};
 // Metadata is a universal structure
 #[derive(Debug, Clone)]
 pub struct Metadata {
-    info: Info,
+    pub info: Info,
     info_hash: [u8; 20],
 
     comment: Option<String>,
@@ -41,9 +41,9 @@ pub struct FileMetadata {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Info {
-    name: String,
+    pub name: String,
     #[serde(rename = "piece length")]
-    piece_length: u32,
+    pub piece_length: u32,
     pieces: ByteString,
     #[serde(flatten)]
     len_or_files: LenFiles,
