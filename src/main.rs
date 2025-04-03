@@ -37,6 +37,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //     ip: None,
     // };
 
+    let torrent_f = include_bytes!("../ubuntu-24.10-desktop-amd64.iso.torrent");
+    let torrent = metadata::FileMetadata::load(torrent_f).unwrap();
+
+    let (metadata, announce_list) = torrent.to_metadata();
+    let metadata_clone = metadata.clone();
+    info!("{:?}", &announce_list);
+
     let ready = Arc::new(tokio::sync::Notify::new());
     let wait_ready = ready.clone();
     let listener = net::TcpListener::bind("::0:35515").await?;
@@ -54,17 +61,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 }
             };
-            let handle = set.spawn(handle_income_connection(bt_stream, addr));
+            let handle = set.spawn(handle_income_connection(
+                bt_stream,
+                addr,
+                metadata_clone.clone(),
+            ));
         }
         set.join_all().await;
     });
     tokio::spawn(server);
-
-    let torrent_f = include_bytes!("../ubuntu-24.10-desktop-amd64.iso.torrent");
-    let torrent = metadata::FileMetadata::load(torrent_f).unwrap();
-
-    let (metadata, announce_list) = torrent.to_metadata();
-    info!("{:?}", &announce_list);
 
     // let mut tm = TransmitManager::new(metadata).with_announce_list(announce_list);
     let mut tm = TorrentManagerHandle::new(Arc::new(metadata));
@@ -96,6 +101,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn handle_income_connection<T: AsyncRead + AsyncWrite + Unpin>(
     mut bt_stream: BTStream<T>,
     addr: SocketAddr,
+    metadata: metadata::Metadata,
 ) -> Result<()> {
     let mut handshake = bt_stream.recv_handshake().await?;
     info!("get handshake {:?}", handshake);
@@ -103,6 +109,10 @@ async fn handle_income_connection<T: AsyncRead + AsyncWrite + Unpin>(
     handshake.client_id = *CLIENT_ID;
     bt_stream.send_handshake(&handshake).await?;
     info!("handshake sent");
+    bt_stream
+        .send_bitfield(&protocol::BitField::new(vec![0xffu8; 550]))
+        .await?;
+    info!("bitfield sent");
     bt_stream.send_choke().await?;
     bt_stream.send_keepalive().await?;
     bt_stream.send_keepalive().await?;

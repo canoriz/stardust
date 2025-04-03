@@ -5,7 +5,7 @@ use std::fmt::Formatter;
 use std::future::IntoFuture;
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tokio::io::{
     self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufStream, BufWriter,
     ReadHalf, WriteHalf,
@@ -17,6 +17,7 @@ pub trait Split {
     type R: AsyncRead + Send + Unpin + 'static;
     type W: AsyncWrite + Send + Unpin + 'static;
     fn split(self) -> (Self::R, Self::W);
+    fn peer_addr(&self) -> SocketAddr;
 }
 
 impl Split for net::TcpStream {
@@ -25,6 +26,11 @@ impl Split for net::TcpStream {
 
     fn split(self) -> (Self::R, Self::W) {
         self.into_split()
+    }
+
+    fn peer_addr(&self) -> SocketAddr {
+        const DEFAULT_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0);
+        self.peer_addr().unwrap_or(DEFAULT_ADDR)
     }
 }
 
@@ -45,10 +51,12 @@ pub struct BTStream<T> {
 
 pub struct ReadStream<T> {
     inner: BufReader<T>,
+    peer_addr: SocketAddr,
 }
 
 pub struct WriteStream<T> {
     inner: BufWriter<T>,
+    peer_addr: SocketAddr,
 }
 
 impl BTStream<net::TcpStream> {
@@ -92,13 +100,16 @@ where
     T: AsyncRead + AsyncWrite + Unpin + Split,
 {
     pub fn split(self) -> (ReadStream<<T as Split>::R>, WriteStream<<T as Split>::W>) {
+        let peer_addr = self.inner.peer_addr();
         let (read_end, write_end) = self.inner.split();
         (
             ReadStream {
                 inner: BufReader::new(read_end),
+                peer_addr,
             },
             WriteStream {
                 inner: BufWriter::new(write_end),
+                peer_addr,
             },
         )
     }
@@ -278,6 +289,11 @@ where
     pub async fn recv_handshake(&mut self) -> io::Result<Handshake> {
         recv_handshake(&mut self.inner).await
     }
+
+    pub fn peer_addr(&self) -> SocketAddr {
+        // TODO: change a different name
+        self.peer_addr
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -382,9 +398,45 @@ impl BitField {
         let bit_offset = 7 - (bit_index % 8);
         self.bitfield[u8_index as usize] & (1 << bit_offset) != 0
     }
+
+    pub fn iter(&self) -> BitFieldIter {
+        let iter = self.bitfield.iter();
+        BitFieldIter {
+            u: 0,
+            iter,
+            bit_offset: 7,
+        }
+    }
 }
 
-#[derive(Debug, Eq, PartialEq)]
+pub struct BitFieldIter<'a> {
+    u: u8,
+    bit_offset: u8,
+    iter: core::slice::Iter<'a, u8>,
+}
+
+impl<'a> Iterator for BitFieldIter<'a> {
+    type Item = bool;
+
+    // TODO: test this
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.bit_offset > 0 {
+            let offset = self.bit_offset;
+            self.bit_offset -= 1;
+            Some(self.u & (1 << offset) != 0)
+        } else {
+            if let Some(u) = self.iter.next() {
+                self.u = *u;
+                self.bit_offset = 7;
+                Some(self.u & (1 << 7) != 0)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Request {
     pub index: u32,
     pub begin: u32,
@@ -526,6 +578,7 @@ async fn recv_msg<T: AsyncRead + Unpin>(handle: &mut T) -> io::Result<Message> {
                 std::mem::transmute(piece)
             };
             handle.read_exact(bitfield.as_mut_slice()).await?;
+            let len = bitfield.len();
             Ok(Message::BitField(BitField::new(bitfield)))
         }
         MsgTy::REQUEST => {
@@ -615,13 +668,17 @@ mod tests {
             ReadStream<ReadHalf<DuplexStream>>,
             WriteStream<WriteHalf<DuplexStream>>,
         ) {
+            const DEFAULT_ADDR: SocketAddr =
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0);
             let (read_end, write_end) = split(self.inner);
             (
                 ReadStream {
                     inner: BufReader::new(read_end),
+                    peer_addr: DEFAULT_ADDR,
                 },
                 WriteStream {
                     inner: BufWriter::new(write_end),
+                    peer_addr: DEFAULT_ADDR,
                 },
             )
         }

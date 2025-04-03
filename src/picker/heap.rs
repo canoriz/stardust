@@ -11,23 +11,11 @@ pub struct PeerInfo {
     pub have: BitField,
 }
 
-pub struct Peers {
+pub(crate) struct Peers {
     peers: Vec<PeerInfo>,
 }
 
-pub struct Picker {
-    heap: Heap<u16>,
-}
-
-// impl PiecePicker {
-//     fn new(piece_count: usize) -> Self {
-//         Self {
-//             heap: Heap::new(piece_count),
-//         }
-//     }
-// }
-
-struct Heap<T> {
+pub(crate) struct Heap<T> {
     data: Vec<(usize, T)>,
     k2i: Vec<Option<usize>>, // key to index in heap
 
@@ -433,14 +421,43 @@ where
 }
 
 impl Heap<i32> {
-    fn increment(&mut self, index: usize) -> &mut Self {
-        // change upward or downword based on delta
-        todo!()
+    pub fn increment_or(&mut self, index: usize, val: i32) -> Option<i32> {
+        if let Some(val) = self.get_val(index) {
+            let v = *val;
+            self.update(index, v + 1);
+            Some(v)
+        } else {
+            self.insert(index, val);
+            None
+        }
     }
 
-    fn decrement(&mut self, index: usize) -> &mut Self {
-        // change upward or downword based on delta
-        todo!()
+    pub fn increment_bulk<V: IntoIterator<Item = usize>>(&mut self, values: V, val: i32) {
+        self.need_rebuild = true;
+        for k in values {
+            self.increment_or(k, val);
+        }
+    }
+
+    pub fn decrement_or_delete(&mut self, index: usize, delete_threshold: i32) -> Option<i32> {
+        if let Some(val) = self.get_val(index) {
+            let v = *val;
+            if v - 1 <= delete_threshold {
+                self.delete(index);
+            } else {
+                self.update(index, v - 1);
+            }
+            Some(v)
+        } else {
+            None
+        }
+    }
+
+    pub fn decrement_bulk<V: IntoIterator<Item = usize>>(&mut self, values: V, delete_threshold: i32) {
+        self.need_rebuild = true;
+        for k in values {
+            self.decrement_or_delete(k, delete_threshold);
+        }
     }
 }
 

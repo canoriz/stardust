@@ -6,6 +6,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tracing::info;
 
 use crate::metadata;
+use crate::picker::BlockRequests;
 use crate::protocol::{self, BTStream, Message, ReadStream, Split, WriteStream};
 use crate::transmit_manager::{self, TransmitManagerHandle};
 
@@ -17,8 +18,8 @@ pub(crate) enum WakeUpOption {
 
 #[derive(Debug)]
 pub(crate) enum Msg {
-    RequestBlocks(BlockRange),
-    SendBlocks(BlockRange),
+    RequestBlocks(BlockRequests),
+    // SendBlocks(BlockRange),
     SetWakeUp(WakeUpOption),
     ResetWakeUp(WakeUpOption),
 }
@@ -93,14 +94,14 @@ impl ConnectionManagerHandle {
     //     }
     // }
 
-    fn send_stream_cmd(&self, m: Msg) {
+    pub fn send_stream_cmd(&self, m: Msg) {
         self.send_stream.sender.send(m);
     }
 
-    pub fn request(&self, br: BlockRange) {
-        let piece_length = self.metadata.info.piece_length;
-        // send task notify
-    }
+    // pub fn request(&self, br: BlockRange) {
+    //     let piece_length = self.metadata.info.piece_length;
+    //     // send task notify
+    // }
 
     pub async fn stop(self) {
         self.recv_stream.cancel.send(());
@@ -172,13 +173,14 @@ async fn run_recv_stream<T>(
             }
             r = conn.read_stream.recv_msg() => {
                 match r {
-                    Ok(ref m) => {
+                    Ok(m) => {
                         info!("received BT msg {m:?}");
                         conn.handle_peer_msg(m).await;
                     }
                     Err(e) => {
                         info!("receive connection error {e}");
-                        break; // just break here. TODO
+                        // TODO: tell transmit manager this connection is dead
+                        break;
                     }
                 }
 
@@ -193,7 +195,7 @@ impl<T> RecvStream<T>
 where
     T: Split,
 {
-    async fn handle_peer_msg(&mut self, m: &Message) {
+    async fn handle_peer_msg(&mut self, m: Message) {
         // TODO: send statistics to transmit handle
 
         // TODO: shall we use mpsc or just lock the manager and set it
@@ -234,7 +236,12 @@ where
             }
             Message::BitField(bit_field) => {
                 // TODO: tell transmit manager
-                todo!();
+                self.transmit_handle
+                    .0
+                    .send(transmit_manager::Msg::PeerBitField(
+                        self.read_stream.peer_addr(),
+                        bit_field,
+                    ));
             }
             Message::Request(request) => {
                 // TODO:
@@ -269,12 +276,15 @@ async fn run_send_stream<T>(
     loop {
         tokio::select! {
             Some(msg) = conn.receiver.recv() => {
-                // info!("connection manager of {} received msg {msg:?}", &manager.conn);
-                // use buffer and Notify
-                todo!();
+                // TODO: maybe use buffer and Notify?
+                info!("send stream received {msg:?}");
             }
             _ = interval.tick() => {
-                conn.write_stream.send_keepalive();
+                if let Err(e) = conn.write_stream.send_keepalive().await {
+                    info!("send keepalive error {e}");
+                    // TODO: tell transmit manager this connection is dead
+                    break;
+                }
             }
             _ = &mut cancel => {
                 info!("send stream cancelled");

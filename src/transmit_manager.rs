@@ -1,6 +1,8 @@
 use crate::connection_manager::ConnectionManagerHandle;
+use crate::connection_manager::Msg as ConnMsg;
 use crate::metadata::{self, AnnounceType, Metadata, TrackerGet};
-use crate::protocol::{self, BTStream};
+use crate::picker::{BlockRequests, HeapPiecePicker, Picker};
+use crate::protocol::{self, BTStream, BitField};
 use std::collections::HashMap;
 use std::future::{Future, IntoFuture};
 use std::io;
@@ -27,6 +29,7 @@ pub(crate) enum Msg {
     PeerUnchoke,
     PeerInterested,
     PeerUninterested,
+    PeerBitField(SocketAddr, BitField),
 }
 
 #[derive(Clone)]
@@ -48,6 +51,8 @@ pub struct TransmitManager {
     // TODO: use a Map instead of Vec?
     // TODO: change V type
     connected_peers: HashMap<SocketAddr, ConnectionManagerHandle>,
+
+    piece_picker: HeapPiecePicker,
 }
 
 impl TransmitManager {
@@ -56,6 +61,8 @@ impl TransmitManager {
         cmd_sender: mpsc::UnboundedSender<Msg>,
         cmd_receiver: mpsc::UnboundedReceiver<Msg>,
     ) -> Self {
+        let piece_size = m.info.piece_length;
+        let piece_count = (m.info.pieces.len() / 20) as u32;
         Self {
             metadata: m,
             receiver: cmd_receiver,
@@ -63,6 +70,7 @@ impl TransmitManager {
             // announce_handle: None,
             // announce_tx: None,
             connected_peers: HashMap::new(),
+            piece_picker: HeapPiecePicker::new(piece_count, piece_size),
         }
     }
 
@@ -77,6 +85,12 @@ impl TransmitManager {
     //     self.announce_tx = Some(self.start_announce_task::<FakeAnnouncer>(announce_list));
     //     self
     // }
+    fn pick_blocks_for_peer(&mut self, n_blocks: usize) {
+        for (addr, h) in &mut self.connected_peers {
+            let reqs = self.piece_picker.pick_blocks(addr, n_blocks);
+            h.send_stream_cmd(ConnMsg::RequestBlocks(reqs));
+        }
+    }
 
     fn handle_msg(&mut self, m: Msg) {
         match m {
@@ -103,6 +117,11 @@ impl TransmitManager {
                     );
                     self.connected_peers.insert(peer_addr, cm);
                 }
+            }
+            Msg::PeerBitField(addr, bitfield) => {
+                info!("new BitField msg from peer {addr}");
+                self.piece_picker.peer_add(addr, bitfield);
+                self.pick_blocks_for_peer(15);
             }
             other => {
                 info!("unhandled other {:?}", other);
@@ -173,6 +192,7 @@ pub(crate) async fn run_transmit_manager(
             }
             _ = ticker.tick() => {
                 info!("transmit ticker tick");
+                transmit.pick_blocks_for_peer(15);
             }
             _ = &mut cancel => {
                 for (addr, handle) in transmit.connected_peers.drain() {

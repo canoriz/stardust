@@ -44,7 +44,7 @@ pub struct Info {
     pub name: String,
     #[serde(rename = "piece length")]
     pub piece_length: u32,
-    pieces: ByteString,
+    pub pieces: ByteString,
     #[serde(flatten)]
     len_or_files: LenFiles,
 }
