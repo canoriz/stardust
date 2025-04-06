@@ -278,6 +278,7 @@ async fn run_send_stream<T>(
             Some(msg) = conn.receiver.recv() => {
                 // TODO: maybe use buffer and Notify?
                 info!("send stream received {msg:?}");
+                conn.handle_cmd(msg).await;
             }
             _ = interval.tick() => {
                 if let Err(e) = conn.write_stream.send_keepalive().await {
@@ -294,6 +295,27 @@ async fn run_send_stream<T>(
     }
     let _ = done.send(());
     info!("done send stream");
+}
+
+impl<T> SendStream<T>
+where
+    T: Split,
+{
+    async fn handle_cmd(&mut self, msg: Msg) {
+        match msg {
+            Msg::RequestBlocks(reqs) => {
+                let piece_size = reqs.piece_size;
+                for rg in reqs.range.iter() {
+                    for r in rg.iter(piece_size) {
+                        self.write_stream
+                            .send_request(r.index, r.begin, r.len)
+                            .await;
+                    }
+                }
+            }
+            other => {}
+        }
+    }
 }
 
 /*

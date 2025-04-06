@@ -382,19 +382,19 @@ impl BitField {
     }
 
     pub fn set(&mut self, bit_index: u32) {
-        let u8_index = (bit_index + 3) >> 2;
+        let u8_index = bit_index >> 3;
         let bit_offset = 7 - (bit_index % 8);
         self.bitfield[u8_index as usize] |= 1 << bit_offset;
     }
 
     pub fn unset(&mut self, bit_index: u32) {
-        let u8_index = (bit_index + 3) >> 2;
+        let u8_index = bit_index >> 3;
         let bit_offset = 7 - (bit_index % 8);
         self.bitfield[u8_index as usize] &= !(1 << bit_offset);
     }
 
     pub fn get(&self, bit_index: u32) -> bool {
-        let u8_index = (bit_index + 3) >> 2;
+        let u8_index = bit_index >> 3;
         let bit_offset = 7 - (bit_index % 8);
         self.bitfield[u8_index as usize] & (1 << bit_offset) != 0
     }
@@ -424,14 +424,12 @@ impl<'a> Iterator for BitFieldIter<'a> {
             let offset = self.bit_offset;
             self.bit_offset -= 1;
             Some(self.u & (1 << offset) != 0)
+        } else if let Some(u) = self.iter.next() {
+            self.u = *u;
+            self.bit_offset = 7;
+            Some(self.u & (1 << 7) != 0)
         } else {
-            if let Some(u) = self.iter.next() {
-                self.u = *u;
-                self.bit_offset = 7;
-                Some(self.u & (1 << 7) != 0)
-            } else {
-                None
-            }
+            None
         }
     }
 }

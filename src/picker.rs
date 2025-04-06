@@ -4,7 +4,9 @@ pub use crate::protocol::BitField;
 use heap::Heap;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use tracing::warn;
+use tracing::{info, warn};
+
+const BLOCK_SIZE: u32 = 16384;
 
 // TODO: maybe use peer_id instead of socketaddr?
 pub trait Picker {
@@ -17,16 +19,21 @@ pub trait Picker {
 // many consecutive block ranges
 #[derive(Debug)]
 pub(crate) struct BlockRequests {
-    range: Vec<BlockRange>,
+    pub piece_size: u32,
+    pub range: Vec<BlockRange>,
 }
 
+// TODO: maybe change protocol::Request to use block-index
+// question: how to represent a part 16kib request?
 #[derive(Debug, Clone)]
-struct BlockRange {
+pub struct BlockRange {
     // from and to are inclusive
+    // TODO: maybe use block index? this [begin, len) pattern is strange
     from: protocol::Request,
     to: protocol::Request,
 }
 
+// TODO: can piece request cross PIECE boundry?
 impl BlockRange {
     pub fn iter(&self, piece_size: u32) -> BlockRangeIter {
         let br = self.clone();
@@ -40,7 +47,7 @@ impl BlockRange {
     }
 }
 
-struct BlockRangeIter {
+pub struct BlockRangeIter {
     current_piece: u32,
     current_in_piece_offset: u32,
     piece_size: u32,
@@ -74,7 +81,7 @@ struct BlockRangeIter {
 //     }
 // }
 impl BlockRangeIter {
-    fn abc(&mut self, last_offset: u32) -> Option<<Self as Iterator>::Item> {
+    fn one_request(&mut self, last_offset: u32) -> Option<<Self as Iterator>::Item> {
         if self.current_in_piece_offset < last_offset {
             if self.current_in_piece_offset + 16384 > last_offset {
                 let step = last_offset - self.current_in_piece_offset;
@@ -84,7 +91,7 @@ impl BlockRangeIter {
                     len: step,
                 };
                 self.current_in_piece_offset += step;
-                return Some(res);
+                Some(res)
             } else {
                 let res = protocol::Request {
                     index: self.current_piece,
@@ -92,7 +99,7 @@ impl BlockRangeIter {
                     len: 16384,
                 };
                 self.current_in_piece_offset += 16384;
-                return Some(res);
+                Some(res)
             }
         } else {
             None
@@ -108,7 +115,7 @@ impl Iterator for BlockRangeIter {
         if self.current_piece == self.br.to.index {
             // this is the last piece
             last_offset = self.br.to.begin + self.br.to.len;
-            return self.abc(last_offset);
+            return self.one_request(last_offset);
         }
 
         let piece_size = self.piece_size;
@@ -116,15 +123,14 @@ impl Iterator for BlockRangeIter {
             self.current_piece += 1;
             self.current_in_piece_offset = 0;
         }
-        self.abc(piece_size)
+        self.one_request(piece_size)
     }
 }
 
-struct PartialRequestedPieces {
-    index: u32,
-
-    // TODO: maybe use a more space efficient data structure?
-    block_field: BitField,
+#[derive(Debug)]
+struct PartialRequestedPiece {
+    // TODO: maybe use a more space/time efficient data structure?
+    block_map: Vec<bool>,
 }
 
 // TODO: change this to PiecePicker<Heap>
@@ -137,7 +143,8 @@ pub struct HeapPiecePicker {
 
     peer_field_map: HashMap<SocketAddr, BitField>,
 
-    partly_requested_pieces: Vec<PartialRequestedPieces>,
+    // index -> Piece
+    partly_requested_pieces: HashMap<u32, PartialRequestedPiece>,
     // TODO: maybe need a Vec<UnackedPieces>
 }
 
@@ -148,14 +155,80 @@ impl HeapPiecePicker {
             piece_size,
             piece_total,
             peer_field_map: HashMap::new(),
-            partly_requested_pieces: Vec::new(),
+            partly_requested_pieces: HashMap::new(),
         }
+    }
+}
+
+// TODO: tests
+// returns blockrequests and count of chosen blocks
+fn choose_blocks_from_partly_requested_piece(
+    prp: &mut PartialRequestedPiece,
+    n_blocks: usize,
+    piece_size: u32,
+    piece_index: u32,
+) -> (BlockRange, usize) {
+    let mut end = piece_size >> 14;
+    let mut begin = end;
+
+    let mut in_middle = false;
+    for (idx, b) in prp.block_map.iter_mut().enumerate() {
+        if !in_middle && !*b {
+            begin = idx as u32;
+            in_middle = true;
+        }
+        // TODO: is this n_blocks condition correct?
+        if in_middle && (*b || begin as usize + n_blocks <= idx) {
+            end = idx as u32;
+            break;
+        } else {
+            *b = true;
+        }
+    }
+
+    if begin < end {
+        dbg!(begin, end, begin + (n_blocks as u32) >= end);
+        (
+            BlockRange {
+                // TODO: FIXME: last block length is not BLOCK_SIZE
+                from: protocol::Request {
+                    index: piece_index,
+                    begin: begin * BLOCK_SIZE,
+                    len: BLOCK_SIZE,
+                },
+                to: protocol::Request {
+                    index: piece_index,
+                    begin: (end - 1) * BLOCK_SIZE,
+                    len: BLOCK_SIZE,
+                },
+            },
+            (end - begin) as usize,
+        )
+    } else {
+        const DUMMY: protocol::Request = protocol::Request {
+            index: 0,
+            begin: 0,
+            len: 0,
+        };
+        (
+            // TODO: maybe use some clever expression
+            BlockRange {
+                from: DUMMY,
+                to: DUMMY,
+            },
+            0,
+        )
     }
 }
 
 impl Picker for HeapPiecePicker {
     fn peer_add(&mut self, peer: SocketAddr, b: BitField) {
-        let field_map = b.iter().take(self.piece_total as usize).enumerate().filter(|(_, v)| *v).map(|(i, _)| i);
+        let field_map = b
+            .iter()
+            .take(self.piece_total as usize)
+            .enumerate()
+            .filter(|(_, v)| *v)
+            .map(|(i, _)| i);
         self.heap.increment_bulk(field_map, 1);
         self.peer_field_map.insert(peer, b);
     }
@@ -165,51 +238,113 @@ impl Picker for HeapPiecePicker {
     }
 
     fn pick_blocks(&mut self, peer: &SocketAddr, n_blocks: usize) -> BlockRequests {
+        let mut n_blocks = n_blocks;
+        let mut res = Vec::new();
         if let Some(peer_field) = self.peer_field_map.get(peer) {
-            for p in self.partly_requested_pieces.iter_mut() {
-                if peer_field.get(p.index) {
-                    // TODO: try to get n blocks from this piece
-                    // now just return
-                    return BlockRequests {
-                        range: vec![BlockRange {
-                            from: protocol::Request {
-                                index: p.index,
-                                begin: 0,
-                                len: 16384,
-                            },
-                            to: protocol::Request {
-                                index: p.index,
-                                begin: self.piece_size - 16384,
-                                len: 16384,
-                            },
-                        }],
-                    };
+            'outer: for (index, p) in self.partly_requested_pieces.iter_mut() {
+                if peer_field.get(*index) {
+                    loop {
+                        let (chosen, n) = choose_blocks_from_partly_requested_piece(
+                            p,
+                            n_blocks,
+                            self.piece_size,
+                            *index,
+                        );
+                        if n == 0 {
+                            break;
+                        }
+                        res.push(chosen);
+                        n_blocks -= n;
+                        if n_blocks == 0 {
+                            break 'outer;
+                        }
+                    }
                 }
             }
 
-            match self
-                .heap
-                .min_of_set(|i| peer_field.get(i as u32), None, None)
-            {
-                Some((index, _)) => BlockRequests {
-                    range: vec![BlockRange {
+            // TODO: optimize this
+            // retain pieces that are not fully requested
+            info!("partial request pieces {:?}", self.partly_requested_pieces);
+            self.partly_requested_pieces
+                .retain(|_, v| v.block_map.iter().any(|b| !*b));
+            info!("partial request pieces {:?}", self.partly_requested_pieces);
+
+            if n_blocks == 0 {
+                return BlockRequests {
+                    piece_size: self.piece_size,
+                    range: res,
+                };
+            }
+
+            loop {
+                let chosen_piece = if let Some((index, _)) =
+                    self.heap
+                        .min_of_set(|i| peer_field.get(i as u32), None, None)
+                {
+                    *index as u32
+                } else {
+                    return BlockRequests {
+                        piece_size: self.piece_size,
+                        range: res,
+                    };
+                };
+
+                self.heap.delete(chosen_piece as usize);
+
+                // TODO: FIXME: last block length is not BLOCK_SIZE
+                let n_blocks_in_piece = (self.piece_size >> 14) as usize;
+                if n_blocks >= n_blocks_in_piece {
+                    res.push(BlockRange {
+                        // TODO: FIXME: last block length is not BLOCK_SIZE
                         from: protocol::Request {
-                            index: *index as u32,
+                            index: chosen_piece,
                             begin: 0,
-                            len: 16384,
+                            len: BLOCK_SIZE,
                         },
                         to: protocol::Request {
-                            index: *index as u32,
+                            index: chosen_piece,
                             begin: self.piece_size - 16384,
-                            len: 16384,
+                            len: BLOCK_SIZE,
                         },
-                    }],
-                },
-                None => BlockRequests { range: Vec::new() },
+                    });
+                    n_blocks -= n_blocks_in_piece;
+                } else {
+                    // add this piece to partial piece list
+                    let mut block_map = vec![false; n_blocks_in_piece];
+                    for i in block_map.iter_mut().take(n_blocks) {
+                        *i = true;
+                    }
+                    self.partly_requested_pieces
+                        .insert(chosen_piece, PartialRequestedPiece { block_map });
+                    res.push(BlockRange {
+                        // TODO: FIXME: last block length is not BLOCK_SIZE
+                        from: protocol::Request {
+                            index: chosen_piece,
+                            begin: 0,
+                            len: BLOCK_SIZE,
+                        },
+                        to: protocol::Request {
+                            index: chosen_piece,
+                            begin: (n_blocks as u32 - 1) * BLOCK_SIZE,
+                            len: BLOCK_SIZE,
+                        },
+                    });
+                    n_blocks = 0;
+                }
+
+                if n_blocks == 0 {
+                    return BlockRequests {
+                        piece_size: self.piece_size,
+                        range: res,
+                    };
+                }
             }
         } else {
             warn!("request blocks of peer {peer} which not exist in field_map");
-            BlockRequests { range: Vec::new() }
+            BlockRequests {
+                piece_size: self.piece_size,
+                range: Vec::new(),
+            }
         }
     }
 

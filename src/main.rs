@@ -110,7 +110,7 @@ async fn handle_income_connection<T: AsyncRead + AsyncWrite + Unpin>(
     bt_stream.send_handshake(&handshake).await?;
     info!("handshake sent");
     bt_stream
-        .send_bitfield(&protocol::BitField::new(vec![0xffu8; 550]))
+        .send_bitfield(&protocol::BitField::new(vec![0xffu8; 3000]))
         .await?;
     info!("bitfield sent");
     bt_stream.send_choke().await?;
