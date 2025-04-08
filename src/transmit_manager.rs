@@ -192,7 +192,7 @@ pub(crate) async fn run_transmit_manager(
             }
             _ = ticker.tick() => {
                 info!("transmit ticker tick");
-                transmit.pick_blocks_for_peer(3);
+                transmit.pick_blocks_for_peer(30);
             }
             _ = &mut cancel => {
                 for (addr, handle) in transmit.connected_peers.drain() {

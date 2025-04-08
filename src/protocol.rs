@@ -415,7 +415,7 @@ pub struct BitFieldIter<'a> {
     iter: core::slice::Iter<'a, u8>,
 }
 
-impl<'a> Iterator for BitFieldIter<'a> {
+impl Iterator for BitFieldIter<'_> {
     type Item = bool;
 
     // TODO: test this

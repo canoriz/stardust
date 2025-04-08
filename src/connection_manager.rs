@@ -112,17 +112,6 @@ impl ConnectionManagerHandle {
     }
 }
 
-// #[inline]
-// fn inside_block_range(index: u32, begin: u32, len: u32, m: &BlockRange) -> bool {
-//     if m.from.index < index && index < m.to.index {
-//         true
-//     } else if index == m.from.index {
-//         m.from.begin <= begin
-//     } else if index == m.to.index {
-//         begin +
-//     }
-// }
-
 struct RecvStreamHandle {
     sender: mpsc::UnboundedSender<Msg>,
     cancel: oneshot::Sender<()>,

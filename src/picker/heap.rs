@@ -421,6 +421,7 @@ where
 }
 
 impl Heap<i32> {
+    // increment heap[index], if heap[index] not exist in heap, set heap[index] = val
     pub fn increment_or(&mut self, index: usize, val: i32) -> Option<i32> {
         if let Some(val) = self.get_val(index) {
             let v = *val;
@@ -439,6 +440,7 @@ impl Heap<i32> {
         }
     }
 
+    // decrement value of heap[index], if decremented value <= delete_threshold, heap[index] is deleted
     pub fn decrement_or_delete(&mut self, index: usize, delete_threshold: i32) -> Option<i32> {
         if let Some(val) = self.get_val(index) {
             let v = *val;
@@ -453,7 +455,12 @@ impl Heap<i32> {
         }
     }
 
-    pub fn decrement_bulk<V: IntoIterator<Item = usize>>(&mut self, values: V, delete_threshold: i32) {
+    // decrement value, if decremented value <= delete_threshold, item is deleted
+    pub fn decrement_bulk<V: IntoIterator<Item = usize>>(
+        &mut self,
+        values: V,
+        delete_threshold: i32,
+    ) {
         self.need_rebuild = true;
         for k in values {
             self.decrement_or_delete(k, delete_threshold);
