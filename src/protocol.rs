@@ -361,7 +361,7 @@ impl Message {
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq, Clone)]
 pub struct BitField {
     bitfield: Vec<u8>, // use array?
 }
@@ -404,7 +404,28 @@ impl BitField {
         BitFieldIter {
             u: 0,
             iter,
-            bit_offset: 7,
+            bit_offset: 0,
+        }
+    }
+}
+
+impl<T> From<T> for BitField
+where
+    T: AsRef<[bool]>,
+{
+    fn from(mut v: T) -> Self {
+        let s = v.as_ref();
+        Self {
+            bitfield: s
+                .chunks(8)
+                .map(|bs| {
+                    let mut ret = 0u8;
+                    for (i, b) in bs.iter().enumerate() {
+                        ret |= (*b as u8) << (7 - i);
+                    }
+                    ret
+                })
+                .collect(),
         }
     }
 }
@@ -418,12 +439,10 @@ pub struct BitFieldIter<'a> {
 impl Iterator for BitFieldIter<'_> {
     type Item = bool;
 
-    // TODO: test this
     fn next(&mut self) -> Option<Self::Item> {
         if self.bit_offset > 0 {
-            let offset = self.bit_offset;
             self.bit_offset -= 1;
-            Some(self.u & (1 << offset) != 0)
+            Some(self.u & (1 << self.bit_offset) != 0)
         } else if let Some(u) = self.iter.next() {
             self.u = *u;
             self.bit_offset = 7;
@@ -644,6 +663,16 @@ async fn recv_handshake<T: AsyncRead + Unpin>(handle: &mut T) -> io::Result<Hand
 mod tests {
     use super::*;
     use tokio::io::{duplex, split, DuplexStream, ReadHalf, WriteHalf};
+
+    #[test]
+    fn test_bitfield() {
+        let test_bits = [false, true, false, true, false, false, false, false, true];
+        let a = BitField::from(&test_bits);
+        assert_eq!(a.bitfield, [0b01010000, 0b10000000]);
+        for (b1, b2) in a.iter().zip(test_bits.iter()) {
+            assert_eq!(b1, *b2);
+        }
+    }
 
     fn make_ends() -> (BTStream<DuplexStream>, BTStream<DuplexStream>) {
         let (end1, end2) = duplex(1024 * 1024);
