@@ -62,7 +62,7 @@ impl TransmitManager {
         cmd_receiver: mpsc::UnboundedReceiver<Msg>,
     ) -> Self {
         let piece_size = m.info.piece_length;
-        let piece_count = (m.info.pieces.len() / 20) as u32;
+        let total_length = m.len();
         Self {
             metadata: m,
             receiver: cmd_receiver,
@@ -70,7 +70,7 @@ impl TransmitManager {
             // announce_handle: None,
             // announce_tx: None,
             connected_peers: HashMap::new(),
-            piece_picker: HeapPiecePicker::new(piece_count, piece_size),
+            piece_picker: HeapPiecePicker::new(total_length, piece_size),
         }
     }
 

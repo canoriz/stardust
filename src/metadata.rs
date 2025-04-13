@@ -15,9 +15,17 @@ pub struct Metadata {
     pub info: Info,
     info_hash: [u8; 20],
 
+    len: usize,
+
     comment: Option<String>,
     created_by: Option<String>,
     creation_date: Option<u64>,
+}
+
+impl Metadata {
+    pub fn len(&self) -> usize {
+        self.len
+    }
 }
 
 // FileMetadata is raw data from .torrent file
@@ -67,6 +75,10 @@ impl FileMetadata {
     }
 
     pub fn to_metadata(self) -> (Metadata, Vec<Vec<String>>) {
+        let len = match &self.info.len_or_files {
+            LenFiles::Length(l) => *l,
+            LenFiles::Files(fs) => fs.iter().map(|f| f.length).sum(),
+        };
         (
             Metadata {
                 info: self.info,
@@ -74,6 +86,7 @@ impl FileMetadata {
                 comment: self.comment,
                 created_by: self.created_by,
                 creation_date: self.creation_date,
+                len,
             },
             self.announce_list.unwrap_or(vec![vec![self.announce]]),
         )

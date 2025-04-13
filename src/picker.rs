@@ -30,9 +30,38 @@ pub(crate) struct BlockRequests {
     pub range: Vec<BlockRange>,
 }
 
-// impl Iterator for BlockRequests {
-//     type Item = BlockRangeIter;
+// struct BlockRequestsIter<'a, T>
+// where
+//     T: Iterator<Item = BlockRange>,
+// {
+//     piece_size: u32,
+//     last_piece_size: u32,
+//     last_piece_index: u32,
+//     br_iter: T,
+//     pr_iter: Option<BlockRangeIter>,
+// }
 
+// impl<T> Iterator for BlockRequestsIter<'_, T>
+// where
+//     T: Iterator<Item = BlockRange>,
+// {
+//     type Item = protocol::Request;
+
+//     fn next(&mut self) -> Option<Self::Item> {
+//         if let Some(i) = self.pr_iter {
+//             let nx = self.pr_iter.next();
+//             if let Some(v) = nx {
+//                 return Some(v);
+//             } else {
+//                 self.pr_iter = match self.br_iter.next() {
+//                     Some(br) => {
+//                         if br.
+//                     }
+//                 }
+//             }
+//         }
+//         let br = self.br_iter.next();
+//     }
 // }
 
 // TODO: maybe change protocol::Request to use block-index
@@ -98,19 +127,17 @@ impl Iterator for BlockRangeIter {
     type Item = protocol::Request;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let mut last_offset = self.piece_size;
         if self.current_piece == self.br.to.index {
-            // this is the last piece
-            last_offset = self.br.to.begin + self.br.to.len;
+            // this is the last piece in range
+            let last_offset = self.br.to.begin + self.br.to.len;
             return self.one_request(last_offset);
         }
 
-        let piece_size = self.piece_size;
-        if self.current_in_piece_offset >= piece_size {
+        if self.current_in_piece_offset >= self.piece_size {
             self.current_piece += 1;
             self.current_in_piece_offset = 0;
         }
-        self.one_request(piece_size)
+        self.one_request(self.piece_size)
     }
 }
 
@@ -190,7 +217,9 @@ impl PartialRequestedPieces {
         peer: &SocketAddr,
         peer_field: &BitField,
         mut n_blocks: usize,
-        piece_size: u32,
+        normal_piece_size: u32, // TODO: maybe use a Fn(index: u32) -> (piecesize: u32)?
+        last_piece_index: u32,
+        last_piece_size: u32,
         picked: &mut Vec<BlockRange>,
     ) -> usize {
         // TODO: pick pieces from picked ratio high to low
@@ -201,8 +230,14 @@ impl PartialRequestedPieces {
                         // no more to pick
                         break 'outer;
                     }
+                    // if is last piece or not, set piece_size
+                    let piece_size = if *index == last_piece_index {
+                        last_piece_size
+                    } else {
+                        normal_piece_size
+                    };
                     let (chosen, n) = choose_blocks_from_a_partial_requested_piece(
-                        peer, p, n_blocks, piece_size, *index,
+                        peer, p, n_blocks, *index, piece_size,
                     );
                     if n == 0 {
                         // every block in this piece have been picked
@@ -226,6 +261,7 @@ pub struct HeapPiecePicker {
     heap: Heap<i32>, // let's say availability is type i32
     piece_size: u32,
     piece_total: u32,
+    last_piece_size: u32,
 
     peer_field_map: HashMap<SocketAddr, BitField>,
 
@@ -238,12 +274,24 @@ pub struct HeapPiecePicker {
 }
 
 impl HeapPiecePicker {
-    pub fn new(piece_total: u32, piece_size: u32) -> Self {
+    pub fn new(total_length: usize, piece_size: u32) -> Self {
+        let n_full_piece = total_length / (piece_size as usize);
+        let full_piece_total_size = n_full_piece * (piece_size as usize);
+        let (piece_total, last_piece_size) = if full_piece_total_size == total_length {
+            (n_full_piece, 0)
+        } else {
+            (
+                n_full_piece + 1,
+                (total_length - full_piece_total_size) as u32,
+            )
+        };
+
         Self {
             heap: Heap::new(piece_total as usize),
             piece_size,
-            piece_total,
+            piece_total: piece_total as u32,
             peer_field_map: HashMap::new(),
+            last_piece_size,
 
             partly_requested_pieces: PartialRequestedPieces(BTreeMap::new()),
             fully_requested_pieces: HashMap::new(),
@@ -251,17 +299,36 @@ impl HeapPiecePicker {
     }
 }
 
-// TODO: tests
+// returns the smallest integer n
+// that x/y <= n
+// let's assume x+y-1 won't overflow
+#[inline]
+fn ceiling_devide(x: u32, y: u32) -> u32 {
+    (x + y - 1) / y
+}
+
+fn block_size(blk_index: u32, piece_size: u32) -> u32 {
+    let normal_end = blk_index * BLOCK_SIZE + BLOCK_SIZE;
+    if normal_end <= piece_size {
+        BLOCK_SIZE
+    } else {
+        piece_size - blk_index * BLOCK_SIZE
+    }
+}
+
 // returns blockrequests and count of chosen blocks
 fn choose_blocks_from_a_partial_requested_piece(
     peer: &SocketAddr,
     prp: &mut PartialRequestedPiece,
     n_blocks: usize,
-    piece_size: u32,
     piece_index: u32,
+    piece_size: u32,
 ) -> (BlockRange, usize) {
-    let mut end = piece_size >> 14;
+    let mut end = prp.block_map.len() as u32;
     let mut begin = end;
+
+    assert!(end * BLOCK_SIZE >= piece_size);
+    assert!((end - 1) * BLOCK_SIZE < piece_size);
 
     let mut in_middle = false;
     for (idx, b) in prp
@@ -288,16 +355,15 @@ fn choose_blocks_from_a_partial_requested_piece(
         dbg!(begin, end, begin + (n_blocks as u32) >= end);
         (
             BlockRange {
-                // TODO: FIXME: last block length is not BLOCK_SIZE
                 from: protocol::Request {
                     index: piece_index,
                     begin: begin * BLOCK_SIZE,
-                    len: BLOCK_SIZE,
+                    len: block_size(begin, piece_size),
                 },
                 to: protocol::Request {
                     index: piece_index,
                     begin: (end - 1) * BLOCK_SIZE,
-                    len: BLOCK_SIZE,
+                    len: block_size(end - 1, piece_size),
                 },
             },
             (end - begin) as usize,
@@ -326,7 +392,9 @@ fn pick_blocks_from_heap(
     peer: &SocketAddr,
     peer_field: &BitField,
     mut n_blocks: usize,
-    piece_size: u32,
+    normal_piece_size: u32, // TODO: maybe use a Fn(index: u32) -> (piecesize: u32)?
+    last_piece_index: u32,
+    last_piece_size: u32,
     picked: &mut Vec<BlockRange>,
     partials: &mut PartialRequestedPieces,
     fullys: &mut HashMap<u32, PartialRequestedPiece>,
@@ -350,20 +418,27 @@ fn pick_blocks_from_heap(
         };
         info!("picked piece {chosen_piece} from heap");
 
-        // TODO: FIXME: last block length is not BLOCK_SIZE
-        let n_blocks_in_piece = (piece_size >> 14) as usize;
+        // calc n blocks base on last piece or not
+        let (n_blocks_in_piece, piece_size) = if chosen_piece == last_piece_index {
+            (
+                ceiling_devide(last_piece_size, BLOCK_SIZE) as usize,
+                last_piece_size,
+            )
+        } else {
+            ((normal_piece_size >> 14) as usize, normal_piece_size)
+        };
+
         if n_blocks >= n_blocks_in_piece {
             picked.push(BlockRange {
-                // TODO: FIXME: last block length is not BLOCK_SIZE
                 from: protocol::Request {
                     index: chosen_piece,
                     begin: 0,
-                    len: BLOCK_SIZE,
+                    len: block_size(0, piece_size),
                 },
                 to: protocol::Request {
                     index: chosen_piece,
-                    begin: piece_size - BLOCK_SIZE,
-                    len: BLOCK_SIZE,
+                    begin: BLOCK_SIZE * (n_blocks_in_piece - 1) as u32,
+                    len: block_size((n_blocks_in_piece - 1) as u32, piece_size),
                 },
             });
 
@@ -376,7 +451,7 @@ fn pick_blocks_from_heap(
                 },
             );
 
-            n_blocks -= n_blocks_in_piece;
+            n_blocks -= (n_blocks_in_piece as usize);
         } else {
             // add this piece to partial piece list
             let mut block_map = vec![BlockStatus::NotRequested; n_blocks_in_piece];
@@ -391,16 +466,16 @@ fn pick_blocks_from_heap(
                 },
             );
             picked.push(BlockRange {
-                // TODO: FIXME: last block length is not BLOCK_SIZE
+                // TODO: test pick last piece and last block
                 from: protocol::Request {
                     index: chosen_piece,
                     begin: 0,
-                    len: BLOCK_SIZE,
+                    len: block_size(0, piece_size),
                 },
                 to: protocol::Request {
                     index: chosen_piece,
                     begin: (n_blocks as u32 - 1) * BLOCK_SIZE,
-                    len: BLOCK_SIZE,
+                    len: block_size((n_blocks - 1) as u32, piece_size),
                 },
             });
             n_blocks = 0;
@@ -537,6 +612,8 @@ impl Picker for HeapPiecePicker {
                     peer_field,
                     n_blocks,
                     self.piece_size,
+                    self.piece_total - 1,
+                    self.last_piece_size,
                     &mut picked,
                 );
 
@@ -551,6 +628,8 @@ impl Picker for HeapPiecePicker {
                 peer_field,
                 n_blocks,
                 self.piece_size,
+                self.piece_total - 1,
+                self.last_piece_size,
                 &mut picked,
                 &mut self.partly_requested_pieces,
                 &mut self.fully_requested_pieces,
@@ -757,7 +836,29 @@ mod test {
             }));
     }
 
-    fn generate_peer(ip: u32) -> SocketAddr {
+    #[test]
+    fn test_block_range_iter_same_block() {
+        let br = BlockRange {
+            from: protocol::Request {
+                index: 5,
+                begin: 9 * BLOCK_SIZE,
+                len: 163,
+            },
+            to: protocol::Request {
+                index: 5,
+                begin: 9 * BLOCK_SIZE,
+                len: 163,
+            },
+        };
+        assert!(br.iter(16 * BLOCK_SIZE).all(|r| r
+            == protocol::Request {
+                index: 5,
+                begin: 9 * BLOCK_SIZE,
+                len: 163,
+            }));
+    }
+
+    const fn generate_peer(ip: u32) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::from_bits(ip)), 1)
     }
 
@@ -815,7 +916,9 @@ mod test {
     fn test_pick_blocks() {
         const PIECE_TOTAL: u32 = 30;
 
-        let mut picker = HeapPiecePicker::new(PIECE_TOTAL, BLOCK_SIZE * 14);
+        const TOTAL_LENGTH: usize = (PIECE_TOTAL * BLOCK_SIZE * 14 - 3 * (BLOCK_SIZE + 1)) as usize;
+        // make a length not multiple of block size
+        let mut picker = HeapPiecePicker::new(TOTAL_LENGTH, BLOCK_SIZE * 14);
 
         // i-th peer has first i piece
         let peers: Vec<_> = (1..)
@@ -966,5 +1069,68 @@ mod test {
             picker.piece_checked(4);
             check_picker_partial_and_fully(&picker, [6, 7], [2, 3]);
         }
+
+        // check pick last piece
+        {
+            println!("test pick last piece");
+            let pick30 = picker.pick_blocks(&peers[29].0, 50);
+            check_block_requests(&pick30, &[6, 7, 27, 29, 28], 50);
+            let last_piece_length = TOTAL_LENGTH % ((BLOCK_SIZE as usize) * 14);
+            let last_block_len = last_piece_length % (BLOCK_SIZE as usize);
+            let last_block_begin = last_piece_length - last_block_len;
+            assert!(pick30.range.iter().any(|br| {
+                for pr in br.iter(pick30.piece_size) {
+                    if pr.index == picker.piece_total - 1
+                        && pr.begin == last_block_begin as u32
+                        && pr.len == last_block_len as u32
+                    {
+                        return true;
+                    }
+                }
+                return false;
+            }));
+            println!("{pick30:?}");
+            check_picker_partial_and_fully(&picker, [27], [2, 3, 6, 7, 28, 29]);
+        };
+    }
+
+    #[test]
+    fn test_choose_from_partial() {
+        const ADDR: SocketAddr = generate_peer(1);
+        let mut prp = PartialRequestedPiece {
+            all_requested_before: 0,
+            block_map: vec![
+                BlockStatus::Received,
+                BlockStatus::NotRequested,
+                BlockStatus::NotRequested,
+                BlockStatus::NotRequested,
+            ],
+        };
+        let last_block_size = 401;
+        let (br, n) = choose_blocks_from_a_partial_requested_piece(
+            &ADDR,
+            &mut prp,
+            4,
+            1,
+            3 * BLOCK_SIZE + last_block_size,
+        );
+        // assert_eq!(from: Request { index: 1, begin: 16384, len: 16384 }, to: Request { index: 1, begin: 49152, len: 15983 } });
+        assert_eq!(n, 3);
+        assert_eq!(
+            br.from,
+            protocol::Request {
+                index: 1,
+                begin: BLOCK_SIZE,
+                len: 16384
+            }
+        );
+        assert_eq!(
+            br.to,
+            protocol::Request {
+                index: 1,
+                begin: 3 * BLOCK_SIZE,
+                len: last_block_size,
+            }
+        );
     }
 }
