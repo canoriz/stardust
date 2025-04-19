@@ -6,7 +6,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tracing::info;
 
 use crate::metadata;
-use crate::picker::BlockRequests;
+use crate::picker::{BlockRange, BlockRequests};
 use crate::protocol::{self, BTStream, Message, ReadStream, Split, WriteStream};
 use crate::transmit_manager::{self, TransmitManagerHandle};
 
@@ -163,7 +163,7 @@ async fn run_recv_stream<T>(
             r = conn.read_stream.recv_msg() => {
                 match r {
                     Ok(m) => {
-                        info!("received BT msg {m:?}");
+                        info!("received BT msg");
                         conn.handle_peer_msg(m).await;
                     }
                     Err(e) => {
@@ -199,24 +199,24 @@ where
                 // TODO: drop all pending requests
                 // stop sending all requests
                 self.transmit_handle
-                    .0
+                    .sender
                     .send(transmit_manager::Msg::PeerChoke);
             }
             Message::Unchoke => {
                 self.transmit_handle
-                    .0
+                    .sender
                     .send(transmit_manager::Msg::PeerUnchoke);
             }
             Message::Interested => {
                 // TODO: update peer state
                 self.transmit_handle
-                    .0
+                    .sender
                     .send(transmit_manager::Msg::PeerInterested);
             }
             Message::NotInterested => {
                 // TODO: update peer state
                 self.transmit_handle
-                    .0
+                    .sender
                     .send(transmit_manager::Msg::PeerUninterested);
             }
             Message::Have(_) => {
@@ -226,7 +226,7 @@ where
             Message::BitField(bit_field) => {
                 // TODO: tell transmit manager
                 self.transmit_handle
-                    .0
+                    .sender
                     .send(transmit_manager::Msg::PeerBitField(
                         self.read_stream.peer_addr(),
                         bit_field,
@@ -244,7 +244,26 @@ where
                 // if coming piece have cache, store it in cache
                 // if coming piece don't have cache, ???
                 // tell manager?
-                todo!();
+                info!(
+                    "block received {} {} {}",
+                    piece.index,
+                    piece.begin,
+                    piece.piece.len(),
+                );
+
+                let received_piece =
+                    self.transmit_handle
+                        .picker
+                        .lock()
+                        .unwrap()
+                        .block_received(protocol::Request {
+                            index: piece.index,
+                            begin: piece.begin,
+                            len: piece.piece.len() as u32,
+                        });
+                if let Some(i) = received_piece {
+                    info!("piece {i} received");
+                }
             }
             Message::Cancel(request) => {
                 // TODO: cancel pending request/fetch task

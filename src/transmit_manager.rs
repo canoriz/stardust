@@ -1,13 +1,13 @@
 use crate::connection_manager::ConnectionManagerHandle;
 use crate::connection_manager::Msg as ConnMsg;
 use crate::metadata::{self, AnnounceType, Metadata, TrackerGet};
-use crate::picker::{BlockRequests, HeapPiecePicker, Picker};
+use crate::picker::{BlockRequests, HeapPiecePicker};
 use crate::protocol::{self, BTStream, BitField};
 use std::collections::HashMap;
 use std::future::{Future, IntoFuture};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -33,7 +33,10 @@ pub(crate) enum Msg {
 }
 
 #[derive(Clone)]
-pub(crate) struct TransmitManagerHandle(pub mpsc::UnboundedSender<Msg>);
+pub(crate) struct TransmitManagerHandle {
+    pub sender: mpsc::UnboundedSender<Msg>,
+    pub picker: Arc<Mutex<HeapPiecePicker>>, // TODO: using dyn <trait Picker>?
+}
 
 pub struct TransmitManager {
     metadata: Arc<Metadata>,
@@ -52,7 +55,7 @@ pub struct TransmitManager {
     // TODO: change V type
     connected_peers: HashMap<SocketAddr, ConnectionManagerHandle>,
 
-    piece_picker: HeapPiecePicker,
+    piece_picker: Arc<Mutex<HeapPiecePicker>>,
 }
 
 impl TransmitManager {
@@ -63,14 +66,18 @@ impl TransmitManager {
     ) -> Self {
         let piece_size = m.info.piece_length;
         let total_length = m.len();
+        let piece_picker = Arc::new(Mutex::new(HeapPiecePicker::new(total_length, piece_size)));
         Self {
             metadata: m,
             receiver: cmd_receiver,
-            self_handle: TransmitManagerHandle(cmd_sender),
+            self_handle: TransmitManagerHandle {
+                sender: cmd_sender,
+                picker: piece_picker.clone(),
+            },
             // announce_handle: None,
             // announce_tx: None,
             connected_peers: HashMap::new(),
-            piece_picker: HeapPiecePicker::new(total_length, piece_size),
+            piece_picker,
         }
     }
 
@@ -87,7 +94,11 @@ impl TransmitManager {
     // }
     fn pick_blocks_for_peer(&mut self, n_blocks: usize) {
         for (addr, h) in &mut self.connected_peers {
-            let reqs = self.piece_picker.pick_blocks(addr, n_blocks);
+            let reqs = self
+                .piece_picker
+                .lock()
+                .unwrap() // TODO: fix unwrap
+                .pick_blocks(addr, n_blocks);
             h.send_stream_cmd(ConnMsg::RequestBlocks(reqs));
         }
     }
@@ -120,7 +131,7 @@ impl TransmitManager {
             }
             Msg::PeerBitField(addr, bitfield) => {
                 info!("new BitField msg from peer {addr}");
-                self.piece_picker.peer_add(addr, bitfield);
+                self.piece_picker.lock().unwrap().peer_add(addr, bitfield);
                 self.pick_blocks_for_peer(15);
             }
             other => {
@@ -212,7 +223,7 @@ async fn connect_peer(main_tx: TransmitManagerHandle, addr: SocketAddr) {
     let conn = protocol::BTStream::connect_tcp(addr).await;
     match conn {
         Ok(c) => {
-            if let Err(e) = main_tx.0.send(Msg::NewPeer(c)) {
+            if let Err(e) = main_tx.sender.send(Msg::NewPeer(c)) {
                 info!("send new peer to main {e}");
             }
         }

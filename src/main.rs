@@ -11,16 +11,18 @@ mod connection_manager;
 mod metadata;
 mod picker;
 mod protocol;
+mod storage;
 mod torrent_manager;
 mod transmit_manager;
 
-use protocol::BTStream;
+use protocol::{BTStream, Message};
 use torrent_manager::{TorrentManagerHandle, TransmitManager};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Hello, world!");
     tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .event_format(
             tracing_subscriber::fmt::format()
                 .with_file(true)
@@ -84,7 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tm.send_msg(transmit_manager::Msg::NewPeer(conn));
     }
     // tm.start().await;
-    time::sleep(Duration::from_secs(5)).await;
+    time::sleep(Duration::from_secs(500)).await;
     // tm.send_announce_msg(announce_manager::Msg::RemoveUrl(
     //     announce_list[0][0].clone(),
     // ));
@@ -120,7 +122,16 @@ async fn handle_income_connection<T: AsyncRead + AsyncWrite + Unpin>(
     info!("all keep alive sent");
     loop {
         let msg = bt_stream.recv_msg().await?;
-        info!("received msg {:?} from {}", msg, addr);
+        match msg {
+            Message::Request(r) => {
+                bt_stream
+                    .send_piece(r.index, r.begin, &vec![0x00; r.len as usize])
+                    .await;
+            }
+            _ => {
+                info!("received msg {:?} from {}", msg, addr);
+            }
+        }
     }
 }
 

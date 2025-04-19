@@ -4,24 +4,24 @@ pub use crate::protocol::BitField;
 use heap::Heap;
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 const BLOCK_SIZE: u32 = 16384;
 
 // TODO: maybe use peer_id instead of socketaddr?
-pub trait Picker {
-    fn peer_add(&mut self, peer: SocketAddr, b: BitField);
-    fn peer_remove(&mut self, peer: &SocketAddr);
-    fn pick_blocks(&mut self, peer: &SocketAddr, n_blocks: usize) -> BlockRequests;
-    fn peer_have(&mut self, peer: &SocketAddr, piece: u32);
-    fn blocks_received(&mut self, block: &BlockRange);
+// pub trait Picker {
+//     fn peer_add(&mut self, peer: SocketAddr, b: BitField);
+//     fn peer_remove(&mut self, peer: &SocketAddr);
+//     fn pick_blocks(&mut self, peer: &SocketAddr, n_blocks: usize) -> BlockRequests;
+//     fn peer_have(&mut self, peer: &SocketAddr, piece: u32);
+//     fn blocks_received(&mut self, block: &BlockRange);
 
-    // these blocks(requested or not) will not come automatically
-    // need to re-request them
-    fn blocks_revoke(&mut self, block: &BlockRange);
+//     // these blocks(requested or not) will not come automatically
+//     // need to re-request them
+//     fn blocks_revoke(&mut self, block: &BlockRange);
 
-    fn piece_checked(&mut self, piece_index: u32);
-}
+//     fn piece_checked(&mut self, piece_index: u32);
+// }
 
 // many consecutive block ranges
 #[derive(Debug)]
@@ -76,6 +76,15 @@ pub struct BlockRange {
 
 // TODO: can piece request cross PIECE boundry?
 impl BlockRange {
+    // TODO: from 3-int tuple or some more sophisticated struct?
+    pub fn one_block(index: u32, begin: u32, len: u32) -> Self {
+        let a = protocol::Request { index, begin, len };
+        Self {
+            from: a.clone(),
+            to: a,
+        }
+    }
+
     pub fn iter(&self, piece_size: u32) -> BlockRangeIter {
         let br = self.clone();
         BlockRangeIter {
@@ -352,7 +361,7 @@ fn choose_blocks_from_a_partial_requested_piece(
     }
 
     if begin < end {
-        dbg!(begin, end, begin + (n_blocks as u32) >= end);
+        assert!(begin + (n_blocks as u32) >= end);
         (
             BlockRange {
                 from: protocol::Request {
@@ -485,8 +494,8 @@ fn pick_blocks_from_heap(
     n_blocks
 }
 
-impl Picker for HeapPiecePicker {
-    fn peer_add(&mut self, peer: SocketAddr, b: BitField) {
+impl HeapPiecePicker {
+    pub fn peer_add(&mut self, peer: SocketAddr, b: BitField) {
         if self.peer_field_map.contains_key(&peer) {
             // if peer previously stored, remove it first
             // TODO: will remove cause big overhead
@@ -503,18 +512,7 @@ impl Picker for HeapPiecePicker {
         self.peer_field_map.insert(peer, b);
     }
 
-    fn peer_remove(&mut self, peer: &SocketAddr) {
-        if let Some(field_map) = self.peer_field_map.get(peer) {
-            let field_map = field_map
-                .iter()
-                .take(self.piece_total as usize)
-                .enumerate()
-                .filter(|(_, v)| *v)
-                .map(|(i, _)| i);
-            self.heap.decrement_bulk(field_map, 0);
-        }
-        self.peer_field_map.remove(peer);
-
+    pub fn peer_mark_not_requested(&mut self, peer: &SocketAddr) {
         let should_remove_from_partial = self
             .partly_requested_pieces
             .0
@@ -600,8 +598,23 @@ impl Picker for HeapPiecePicker {
         }
     }
 
+    pub fn peer_remove(&mut self, peer: &SocketAddr) {
+        if let Some(field_map) = self.peer_field_map.get(peer) {
+            let field_map = field_map
+                .iter()
+                .take(self.piece_total as usize)
+                .enumerate()
+                .filter(|(_, v)| *v)
+                .map(|(i, _)| i);
+            self.heap.decrement_bulk(field_map, 0);
+        }
+        self.peer_field_map.remove(peer);
+
+        self.peer_mark_not_requested(peer);
+    }
+
     // TODO: change this struct to reuse return request's Vec buffer?
-    fn pick_blocks(&mut self, peer: &SocketAddr, n_blocks: usize) -> BlockRequests {
+    pub fn pick_blocks(&mut self, peer: &SocketAddr, n_blocks: usize) -> BlockRequests {
         let mut n_blocks = n_blocks;
         let mut picked = Vec::new();
         if let Some(peer_field) = self.peer_field_map.get(peer) {
@@ -657,13 +670,18 @@ impl Picker for HeapPiecePicker {
                 self.fully_requested_pieces.insert(*k, v);
             }
 
-            info!(
+            debug!(
                 "after move, partial request pieces {:?}",
                 self.partly_requested_pieces.0
             );
-            info!(
+            debug!(
                 "after move, fully request pieces {:?}",
                 self.fully_requested_pieces
+            );
+            warn!(
+                "n fully request pieces: {}/{}",
+                self.fully_requested_pieces.len(),
+                self.piece_total,
             );
 
             return BlockRequests {
@@ -679,7 +697,7 @@ impl Picker for HeapPiecePicker {
         }
     }
 
-    fn peer_have(&mut self, peer: &SocketAddr, piece: u32) {
+    pub fn peer_have(&mut self, peer: &SocketAddr, piece: u32) {
         if let Some(v) = self.peer_field_map.get_mut(peer) {
             v.set(piece);
             self.heap.increment_or(piece as usize, 1);
@@ -693,42 +711,54 @@ impl Picker for HeapPiecePicker {
         }
     }
 
-    // TODO: maybe use &BlockRange?
-    fn blocks_received(&mut self, block: &BlockRange) {
-        for blk in block.iter(self.piece_size) {
-            let block_index = blk.begin >> 14;
-            if let Some(p) = self.partly_requested_pieces.0.get_mut(&blk.index) {
-                info!("received blocks of partial requested piece {block:?}");
-                debug_assert_eq!(blk.begin / BLOCK_SIZE, block_index);
-                p.set_block_status(&blk, BlockStatus::Received);
-            } else if let Some(p) = self.fully_requested_pieces.get_mut(&blk.index) {
-                info!("received blocks of fully requested piece {block:?}");
-                debug_assert!(!self.partly_requested_pieces.0.contains_key(&blk.index));
-                debug_assert_eq!(blk.begin / BLOCK_SIZE, block_index);
-                p.set_block_status(&blk, BlockStatus::Received);
-                if p.is_all_received() {
-                    info!("piece blk.index is fully received");
-                }
+    // receive one block, returns if any piece is all received
+    #[must_use = "returns fully received pieces"]
+    pub fn block_received(&mut self, blk: protocol::Request) -> Option<u32> {
+        let block_index = blk.begin >> 14;
+        if let Some(p) = self.partly_requested_pieces.0.get_mut(&blk.index) {
+            info!("received blocks of partial requested piece {blk:?}");
+            debug_assert_eq!(blk.begin / BLOCK_SIZE, block_index);
+            p.set_block_status(&blk, BlockStatus::Received);
+            p.is_all_received().then_some(blk.index)
+        } else if let Some(p) = self.fully_requested_pieces.get_mut(&blk.index) {
+            info!("received blocks of fully requested piece {blk:?}");
+            debug_assert!(!self.partly_requested_pieces.0.contains_key(&blk.index));
+            debug_assert_eq!(blk.begin / BLOCK_SIZE, block_index);
+            p.set_block_status(&blk, BlockStatus::Received);
+            if p.is_all_received() {
+                info!("piece {} is fully received", blk.index);
+                Some(blk.index)
             } else {
-                // some un-requested blocks come
-                info!("received blocks of not requested piece {block:?}");
-                let n_blocks_in_piece = (self.piece_size >> 14) as usize;
-                debug_assert_eq!(blk.begin / BLOCK_SIZE, block_index);
-                let mut p = PartialRequestedPiece {
-                    block_map: vec![BlockStatus::NotRequested; n_blocks_in_piece],
-                    all_requested_before: 0,
-                };
-                p.set_block_status(&blk, BlockStatus::Received);
+                None
+            }
+        } else {
+            // some un-requested blocks come
+            info!("received blocks of not requested piece {blk:?}");
+            let n_blocks_in_piece = (self.piece_size >> 14) as usize;
+            debug_assert_eq!(blk.begin / BLOCK_SIZE, block_index);
+            let mut p = PartialRequestedPiece {
+                block_map: vec![BlockStatus::NotRequested; n_blocks_in_piece],
+                all_requested_before: 0,
+            };
+            p.set_block_status(&blk, BlockStatus::Received);
 
-                // TODO: maybe check moved to fully requested pieces
-                // currently we are not doing it. The next pick call will move
-                // this piece to fully requested pieces
+            let is_all_received = p.is_all_received();
+            if is_all_received || p.is_all_requested() {
+                self.fully_requested_pieces.insert(blk.index, p);
+            } else {
                 self.partly_requested_pieces.0.insert(blk.index, p);
             }
+            is_all_received.then_some(blk.index)
         }
     }
 
-    fn blocks_revoke(&mut self, block: &BlockRange) {
+    pub fn blocks_received(&mut self, block: &BlockRange) {
+        for blk in block.iter(self.piece_size) {
+            self.block_received(blk);
+        }
+    }
+
+    pub fn blocks_revoke(&mut self, block: &BlockRange) {
         for blk in block.iter(self.piece_size) {
             let block_index = blk.begin >> 14;
             if let Some(p) = self.partly_requested_pieces.0.get_mut(&blk.index) {
@@ -762,7 +792,7 @@ impl Picker for HeapPiecePicker {
             .retain(|_, v| !v.is_none_requested());
     }
 
-    fn piece_checked(&mut self, piece_index: u32) {
+    pub fn piece_checked(&mut self, piece_index: u32) {
         let in_fully = self.fully_requested_pieces.remove(&piece_index);
         if in_fully.is_none() {
             warn!("checked not request piece {piece_index}");
