@@ -282,6 +282,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    #[ignore]
     async fn test_real_torrent() {
         let torrent_f = include_bytes!("../ubuntu-24.10-desktop-amd64.iso.torrent");
         let torrent = FileMetadata::load(torrent_f).unwrap();

@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time;
 use tokio::sync::{mpsc, oneshot, Notify};
@@ -160,19 +161,7 @@ async fn run_recv_stream<T>(
                 // TODO: use buffer and tokio::Notify
                 // info!("connection manager of {} received msg {msg:?}", &manager.conn);
             }
-            r = conn.read_stream.recv_msg() => {
-                match r {
-                    Ok(m) => {
-                        info!("received BT msg");
-                        conn.handle_peer_msg(m).await;
-                    }
-                    Err(e) => {
-                        info!("receive connection error {e}");
-                        // TODO: tell transmit manager this connection is dead
-                        break;
-                    }
-                }
-
+            r = receive_peer_msg(&mut conn.read_stream, &mut conn.transmit_handle) => {
             }
         };
     }
@@ -180,97 +169,107 @@ async fn run_recv_stream<T>(
     info!("done recv stream");
 }
 
-impl<T> RecvStream<T>
-where
-    T: Split,
+async fn receive_peer_msg<T>(
+    read_stream: &mut ReadStream<T>,
+    transmit_handle: &mut TransmitManagerHandle,
+) where
+    T: AsyncRead + Unpin,
 {
-    async fn handle_peer_msg(&mut self, m: Message) {
-        // TODO: send statistics to transmit handle
-
-        // TODO: shall we use mpsc or just lock the manager and set it
-        // since this is generally a sync operation
-
-        // TODO: maybe use bounded channel?
-        match m {
-            Message::KeepAlive => {
-                // do nothing
-            }
-            Message::Choke => {
-                // TODO: drop all pending requests
-                // stop sending all requests
-                self.transmit_handle
-                    .sender
-                    .send(transmit_manager::Msg::PeerChoke);
-            }
-            Message::Unchoke => {
-                self.transmit_handle
-                    .sender
-                    .send(transmit_manager::Msg::PeerUnchoke);
-            }
-            Message::Interested => {
-                // TODO: update peer state
-                self.transmit_handle
-                    .sender
-                    .send(transmit_manager::Msg::PeerInterested);
-            }
-            Message::NotInterested => {
-                // TODO: update peer state
-                self.transmit_handle
-                    .sender
-                    .send(transmit_manager::Msg::PeerUninterested);
-            }
-            Message::Have(_) => {
-                // TODO: tell transmit manager
-                todo!();
-            }
-            Message::BitField(bit_field) => {
-                // TODO: tell transmit manager
-                self.transmit_handle
-                    .sender
-                    .send(transmit_manager::Msg::PeerBitField(
-                        self.read_stream.peer_addr(),
-                        bit_field,
-                    ));
-            }
-            Message::Request(request) => {
-                // TODO:
-                // if in cache, mark cache in use
-                // add to send queue, wake sending task
-                // if not in cache, send to background fetch task
-                // when block fetched, wake sending task
-            }
-            Message::Piece(piece) => {
-                // TODO:
-                // if coming piece have cache, store it in cache
-                // if coming piece don't have cache, ???
-                // tell manager?
-                info!(
-                    "block received {} {} {}",
-                    piece.index,
-                    piece.begin,
-                    piece.piece.len(),
-                );
-
-                let received_piece =
-                    self.transmit_handle
-                        .picker
-                        .lock()
-                        .unwrap()
-                        .block_received(protocol::Request {
-                            index: piece.index,
-                            begin: piece.begin,
-                            len: piece.piece.len() as u32,
-                        });
-                if let Some(i) = received_piece {
-                    info!("piece {i} received");
-                }
-            }
-            Message::Cancel(request) => {
-                // TODO: cancel pending request/fetch task
-                todo!();
-            }
-        };
+    let peer_addr = read_stream.peer_addr();
+    let r = read_stream.recv_msg_header().await;
+    match r {
+        Ok(m) => {
+            info!("received BT msg");
+            handle_peer_msg(transmit_handle, peer_addr, m).await;
+        }
+        Err(e) => {
+            info!("receive connection error {e}");
+            // TODO: tell transmit manager this connection is dead
+        }
     }
+}
+
+// TODO: socketaddr use ref?
+async fn handle_peer_msg<'a, R>(
+    tmh: &'a mut TransmitManagerHandle,
+    addr: SocketAddr,
+    m: Message<'a, R>,
+) where
+    R: AsyncRead + Unpin,
+{
+    // TODO: send statistics to transmit handle
+
+    // TODO: shall we use mpsc or just lock the manager and set it
+    // since this is generally a sync operation
+
+    // TODO: maybe use bounded channel?
+    match m {
+        Message::KeepAlive => {
+            // do nothing
+        }
+        Message::Choke => {
+            // TODO: drop all pending requests
+            // stop sending all requests
+            tmh.sender.send(transmit_manager::Msg::PeerChoke);
+        }
+        Message::Unchoke => {
+            tmh.sender.send(transmit_manager::Msg::PeerUnchoke);
+        }
+        Message::Interested => {
+            // TODO: update peer state
+            tmh.sender.send(transmit_manager::Msg::PeerInterested);
+        }
+        Message::NotInterested => {
+            // TODO: update peer state
+            tmh.sender.send(transmit_manager::Msg::PeerUninterested);
+        }
+        Message::Have(_) => {
+            // TODO: tell transmit manager
+            todo!();
+        }
+        Message::BitField(bit_field) => {
+            // TODO: tell transmit manager
+            tmh.sender
+                .send(transmit_manager::Msg::PeerBitField(addr, bit_field));
+        }
+        Message::Request(request) => {
+            // TODO:
+            // if in cache, mark cache in use
+            // add to send queue, wake sending task
+            // if not in cache, send to background fetch task
+            // when block fetched, wake sending task
+        }
+        Message::Piece(mut piece) => {
+            // TODO:
+            // if coming piece have cache, store it in cache
+            // if coming piece don't have cache, ???
+            // tell manager?
+            info!(
+                "block received {} {} {}",
+                piece.index, piece.begin, piece.len,
+            );
+
+            let mut buf = vec![0u8; piece.len as usize];
+            piece.read(&mut buf).await;
+
+            let received_piece = tmh
+                .picker
+                .lock()
+                .unwrap()
+                .block_received(protocol::Request {
+                    index: piece.index,
+                    begin: piece.begin,
+                    len: piece.len,
+                });
+            if let Some(i) = received_piece {
+                info!("piece {i} received");
+            }
+        }
+        Message::Cancel(request) => {
+            // TODO: cancel pending request/fetch task
+            todo!();
+        }
+    };
 }
 
 async fn run_send_stream<T>(

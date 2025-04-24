@@ -100,11 +100,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn handle_income_connection<T: AsyncRead + AsyncWrite + Unpin>(
+async fn handle_income_connection<T>(
     mut bt_stream: BTStream<T>,
     addr: SocketAddr,
     metadata: metadata::Metadata,
-) -> Result<()> {
+) -> Result<()>
+where
+    T: AsyncRead + AsyncWrite + Unpin + std::fmt::Debug, // TODO: maybe remove this Debug
+{
     let mut handshake = bt_stream.recv_handshake().await?;
     info!("get handshake {:?}", handshake);
     handshake.reserved = [0; 8];
@@ -121,7 +124,7 @@ async fn handle_income_connection<T: AsyncRead + AsyncWrite + Unpin>(
     bt_stream.send_keepalive().await?;
     info!("all keep alive sent");
     loop {
-        let msg = bt_stream.recv_msg().await?;
+        let msg = bt_stream.recv_msg_header().await?;
         match msg {
             Message::Request(r) => {
                 bt_stream

@@ -40,6 +40,7 @@ pub(crate) struct TransmitManagerHandle {
     // reduce contention?
     // TODO: using dyn <trait Picker>?
     pub picker: Arc<Mutex<HeapPiecePicker>>,
+    // TODO: pub piece_buffer: XXX
 }
 
 pub struct TransmitManager {
