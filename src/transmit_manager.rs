@@ -35,7 +35,11 @@ pub(crate) enum Msg {
 #[derive(Clone)]
 pub(crate) struct TransmitManagerHandle {
     pub sender: mpsc::UnboundedSender<Msg>,
-    pub picker: Arc<Mutex<HeapPiecePicker>>, // TODO: using dyn <trait Picker>?
+
+    // TODO: maybe not use Arc<Mutex<..>> but use a splitted lock structure to
+    // reduce contention?
+    // TODO: using dyn <trait Picker>?
+    pub picker: Arc<Mutex<HeapPiecePicker>>,
 }
 
 pub struct TransmitManager {
