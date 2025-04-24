@@ -386,7 +386,7 @@ where
         debug_assert!(self.test_struct(index0, None), "push_down wrong");
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(any(test, debug_assertions))]
     fn test_struct(&self, from: usize, parent: Option<&T>) -> bool {
         if from >= self.data.len() {
             return true;
@@ -404,13 +404,13 @@ where
         self.test_struct(left, Some(&val.1)) && self.test_struct(right, Some(&val.1))
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(any(test, debug_assertions))]
     fn test_all(&self) {
         debug_assert!(self.test_struct(0, None), "invalid heap after rebuild");
         self.test_all_index();
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(any(test, debug_assertions))]
     fn test_all_index(&self) {
         for (key, idx) in self.k2i.iter().enumerate() {
             if let Some(i) = idx {

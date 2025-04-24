@@ -308,14 +308,6 @@ impl HeapPiecePicker {
     }
 }
 
-// returns the smallest integer n
-// that x/y <= n
-// let's assume x+y-1 won't overflow
-#[inline]
-fn ceiling_devide(x: u32, y: u32) -> u32 {
-    (x + y - 1) / y
-}
-
 fn block_size(blk_index: u32, piece_size: u32) -> u32 {
     let normal_end = blk_index * BLOCK_SIZE + BLOCK_SIZE;
     if normal_end <= piece_size {
@@ -430,7 +422,7 @@ fn pick_blocks_from_heap(
         // calc n blocks base on last piece or not
         let (n_blocks_in_piece, piece_size) = if chosen_piece == last_piece_index {
             (
-                ceiling_devide(last_piece_size, BLOCK_SIZE) as usize,
+                last_piece_size.div_ceil(BLOCK_SIZE) as usize,
                 last_piece_size,
             )
         } else {
