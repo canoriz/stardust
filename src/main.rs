@@ -8,6 +8,7 @@ use tokio::{net, time};
 use tracing::{info, Level};
 
 mod announce_manager;
+mod backfile;
 mod connection_manager;
 mod metadata;
 mod picker;

@@ -249,8 +249,16 @@ async fn handle_peer_msg<'a, R>(
                 piece.index, piece.begin, piece.len,
             );
 
-            let mut buf = vec![0u8; piece.len as usize];
-            piece.read(&mut buf).await;
+            let mut pb = tmh.piece_buffer.lock().unwrap();
+            if pb.get(&piece.index).is_none() {
+                pb.insert(piece.index, vec![0u8; tmh.piece_size]);
+            }
+            if let Some(buf) = pb.get_mut(&piece.index) {
+                piece.read(buf).await;
+            } else {
+                let mut drain = vec![0u8; piece.len as usize];
+                piece.read(&mut drain).await;
+            }
 
             let received_piece = tmh
                 .picker

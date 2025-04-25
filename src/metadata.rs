@@ -26,6 +26,13 @@ impl Metadata {
     pub fn len(&self) -> usize {
         self.len
     }
+
+    pub fn files(&self) -> &Vec<File> {
+        match self.info.len_or_files {
+            LenFiles::Length(l) => todo!(),
+            LenFiles::Files(ref fs) => fs,
+        }
+    }
 }
 
 // FileMetadata is raw data from .torrent file
@@ -98,9 +105,9 @@ pub trait ToMetadata {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-struct File {
-    length: usize,
-    path: String,
+pub struct File {
+    pub length: usize,
+    pub path: String,
 }
 
 #[derive(Debug, Clone)]

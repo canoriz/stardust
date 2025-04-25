@@ -40,7 +40,8 @@ pub(crate) struct TransmitManagerHandle {
     // reduce contention?
     // TODO: using dyn <trait Picker>?
     pub picker: Arc<Mutex<HeapPiecePicker>>,
-    // TODO: pub piece_buffer: XXX
+    pub piece_buffer: Arc<Mutex<HashMap<u32, Vec<u8>>>>,
+    pub piece_size: usize,
 }
 
 pub struct TransmitManager {
@@ -61,6 +62,7 @@ pub struct TransmitManager {
     connected_peers: HashMap<SocketAddr, ConnectionManagerHandle>,
 
     piece_picker: Arc<Mutex<HeapPiecePicker>>,
+    piece_buffer: Arc<Mutex<HashMap<u32, Vec<u8>>>>,
 }
 
 impl TransmitManager {
@@ -72,17 +74,21 @@ impl TransmitManager {
         let piece_size = m.info.piece_length;
         let total_length = m.len();
         let piece_picker = Arc::new(Mutex::new(HeapPiecePicker::new(total_length, piece_size)));
+        let piece_buffer = Arc::new(Mutex::new(HashMap::new()));
         Self {
             metadata: m,
             receiver: cmd_receiver,
             self_handle: TransmitManagerHandle {
                 sender: cmd_sender,
                 picker: piece_picker.clone(),
+                piece_buffer: piece_buffer.clone(),
+                piece_size: piece_size as usize,
             },
             // announce_handle: None,
             // announce_tx: None,
             connected_peers: HashMap::new(),
             piece_picker,
+            piece_buffer,
         }
     }
 
