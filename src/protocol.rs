@@ -12,6 +12,7 @@ use tokio::io::{
 };
 use tokio::net;
 use tokio::net::tcp;
+use tracing::warn;
 
 pub trait Split {
     type R: AsyncRead + Send + Unpin + 'static;
@@ -599,14 +600,36 @@ async fn send_cancel<T: AsyncWrite + Unpin>(
     handle.flush().await
 }
 
+async fn discard_remain<T: AsyncRead + Unpin>(
+    handle: &mut T,
+    mut n_remain: usize,
+) -> io::Result<()> {
+    // there should not be many unread bytes, 1024 should be enough
+    #[allow(invalid_value)]
+    let mut buf = unsafe { MaybeUninit::<[u8; 1024]>::uninit().assume_init() };
+
+    while n_remain > 0 {
+        // TODO: will this out of bound?
+        let n_read = handle.read_exact(&mut buf[..n_remain]).await?;
+        n_remain -= n_read;
+    }
+    Ok(())
+}
+
 async fn recv_msg_header<T: AsyncRead + Unpin>(handle: &mut T) -> io::Result<Message<'_, T>> {
     // TODO: what to do if some malicious peer sends a long len data
     // and a lot of garbage data? use timeout
+    // TODO: what if some bug happens in peer and peer shutdown connection
+    // leaving data unsend?
+    // TODO: what if peer claims to send data, but does not really send?
     let len = handle.read_u32().await?;
     if len == 0 {
         return Ok(Message::KeepAlive);
     }
     let msg_ty = handle.read_u8().await?;
+
+    let mut n_remain = len as usize - 1;
+
     match msg_ty {
         MsgTy::CHOKE => Ok(Message::Choke),
         MsgTy::UNCHOKE => Ok(Message::Unchoke),
@@ -616,6 +639,7 @@ async fn recv_msg_header<T: AsyncRead + Unpin>(handle: &mut T) -> io::Result<Mes
             // TODO: check length match, absorb remain length in case
             // unimplemented extension
             let index = handle.read_u32().await?;
+            n_remain -= 4;
             Ok(Message::Have(index))
         }
         MsgTy::BITFIELD => {
@@ -625,8 +649,9 @@ async fn recv_msg_header<T: AsyncRead + Unpin>(handle: &mut T) -> io::Result<Mes
                 piece.set_len(capacity);
                 std::mem::transmute(piece)
             };
-            handle.read_exact(bitfield.as_mut_slice()).await?;
-            let len = bitfield.len();
+            let n_read = handle.read_exact(bitfield.as_mut_slice()).await?;
+            assert_eq!(n_read, capacity);
+            n_remain -= n_read;
             Ok(Message::BitField(BitField::new(bitfield)))
         }
         MsgTy::REQUEST => {
@@ -634,6 +659,7 @@ async fn recv_msg_header<T: AsyncRead + Unpin>(handle: &mut T) -> io::Result<Mes
             let index = handle.read_u32().await?;
             let begin = handle.read_u32().await?;
             let len = handle.read_u32().await?;
+            n_remain -= 12;
             Ok(Message::Request(Request { index, begin, len }))
         }
         MsgTy::PIECE => {
@@ -641,6 +667,7 @@ async fn recv_msg_header<T: AsyncRead + Unpin>(handle: &mut T) -> io::Result<Mes
             let capacity = (len - 4 - 4 - 1) as usize;
             let index = handle.read_u32().await?;
             let begin = handle.read_u32().await?;
+            n_remain -= 8;
 
             Ok(Message::Piece(Piece {
                 index,
@@ -654,9 +681,12 @@ async fn recv_msg_header<T: AsyncRead + Unpin>(handle: &mut T) -> io::Result<Mes
             let index = handle.read_u32().await?;
             let begin = handle.read_u32().await?;
             let len = handle.read_u32().await?;
+            n_remain -= 12;
             Ok(Message::Cancel(Request { index, begin, len }))
         }
-        _ => {
+        other => {
+            warn!("received unknown Msg type {other}, length {len}");
+            discard_remain(handle, n_remain).await?;
             panic!();
         }
     }
