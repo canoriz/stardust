@@ -963,13 +963,26 @@ mod test {
 
         let blks = picker.pick_blocks(&addr1, 15);
 
-        let mut complete = None;
-        for br in blks.range {
-            for b in br.iter(LAST_PIECE_SIZE) {
-                complete = complete.or(picker.block_received(b));
+        {
+            let mut complete = None;
+            for br in &blks.range {
+                for b in br.iter(LAST_PIECE_SIZE) {
+                    complete = complete.or(picker.block_received(b));
+                }
             }
+            assert_eq!(complete, Some(PIECE_TOTAL - 1));
         }
-        assert_eq!(complete, Some(PIECE_TOTAL - 1));
+
+        {
+            // if picker not set complete, should also return piece index
+            let mut complete = None;
+            for br in &blks.range {
+                for b in br.iter(LAST_PIECE_SIZE) {
+                    complete = complete.or(picker.block_received(b));
+                }
+            }
+            assert_eq!(complete, Some(PIECE_TOTAL - 1));
+        }
     }
 
     #[test]

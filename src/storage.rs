@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::{any, marker::PhantomData, mem::MaybeUninit, net::SocketAddr, slice, vec};
 
 #[cfg(mloom)]
@@ -21,6 +22,8 @@ enum BlockState {
 }
 
 struct Cache {
+    allow_new_ref: AtomicBool,
+    ref_count: AtomicU32,
     cache: Vec<u8>,
 
     // TODO: since all jobs access to cache,
@@ -41,6 +44,11 @@ impl Cache {
 
     fn release_part_ref(&self, offset: usize, len: usize) {
         self.change_state(offset, len, BlockState::Vacant);
+        self.ref_count.fetch_sub(1, Ordering::Release);
+    }
+
+    fn allow_new_ref(&self, allow_new_ref: bool) {
+        self.allow_new_ref.store(allow_new_ref, Ordering::Release);
     }
 }
 
@@ -59,6 +67,8 @@ impl ArcCache {
         let size = size.next_multiple_of(BLOCKSIZE as usize);
         Self {
             inner: Arc::new(Cache {
+                allow_new_ref: AtomicBool::new(true),
+                ref_count: AtomicU32::new(0),
                 cache: vec![0u8; size],
                 state: Mutex::new(vec![BlockState::Vacant; size >> BLOCKBITS]),
             }),
@@ -82,30 +92,47 @@ impl ArcCache {
         todo!()
     }
 
+    pub fn disable_new_ref(&self) {
+        self.inner.allow_new_ref(false);
+    }
+
+    pub fn enable_new_ref(&self) {
+        self.inner.allow_new_ref(true);
+    }
+
     // TODO: maybe not use (offset,length) but use
     // (offset_mutlple_of(block), len_multiple_of(block))
+    // TODO: this needs a lot of tests
     pub fn get_part_ref(&self, offset: usize, len: usize) -> Option<Ref> {
         if len.trailing_zeros() < BLOCKSIZE.trailing_zeros() {
             // TODO: maybe not panic, fix size instead?
             panic!("should be multiple of {BLOCKSIZE}");
         }
-        let any_block_not_vacant = self.inner.state.lock().expect("should no error")
-            [offset >> BLOCKBITS..(offset + len) >> BLOCKBITS]
+
+        if !self.inner.allow_new_ref.load(Ordering::Acquire) {
+            return None;
+        }
+
+        let mut range_state = self.inner.state.lock().expect("should no error");
+        if !self.inner.allow_new_ref.load(Ordering::Relaxed) {
+            return None;
+        }
+        self.inner.ref_count.fetch_add(1, Ordering::Relaxed); // under mutex, can relax
+
+        let any_block_not_vacant = range_state[offset >> BLOCKBITS..(offset + len) >> BLOCKBITS]
             .iter()
             .any(|s| *s != BlockState::Vacant);
         if any_block_not_vacant {
             return None;
         }
 
-        for s in self.inner.state.lock().expect("should no error")
-            [offset >> BLOCKBITS..(offset + len) >> BLOCKBITS]
-            .iter_mut()
-        {
+        for s in range_state[offset >> BLOCKBITS..(offset + len) >> BLOCKBITS].iter_mut() {
             if *s != BlockState::Vacant {
                 return None;
             }
             *s = BlockState::InUse;
         }
+
         Some(Ref {
             from: offset,
             ptr: unsafe { self.inner.cache.as_ptr().add(offset) },
@@ -147,6 +174,28 @@ impl Ref {
         assert!(len <= self.len);
         // TODO: is this safe? is ptr valid (will inner address in arc change?)
         unsafe { slice::from_raw_parts_mut(self.ptr as *mut _, len) }
+    }
+
+    // extend block ref to full ref
+    // TODO: do we have a better way?
+    // TODO: this needs many tests
+    pub fn extend_to_entire(&mut self) -> bool {
+        if self.main_cache.ref_count.load(Ordering::Acquire) == 1 {
+            let mut state = self.main_cache.state.lock().unwrap();
+            if self.main_cache.ref_count.load(Ordering::Relaxed) == 1 {
+                for s in state.iter_mut() {
+                    *s = BlockState::InUse;
+                }
+                self.from = 0;
+                self.ptr = self.main_cache.cache.as_ptr();
+                self.len = self.main_cache.cache.len();
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        }
     }
 
     pub fn len(&self) -> usize {

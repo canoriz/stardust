@@ -17,7 +17,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time;
-use tracing::{debug_span, info, Instrument, Level, Span};
+use tracing::{debug_span, info, warn, Instrument, Level, Span};
 
 #[derive(Debug)]
 #[non_exhaustive]
@@ -223,7 +223,9 @@ pub(crate) async fn run_transmit_manager(
             }
             _ = ticker.tick() => {
                 info!("transmit ticker tick");
-                transmit.pick_blocks_for_peer(120);
+                transmit.pick_blocks_for_peer(300);
+                let pbl = transmit.self_handle.piece_buffer.lock().unwrap().len();
+                warn!("pbl remains {pbl}");
             }
             _ = &mut cancel => {
                 for (addr, handle) in transmit.connected_peers.drain() {

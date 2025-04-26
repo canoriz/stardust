@@ -251,37 +251,40 @@ async fn handle_peer_msg<'a, R>(
                 piece.index, piece.begin, piece.len,
             );
 
-            let block_ref = {
-                // must drop pb before await point
-                // pb is not Send
-                let mut pb = tmh.piece_buffer.lock().unwrap();
-                if pb.get(&piece.index).is_none() {
-                    pb.insert(piece.index, ArcCache::new(tmh.piece_size));
-                }
+            // TODO: if coming block is already received and checked,
+            // then discard this block, don't alloc (if needed) piece buffer.
+            // And there should be no piece buffer of this piece in pb_map
+            let (mut block_ref, piece_buf) = {
+                // must drop pb_map before await point
+                // pb_map is not Send
+                let mut pb_map = tmh.piece_buffer.lock().unwrap();
+                let pb = match pb_map.get(&piece.index) {
+                    Some(pb) => pb.clone(),
+                    None => {
+                        let pb = ArcCache::new(tmh.piece_size);
+                        pb_map.insert(piece.index, pb.clone());
+                        pb
+                    }
+                };
 
-                let block_buf = pb
-                    .get(&piece.index)
-                    .expect(&format!(
-                        "piece {} should exist in piece-buffer",
-                        piece.index
-                    ))
-                    .get_part_ref(
-                        piece.begin as usize,
-                        // TODO: change 16384 to const
-                        (piece.len.next_multiple_of(16384)) as usize,
-                    );
+                let block_ref = pb.get_part_ref(
+                    piece.begin as usize,
+                    // TODO: change 16384 to const
+                    (piece.len.next_multiple_of(16384)) as usize,
+                );
 
-                if let None = block_buf {
+                if block_ref.is_none() {
                     warn!(
                         "error get block buf of piece {} block offset {}",
                         piece.index, piece.begin
                     );
                 }
-                block_buf
+                (block_ref, pb)
             };
 
-            if let Some(mut bbuf) = block_ref {
+            let mut block_buf = if let Some(mut bbuf) = block_ref {
                 piece.read(bbuf.to_slice_len(piece.len as usize)).await;
+                bbuf
             } else {
                 let mut drain = vec![0u8; piece.len as usize];
                 piece.read(&mut drain).await;
@@ -289,7 +292,12 @@ async fn handle_peer_msg<'a, R>(
                     "drain PIECE msg {} {} {}",
                     piece.index, piece.begin, piece.len
                 );
-            }
+                // TODO: what should we do now?
+                // we don't have that space
+                // maybe reads to supplementary buffer?
+                // just return now
+                return;
+            };
 
             let received_piece = tmh
                 .picker
@@ -303,22 +311,22 @@ async fn handle_peer_msg<'a, R>(
             if let Some(i) = received_piece {
                 info!("piece {i} received");
 
+                // block new ref to piece buffer
+                // so ref count only decreases
+                piece_buf.disable_new_ref();
+
                 let (write_tx, write_rx) = tokio::sync::oneshot::channel::<std::io::Result<()>>();
                 let write_job = {
-                    // TODO: dead lock?
-                    let mut pb = tmh.piece_buffer.lock().unwrap();
-
-                    let piece_i_buf = pb.get(&i).expect("should exist in piece buffer");
-
-                    // TODO: should mark as ready to write,
+                    // TODO: mark piece_buf as ready to write,
                     // get_part_ref should stop return new refs
                     // TODO: last piece
-                    if let Some(mut pbuf) = piece_i_buf.get_part_ref(0, tmh.piece_size) {
-                        let pbuf_s = pbuf.to_slice();
+                    if block_buf.extend_to_entire() {
+                        let pbuf_s = block_buf.to_slice();
 
                         let bf_copy = tmh.back_file.clone();
                         let piece_size = tmh.piece_size;
-                        pb.remove(&i);
+                        tmh.piece_buffer.lock().expect("lock should ok").remove(&i);
+
                         Some(WriteJob {
                             f: bf_copy,
                             offset: (i as usize) * piece_size,
@@ -338,6 +346,7 @@ async fn handle_peer_msg<'a, R>(
                     let write_res = write_rx.await;
                     // let r = hdl.await;
                     info!("write piece {i} result {write_res:?}");
+                    // TODO: should really check sha1 of piece
                     tmh.picker.lock().unwrap().piece_checked(i);
                 }
             }
@@ -357,6 +366,7 @@ async fn run_send_stream<T>(
     T: Split,
 {
     let mut interval = tokio::time::interval(time::Duration::from_secs(120));
+    conn.write_stream.send_interested().await;
     loop {
         tokio::select! {
             Some(msg) = conn.receiver.recv() => {
