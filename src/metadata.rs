@@ -263,9 +263,9 @@ pub type AnnounceResult = Result<AnnounceResp, AnnounceError>;
 
 pub trait Announce {
     // TODO: maybe don't need announcer, just a function is enough
-    fn announce_tier<'a>(
+    fn announce_tier(
         net_type: AnnounceType,
-        req: &TrackerGet<'a>,
+        req: &TrackerGet<'_>,
         torrent: &Metadata,
         url: String,
     ) -> impl Future<Output = AnnounceResult> + Send;
@@ -275,9 +275,9 @@ pub trait Announce {
 pub struct Announcer {}
 
 impl Announce for Announcer {
-    async fn announce_tier<'a>(
+    async fn announce_tier(
         net_type: AnnounceType,
-        req: &TrackerGet<'a>,
+        req: &TrackerGet<'_>,
         torrent: &Metadata,
         url: String,
     ) -> AnnounceResult {

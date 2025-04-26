@@ -229,11 +229,11 @@ async fn run_announce_manager<A>(
 
 struct FakeAnnouncer {}
 impl metadata::Announce for FakeAnnouncer {
-    async fn announce_tier<'a>(
-        net_type: metadata::AnnounceType,
-        req: &TrackerGet<'a>,
-        torrent: &Metadata,
-        url: String,
+    async fn announce_tier(
+        _net_type: metadata::AnnounceType,
+        _req: &TrackerGet<'_>,
+        _torrent: &Metadata,
+        _url: String,
     ) -> metadata::AnnounceResult {
         // return Err(metadata::AnnounceError::ClientErr(
         //     metadata::ClientErr::Ipv4Err,
