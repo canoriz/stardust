@@ -37,6 +37,7 @@ impl NormalFile {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(path)?;
         Ok(Self { file })
     }
@@ -111,7 +112,7 @@ impl BackFile {
     }
 
     // TODO: does buf need static?
-    pub fn write<'b>(&mut self, offset: usize, buf: &'b [u8]) -> Result<()> {
+    pub fn write(&mut self, offset: usize, buf: &[u8]) -> Result<()> {
         let mut wops = self.find_file(offset, buf);
         for w in wops.iter_mut() {
             info!(
@@ -122,19 +123,21 @@ impl BackFile {
             );
             // TODO: these jobs should be sent to IO worker threads
             // shall not block net requests.
-            let mut h = w.file.handle.get_or_insert_with(|| {
-                let hr = NormalFile::open(&w.file.path);
-                // TODO: FIXME
-                hr.unwrap()
-                // if let Ok(h) = hr {
-                //     h
-                // } else {
-                //     h
-                // }
-            });
 
-            // TODO: FIXME: one error write should not trigger fn call error
-            h.write_all(w.offset, w.buf)?;
+            if w.file.handle.is_none() {
+                w.file.handle = match NormalFile::open(&w.file.path) {
+                    Err(e) => {
+                        warn!("error open file {} {e:?}", w.file.path);
+                        None
+                    }
+                    Ok(fh) => Some(fh),
+                };
+            }
+
+            if let Some(ref mut fh) = w.file.handle {
+                // TODO: FIXME: one error write should not trigger fn call error
+                fh.write_all(w.offset, w.buf)?;
+            }
         }
         Ok(())
     }
