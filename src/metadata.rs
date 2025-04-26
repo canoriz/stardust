@@ -17,6 +17,7 @@ pub struct Metadata {
 
     len: usize,
 
+    files: Vec<File>,
     comment: Option<String>,
     created_by: Option<String>,
     creation_date: Option<u64>,
@@ -28,17 +29,14 @@ impl Metadata {
     }
 
     pub fn files(&self) -> &Vec<File> {
-        match self.info.len_or_files {
-            LenFiles::Length(l) => todo!(),
-            LenFiles::Files(ref fs) => fs,
-        }
+        &self.files
     }
 }
 
 // FileMetadata is raw data from .torrent file
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct FileMetadata {
-    announce: String,
+    announce: Option<String>,
     #[serde(rename = "announce-list")]
     announce_list: Option<Vec<Vec<String>>>,
 
@@ -68,6 +66,7 @@ pub struct Info {
 enum LenFiles {
     #[serde(rename = "length")]
     Length(usize),
+
     #[serde(rename = "files")]
     Files(Vec<File>),
 }
@@ -82,9 +81,27 @@ impl FileMetadata {
     }
 
     pub fn to_metadata(self) -> (Metadata, Vec<Vec<String>>) {
-        let len = match &self.info.len_or_files {
-            LenFiles::Length(l) => *l,
-            LenFiles::Files(fs) => fs.iter().map(|f| f.length).sum(),
+        let (len, files) = match &self.info.len_or_files {
+            LenFiles::Length(l) => (
+                *l,
+                vec![File {
+                    length: *l,
+                    path: vec![self.info.name.clone()],
+                }],
+            ),
+            LenFiles::Files(fs) => (
+                fs.iter().map(|f| f.length).sum(),
+                fs.iter()
+                    .map(|sub| {
+                        let mut path = vec![self.info.name.clone()];
+                        path.extend_from_slice(&sub.path);
+                        File {
+                            length: sub.length,
+                            path,
+                        }
+                    })
+                    .collect(),
+            ),
         };
         (
             Metadata {
@@ -94,8 +111,15 @@ impl FileMetadata {
                 created_by: self.created_by,
                 creation_date: self.creation_date,
                 len,
+                files,
             },
-            self.announce_list.unwrap_or(vec![vec![self.announce]]),
+            if let Some(li) = self.announce_list {
+                li
+            } else if let Some(a) = self.announce {
+                vec![vec![a]]
+            } else {
+                vec![vec![]]
+            },
         )
     }
 }
@@ -107,7 +131,10 @@ pub trait ToMetadata {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct File {
     pub length: usize,
-    pub path: String,
+
+    // TODO: many sub path are same, e.g. a sub directory containing many files
+    // use a more effeicient structure
+    pub path: Vec<String>,
 }
 
 #[derive(Debug, Clone)]

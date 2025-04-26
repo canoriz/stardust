@@ -41,7 +41,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //     ip: None,
     // };
 
-    let torrent_f = include_bytes!("../ubuntu-24.10-desktop-amd64.iso.torrent");
+    // let torrent_f = include_bytes!("../ubuntu-24.10-desktop-amd64.iso.torrent");
+    let torrent_f = include_bytes!("../31.torrent");
     let torrent = metadata::FileMetadata::load(torrent_f).unwrap();
 
     let (metadata, announce_list) = torrent.to_metadata();
@@ -88,7 +89,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tm.send_msg(transmit_manager::Msg::NewPeer(conn));
     }
     // tm.start().await;
-    time::sleep(Duration::from_secs(500)).await;
+    time::sleep(Duration::from_secs(1000)).await;
     // tm.send_announce_msg(announce_manager::Msg::RemoveUrl(
     //     announce_list[0][0].clone(),
     // ));

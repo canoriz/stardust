@@ -785,6 +785,12 @@ impl HeapPiecePicker {
     }
 
     pub fn piece_checked(&mut self, piece_index: u32) {
+        warn!(
+            "piece {piece_index} received, unpicked {} partial {}, fully {}",
+            self.heap.len(),
+            self.partly_requested_pieces.0.len(),
+            self.fully_requested_pieces.len()
+        );
         let in_fully = self.fully_requested_pieces.remove(&piece_index);
         if in_fully.is_none() {
             warn!("checked not request piece {piece_index}");
@@ -932,6 +938,38 @@ mod test {
             fi_exp.sort();
             assert_eq!(fi, fi_exp);
         }
+    }
+
+    #[test]
+    fn test_receive_last_block() {
+        const PIECE_TOTAL: u32 = 30;
+        const TOTAL_LENGTH: usize = (PIECE_TOTAL * BLOCK_SIZE * 14 - 3 * (BLOCK_SIZE + 1)) as usize;
+
+        // make a length not multiple of block size
+        let mut picker = HeapPiecePicker::new(TOTAL_LENGTH, BLOCK_SIZE * 14);
+
+        let addr1 = generate_peer(1);
+        picker.peer_add(
+            addr1,
+            BitField::from({
+                let mut v = vec![false; PIECE_TOTAL as usize];
+                v[PIECE_TOTAL as usize - 1] = true;
+                assert_eq!(v.len(), PIECE_TOTAL as usize);
+                v
+            }),
+        );
+
+        const LAST_PIECE_SIZE: u32 = TOTAL_LENGTH as u32 % (14 * BLOCK_SIZE);
+
+        let blks = picker.pick_blocks(&addr1, 15);
+
+        let mut complete = None;
+        for br in blks.range {
+            for b in br.iter(LAST_PIECE_SIZE) {
+                complete = complete.or(picker.block_received(b));
+            }
+        }
+        assert_eq!(complete, Some(PIECE_TOTAL - 1));
     }
 
     #[test]

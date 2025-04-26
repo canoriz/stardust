@@ -131,6 +131,11 @@ where
         None
     }
 
+    // TODO: add test
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
     // try to update an index, if key not exist in heap, do nothing and return None
     // if key exists in heap, update value and return previous value
     fn update(&mut self, key: usize, val: T) -> Option<T> {

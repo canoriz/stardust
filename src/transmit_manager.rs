@@ -1,11 +1,14 @@
+use crate::backfile;
+use crate::backfile::BackFile;
+use crate::backfile::WriteJob;
 use crate::connection_manager::ConnectionManagerHandle;
 use crate::connection_manager::Msg as ConnMsg;
 use crate::metadata::{self, AnnounceType, Metadata, TrackerGet};
 use crate::picker::{BlockRequests, HeapPiecePicker};
 use crate::protocol::{self, BTStream, BitField};
+use crate::storage::ArcCache;
+
 use std::collections::HashMap;
-use std::future::{Future, IntoFuture};
-use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -40,8 +43,10 @@ pub(crate) struct TransmitManagerHandle {
     // reduce contention?
     // TODO: using dyn <trait Picker>?
     pub picker: Arc<Mutex<HeapPiecePicker>>,
-    pub piece_buffer: Arc<Mutex<HashMap<u32, Vec<u8>>>>,
+    pub piece_buffer: Arc<Mutex<HashMap<u32, ArcCache>>>,
     pub piece_size: usize,
+    pub back_file: Arc<Mutex<BackFile>>,
+    pub write_worker: std::sync::mpsc::Sender<WriteJob<'static>>,
 }
 
 pub struct TransmitManager {
@@ -62,7 +67,7 @@ pub struct TransmitManager {
     connected_peers: HashMap<SocketAddr, ConnectionManagerHandle>,
 
     piece_picker: Arc<Mutex<HeapPiecePicker>>,
-    piece_buffer: Arc<Mutex<HashMap<u32, Vec<u8>>>>,
+    piece_buffer: Arc<Mutex<HashMap<u32, ArcCache>>>,
 }
 
 impl TransmitManager {
@@ -75,14 +80,19 @@ impl TransmitManager {
         let total_length = m.len();
         let piece_picker = Arc::new(Mutex::new(HeapPiecePicker::new(total_length, piece_size)));
         let piece_buffer = Arc::new(Mutex::new(HashMap::new()));
+
+        let (job_tx, job_rx) = std::sync::mpsc::channel();
+        tokio::task::spawn_blocking(move || backfile::write_worker(job_rx));
         Self {
-            metadata: m,
+            metadata: m.clone(),
             receiver: cmd_receiver,
             self_handle: TransmitManagerHandle {
                 sender: cmd_sender,
                 picker: piece_picker.clone(),
                 piece_buffer: piece_buffer.clone(),
                 piece_size: piece_size as usize,
+                back_file: Arc::new(Mutex::new(BackFile::new(m))),
+                write_worker: job_tx,
             },
             // announce_handle: None,
             // announce_tx: None,
@@ -203,8 +213,7 @@ pub(crate) async fn run_transmit_manager(
     mut cancel: oneshot::Receiver<()>,
     done: oneshot::Sender<()>,
 ) {
-    let mut ticker =
-        tokio::time::interval(time::Duration::from_millis(500 + rand::random_range(0..50)));
+    let mut ticker = tokio::time::interval(time::Duration::from_millis(500));
     loop {
         // TODO: lets use notify?
         tokio::select! {
@@ -214,7 +223,7 @@ pub(crate) async fn run_transmit_manager(
             }
             _ = ticker.tick() => {
                 info!("transmit ticker tick");
-                transmit.pick_blocks_for_peer(30);
+                transmit.pick_blocks_for_peer(120);
             }
             _ = &mut cancel => {
                 for (addr, handle) in transmit.connected_peers.drain() {
