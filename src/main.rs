@@ -41,8 +41,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //     ip: None,
     // };
 
-    // let torrent_f = include_bytes!("../ubuntu-24.10-desktop-amd64.iso.torrent");
-    let torrent_f = include_bytes!("../31.torrent");
+    let torrent_f = include_bytes!("../ubuntu-24.10-desktop-amd64.iso.torrent");
+    // let torrent_f = include_bytes!("../31.torrent");
     let torrent = metadata::FileMetadata::load(torrent_f).unwrap();
 
     let (metadata, announce_list) = torrent.to_metadata();

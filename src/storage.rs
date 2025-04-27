@@ -1,14 +1,16 @@
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::{any, marker::PhantomData, mem::MaybeUninit, net::SocketAddr, slice, vec};
 
 #[cfg(mloom)]
-use loom::{
-    sync::{Arc, Mutex},
-    thread,
+use loom::sync::{
+    atomic::{AtomicBool, AtomicU32, Ordering},
+    Arc, Mutex,
 };
 
 #[cfg(not(mloom))]
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, AtomicU32, Ordering},
+    Arc, Mutex,
+};
 
 type Peer = SocketAddr;
 const BLOCKBITS: usize = 14;
@@ -45,6 +47,7 @@ impl Cache {
     fn release_part_ref(&self, offset: usize, len: usize) {
         self.change_state(offset, len, BlockState::Vacant);
         self.ref_count.fetch_sub(1, Ordering::Release);
+        println!("release part ref");
     }
 
     fn allow_new_ref(&self, allow_new_ref: bool) {
@@ -179,22 +182,42 @@ impl Ref {
     // extend block ref to full ref
     // TODO: do we have a better way?
     // TODO: this needs many tests
-    pub fn extend_to_entire(&mut self) -> bool {
-        if self.main_cache.ref_count.load(Ordering::Acquire) == 1 {
+    pub fn extend_to_entire(mut self) -> Option<Self> {
+        println!("enter");
+        let ref_cnt = self.main_cache.ref_count.compare_and_swap(1, Ordering::Acquire);
+        println!("ref_cnt sub 1 before {ref_cnt}");
+        if ref_cnt != 1 {
+            println!("fail2 extend {ref_cnt}");
+            return None;
+        }
+
+        // we are the only one reference
+        // if disable_new_ref() called, no more ref created
+        // this ref_count only decreases
+        // since we are the only one, no one else can decrease this
+        // TODO: what if enable_new_ref() called now?
+        let success = {
             let mut state = self.main_cache.state.lock().unwrap();
-            if self.main_cache.ref_count.load(Ordering::Relaxed) == 1 {
-                for s in state.iter_mut() {
-                    *s = BlockState::InUse;
-                }
-                self.from = 0;
-                self.ptr = self.main_cache.cache.as_ptr();
-                self.len = self.main_cache.cache.len();
-                true
-            } else {
-                false
+            self.main_cache.ref_count.fetch_add(1, Ordering::Relaxed);
+            println!("add 1");
+            // if self.main_cache.ref_count.fetch_sub(1, Ordering::Relaxed) == 2 {
+            for s in state.iter_mut() {
+                *s = BlockState::InUse;
             }
+            self.from = 0;
+            self.ptr = self.main_cache.cache.as_ptr();
+            self.len = self.main_cache.cache.len();
+            println!("success extend");
+            true
+            // } else {
+            //     println!("fail1 extend");
+            //     false
+            // }
+        };
+        if success {
+            Some(self)
         } else {
-            false
+            None
         }
     }
 
@@ -206,6 +229,7 @@ impl Ref {
 impl Drop for Ref {
     fn drop(&mut self) {
         self.main_cache.release_part_ref(self.from, self.len);
+        println!("drop");
     }
 }
 
@@ -221,86 +245,198 @@ mod test {
     #[cfg(not(mloom))]
     use std::thread;
 
+    fn loom_test<F>(f: F)
+    where
+        F: Fn() + Sync + Send + 'static,
+    {
+        #[cfg(not(mloom))]
+        f();
+
+        #[cfg(mloom)]
+        loom::model(f);
+    }
+
     #[test]
     fn test_cache_disjoint_ref() {
-        let mut cache = ArcCache::new(BLOCKSIZE * 16);
-        let ref5to7 = cache.get_part_ref(5 * BLOCKSIZE, 2 * BLOCKSIZE);
-        let ref6to8 = cache.get_part_ref(6 * BLOCKSIZE, 2 * BLOCKSIZE);
-        assert!(ref5to7.is_some());
-        assert!(ref6to8.is_none());
-        cache
-            .inner
-            .state
-            .lock()
-            .unwrap()
-            .iter()
-            .enumerate()
-            .for_each(|(i, s)| {
-                if i >= 5 && i < 7 {
-                    assert_eq!((i, *s), (i, BlockState::InUse))
-                } else {
-                    assert_ne!((i, *s), (i, BlockState::InUse))
+        loom_test(|| {
+            let mut cache = ArcCache::new(BLOCKSIZE * 16);
+            let ref5to7 = cache.get_part_ref(5 * BLOCKSIZE, 2 * BLOCKSIZE);
+            let ref6to8 = cache.get_part_ref(6 * BLOCKSIZE, 2 * BLOCKSIZE);
+            assert!(ref5to7.is_some());
+            assert!(ref6to8.is_none());
+            cache
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .iter()
+                .enumerate()
+                .for_each(|(i, s)| {
+                    if i >= 5 && i < 7 {
+                        assert_eq!((i, *s), (i, BlockState::InUse))
+                    } else {
+                        assert_ne!((i, *s), (i, BlockState::InUse))
+                    }
+                });
+        })
+    }
+
+    #[test]
+    fn test_concurrent_read_write() {
+        loom_test(|| {
+            let a = ArcCache::new(30 * BLOCKSIZE);
+
+            let a1 = a.clone();
+            let h1 = thread::spawn(move || {
+                let mut s_ref = a1.get_part_ref(0, 2 * BLOCKSIZE).expect("ok");
+                let s = s_ref.to_slice();
+                for b in s.iter_mut() {
+                    *b = 1u8;
                 }
             });
+
+            let a2 = a.clone();
+            let h2 = thread::spawn(move || {
+                let mut s_ref = a2.get_part_ref(4 * BLOCKSIZE, 2 * BLOCKSIZE).expect("ok");
+                let s = s_ref.to_slice();
+                for b in s.iter_mut() {
+                    *b = 3u8;
+                }
+            });
+            let _ = h1.join();
+            let _ = h2.join();
+
+            a.inner
+                .state
+                .lock()
+                .unwrap()
+                .iter()
+                .enumerate()
+                .for_each(|(i, s)| {
+                    assert_eq!((i, *s), (i, BlockState::Vacant));
+                });
+
+            for (i, s) in a.inner.cache.iter().enumerate() {
+                if (4 * BLOCKSIZE..6 * BLOCKSIZE).contains(&i) {
+                    assert_eq!((i, *s), (i, 3u8))
+                } else if (0..2 * BLOCKSIZE).contains(&i) {
+                    assert_eq!((i, *s), (i, 1u8))
+                }
+            }
+        });
     }
 
     #[test]
-    #[cfg(mloom)]
-    fn test_concurrent_read_write() {
-        loom::model(
-            || {
-                // let v1 = Arc::new(AtomicUsize::new(0));
-                // let v2 = v1.clone();
-                test_concurrent_read_write_inner();
-            }, // assert_eq!(0, v2.load(SeqCst));
-        );
-    }
+    fn test_disable_new_ref() {
+        loom_test(|| {
+            let cache = ArcCache::new(BLOCKSIZE * 16);
+            let cache_clone = cache.clone();
+            let cache_clone2 = cache.clone();
+            let ref5to7 = cache.get_part_ref(5 * BLOCKSIZE, 2 * BLOCKSIZE).unwrap();
+            let ref8to9 = cache.get_part_ref(8 * BLOCKSIZE, 2 * BLOCKSIZE).unwrap();
+            cache
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .iter()
+                .enumerate()
+                .for_each(|(i, s)| {
+                    println!("cc0{:?}", (i, *s));
+                });
 
-    #[test]
-    #[cfg(not(mloom))]
-    fn test_concurrent_read_write() {
-        test_concurrent_read_write_inner();
-    }
-
-    fn test_concurrent_read_write_inner() {
-        let a = ArcCache::new(30 * BLOCKSIZE);
-
-        let a1 = a.clone();
-        let h1 = thread::spawn(move || {
-            let mut s_ref = a1.get_part_ref(0, 2 * BLOCKSIZE).expect("ok");
-            let s = s_ref.to_slice();
-            for b in s.iter_mut() {
-                *b = 1u8;
-            }
-        });
-
-        let a2 = a.clone();
-        let h2 = thread::spawn(move || {
-            let mut s_ref = a2.get_part_ref(4 * BLOCKSIZE, 2 * BLOCKSIZE).expect("ok");
-            let s = s_ref.to_slice();
-            for b in s.iter_mut() {
-                *b = 3u8;
-            }
-        });
-        let _ = h1.join();
-        let _ = h2.join();
-
-        a.inner
-            .state
-            .lock()
-            .unwrap()
-            .iter()
-            .enumerate()
-            .for_each(|(i, s)| {
-                assert_eq!((i, *s), (i, BlockState::Vacant));
+            let h1 = thread::spawn(move || {
+                cache_clone.disable_new_ref();
+                ref5to7.extend_to_entire()
             });
 
-        for (i, s) in a.inner.cache.iter().enumerate() {
-            if (4 * BLOCKSIZE..6 * BLOCKSIZE).contains(&i) {
-                assert_eq!((i, *s), (i, 3u8))
-            } else if (0..2 * BLOCKSIZE).contains(&i) {
-                assert_eq!((i, *s), (i, 1u8))
+            let h2 = thread::spawn(move || {
+                cache_clone2.disable_new_ref();
+                ref8to9.extend_to_entire()
+            });
+
+            let ex1 = h1.join().unwrap();
+            let ex2 = h2.join().unwrap();
+            assert!(ex1.is_some() ^ ex2.is_some());
+            cache
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .iter()
+                .enumerate()
+                .for_each(|(i, s)| {
+                    assert_eq!((i, *s), (i, BlockState::InUse));
+                });
+
+            match ex1 {
+                Some(a) => {
+                    assert_eq!(a.ptr, cache.inner.cache.as_ptr());
+                    assert_eq!(a.from, 0);
+                    assert_eq!(a.len, cache.inner.cache.len());
+                }
+                _ => {
+                    let a = ex2.unwrap();
+                    assert_eq!(a.ptr, cache.inner.cache.as_ptr());
+                    assert_eq!(a.from, 0);
+                    assert_eq!(a.len, cache.inner.cache.len());
+                }
             }
-        }
+        })
+    }
+
+    #[test]
+    fn test_ref_count() {
+        loom_test(|| {
+            let cache = ArcCache::new(BLOCKSIZE * 16);
+            let cache_clone = cache.clone();
+            let cache_clone2 = cache.clone();
+            let mut ref5to7 = cache.get_part_ref(5 * BLOCKSIZE, 2 * BLOCKSIZE).unwrap();
+            assert_eq!(cache.inner.ref_count.load(Ordering::Acquire), 1);
+            let mut ref8to9 = cache.get_part_ref(8 * BLOCKSIZE, 2 * BLOCKSIZE).unwrap();
+            assert_eq!(cache.inner.ref_count.load(Ordering::Acquire), 2);
+            drop(ref5to7);
+            assert_eq!(cache.inner.ref_count.load(Ordering::Acquire), 1);
+            drop(ref8to9);
+            assert_eq!(cache.inner.ref_count.load(Ordering::Acquire), 0);
+
+            // let h1 = thread::spawn(move || {
+            //     cache_clone.disable_new_ref();
+            //     ref5to7.extend_to_entire()
+            // });
+
+            // let h2 = thread::spawn(move || {
+            //     cache_clone2.disable_new_ref();
+            //     ref8to9.extend_to_entire()
+            // });
+
+            // let success1) = h1.join().unwrap();
+            // let (r89, success2) = h2.join().unwrap();
+            // dbg!(success1);
+            // dbg!(success2);
+            // assert!(success1 ^ success2);
+            // if success1 {
+            //     assert_eq!(r57.ptr, cache.inner.cache.as_ptr());
+            //     assert_eq!(r57.from, 0);
+            //     assert_eq!(r57.len, cache.inner.cache.len());
+            //     assert_eq!(r89.len, 0);
+            // } else {
+            //     assert_eq!(r89.ptr, cache.inner.cache.as_ptr());
+            //     assert_eq!(r89.from, 0);
+            //     assert_eq!(r89.len, cache.inner.cache.len());
+            //     assert_eq!(r57.len, 0);
+            // }
+
+            // cache
+            //     .inner
+            //     .state
+            //     .lock()
+            //     .unwrap()
+            //     .iter()
+            //     .enumerate()
+            //     .for_each(|(i, s)| {
+            //         assert_eq!((i, *s), (i, BlockState::InUse));
+            //     });
+        })
     }
 }

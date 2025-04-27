@@ -320,8 +320,8 @@ async fn handle_peer_msg<'a, R>(
                     // TODO: mark piece_buf as ready to write,
                     // get_part_ref should stop return new refs
                     // TODO: last piece
-                    if block_buf.extend_to_entire() {
-                        let pbuf_s = block_buf.to_slice();
+                    if let Some(mut entire_block) = block_buf.extend_to_entire() {
+                        let pbuf_s = entire_block.to_slice();
 
                         let bf_copy = tmh.back_file.clone();
                         let piece_size = tmh.piece_size;
