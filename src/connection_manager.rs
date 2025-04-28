@@ -319,7 +319,10 @@ async fn handle_peer_msg<'a, R>(
                 let write_job = {
                     // TODO: mark piece_buf as ready to write,
                     // get_part_ref should stop return new refs
-                    // TODO: last piece
+                    // TODO: extend_to_entire may fail, if every Ref extend fail,
+                    // will leaving completed block not written to disk.
+                    // i.e. some Ref may not call extend_to_entire because the piece
+                    // did not complete from their views.
                     if let Some(mut entire_block) = block_buf.extend_to_entire() {
                         let pbuf_s = entire_block.to_slice();
 
