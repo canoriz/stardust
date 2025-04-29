@@ -151,7 +151,7 @@ impl Iterator for BlockRangeIter {
 }
 
 // TODO: maybe introduce finer BlockStatus types like Revoked/Rejected?
-#[derive(PartialEq, Debug, Clone)]
+#[derive(PartialEq, Debug, Clone, Copy)]
 enum BlockStatus {
     NotRequested,
     Requested(SocketAddr), // TODO: maybe use a Rc here to save space?
@@ -195,20 +195,47 @@ impl PartialRequestedPiece {
             })
     }
 
-    fn set_block_status(&mut self, block: &protocol::Request, status: BlockStatus) {
-        let block_index = block.begin >> 14;
-        self.block_map[block_index as usize] = status.clone();
+    fn update_requested_before(
+        all_requested_before: &mut usize,
+        block_index: usize,
+        status: &BlockStatus,
+    ) {
         match status {
             BlockStatus::NotRequested => {
-                if self.all_requested_before >= block_index as usize {
-                    self.all_requested_before = block_index as usize;
+                if *all_requested_before >= block_index {
+                    *all_requested_before = block_index;
                 }
             }
             BlockStatus::Requested(_) | BlockStatus::Received => {
-                if self.all_requested_before == block_index as usize {
-                    self.all_requested_before = block_index as usize + 1;
+                if *all_requested_before == block_index {
+                    *all_requested_before = block_index + 1;
                 }
             }
+        }
+    }
+
+    fn set_one_block_status(&mut self, block: &protocol::Request, status: BlockStatus) {
+        let block_index = block.begin >> 14; // TODO: change this const
+        self.set_one_block_status_by_block_index(block_index as usize, status);
+    }
+
+    fn set_one_block_status_by_block_index(&mut self, block_index: usize, status: BlockStatus) {
+        self.block_map[block_index] = status.clone();
+        Self::update_requested_before(
+            &mut self.all_requested_before,
+            block_index as usize,
+            &status,
+        );
+    }
+
+    // apply f to every block
+    fn map_block_status<F>(&mut self, f: F)
+    where
+        F: Fn(u32, &BlockStatus) -> BlockStatus,
+    {
+        for (i, bs) in self.block_map.iter_mut().enumerate() {
+            *bs = f(i as u32, bs);
+            Self::update_requested_before(&mut self.all_requested_before, i, bs);
         }
     }
 }
@@ -489,9 +516,10 @@ fn pick_blocks_from_heap(
 impl HeapPiecePicker {
     pub fn peer_add(&mut self, peer: SocketAddr, b: BitField) {
         if self.peer_field_map.contains_key(&peer) {
-            // if peer previously stored, remove it first
-            // TODO: will remove cause big overhead
-            self.peer_remove(&peer);
+            // TODO: remove picker blocks first? And maintain picked blocks
+            // new bitfield have?
+            warn!("called peer_add of an existing peer {peer}");
+            return;
         }
 
         let field_map = b
@@ -505,33 +533,23 @@ impl HeapPiecePicker {
     }
 
     pub fn peer_mark_not_requested(&mut self, peer: &SocketAddr) {
+        // TODO: perf: use a more efficient datastructure
+        // which can only iterate over blocks requested by peer
         let should_remove_from_partial = self
             .partly_requested_pieces
             .0
             .iter_mut()
             .filter_map(|(k, v)| {
-                let mut has = false;
-                for (bk, bv) in v
-                    .block_map
-                    .iter_mut()
-                    .enumerate()
-                    .rev()
-                    .filter(|(_, bv)| **bv == BlockStatus::Requested(*peer))
-                {
-                    *bv = BlockStatus::NotRequested;
-                    v.all_requested_before = bk;
-                    has = true;
-                }
+                let mark_unreqested = |_: u32, b: &BlockStatus| {
+                    if b == &BlockStatus::Requested(*peer) {
+                        BlockStatus::NotRequested
+                    } else {
+                        *b
+                    }
+                };
+                v.map_block_status(mark_unreqested);
 
-                if has && v.all_requested_before == 0 {
-                    // now we need to check if all blocks in this piece is NotRequested
-                    v.block_map
-                        .iter()
-                        .all(|bv| *bv == BlockStatus::NotRequested)
-                        .then_some(*k)
-                } else {
-                    None
-                }
+                v.is_none_requested().then_some(*k)
             })
             .collect::<Vec<u32>>();
 
@@ -710,13 +728,13 @@ impl HeapPiecePicker {
         if let Some(p) = self.partly_requested_pieces.0.get_mut(&blk.index) {
             info!("received blocks of partial requested piece {blk:?}");
             debug_assert_eq!(blk.begin / BLOCK_SIZE, block_index);
-            p.set_block_status(&blk, BlockStatus::Received);
+            p.set_one_block_status(&blk, BlockStatus::Received);
             p.is_all_received().then_some(blk.index)
         } else if let Some(p) = self.fully_requested_pieces.get_mut(&blk.index) {
             info!("received blocks of fully requested piece {blk:?}");
             debug_assert!(!self.partly_requested_pieces.0.contains_key(&blk.index));
             debug_assert_eq!(blk.begin / BLOCK_SIZE, block_index);
-            p.set_block_status(&blk, BlockStatus::Received);
+            p.set_one_block_status(&blk, BlockStatus::Received);
             if p.is_all_received() {
                 info!("piece {} is fully received", blk.index);
                 Some(blk.index)
@@ -732,7 +750,7 @@ impl HeapPiecePicker {
                 block_map: vec![BlockStatus::NotRequested; n_blocks_in_piece],
                 all_requested_before: 0,
             };
-            p.set_block_status(&blk, BlockStatus::Received);
+            p.set_one_block_status(&blk, BlockStatus::Received);
 
             let is_all_received = p.is_all_received();
             if is_all_received || p.is_all_requested() {
@@ -757,13 +775,13 @@ impl HeapPiecePicker {
                 info!("reschedule blocks of partial requested piece {block:?}");
                 debug_assert_eq!(blk.begin / BLOCK_SIZE, block_index);
 
-                p.set_block_status(&blk, BlockStatus::NotRequested);
+                p.set_one_block_status(&blk, BlockStatus::NotRequested);
             } else if let Some(p) = self.fully_requested_pieces.get_mut(&blk.index) {
                 info!("reschedule blocks of fully requested piece {block:?}");
                 debug_assert!(!self.partly_requested_pieces.0.contains_key(&blk.index));
                 debug_assert_eq!(blk.begin / BLOCK_SIZE, block_index);
 
-                p.set_block_status(&blk, BlockStatus::NotRequested);
+                p.set_one_block_status(&blk, BlockStatus::NotRequested);
 
                 let v = self
                     .fully_requested_pieces
@@ -1205,5 +1223,132 @@ mod test {
                 len: last_block_size,
             }
         );
+    }
+
+    #[test]
+    fn test_peer_mark_not_requested() {
+        let peer1 = generate_peer(1);
+        let peer2 = generate_peer(2);
+        let mut picker = HeapPiecePicker::new(16 * 16 * BLOCK_SIZE as usize, 16 * BLOCK_SIZE);
+        picker.peer_add(peer1, BitField::from(vec![true; 16]));
+        picker.pick_blocks(&peer1, 5);
+        picker.peer_add(peer2, BitField::from(vec![true; 16]));
+        picker.pick_blocks(&peer2, 13);
+        check_picker_partial_and_fully(&picker, [1], [0]);
+
+        picker.peer_mark_not_requested(&peer2);
+        check_picker_partial_and_fully(&picker, [0], []);
+        let blockmap = picker.partly_requested_pieces.0.get(&0).unwrap();
+        assert_eq!(blockmap.all_requested_before, 5);
+        for (i, b) in blockmap.block_map[0..5].iter().enumerate() {
+            assert_eq!((i, b), (i, &BlockStatus::Requested(peer1)));
+        }
+        for (i, b) in blockmap.block_map[5..].iter().enumerate() {
+            assert_eq!((i, b), (i, &BlockStatus::NotRequested));
+        }
+    }
+
+    #[test]
+    fn test_maintain_blockstatus() {
+        let peer1 = generate_peer(1);
+        let mut bs = PartialRequestedPiece {
+            all_requested_before: 0,
+            block_map: vec![BlockStatus::NotRequested; 16],
+        };
+        assert!(bs.is_none_requested());
+        assert!(!bs.is_all_requested());
+
+        bs.set_one_block_status_by_block_index(3, BlockStatus::Requested(peer1));
+        assert!(!bs.is_all_requested());
+        assert!(!bs.is_none_requested());
+
+        for i in 0..3 {
+            bs.set_one_block_status_by_block_index(i, BlockStatus::Requested(peer1));
+        }
+
+        // now 0,1,2,3 are requested
+        assert!(!bs.is_all_requested());
+        assert!(!bs.is_none_requested());
+    }
+
+    #[test]
+    fn test_maintain_blockstatus2() {
+        let peer1 = generate_peer(1);
+        let bs = PartialRequestedPiece {
+            all_requested_before: 0,
+            block_map: vec![
+                BlockStatus::NotRequested,
+                BlockStatus::Requested(peer1),
+                BlockStatus::NotRequested,
+            ],
+        };
+        assert!(!bs.is_none_requested());
+        assert!(!bs.is_all_requested());
+    }
+
+    #[test]
+    fn test_maintain_blockstatus3() {
+        let peer1 = generate_peer(1);
+        let bs = PartialRequestedPiece {
+            all_requested_before: 0,
+            block_map: vec![BlockStatus::Requested(peer1), BlockStatus::Requested(peer1)],
+        };
+        assert!(!bs.is_none_requested());
+        assert!(bs.is_all_requested());
+    }
+
+    #[test]
+    fn test_maintain_blockstatus_map() {
+        let peer1 = generate_peer(1);
+        let peer2 = generate_peer(2);
+        let mut bs = PartialRequestedPiece {
+            all_requested_before: 0,
+            block_map: vec![
+                BlockStatus::NotRequested,
+                BlockStatus::Requested(peer1),
+                BlockStatus::Requested(peer2),
+                BlockStatus::NotRequested,
+            ],
+        };
+        assert!(!bs.is_none_requested());
+        assert!(!bs.is_all_received());
+
+        bs.map_block_status(|_, bs| {
+            if bs == &BlockStatus::Requested(peer1) {
+                BlockStatus::NotRequested
+            } else {
+                *bs
+            }
+        });
+        assert_eq!(
+            bs.block_map,
+            vec![
+                BlockStatus::NotRequested,
+                BlockStatus::NotRequested,
+                BlockStatus::Requested(peer2),
+                BlockStatus::NotRequested,
+            ]
+        );
+        assert!(!bs.is_none_requested());
+        assert!(!bs.is_all_requested());
+
+        bs.map_block_status(|_, bs| {
+            if bs == &BlockStatus::Requested(peer2) {
+                BlockStatus::NotRequested
+            } else {
+                *bs
+            }
+        });
+        assert_eq!(
+            bs.block_map,
+            vec![
+                BlockStatus::NotRequested,
+                BlockStatus::NotRequested,
+                BlockStatus::NotRequested,
+                BlockStatus::NotRequested,
+            ]
+        );
+        assert!(bs.is_none_requested());
+        assert!(!bs.is_all_requested());
     }
 }

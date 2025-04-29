@@ -113,8 +113,19 @@ impl TransmitManager {
     //     self.announce_tx = Some(self.start_announce_task::<FakeAnnouncer>(announce_list));
     //     self
     // }
-    fn pick_blocks_for_peer(&mut self, n_blocks: usize) {
+    fn pick_blocks_for_all_peers(&mut self, n_blocks: usize) {
         for (addr, h) in &mut self.connected_peers {
+            let reqs = self
+                .piece_picker
+                .lock()
+                .unwrap() // TODO: fix unwrap
+                .pick_blocks(addr, n_blocks);
+            h.send_stream_cmd(ConnMsg::RequestBlocks(reqs));
+        }
+    }
+
+    fn pick_blocks_for_peer(&mut self, addr: &SocketAddr, n_blocks: usize) {
+        if let Some(h) = self.connected_peers.get(addr) {
             let reqs = self
                 .piece_picker
                 .lock()
@@ -153,7 +164,7 @@ impl TransmitManager {
             Msg::PeerBitField(addr, bitfield) => {
                 info!("new BitField msg from peer {addr}");
                 self.piece_picker.lock().unwrap().peer_add(addr, bitfield);
-                self.pick_blocks_for_peer(15);
+                self.pick_blocks_for_all_peers(15); // TODO: ?
             }
             other => {
                 info!("unhandled other {:?}", other);
@@ -223,7 +234,7 @@ pub(crate) async fn run_transmit_manager(
             }
             _ = ticker.tick() => {
                 info!("transmit ticker tick");
-                transmit.pick_blocks_for_peer(300);
+                transmit.pick_blocks_for_all_peers(300);
                 let pbl = transmit.self_handle.piece_buffer.lock().unwrap().len();
                 warn!("pbl remains {pbl}");
             }
