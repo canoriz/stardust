@@ -30,7 +30,6 @@ pub(crate) enum Msg {
 pub(crate) struct ConnectionManagerHandle {
     recv_stream: RecvStreamHandle,
     send_stream: SendStreamHandle,
-    metadata: Arc<metadata::Metadata>,
 }
 
 impl ConnectionManagerHandle {
@@ -59,7 +58,6 @@ impl ConnectionManagerHandle {
         let (send_done_tx, send_done_rx) = oneshot::channel();
         let send_stream_handle = SendStreamHandle {
             sender: send_tx,
-            notify: Arc::new(Notify::new()),
             cancel: send_cancel_tx,
             done: send_done_rx,
         };
@@ -73,7 +71,6 @@ impl ConnectionManagerHandle {
         Self {
             recv_stream: recv_stream_handle,
             send_stream: send_stream_handle,
-            metadata: m,
         }
     }
 
@@ -132,7 +129,6 @@ where
 
 struct SendStreamHandle {
     sender: mpsc::UnboundedSender<Msg>,
-    notify: Arc<Notify>,
     cancel: oneshot::Sender<()>,
     done: oneshot::Receiver<()>,
 }
@@ -143,6 +139,8 @@ where
 {
     receiver: mpsc::UnboundedReceiver<Msg>,
     write_stream: WriteStream<<T as Split>::W>,
+    // TODO: do we use this to get blocks to requests?
+    // transmit_handle: TransmitManagerHandle,
 }
 
 async fn run_recv_stream<T>(
@@ -199,6 +197,7 @@ async fn handle_peer_msg<'a, R>(
 ) where
     R: AsyncRead + Unpin,
 {
+    info!("handle_perr_msg");
     // TODO: send statistics to transmit handle
 
     // TODO: shall we use mpsc or just lock the manager and set it
@@ -208,14 +207,20 @@ async fn handle_peer_msg<'a, R>(
     match m {
         Message::KeepAlive => {
             // do nothing
+            info!("ka");
         }
         Message::Choke => {
+            info!("ck");
             // TODO: drop all pending requests
             // stop sending all requests
-            tmh.sender.send(transmit_manager::Msg::PeerChoke);
+            let r = tmh.sender.send(transmit_manager::Msg::PeerChoke(addr));
+            if let Err(e) = r {
+                warn!("error send unchoke to transmit manager {e}")
+            }
         }
         Message::Unchoke => {
-            tmh.sender.send(transmit_manager::Msg::PeerUnchoke);
+            info!("uck");
+            tmh.sender.send(transmit_manager::Msg::PeerUnchoke(addr));
         }
         Message::Interested => {
             // TODO: update peer state

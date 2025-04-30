@@ -203,18 +203,18 @@ impl Ref {
     // extend block ref's length to full ref
     pub fn extend_to_entire(self) -> Option<Self> {
         let mut c = ManuallyDrop::new(self);
-        println!("enter");
+        // println!("enter");
         let success = {
             let mut state = c.main_cache.state.lock().unwrap();
             // println!("{:?}", self.main_cache.ref_count);
             // let ref_cnt = self.main_cache.ref_count.load(Ordering::Acquire);
-            println!("cnt {}", state.ref_cnt);
+            // println!("cnt {}", state.ref_cnt);
             if state.ref_cnt != 1 {
-                println!("extend ref_cnt stop");
+                // println!("extend ref_cnt stop");
                 state.release_ref(&c);
                 false
             } else {
-                println!("extend ref_cnt go ahead {}", state.ref_cnt);
+                // println!("extend ref_cnt go ahead {}", state.ref_cnt);
 
                 for s in state.state.iter_mut() {
                     *s = BlockState::InUse;
@@ -222,14 +222,14 @@ impl Ref {
                 true
             }
         };
-        println!("success: {success}");
+        // println!("success: {success}");
         if success {
             c.from = 0;
             c.ptr = c.main_cache.cache.as_ptr();
             c.len = c.main_cache.cache.len();
             Some(ManuallyDrop::into_inner(c))
         } else {
-            println!("manually drop arc");
+            // println!("manually drop arc");
             unsafe { ManuallyDrop::drop(&mut c.main_cache) };
             None
         }
@@ -244,7 +244,7 @@ impl Drop for Ref {
     fn drop(&mut self) {
         self.main_cache.release_ref(self);
         unsafe { ManuallyDrop::drop(&mut self.main_cache) };
-        println!("real drop");
+        // println!("real drop");
     }
 }
 

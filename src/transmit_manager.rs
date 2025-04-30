@@ -8,6 +8,7 @@ use crate::picker::{BlockRequests, HeapPiecePicker};
 use crate::protocol::{self, BTStream, BitField};
 use crate::storage::ArcCache;
 
+use reqwest::header::OccupiedEntry;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
@@ -28,11 +29,38 @@ pub(crate) enum Msg {
     NewPeer(protocol::BTStream<TcpStream>),
     NewIncomePeer(protocol::BTStream<TcpStream>),
 
-    PeerChoke,
-    PeerUnchoke,
+    PeerChoke(SocketAddr),
+    PeerUnchoke(SocketAddr),
     PeerInterested,
     PeerUninterested,
     PeerBitField(SocketAddr, BitField),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ChokeStatus {
+    Choked,
+    Unchoked,
+    Unknown,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum InterestStatus {
+    Interested,
+    Uninterested,
+    Unknown,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct PeerStatus {
+    our_choke_status: ChokeStatus,
+    our_interest_status: InterestStatus,
+    peer_choke_status: ChokeStatus,
+    peer_interest_status: InterestStatus,
+}
+
+struct PeerConn {
+    conn: ConnectionManagerHandle,
+    state: PeerStatus,
 }
 
 #[derive(Clone)]
@@ -64,7 +92,7 @@ pub struct TransmitManager {
 
     // TODO: use a Map instead of Vec?
     // TODO: change V type
-    connected_peers: HashMap<SocketAddr, ConnectionManagerHandle>,
+    connected_peers: HashMap<SocketAddr, PeerConn>,
 
     piece_picker: Arc<Mutex<HeapPiecePicker>>,
     piece_buffer: Arc<Mutex<HashMap<u32, ArcCache>>>,
@@ -115,12 +143,16 @@ impl TransmitManager {
     // }
     fn pick_blocks_for_all_peers(&mut self, n_blocks: usize) {
         for (addr, h) in &mut self.connected_peers {
-            let reqs = self
-                .piece_picker
-                .lock()
-                .unwrap() // TODO: fix unwrap
-                .pick_blocks(addr, n_blocks);
-            h.send_stream_cmd(ConnMsg::RequestBlocks(reqs));
+            info!("peer status {addr}: {:?}", h.state);
+            if h.state.peer_choke_status == ChokeStatus::Unchoked {
+                let reqs = self
+                    .piece_picker
+                    .lock()
+                    .unwrap() // TODO: fix unwrap
+                    .pick_blocks(addr, n_blocks);
+                info!("aaa {n_blocks} {reqs:?}");
+                h.conn.send_stream_cmd(ConnMsg::RequestBlocks(reqs));
+            }
         }
     }
 
@@ -131,7 +163,7 @@ impl TransmitManager {
                 .lock()
                 .unwrap() // TODO: fix unwrap
                 .pick_blocks(addr, n_blocks);
-            h.send_stream_cmd(ConnMsg::RequestBlocks(reqs));
+            h.conn.send_stream_cmd(ConnMsg::RequestBlocks(reqs));
         }
     }
 
@@ -158,13 +190,49 @@ impl TransmitManager {
                         self.self_handle.clone(),
                         self.metadata.clone(),
                     );
-                    self.connected_peers.insert(peer_addr, cm);
+                    self.connected_peers.insert(
+                        peer_addr,
+                        PeerConn {
+                            conn: cm,
+                            state: PeerStatus {
+                                our_choke_status: ChokeStatus::Unknown,
+                                our_interest_status: InterestStatus::Unknown,
+                                peer_choke_status: ChokeStatus::Unknown,
+                                peer_interest_status: InterestStatus::Unknown,
+                            },
+                        },
+                    );
                 }
             }
             Msg::PeerBitField(addr, bitfield) => {
                 info!("new BitField msg from peer {addr}");
                 self.piece_picker.lock().unwrap().peer_add(addr, bitfield);
-                self.pick_blocks_for_all_peers(15); // TODO: ?
+            }
+            Msg::PeerChoke(peer) => {
+                info!("{peer} choked us");
+                self.piece_picker
+                    .lock()
+                    .unwrap()
+                    .peer_mark_not_requested(&peer);
+                self.connected_peers
+                    .entry(peer)
+                    .and_modify(|st| st.state.peer_choke_status = ChokeStatus::Choked);
+                assert_eq!(
+                    self.connected_peers[&peer].state.peer_choke_status,
+                    ChokeStatus::Choked
+                );
+            }
+            Msg::PeerUnchoke(peer) => {
+                info!("{peer} unchoked us");
+                self.connected_peers
+                    .entry(peer)
+                    .and_modify(|st| st.state.peer_choke_status = ChokeStatus::Unchoked);
+                assert_eq!(
+                    self.connected_peers[&peer].state.peer_choke_status,
+                    ChokeStatus::Unchoked
+                );
+                // TODO: are we interested in this peer?
+                self.pick_blocks_for_peer(&peer, 10);
             }
             other => {
                 info!("unhandled other {:?}", other);
@@ -229,19 +297,19 @@ pub(crate) async fn run_transmit_manager(
         // TODO: lets use notify?
         tokio::select! {
             Some(msg) = transmit.receiver.recv() => {
-                info!("main received msg {msg:?}");
+                info!("transmit manager received msg {msg:?}");
                 transmit.handle_msg(msg);
             }
             _ = ticker.tick() => {
                 info!("transmit ticker tick");
                 transmit.pick_blocks_for_all_peers(300);
                 let pbl = transmit.self_handle.piece_buffer.lock().unwrap().len();
-                warn!("pbl remains {pbl}");
+                warn!("piece buffer pending remains {pbl}");
             }
             _ = &mut cancel => {
-                for (addr, handle) in transmit.connected_peers.drain() {
+                for (addr, conn) in transmit.connected_peers.drain() {
                     info!("stopping connection to {addr}");
-                    handle.stop().await;
+                    conn.conn.stop().await;
                 };
                 info!("transmit manager cancelled");
                 break;

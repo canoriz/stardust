@@ -75,6 +75,9 @@ pub struct BlockRange {
 }
 
 // TODO: can piece request cross PIECE boundry?
+// YES!. transmission states that some torrent's piece size
+// is not multiple of BLOCKSIZE, so leaving last block in piece
+// smaller than BLOCKSIZE
 impl BlockRange {
     // TODO: from 3-int tuple or some more sophisticated struct?
     pub fn one_block(index: u32, begin: u32, len: u32) -> Self {
@@ -533,6 +536,7 @@ impl HeapPiecePicker {
     }
 
     pub fn peer_mark_not_requested(&mut self, peer: &SocketAddr) {
+        info!("mark all block requested from {peer} NotRequested");
         // TODO: perf: use a more efficient datastructure
         // which can only iterate over blocks requested by peer
         let should_remove_from_partial = self

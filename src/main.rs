@@ -121,23 +121,37 @@ where
         .send_bitfield(&protocol::BitField::new(vec![0xffu8; 3000]))
         .await?;
     info!("bitfield sent");
-    bt_stream.send_choke().await?;
     bt_stream.send_keepalive().await?;
     bt_stream.send_keepalive().await?;
     bt_stream.send_keepalive().await?;
     info!("all keep alive sent");
+    let mut ticker = tokio::time::interval(time::Duration::from_millis(5000));
     loop {
-        let msg = bt_stream.recv_msg_header().await?;
-        match msg {
-            Message::Request(r) => {
-                bt_stream
-                    .send_piece(r.index, r.begin, &vec![0x00; r.len as usize])
-                    .await;
+        tokio::select! {
+            msg = bt_stream.recv_msg_header() => {
+                let m = msg?;
+                match m {
+                    Message::Request(r) => {
+                        bt_stream
+                            .send_piece(r.index, r.begin, &vec![0x00; r.len as usize])
+                            .await;
+                    }
+                    _ => {
+                        info!("received msg {:?} from {}", m, addr);
+                    }
+                }
             }
-            _ => {
-                info!("received msg {:?} from {}", msg, addr);
+            _ = ticker.tick() => {
+                let unchoke: bool = rand::random();
+                if unchoke {
+                    info!("main unchoke");
+                    bt_stream.send_unchoke().await;
+                } else {
+                    info!("main choke");
+                    bt_stream.send_choke().await;
+                }
             }
-        }
+        };
     }
 }
 
