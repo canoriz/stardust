@@ -13,7 +13,7 @@ use tracing::{info, Level};
 #[derive(Debug, Clone)]
 pub struct Metadata {
     pub info: Info,
-    info_hash: [u8; 20],
+    pub info_hash: [u8; 20],
 
     len: usize,
 

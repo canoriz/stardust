@@ -34,6 +34,8 @@ pub(crate) enum Msg {
     PeerInterested,
     PeerUninterested,
     PeerBitField(SocketAddr, BitField),
+
+    PieceReceived(u32),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -234,6 +236,11 @@ impl TransmitManager {
                 // TODO: are we interested in this peer?
                 self.pick_blocks_for_peer(&peer, 10);
             }
+            Msg::PieceReceived(i) => {
+                for (_, h) in self.connected_peers.iter() {
+                    h.conn.send_stream_cmd(ConnMsg::Have(i));
+                }
+            }
             other => {
                 info!("unhandled other {:?}", other);
                 // todo!()
@@ -292,7 +299,7 @@ pub(crate) async fn run_transmit_manager(
     mut cancel: oneshot::Receiver<()>,
     done: oneshot::Sender<()>,
 ) {
-    let mut ticker = tokio::time::interval(time::Duration::from_millis(500));
+    let mut ticker = tokio::time::interval(time::Duration::from_millis(1000));
     loop {
         // TODO: lets use notify?
         tokio::select! {
@@ -302,7 +309,7 @@ pub(crate) async fn run_transmit_manager(
             }
             _ = ticker.tick() => {
                 info!("transmit ticker tick");
-                transmit.pick_blocks_for_all_peers(300);
+                transmit.pick_blocks_for_all_peers(2);
                 let pbl = transmit.self_handle.piece_buffer.lock().unwrap().len();
                 warn!("piece buffer pending remains {pbl}");
             }

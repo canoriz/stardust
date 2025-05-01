@@ -22,6 +22,7 @@ pub(crate) enum WakeUpOption {
 #[derive(Debug)]
 pub(crate) enum Msg {
     RequestBlocks(BlockRequests),
+    Have(u32),
     // SendBlocks(BlockRange),
     SetWakeUp(WakeUpOption),
     ResetWakeUp(WakeUpOption),
@@ -315,6 +316,7 @@ async fn handle_peer_msg<'a, R>(
                 });
             if let Some(i) = received_piece {
                 info!("piece {i} received");
+                tmh.sender.send(transmit_manager::Msg::PieceReceived(i));
 
                 // block new ref to piece buffer
                 // so ref count only decreases
@@ -414,6 +416,9 @@ where
                             .await;
                     }
                 }
+            }
+            Msg::Have(i) => {
+                self.write_stream.send_have(i).await;
             }
             other => {}
         }

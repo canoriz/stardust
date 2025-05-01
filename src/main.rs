@@ -17,7 +17,7 @@ mod storage;
 mod torrent_manager;
 mod transmit_manager;
 
-use protocol::{BTStream, Message};
+use protocol::{BTStream, Handshake, Message};
 use torrent_manager::{TorrentManagerHandle, TransmitManager};
 
 #[tokio::main]
@@ -41,8 +41,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //     ip: None,
     // };
 
-    let torrent_f = include_bytes!("../ubuntu-24.10-desktop-amd64.iso.torrent");
-    // let torrent_f = include_bytes!("../31.torrent");
+    // let torrent_f = include_bytes!("../ubuntu-24.10-desktop-amd64.iso.torrent");
+    let torrent_f = include_bytes!("../31.torrent");
     let torrent = metadata::FileMetadata::load(torrent_f).unwrap();
 
     let (metadata, announce_list) = torrent.to_metadata();
@@ -76,20 +76,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     tokio::spawn(server);
 
+    let info_hash = metadata.info_hash;
     // let mut tm = TransmitManager::new(metadata).with_announce_list(announce_list);
     let mut tm = TorrentManagerHandle::new(Arc::new(metadata));
     // tm.send_announce_msg(announce_manager::Msg::AddUrl(announce_list[0].clone()));
     // tm.send_announce_msg(announce_manager::Msg::AddUrl(announce_list[1].clone()));
     wait_ready.notified().await;
 
-    if let Ok(mut conn) = protocol::BTStream::connect_tcp("127.0.0.1:35515".parse().unwrap()).await
+    if let Ok(mut conn) =
+        protocol::BTStream::connect_tcp("192.168.71.36:62227".parse().unwrap()).await
     {
-        conn.send_handshake(&HANDSHAKE).await?;
+        info!("{info_hash:?}");
+        conn.send_handshake(&Handshake {
+            reserved: [0u8; 8],
+            client_id: HANDSHAKE.client_id,
+            torrent_hash: info_hash,
+        })
+        .await?;
         conn.recv_handshake().await?;
         tm.send_msg(transmit_manager::Msg::NewPeer(conn));
     }
     // tm.start().await;
-    time::sleep(Duration::from_secs(1000)).await;
+    time::sleep(Duration::from_secs(100000)).await;
     // tm.send_announce_msg(announce_manager::Msg::RemoveUrl(
     //     announce_list[0][0].clone(),
     // ));

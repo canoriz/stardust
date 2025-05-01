@@ -242,8 +242,8 @@ impl metadata::Announce for FakeAnnouncer {
             interval: 1800,
             peers: vec![metadata::Peer {
                 peer_id: "1384".into(),
-                ip: "127.0.0.1".into(),
-                port: 35515,
+                ip: "192.168.71.36".into(),
+                port: 55236,
             }],
         })
     }
