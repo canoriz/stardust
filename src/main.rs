@@ -84,7 +84,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     wait_ready.notified().await;
 
     if let Ok(mut conn) =
-        protocol::BTStream::connect_tcp("192.168.71.36:62227".parse().unwrap()).await
+        // protocol::BTStream::connect_tcp("192.168.71.36:62227".parse().unwrap()).await
+        protocol::BTStream::connect_tcp("127.0.0.1:35515".parse().unwrap()).await
     {
         info!("{info_hash:?}");
         conn.send_handshake(&Handshake {
@@ -125,8 +126,10 @@ where
     handshake.client_id = *CLIENT_ID;
     bt_stream.send_handshake(&handshake).await?;
     info!("handshake sent");
+    let bitfield_total = metadata.info.pieces.len() / 20 / 8;
+    info!("{bitfield_total}");
     bt_stream
-        .send_bitfield(&protocol::BitField::new(vec![0xffu8; 3000]))
+        .send_bitfield(&protocol::BitField::new(vec![0xffu8; bitfield_total]))
         .await?;
     info!("bitfield sent");
     bt_stream.send_keepalive().await?;
@@ -134,14 +137,16 @@ where
     bt_stream.send_keepalive().await?;
     info!("all keep alive sent");
     let mut ticker = tokio::time::interval(time::Duration::from_millis(5000));
+    bt_stream.send_unchoke().await;
     loop {
         tokio::select! {
             msg = bt_stream.recv_msg_header() => {
                 let m = msg?;
                 match m {
                     Message::Request(r) => {
+                        let a = [0u8; 16384];
                         bt_stream
-                            .send_piece(r.index, r.begin, &vec![0x00; r.len as usize])
+                            .send_piece(r.index, r.begin, &a)
                             .await;
                     }
                     _ => {
@@ -149,16 +154,16 @@ where
                     }
                 }
             }
-            _ = ticker.tick() => {
-                let unchoke: bool = rand::random();
-                if unchoke {
-                    info!("main unchoke");
-                    bt_stream.send_unchoke().await;
-                } else {
-                    info!("main choke");
-                    bt_stream.send_choke().await;
-                }
-            }
+            // _ = ticker.tick() => {
+            //     let unchoke: bool = rand::random();
+            //     if unchoke {
+            //         info!("main unchoke");
+            //         bt_stream.send_unchoke().await;
+            //     } else {
+            //         info!("main choke");
+            //         bt_stream.send_choke().await;
+            //     }
+            // }
         };
     }
 }

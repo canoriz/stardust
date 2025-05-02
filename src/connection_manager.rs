@@ -11,6 +11,7 @@ use crate::metadata;
 use crate::picker::{BlockRange, BlockRequests};
 use crate::protocol::{self, BTStream, Message, ReadStream, Split, WriteStream};
 use crate::storage::ArcCache;
+use crate::transmit_manager::Msg as TransmitMsg;
 use crate::transmit_manager::{self, TransmitManagerHandle};
 
 #[derive(Debug)]
@@ -52,6 +53,7 @@ impl ConnectionManagerHandle {
             receiver: recv_rx,
             read_stream: read_stream,
             transmit_handle: trh,
+            blk_recv_count: 0,
         };
 
         let (send_tx, send_rx) = mpsc::unbounded_channel();
@@ -126,6 +128,8 @@ where
     receiver: mpsc::UnboundedReceiver<Msg>,
     read_stream: ReadStream<<T as Split>::R>,
     transmit_handle: TransmitManagerHandle,
+
+    blk_recv_count: u32,
 }
 
 struct SendStreamHandle {
@@ -141,6 +145,7 @@ where
     receiver: mpsc::UnboundedReceiver<Msg>,
     write_stream: WriteStream<<T as Split>::W>,
     // TODO: do we use this to get blocks to requests?
+    // so we can receive requests from recv_handle
     // transmit_handle: TransmitManagerHandle,
 }
 
@@ -152,6 +157,8 @@ async fn run_recv_stream<T>(
     T: Split,
 {
     info!("in recv stream");
+    let mut ticker = tokio::time::interval(time::Duration::from_millis(1000));
+    let addr = conn.read_stream.peer_addr();
     loop {
         tokio::select! {
             _ = &mut cancel => {
@@ -160,9 +167,25 @@ async fn run_recv_stream<T>(
             }
             Some(msg) = conn.receiver.recv() => {
                 // TODO: use buffer and tokio::Notify
-                // info!("connection manager of {} received msg {msg:?}", &manager.conn);
+                // info!("connection manager recv stream of {} received msg {msg:?}", &manager.conn);
             }
-            r = receive_peer_msg(&mut conn.read_stream, &mut conn.transmit_handle) => {
+            r = conn.read_stream.recv_msg_header() => {
+                // r = receive_peer_msg(&mut conn.read_stream, &mut conn.transmit_handle) => {
+                match r {
+                    Ok(hdr) => {
+                        // (handle_peer_hdr(&mut conn, addr, hdr));
+                        let n_blk = handle_peer_msg(&mut conn.transmit_handle, addr, hdr).await;
+                        conn.blk_recv_count += n_blk;
+                    }
+                    Err(e) => {
+                        warn!("recv stream read header error {e}");
+                    }
+                }
+            }
+            _ = ticker.tick() => {
+                info!("recv conn ticker tick {} block received in this epoch", conn.blk_recv_count);
+                conn.transmit_handle.sender.send(TransmitMsg::BlockReceived(conn.read_stream.peer_addr(), conn.blk_recv_count));
+                conn.blk_recv_count = 0;
             }
         };
     }
@@ -170,35 +193,32 @@ async fn run_recv_stream<T>(
     info!("done recv stream");
 }
 
-async fn receive_peer_msg<T>(
-    read_stream: &mut ReadStream<T>,
-    transmit_handle: &mut TransmitManagerHandle,
-) where
-    T: AsyncRead + Unpin,
-{
-    let peer_addr = read_stream.peer_addr();
-    let r = read_stream.recv_msg_header().await;
-    match r {
-        Ok(m) => {
-            info!("received BT msg");
-            handle_peer_msg(transmit_handle, peer_addr, m).await;
-        }
-        Err(e) => {
-            info!("receive connection error {e}");
-            // TODO: tell transmit manager this connection is dead
-        }
-    }
-}
+// // TODO: change a better name
+// async fn handle_peer_hdr<'a, T, U>(
+//     tmh: &'a mut TransmitManagerHandle,
+//     addr: SocketAddr,
+//     hdr: Message<'a, U>,
+// ) -> u32
+// where
+//     T: Split,
+//     U: AsyncRead + Unpin,
+// {
+//     info!("received BT msg hdr {hdr:?}");
+//     handle_peer_msg(tmh, addr, hdr).await
+// }
 
 // TODO: socketaddr use ref?
+// TODO: returns some more meaningful val
+// returns if one block is received
 async fn handle_peer_msg<'a, R>(
     tmh: &'a mut TransmitManagerHandle,
     addr: SocketAddr,
     m: Message<'a, R>,
-) where
+) -> u32
+where
     R: AsyncRead + Unpin,
 {
-    info!("handle_perr_msg");
+    info!("handle_peer_msg {m:?}");
     // TODO: send statistics to transmit handle
 
     // TODO: shall we use mpsc or just lock the manager and set it
@@ -209,36 +229,44 @@ async fn handle_peer_msg<'a, R>(
         Message::KeepAlive => {
             // do nothing
             info!("ka");
+            0
         }
         Message::Choke => {
             info!("ck");
             // TODO: drop all pending requests
             // stop sending all requests
-            let r = tmh.sender.send(transmit_manager::Msg::PeerChoke(addr));
+            let r = tmh.sender.send(TransmitMsg::PeerChoke(addr));
             if let Err(e) = r {
                 warn!("error send unchoke to transmit manager {e}")
             }
+            0
         }
         Message::Unchoke => {
             info!("uck");
-            tmh.sender.send(transmit_manager::Msg::PeerUnchoke(addr));
+            tmh.sender.send(TransmitMsg::PeerUnchoke(addr));
+            0
         }
         Message::Interested => {
             // TODO: update peer state
-            tmh.sender.send(transmit_manager::Msg::PeerInterested);
+            tmh.sender.send(TransmitMsg::PeerInterested);
+            0
         }
         Message::NotInterested => {
             // TODO: update peer state
-            tmh.sender.send(transmit_manager::Msg::PeerUninterested);
+            tmh.sender.send(TransmitMsg::PeerUninterested);
+            0
         }
         Message::Have(_) => {
             // TODO: tell transmit manager
             todo!();
+            0
         }
-        Message::BitField(bit_field) => {
-            // TODO: tell transmit manager
-            tmh.sender
-                .send(transmit_manager::Msg::PeerBitField(addr, bit_field));
+        Message::BitField(mut bf_recv) => {
+            info!("bf");
+            // TODO: handle error
+            let bit_field = bf_recv.read().await.unwrap();
+            tmh.sender.send(TransmitMsg::PeerBitField(addr, bit_field));
+            0
         }
         Message::Request(request) => {
             // TODO:
@@ -246,126 +274,18 @@ async fn handle_peer_msg<'a, R>(
             // add to send queue, wake sending task
             // if not in cache, send to background fetch task
             // when block fetched, wake sending task
+            0
         }
-        Message::Piece(mut piece) => {
-            // TODO:
-            // if coming piece have cache, store it in cache
-            // if coming piece don't have cache, ???
-            // tell manager?
-            info!(
-                "block received {} {} {}",
-                piece.index, piece.begin, piece.len,
-            );
-
-            // TODO: if coming block is already received and checked,
-            // then discard this block, don't alloc (if needed) piece buffer.
-            // And there should be no piece buffer of this piece in pb_map
-            let (mut block_ref, piece_buf) = {
-                // must drop pb_map before await point
-                // pb_map is not Send
-                let mut pb_map = tmh.piece_buffer.lock().unwrap();
-                let pb = match pb_map.get(&piece.index) {
-                    Some(pb) => pb.clone(),
-                    None => {
-                        let pb = ArcCache::new(tmh.piece_size);
-                        pb_map.insert(piece.index, pb.clone());
-                        pb
-                    }
-                };
-
-                let block_ref = pb.get_part_ref(
-                    piece.begin as usize,
-                    // TODO: change 16384 to const
-                    (piece.len.next_multiple_of(16384)) as usize,
-                );
-
-                if block_ref.is_none() {
-                    warn!(
-                        "error get block buf of piece {} block offset {}",
-                        piece.index, piece.begin
-                    );
-                }
-                (block_ref, pb)
-            };
-
-            let mut block_buf = if let Some(mut bbuf) = block_ref {
-                piece.read(bbuf.to_slice_len(piece.len as usize)).await;
-                bbuf
-            } else {
-                let mut drain = vec![0u8; piece.len as usize];
-                piece.read(&mut drain).await;
-                warn!(
-                    "drain PIECE msg {} {} {}",
-                    piece.index, piece.begin, piece.len
-                );
-                // TODO: what should we do now?
-                // we don't have that space
-                // maybe reads to supplementary buffer?
-                // just return now
-                return;
-            };
-
-            let received_piece = tmh
-                .picker
-                .lock()
-                .unwrap()
-                .block_received(protocol::Request {
-                    index: piece.index,
-                    begin: piece.begin,
-                    len: piece.len,
-                });
-            if let Some(i) = received_piece {
-                info!("piece {i} received");
-                tmh.sender.send(transmit_manager::Msg::PieceReceived(i));
-
-                // block new ref to piece buffer
-                // so ref count only decreases
-                piece_buf.disable_new_ref();
-
-                let (write_tx, write_rx) = tokio::sync::oneshot::channel::<std::io::Result<()>>();
-                let write_job = {
-                    // TODO: mark piece_buf as ready to write,
-                    // get_part_ref should stop return new refs
-                    // TODO: extend_to_entire may fail, if every Ref extend fail,
-                    // will leaving completed block not written to disk.
-                    // i.e. some Ref may not call extend_to_entire because the piece
-                    // did not complete from their views.
-                    if let Some(mut entire_block) = block_buf.extend_to_entire() {
-                        let pbuf_s = entire_block.to_slice();
-
-                        let bf_copy = tmh.back_file.clone();
-                        let piece_size = tmh.piece_size;
-                        tmh.piece_buffer.lock().expect("lock should ok").remove(&i);
-
-                        Some(WriteJob {
-                            f: bf_copy,
-                            offset: (i as usize) * piece_size,
-                            buf: pbuf_s,
-                            write_tx,
-                        })
-                    } else {
-                        warn!("some one holding block ref in piece {i}, give up writing",);
-                        None
-                    }
-                };
-
-                if let Some(wj) = write_job {
-                    if let Err(e) = tmh.write_worker.send(wj) {
-                        warn!("error sending write job to worker error {e:?}");
-                    }
-                    let write_res = write_rx.await;
-                    // let r = hdl.await;
-                    info!("write piece {i} result {write_res:?}");
-                    // TODO: should really check sha1 of piece
-                    tmh.picker.lock().unwrap().piece_checked(i);
-                }
-            }
+        Message::Piece(piece) => {
+            handle_piece_msg(tmh, piece).await;
+            1
         }
         Message::Cancel(request) => {
             // TODO: cancel pending request/fetch task
             todo!();
+            0
         }
-    };
+    }
 }
 
 async fn run_send_stream<T>(
@@ -376,7 +296,8 @@ async fn run_send_stream<T>(
     T: Split,
 {
     let mut interval = tokio::time::interval(time::Duration::from_secs(120));
-    conn.write_stream.send_interested().await;
+    // conn.write_stream.send_interested().await;
+
     loop {
         tokio::select! {
             Some(msg) = conn.receiver.recv() => {
@@ -461,3 +382,120 @@ where
     }
 }
 */
+
+// TODO: use &mut piece?
+async fn handle_piece_msg<T>(tmh: &mut TransmitManagerHandle, mut piece: protocol::Piece<'_, T>)
+where
+    T: AsyncRead + Unpin,
+{
+    // TODO:
+    // if coming piece have cache, store it in cache
+    // if coming piece don't have cache, ???
+    // tell manager?
+    info!("handle_piece_msg {piece:?}");
+
+    // TODO: if coming block is already received and checked,
+    // then discard this block, don't alloc (if needed) piece buffer.
+    // And there should be no piece buffer of this piece in pb_map
+    let (mut block_ref, piece_buf) = {
+        // must drop pb_map before await point
+        // pb_map is not Send
+        let mut pb_map = tmh.piece_buffer.lock().unwrap();
+        let pb = match pb_map.get(&piece.index) {
+            Some(pb) => pb.clone(),
+            None => {
+                let pb = ArcCache::new(tmh.piece_size);
+                pb_map.insert(piece.index, pb.clone());
+                pb
+            }
+        };
+
+        let block_ref = pb.get_part_ref(
+            piece.begin as usize,
+            // TODO: change 16384 to const
+            (piece.len.next_multiple_of(16384)) as usize,
+        );
+
+        if block_ref.is_none() {
+            warn!(
+                "error get block buf of piece {} block offset {}",
+                piece.index, piece.begin
+            );
+        }
+        (block_ref, pb)
+    };
+
+    let block_buf = if let Some(mut bbuf) = block_ref {
+        piece.read(bbuf.to_slice_len(piece.len as usize)).await;
+        bbuf
+    } else {
+        let mut drain = vec![0u8; piece.len as usize];
+        piece.read(&mut drain).await;
+        warn!(
+            "drain PIECE msg {} {} {}",
+            piece.index, piece.begin, piece.len
+        );
+        // TODO: what should we do now?
+        // we don't have that space
+        // maybe reads to supplementary buffer?
+        // just return now
+        return;
+    };
+
+    let received_piece = tmh
+        .picker
+        .lock()
+        .unwrap()
+        .block_received(protocol::Request {
+            index: piece.index,
+            begin: piece.begin,
+            len: piece.len,
+        });
+    if let Some(i) = received_piece {
+        info!("piece {i} received");
+        // TODO: maybe returns and let upper fn sends this message
+        tmh.sender.send(TransmitMsg::PieceReceived(i));
+
+        // block new ref to piece buffer
+        // so ref count only decreases
+        piece_buf.disable_new_ref();
+
+        let (write_tx, write_rx) = tokio::sync::oneshot::channel::<std::io::Result<()>>();
+        let write_job = {
+            // TODO: mark piece_buf as ready to write,
+            // get_part_ref should stop return new refs
+            // TODO: extend_to_entire may fail, if every Ref extend fail,
+            // will leaving completed block not written to disk.
+            // i.e. some Ref may not call extend_to_entire because the piece
+            // did not complete from their views.
+            if let Some(mut entire_block) = block_buf.extend_to_entire() {
+                let pbuf_s = entire_block.to_slice();
+
+                let bf_copy = tmh.back_file.clone();
+                let piece_size = tmh.piece_size;
+                tmh.piece_buffer.lock().expect("lock should ok").remove(&i);
+
+                Some(WriteJob {
+                    f: bf_copy,
+                    offset: (i as usize) * piece_size,
+                    buf: pbuf_s,
+                    write_tx,
+                })
+            } else {
+                warn!("some one holding block ref in piece {i}, give up writing",);
+                None
+            }
+        };
+
+        if let Some(wj) = write_job {
+            if let Err(e) = tmh.write_worker.send(wj) {
+                warn!("error sending write job to worker error {e:?}");
+            }
+            let write_res = write_rx.await;
+            // let r = hdl.await;
+            info!("write piece {i} result {write_res:?}");
+            // TODO: should really check sha1 of piece
+            tmh.picker.lock().unwrap().piece_checked(i);
+        }
+    }
+}

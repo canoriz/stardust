@@ -29,6 +29,9 @@ pub(crate) enum Msg {
     NewPeer(protocol::BTStream<TcpStream>),
     NewIncomePeer(protocol::BTStream<TcpStream>),
 
+    // TODO: use a structure ptr to connection_peer struct
+    // to replace SocketAddr
+    // which removes the HashMap cost
     PeerChoke(SocketAddr),
     PeerUnchoke(SocketAddr),
     PeerInterested,
@@ -36,6 +39,8 @@ pub(crate) enum Msg {
     PeerBitField(SocketAddr, BitField),
 
     PieceReceived(u32),
+
+    BlockReceived(SocketAddr, u32),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -63,6 +68,8 @@ struct PeerStatus {
 struct PeerConn {
     conn: ConnectionManagerHandle,
     state: PeerStatus,
+
+    n_block_in_flight: u32,
 }
 
 #[derive(Clone)]
@@ -158,14 +165,17 @@ impl TransmitManager {
         }
     }
 
+    // TODO: returns num of blocks picked
     fn pick_blocks_for_peer(&mut self, addr: &SocketAddr, n_blocks: usize) {
         if let Some(h) = self.connected_peers.get(addr) {
-            let reqs = self
-                .piece_picker
-                .lock()
-                .unwrap() // TODO: fix unwrap
-                .pick_blocks(addr, n_blocks);
-            h.conn.send_stream_cmd(ConnMsg::RequestBlocks(reqs));
+            if h.state.peer_choke_status == ChokeStatus::Unchoked {
+                let reqs = self
+                    .piece_picker
+                    .lock()
+                    .unwrap() // TODO: fix unwrap
+                    .pick_blocks(addr, n_blocks);
+                h.conn.send_stream_cmd(ConnMsg::RequestBlocks(reqs));
+            }
         }
     }
 
@@ -202,6 +212,7 @@ impl TransmitManager {
                                 peer_choke_status: ChokeStatus::Unknown,
                                 peer_interest_status: InterestStatus::Unknown,
                             },
+                            n_block_in_flight: 0,
                         },
                     );
                 }
@@ -225,21 +236,49 @@ impl TransmitManager {
                 );
             }
             Msg::PeerUnchoke(peer) => {
+                let n_first_pick = 10;
                 info!("{peer} unchoked us");
-                self.connected_peers
-                    .entry(peer)
-                    .and_modify(|st| st.state.peer_choke_status = ChokeStatus::Unchoked);
+                self.connected_peers.entry(peer).and_modify(|st| {
+                    st.state.peer_choke_status = ChokeStatus::Unchoked;
+                    st.n_block_in_flight = n_first_pick;
+                });
                 assert_eq!(
                     self.connected_peers[&peer].state.peer_choke_status,
                     ChokeStatus::Unchoked
                 );
                 // TODO: are we interested in this peer?
-                self.pick_blocks_for_peer(&peer, 10);
+                self.pick_blocks_for_peer(&peer, n_first_pick as usize);
             }
             Msg::PieceReceived(i) => {
                 for (_, h) in self.connected_peers.iter() {
                     h.conn.send_stream_cmd(ConnMsg::Have(i));
                 }
+            }
+            Msg::BlockReceived(peer, n) => {
+                info!("peer {peer} received {n} block in prev period");
+                let conn_stat = self.connected_peers.get_mut(&peer).expect("should exist");
+                let n_blk = if n == 1 {
+                    2
+                } else if conn_stat.n_block_in_flight <= n {
+                    (n as f32 * 1.5) as u32 + 1
+                } else {
+                    (n as f32 * 0.8) as u32 + 1
+                };
+
+                info!(
+                    "peer {peer} picking {n_blk} block in next period, {} in flight",
+                    conn_stat.n_block_in_flight
+                );
+                if conn_stat.state.peer_choke_status == ChokeStatus::Unchoked {
+                    // conn_stat.n_block_in_flight -= n;
+                    conn_stat.n_block_in_flight = n_blk;
+                }
+
+                // TODO: if peer is choking us?
+
+                self.pick_blocks_for_peer(&peer, n_blk as usize);
+                let pbl = self.self_handle.piece_buffer.lock().unwrap().len();
+                info!("piece buffer pending remains {pbl}");
             }
             other => {
                 info!("unhandled other {:?}", other);
@@ -299,7 +338,7 @@ pub(crate) async fn run_transmit_manager(
     mut cancel: oneshot::Receiver<()>,
     done: oneshot::Sender<()>,
 ) {
-    let mut ticker = tokio::time::interval(time::Duration::from_millis(1000));
+    // let mut ticker = tokio::time::interval(time::Duration::from_millis(1000));
     loop {
         // TODO: lets use notify?
         tokio::select! {
@@ -307,12 +346,12 @@ pub(crate) async fn run_transmit_manager(
                 info!("transmit manager received msg {msg:?}");
                 transmit.handle_msg(msg);
             }
-            _ = ticker.tick() => {
-                info!("transmit ticker tick");
-                transmit.pick_blocks_for_all_peers(2);
-                let pbl = transmit.self_handle.piece_buffer.lock().unwrap().len();
-                warn!("piece buffer pending remains {pbl}");
-            }
+            // _ = ticker.tick() => {
+            //     info!("transmit ticker tick");
+            //     transmit.pick_blocks_for_all_peers(2);
+            //     let pbl = transmit.self_handle.piece_buffer.lock().unwrap().len();
+            //     warn!("piece buffer pending remains {pbl}");
+            // }
             _ = &mut cancel => {
                 for (addr, conn) in transmit.connected_peers.drain() {
                     info!("stopping connection to {addr}");

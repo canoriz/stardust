@@ -130,6 +130,7 @@ impl ArcCache {
     // TODO: maybe not use (offset,length) but use
     // (offset_mutlple_of(block), len_multiple_of(block))
     // TODO: this needs a lot of tests
+    // TODO: FIXME: out of range panic
     pub fn get_part_ref(&self, offset: usize, len: usize) -> Option<Ref> {
         if len.trailing_zeros() < BLOCKSIZE.trailing_zeros() {
             // TODO: maybe not panic, fix size instead?

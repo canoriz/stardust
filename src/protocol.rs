@@ -12,7 +12,7 @@ use tokio::io::{
 };
 use tokio::net;
 use tokio::net::tcp;
-use tracing::warn;
+use tracing::{error, info, warn};
 
 pub trait Split {
     type R: AsyncRead + Send + Unpin + 'static;
@@ -48,11 +48,28 @@ pub trait TryWrite {
 pub struct BTStream<T> {
     // inner: BufStream<T>,
     inner: T,
+    partial_header: PartialHeader,
 }
 
 pub struct ReadStream<T> {
     inner: BufReader<T>,
     peer_addr: SocketAddr,
+
+    // required to implement Cancel Safe for read_msg_header
+    partial_header: PartialHeader,
+}
+
+// store partial received header,
+// Cancel Safe for read_msg_header
+struct PartialHeader {
+    field_len: [u8; 4],
+    field_ty: u8,
+    field1: [u8; 4],
+    field2: [u8; 4],
+    field3: [u8; 4],
+    filled: usize,
+
+    discard_remain: usize,
 }
 
 pub struct WriteStream<T> {
@@ -68,6 +85,15 @@ impl BTStream<net::TcpStream> {
         Ok(BTStream::<net::TcpStream> {
             // inner: BufStream::new(tcp_stream),
             inner: tcp_stream,
+            partial_header: PartialHeader {
+                field_len: [0; 4],
+                field_ty: 0,
+                field1: [0; 4],
+                field2: [0; 4],
+                field3: [0; 4],
+                filled: 0,
+                discard_remain: 0,
+            },
         })
     }
 
@@ -92,6 +118,15 @@ where
         Self {
             // inner: BufStream::new(t),
             inner: t,
+            partial_header: PartialHeader {
+                field_len: [0; 4],
+                field_ty: 0,
+                field1: [0; 4],
+                field2: [0; 4],
+                field3: [0; 4],
+                filled: 0,
+                discard_remain: 0,
+            },
         }
     }
 }
@@ -107,6 +142,7 @@ where
             ReadStream {
                 inner: BufReader::new(read_end),
                 peer_addr,
+                partial_header: self.partial_header,
             },
             WriteStream {
                 inner: BufWriter::new(write_end),
@@ -270,10 +306,14 @@ impl<T> BTStream<T>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
+    /// # Cancel Safety
+    /// this is safe
     pub async fn recv_msg_header(&mut self) -> io::Result<Message<'_, T>> {
-        recv_msg_header(&mut self.inner).await
+        recv_msg_header(&mut self.inner, &mut self.partial_header).await
     }
 
+    /// # Cancel Safety
+    /// this is not cancel safe
     pub async fn recv_handshake(&mut self) -> io::Result<Handshake> {
         recv_handshake(&mut self.inner).await
     }
@@ -283,17 +323,21 @@ impl<T> ReadStream<T>
 where
     T: AsyncRead + Unpin,
 {
-    // receive one message header
-    // It's header because if it's a piece message,
-    // further handling of body is required
+    /// receive one message header
+    /// It's header because if it's a piece message,
+    /// further handling of body is required
+    /// # Cancel safety
+    /// this is cancel safe
     pub async fn recv_msg_header(&mut self) -> io::Result<Message<'_, BufReader<T>>> {
-        recv_msg_header(&mut self.inner).await
+        recv_msg_header(&mut self.inner, &mut self.partial_header).await
     }
 
     pub async fn recv_handshake(&mut self) -> io::Result<Handshake> {
         recv_handshake(&mut self.inner).await
     }
 
+    /// # Cancel safety
+    /// this is not cancel safe
     pub fn peer_addr(&self) -> SocketAddr {
         // TODO: change a different name
         self.peer_addr
@@ -331,7 +375,7 @@ impl MsgTy {
     const CANCEL_LEN: u32 = 13;
 }
 
-#[derive(Eq, Debug, PartialEq)]
+#[derive(Eq, PartialEq)]
 pub enum Message<'a, T> {
     KeepAlive,
     Choke,
@@ -339,7 +383,7 @@ pub enum Message<'a, T> {
     Interested,
     NotInterested,
     Have(u32),
-    BitField(BitField),
+    BitField(BitFieldRecv<'a, T>),
     Request(Request),
     Piece(Piece<'a, T>),
     Cancel(Request),
@@ -373,6 +417,50 @@ impl<T> Message<'_, T> {
             Message::Piece(_) => MsgTy::PIECE,
             Message::Cancel(_) => MsgTy::PIECE,
         }
+    }
+}
+
+impl<T> std::fmt::Debug for Message<'_, T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Message::KeepAlive => {
+                f.write_str("KeepAlive")?;
+            }
+            Message::Choke => {
+                f.write_str("Choke")?;
+            }
+            Message::Unchoke => {
+                f.write_str("Unchoke")?;
+            }
+            Message::Interested => {
+                f.write_str("Interested")?;
+            }
+            Message::NotInterested => {
+                f.write_str("Notinterested")?;
+            }
+            Message::Have(h) => {
+                h.fmt(f)?;
+            }
+            Message::BitField(bit_field) => {
+                f.debug_struct("BitField")
+                    .field("capacity", &bit_field.capacity)
+                    .finish()?;
+            }
+            Message::Request(request) => {
+                request.fmt(f)?;
+            }
+            Message::Piece(piece) => {
+                f.debug_struct("Piece")
+                    .field("index", &piece.index)
+                    .field("begin", &piece.begin)
+                    .field("len", &piece.len)
+                    .finish()?;
+            }
+            Message::Cancel(request) => {
+                request.fmt(f)?;
+            }
+        };
+        Ok(())
     }
 }
 
@@ -475,7 +563,7 @@ pub struct Request {
     pub len: u32,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Eq, PartialEq)]
 pub struct Piece<'a, T> {
     pub index: u32,
     pub begin: u32,
@@ -483,6 +571,7 @@ pub struct Piece<'a, T> {
 
     handle: &'a mut T,
 }
+
 impl<T> Piece<'_, T>
 where
     T: AsyncRead + Unpin,
@@ -493,13 +582,44 @@ where
     pub async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         assert!(buf.len() >= self.len as usize);
 
-        let n = self
-            .handle
+        self.handle
             .read_exact(&mut buf[..(self.len as usize)])
-            .await?;
+            .await
+    }
+}
 
-        assert_eq!(n, self.len as usize);
-        Ok(n)
+impl<T> std::fmt::Debug for Piece<'_, T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!(
+            "Piece index {}, begin {}, len {}",
+            self.index, self.begin, self.len,
+        ))
+    }
+}
+
+#[derive(Eq, PartialEq)]
+pub struct BitFieldRecv<'a, T> {
+    pub capacity: usize,
+    handle: &'a mut T,
+}
+
+impl<T> BitFieldRecv<'_, T>
+where
+    T: AsyncRead + Unpin,
+{
+    // read all remaining piece(block) data into buf
+    // read should be called once, buf.len should
+    // be large enough to store the entire block
+    pub async fn read(&mut self) -> io::Result<BitField> {
+        info!("BitFieldRecv read capacity {}", self.capacity);
+        let mut bitfield: Vec<u8> = unsafe {
+            let mut piece: Vec<MaybeUninit<u8>> = Vec::with_capacity(self.capacity);
+            piece.set_len(self.capacity);
+            std::mem::transmute(piece)
+        };
+        let n_read = self.handle.read_exact(bitfield.as_mut_slice()).await?;
+        assert_eq!(n_read, self.capacity);
+        Ok(BitField::new(bitfield))
     }
 }
 
@@ -602,73 +722,143 @@ async fn send_cancel<T: AsyncWrite + Unpin>(
 
 async fn discard_remain<T: AsyncRead + Unpin>(
     handle: &mut T,
-    mut n_remain: usize,
+    state: &mut PartialHeader,
 ) -> io::Result<()> {
     // there should not be many unread bytes, 1024 should be enough
     #[allow(invalid_value)]
+    #[allow(clippy::uninit_assumed_init)]
     let mut buf = unsafe { MaybeUninit::<[u8; 1024]>::uninit().assume_init() };
 
-    while n_remain > 0 {
-        // TODO: will this out of bound?
-        let n_read = handle.read_exact(&mut buf[..n_remain]).await?;
-        n_remain -= n_read;
+    while state.discard_remain > 0 {
+        let n_read = if state.discard_remain > buf.len() {
+            handle.read(&mut buf).await?
+        } else {
+            handle.read(&mut buf[..state.discard_remain]).await?
+        };
+        state.discard_remain -= n_read;
     }
+    state.filled = 0;
     Ok(())
 }
 
-async fn recv_msg_header<T: AsyncRead + Unpin>(handle: &mut T) -> io::Result<Message<'_, T>> {
+async fn recv_msg_header<'a, T: AsyncRead + Unpin>(
+    handle: &'a mut T,
+    state: &'_ mut PartialHeader,
+) -> io::Result<Message<'a, T>> {
     // TODO: what to do if some malicious peer sends a long len data
     // and a lot of garbage data? use timeout
     // TODO: what if some bug happens in peer and peer shutdown connection
     // leaving data unsend?
     // TODO: what if peer claims to send data, but does not really send?
-    let len = handle.read_u32().await?;
+
+    while state.filled < 4 {
+        let n = handle.read(&mut state.field_len[state.filled..4]).await?;
+        state.filled += n;
+    }
+
+    let len = u32::from_be_bytes(state.field_len);
     if len == 0 {
+        state.filled = 0;
         return Ok(Message::KeepAlive);
     }
-    let msg_ty = handle.read_u8().await?;
+
+    if state.filled <= 4 {
+        // read_u8 is cancel safe
+        state.field_ty = handle.read_u8().await?;
+        state.filled += 1;
+    }
 
     let mut n_remain = len as usize - 1;
 
-    match msg_ty {
-        MsgTy::CHOKE => Ok(Message::Choke),
-        MsgTy::UNCHOKE => Ok(Message::Unchoke),
-        MsgTy::INTERESTED => Ok(Message::Interested),
-        MsgTy::NOTINTERESTED => Ok(Message::NotInterested),
+    match state.field_ty {
+        MsgTy::CHOKE => {
+            state.filled = 0;
+            Ok(Message::Choke)
+        }
+        MsgTy::UNCHOKE => {
+            state.filled = 0;
+            Ok(Message::Unchoke)
+        }
+        MsgTy::INTERESTED => {
+            state.filled = 0;
+            Ok(Message::Interested)
+        }
+        MsgTy::NOTINTERESTED => {
+            state.filled = 0;
+            Ok(Message::NotInterested)
+        }
         MsgTy::HAVE => {
             // TODO: check length match, absorb remain length in case
             // unimplemented extension
-            let index = handle.read_u32().await?;
-            n_remain -= 4;
-            Ok(Message::Have(index))
+            let mut filled_len = state.filled - 5;
+            assert!(filled_len >= 0);
+            while filled_len < 4 {
+                let n = handle.read(&mut state.field1[filled_len..4]).await?;
+                state.filled += n;
+                filled_len += n;
+            }
+            state.filled = 0;
+            Ok(Message::Have(u32::from_be_bytes(state.field1)))
         }
         MsgTy::BITFIELD => {
             let capacity = (len - 1) as usize;
-            let mut bitfield: Vec<u8> = unsafe {
-                let mut piece: Vec<MaybeUninit<u8>> = Vec::with_capacity(capacity);
-                piece.set_len(capacity);
-                std::mem::transmute(piece)
-            };
-            let n_read = handle.read_exact(bitfield.as_mut_slice()).await?;
-            assert_eq!(n_read, capacity);
-            n_remain -= n_read;
-            Ok(Message::BitField(BitField::new(bitfield)))
+            state.filled = 0;
+            Ok(Message::BitField(BitFieldRecv { capacity, handle }))
         }
         MsgTy::REQUEST => {
             // TODO: check length match
-            let index = handle.read_u32().await?;
-            let begin = handle.read_u32().await?;
-            let len = handle.read_u32().await?;
-            n_remain -= 12;
+            let mut filled_len = state.filled - 5;
+            assert!(filled_len >= 0);
+            while filled_len < 4 {
+                let n = handle.read(&mut state.field1[filled_len..4]).await?;
+                state.filled += n;
+                filled_len += n;
+            }
+            let index = u32::from_be_bytes(state.field1);
+
+            let mut filled_len = state.filled - 9;
+            assert!(filled_len >= 0);
+            while filled_len < 4 {
+                let n = handle.read(&mut state.field2[filled_len..4]).await?;
+                state.filled += n;
+                filled_len += n;
+            }
+            let begin = u32::from_be_bytes(state.field2);
+
+            let mut filled_len = state.filled - 13;
+            assert!(filled_len >= 0);
+            while filled_len < 4 {
+                let n = handle.read(&mut state.field3[filled_len..4]).await?;
+                state.filled += n;
+                filled_len += n;
+            }
+            let len = u32::from_be_bytes(state.field3);
+            state.filled = 0;
             Ok(Message::Request(Request { index, begin, len }))
         }
         MsgTy::PIECE => {
             // TODO: check length match
             let capacity = (len - 4 - 4 - 1) as usize;
-            let index = handle.read_u32().await?;
-            let begin = handle.read_u32().await?;
-            n_remain -= 8;
 
+            let mut filled_len = state.filled - 5;
+            assert!(filled_len >= 0);
+            while filled_len < 4 {
+                let n = handle.read(&mut state.field1[filled_len..4]).await?;
+                state.filled += n;
+                filled_len += n;
+            }
+            let index = u32::from_be_bytes(state.field1);
+
+            let mut filled_len = state.filled - 9;
+            assert!(filled_len >= 0);
+            while filled_len < 4 {
+                let n = handle.read(&mut state.field2[filled_len..4]).await?;
+                state.filled += n;
+                filled_len += n;
+            }
+            let begin = u32::from_be_bytes(state.field2);
+
+            state.filled = 0;
             Ok(Message::Piece(Piece {
                 index,
                 begin,
@@ -678,15 +868,39 @@ async fn recv_msg_header<T: AsyncRead + Unpin>(handle: &mut T) -> io::Result<Mes
         }
         MsgTy::CANCEL => {
             // TODO: check length match
-            let index = handle.read_u32().await?;
-            let begin = handle.read_u32().await?;
-            let len = handle.read_u32().await?;
-            n_remain -= 12;
+            let mut filled_len = state.filled - 5;
+            assert!(filled_len >= 0);
+            while filled_len < 4 {
+                let n = handle.read(&mut state.field1[filled_len..4]).await?;
+                state.filled += n;
+                filled_len += n;
+            }
+            let index = u32::from_be_bytes(state.field1);
+
+            let mut filled_len = state.filled - 9;
+            assert!(filled_len >= 0);
+            while filled_len < 4 {
+                let n = handle.read(&mut state.field2[filled_len..4]).await?;
+                state.filled += n;
+                filled_len += n;
+            }
+            let begin = u32::from_be_bytes(state.field2);
+
+            let mut filled_len = state.filled - 13;
+            assert!(filled_len >= 0);
+            while filled_len < 4 {
+                let n = handle.read(&mut state.field3[filled_len..4]).await?;
+                state.filled += n;
+                filled_len += n;
+            }
+            let len = u32::from_be_bytes(state.field3);
+
+            state.filled = 0;
             Ok(Message::Cancel(Request { index, begin, len }))
         }
         other => {
             warn!("received unknown Msg type {other}, length {len}");
-            discard_remain(handle, n_remain).await?;
+            discard_remain(handle, state).await?;
             panic!();
         }
     }
@@ -744,16 +958,28 @@ mod tests {
         }
     }
 
+    const EMPTY_PARTIAL_HEADER: PartialHeader = PartialHeader {
+        field_len: [0; 4],
+        field_ty: 0,
+        field1: [0; 4],
+        field2: [0; 4],
+        field3: [0; 4],
+        filled: 0,
+        discard_remain: 0,
+    };
+
     fn make_ends() -> (BTStream<DuplexStream>, BTStream<DuplexStream>) {
         let (end1, end2) = duplex(1024 * 1024);
         (
             BTStream::<DuplexStream> {
                 // inner: tokio::io::BufStream::new(end1),
                 inner: end1,
+                partial_header: EMPTY_PARTIAL_HEADER,
             },
             BTStream::<DuplexStream> {
                 // inner: tokio::io::BufStream::new(end2),
                 inner: end2,
+                partial_header: EMPTY_PARTIAL_HEADER,
             },
         )
     }
@@ -772,6 +998,7 @@ mod tests {
                 ReadStream {
                     inner: BufReader::new(read_end),
                     peer_addr: DEFAULT_ADDR,
+                    partial_header: EMPTY_PARTIAL_HEADER,
                 },
                 WriteStream {
                     inner: BufWriter::new(write_end),
@@ -795,11 +1022,13 @@ mod tests {
             BTStream::<DuplexStream> {
                 // inner: tokio::io::BufStream::new(end1),
                 inner: end1,
+                partial_header: EMPTY_PARTIAL_HEADER,
             }
             .into_split(),
             BTStream::<DuplexStream> {
                 // inner: tokio::io::BufStream::new(end2),
                 inner: end2,
+                partial_header: EMPTY_PARTIAL_HEADER,
             }
             .into_split(),
         )
@@ -949,8 +1178,9 @@ mod tests {
             .await
             .expect("should send ok");
         let received = peer2.recv_msg_header().await.expect("should recv ok");
-        let b = extract_enum!(received, Message::BitField);
-        assert_eq!(b, BitField::new(fields.into()));
+        let mut b = extract_enum!(received, Message::BitField);
+        let bf = b.read().await.unwrap();
+        assert_eq!(bf, BitField::new(fields.into()));
 
         let ((_, mut p1w), (mut p2r, _)) = make_ends_split();
         let fields = rand::random::<[u8; 143]>();
@@ -958,8 +1188,9 @@ mod tests {
             .await
             .expect("should send ok");
         let received = p2r.recv_msg_header().await.expect("should recv ok");
-        let b = extract_enum!(received, Message::BitField);
-        assert_eq!(b, BitField::new(fields.into()));
+        let mut b = extract_enum!(received, Message::BitField);
+        let bf = b.read().await.unwrap();
+        assert_eq!(bf, BitField::new(fields.into()));
     }
 
     #[tokio::test]
@@ -1081,4 +1312,6 @@ mod tests {
         assert!(matches!(p2_recv, Message::Interested));
         assert!(matches!(p1_recv, Message::Choke));
     }
+
+    // TODO: add cancel safe tests
 }
