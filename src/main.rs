@@ -84,8 +84,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     wait_ready.notified().await;
 
     if let Ok(mut conn) =
-        // protocol::BTStream::connect_tcp("192.168.71.36:62227".parse().unwrap()).await
-        protocol::BTStream::connect_tcp("127.0.0.1:35515".parse().unwrap()).await
+        protocol::BTStream::connect_tcp("192.168.71.36:62227".parse().unwrap()).await
+    // protocol::BTStream::connect_tcp("127.0.0.1:35515".parse().unwrap()).await
     {
         info!("{info_hash:?}");
         conn.send_handshake(&Handshake {
@@ -136,7 +136,7 @@ where
     bt_stream.send_keepalive().await?;
     bt_stream.send_keepalive().await?;
     info!("all keep alive sent");
-    let mut ticker = tokio::time::interval(time::Duration::from_millis(5000));
+    let mut ticker = tokio::time::interval(time::Duration::from_millis(1500));
     bt_stream.send_unchoke().await;
     loop {
         tokio::select! {
@@ -144,10 +144,16 @@ where
                 let m = msg?;
                 match m {
                     Message::Request(r) => {
-                        let a = [0u8; 16384];
-                        bt_stream
-                            .send_piece(r.index, r.begin, &a)
-                            .await;
+                        let response: bool = rand::random();
+                        if response {
+                            info!("response");
+                            let a = [0u8; 16384];
+                            bt_stream
+                                .send_piece(r.index, r.begin, &a)
+                                .await;
+                        } else {
+                            info!("not response");
+                        }
                     }
                     _ => {
                         info!("received msg {:?} from {}", m, addr);
