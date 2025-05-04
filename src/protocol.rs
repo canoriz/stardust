@@ -2,7 +2,6 @@ use bytes::BufMut;
 use core::fmt;
 use sha1::digest::crypto_common::Key;
 use std::fmt::Formatter;
-use std::future::IntoFuture;
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -790,8 +789,8 @@ async fn recv_msg_header<'a, T: AsyncRead + Unpin>(
         MsgTy::HAVE => {
             // TODO: check length match, absorb remain length in case
             // unimplemented extension
+            assert!(state.filled >= 5);
             let mut filled_len = state.filled - 5;
-            assert!(filled_len >= 0);
             while filled_len < 4 {
                 let n = handle.read(&mut state.field1[filled_len..4]).await?;
                 state.filled += n;
@@ -807,8 +806,8 @@ async fn recv_msg_header<'a, T: AsyncRead + Unpin>(
         }
         MsgTy::REQUEST => {
             // TODO: check length match
+            assert!(state.filled >= 5);
             let mut filled_len = state.filled - 5;
-            assert!(filled_len >= 0);
             while filled_len < 4 {
                 let n = handle.read(&mut state.field1[filled_len..4]).await?;
                 state.filled += n;
@@ -816,8 +815,8 @@ async fn recv_msg_header<'a, T: AsyncRead + Unpin>(
             }
             let index = u32::from_be_bytes(state.field1);
 
+            assert!(state.filled >= 9);
             let mut filled_len = state.filled - 9;
-            assert!(filled_len >= 0);
             while filled_len < 4 {
                 let n = handle.read(&mut state.field2[filled_len..4]).await?;
                 state.filled += n;
@@ -825,8 +824,8 @@ async fn recv_msg_header<'a, T: AsyncRead + Unpin>(
             }
             let begin = u32::from_be_bytes(state.field2);
 
+            assert!(state.filled >= 13);
             let mut filled_len = state.filled - 13;
-            assert!(filled_len >= 0);
             while filled_len < 4 {
                 let n = handle.read(&mut state.field3[filled_len..4]).await?;
                 state.filled += n;
@@ -840,8 +839,8 @@ async fn recv_msg_header<'a, T: AsyncRead + Unpin>(
             // TODO: check length match
             let capacity = (len - 4 - 4 - 1) as usize;
 
+            assert!(state.filled >= 5);
             let mut filled_len = state.filled - 5;
-            assert!(filled_len >= 0);
             while filled_len < 4 {
                 let n = handle.read(&mut state.field1[filled_len..4]).await?;
                 state.filled += n;
@@ -849,8 +848,8 @@ async fn recv_msg_header<'a, T: AsyncRead + Unpin>(
             }
             let index = u32::from_be_bytes(state.field1);
 
+            assert!(state.filled >= 9);
             let mut filled_len = state.filled - 9;
-            assert!(filled_len >= 0);
             while filled_len < 4 {
                 let n = handle.read(&mut state.field2[filled_len..4]).await?;
                 state.filled += n;
@@ -868,8 +867,8 @@ async fn recv_msg_header<'a, T: AsyncRead + Unpin>(
         }
         MsgTy::CANCEL => {
             // TODO: check length match
+            assert!(state.filled >= 5);
             let mut filled_len = state.filled - 5;
-            assert!(filled_len >= 0);
             while filled_len < 4 {
                 let n = handle.read(&mut state.field1[filled_len..4]).await?;
                 state.filled += n;
@@ -877,8 +876,8 @@ async fn recv_msg_header<'a, T: AsyncRead + Unpin>(
             }
             let index = u32::from_be_bytes(state.field1);
 
+            assert!(state.filled >= 9);
             let mut filled_len = state.filled - 9;
-            assert!(filled_len >= 0);
             while filled_len < 4 {
                 let n = handle.read(&mut state.field2[filled_len..4]).await?;
                 state.filled += n;
@@ -886,8 +885,8 @@ async fn recv_msg_header<'a, T: AsyncRead + Unpin>(
             }
             let begin = u32::from_be_bytes(state.field2);
 
+            assert!(state.filled >= 13);
             let mut filled_len = state.filled - 13;
-            assert!(filled_len >= 0);
             while filled_len < 4 {
                 let n = handle.read(&mut state.field3[filled_len..4]).await?;
                 state.filled += n;
@@ -931,6 +930,10 @@ async fn recv_handshake<T: AsyncRead + Unpin>(handle: &mut T) -> io::Result<Hand
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Wake};
+
     use super::*;
     use tokio::io::{duplex, split, DuplexStream, ReadHalf, WriteHalf};
 
@@ -1313,5 +1316,62 @@ mod tests {
         assert!(matches!(p1_recv, Message::Choke));
     }
 
-    // TODO: add cancel safe tests
+    #[tokio::test]
+    async fn read_msg_header_cancel_safe() {
+        let ((mut p1r, mut p1w), (mut p2r, mut p2w)) = make_ends_split();
+        let request_msg = [
+            0u8, 0, 0, 13, 6, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xa, 0xb, 0xc,
+        ];
+        // this requests a Request message with piece 0x01020304
+        // begin 0x05060708
+        // len 0x090a0b0c
+
+        // TODO: test all types of message
+
+        struct MockWaker;
+        impl Wake for MockWaker {
+            fn wake(self: Arc<Self>) {}
+        }
+
+        let waker = Arc::new(MockWaker).into();
+        let mut cx = Context::from_waker(&waker);
+
+        let mut split = vec![];
+        for i in 0..request_msg.len() - 2 {
+            for j in i + 1..request_msg.len() - 1 {
+                split.push((i, j));
+            }
+        }
+
+        for (i, j) in split {
+            let p2_recv_fut = p2r.recv_msg_header();
+            let mut fut_pin = Box::pin(p2_recv_fut);
+
+            // write 0..i
+            let _ = p1w.inner.write(&request_msg[0..i]).await;
+            let _ = p1w.inner.flush().await;
+
+            let res1 = fut_pin.as_mut().poll(&mut cx);
+            assert!(matches!(res1, Poll::Pending));
+
+            // write i..j
+            let _ = p1w.inner.write(&request_msg[i..j]).await;
+            let _ = p1w.inner.flush().await;
+            let res2 = fut_pin.as_mut().poll(&mut cx);
+            assert!(matches!(res2, Poll::Pending));
+
+            // write j..
+            let _ = p1w.inner.write(&request_msg[j..]).await;
+            let _ = p1w.inner.flush().await;
+            let res3 = fut_pin.as_mut().await;
+            assert!(matches!(
+                res3,
+                Ok(Message::Request(Request {
+                    index: 0x01020304,
+                    begin: 0x05060708,
+                    len: 0x090a0b0c
+                }))
+            ));
+        }
+    }
 }
