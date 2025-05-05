@@ -2,7 +2,7 @@ mod heap;
 use crate::protocol;
 pub use crate::protocol::BitField;
 use heap::Heap;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::time;
 use tracing::{debug, info, warn};
@@ -182,10 +182,7 @@ impl PartialRequestedPiece {
             self.block_map
                 .iter()
                 .skip(self.all_requested_before)
-                .all(|b| match b {
-                    BlockStatus::NotRequested => true,
-                    _ => false,
-                })
+                .all(|b| matches!(b, BlockStatus::NotRequested))
         }
     }
 
@@ -193,10 +190,7 @@ impl PartialRequestedPiece {
         self.block_map
             .iter()
             .skip(self.all_requested_before)
-            .all(|b| match b {
-                BlockStatus::Requested(_, _) => true,
-                _ => false,
-            })
+            .all(|b| matches!(b, BlockStatus::Requested(_, _)))
     }
 
     fn update_requested_before(
@@ -312,6 +306,10 @@ pub struct HeapPiecePicker {
     // TODO: maybe change to a Vec<UnackedPieces>
     fully_requested_pieces: HashMap<u32, PartialRequestedPiece>,
 
+    // TODO: do we really need this? Is it OK to use fully_requested with all block Received?
+    // ??fully is special since we have a received but not checked state
+    fully_received_pieces: HashSet<u32>,
+
     last_check_timeout: time::Instant,
 }
 
@@ -337,6 +335,7 @@ impl HeapPiecePicker {
 
             partly_requested_pieces: PartialRequestedPieces(BTreeMap::new()),
             fully_requested_pieces: HashMap::new(),
+            fully_received_pieces: HashSet::new(),
 
             last_check_timeout: time::Instant::now(),
         }
@@ -435,6 +434,7 @@ fn pick_blocks_from_heap(
     picked: &mut Vec<BlockRange>,
     partials: &mut PartialRequestedPieces,
     fullys: &mut HashMap<u32, PartialRequestedPiece>,
+    fully_received: &HashSet<u32>,
 ) -> usize {
     while n_blocks > 0 {
         let chosen_piece = if let Some((index, _)) = heap.min_of_set(
@@ -443,6 +443,7 @@ fn pick_blocks_from_heap(
                 // TODO: contains_key is inefficient. maybe use another field_map?
                     && !partials.0.contains_key(&(i as u32))
                     && !fullys.contains_key(&(i as u32))
+                    && !fully_received.contains(&(i as u32))
             },
             None,
             None,
@@ -453,7 +454,7 @@ fn pick_blocks_from_heap(
             // can pick nothing, just return
             return n_blocks;
         };
-        info!("picked piece {chosen_piece} from heap");
+        warn!("picked piece {chosen_piece} from heap");
 
         // calc n blocks base on last piece or not
         let (n_blocks_in_piece, piece_size) = if chosen_piece == last_piece_index {
@@ -647,13 +648,15 @@ impl HeapPiecePicker {
                 .iter()
                 .flat_map(|(index, v)| {
                     v.block_map.iter().enumerate().filter_map(|(i, b)| {
-                        match b {
-                        BlockStatus::Requested(_, req_t) => println!("partial piece {} block {i} {b:?}, since {:?}", *index, now.duration_since(*req_t)),
-                        _ => {},
-                            }
+                        // match b {
+                        // BlockStatus::Requested(_, req_t) => println!("partial piece {} block {i} {b:?}, since {:?}", *index, now.duration_since(*req_t)),
+                        // _ => {},
+                        //     }
+
+                        // TODO: use if let
                         if matches!(
                             b,
-                            BlockStatus::Requested(_, req_t) if now.duration_since(*req_t) > time::Duration::from_secs(5),
+                            BlockStatus::Requested(_, req_t) if now.duration_since(*req_t) > time::Duration::from_secs(15),
                         ) {
                             let blk_req = protocol::Request {
                                 index: *index,
@@ -673,13 +676,11 @@ impl HeapPiecePicker {
                         .iter()
                         .flat_map(|(index, v)| {
                             v.block_map.iter().enumerate().filter_map(|(i, b)| {
-                        match b {
-                        BlockStatus::Requested(_, req_t) => println!("full piece {} block {i} {b:?}, since {:?}", *index, now.duration_since(*req_t)),
-                        _ => {},
-                            }
+
+                        // TODO: use if let
                                 if matches!(
                                     b,
-                                    BlockStatus::Requested(_, req_t) if now.duration_since(*req_t) > time::Duration::from_secs(10),
+                                    BlockStatus::Requested(_, req_t) if now.duration_since(*req_t) > time::Duration::from_secs(15),
                                 ) {
                                     let blk_req = protocol::Request {
                                         index: *index,
@@ -733,6 +734,7 @@ impl HeapPiecePicker {
                 &mut picked,
                 &mut self.partly_requested_pieces,
                 &mut self.fully_requested_pieces,
+                &self.fully_received_pieces,
             );
 
             // TODO: 3 optimizations:
@@ -798,6 +800,40 @@ impl HeapPiecePicker {
         }
     }
 
+    #[must_use = "returns if this piece received or not"]
+    pub fn have_block(&self, blk: &protocol::Request) -> bool {
+        let block_index = blk.begin >> 14;
+        if self.fully_received_pieces.contains(&blk.index) {
+            warn!(
+                "received duplicated block piece {} block {block_index}",
+                blk.index,
+            );
+            true
+        } else if let Some(p) = self.fully_requested_pieces.get(&blk.index) {
+            if p.block_map[block_index as usize] == BlockStatus::Received {
+                warn!(
+                    "received duplicated block piece {} block {block_index}",
+                    blk.index,
+                );
+                true
+            } else {
+                false
+            }
+        } else if let Some(p) = self.partly_requested_pieces.0.get(&blk.index) {
+            if p.block_map[block_index as usize] == BlockStatus::Received {
+                warn!(
+                    "received duplicated block piece {} block {block_index}",
+                    blk.index,
+                );
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    }
+
     // receive one block, returns if any piece is all received
     #[must_use = "returns fully received pieces"]
     pub fn block_received(&mut self, blk: protocol::Request) -> Option<u32> {
@@ -805,24 +841,58 @@ impl HeapPiecePicker {
         if let Some(p) = self.partly_requested_pieces.0.get_mut(&blk.index) {
             info!("received blocks of partial requested piece {blk:?}");
             debug_assert_eq!(blk.begin / BLOCK_SIZE, block_index);
+            if let BlockStatus::Received = p.block_map[block_index as usize] {
+                warn!(
+                    "received duplicated block piece {} block {}",
+                    blk.index,
+                    blk.begin >> 14
+                );
+            }
             p.set_one_block_status(&blk, BlockStatus::Received);
-            p.is_all_received().then_some(blk.index)
-        } else if let Some(p) = self.fully_requested_pieces.get_mut(&blk.index) {
-            info!("received blocks of fully requested piece {blk:?}");
-            debug_assert!(!self.partly_requested_pieces.0.contains_key(&blk.index));
-            debug_assert_eq!(blk.begin / BLOCK_SIZE, block_index);
-            p.set_one_block_status(&blk, BlockStatus::Received);
-            if p.is_all_received() {
-                info!("piece {} is fully received", blk.index);
+            let piece_received = p.is_all_received();
+            if piece_received {
+                self.partly_requested_pieces.0.remove(&blk.index);
+                self.fully_received_pieces.insert(blk.index);
                 Some(blk.index)
             } else {
                 None
             }
+        } else if let Some(p) = self.fully_requested_pieces.get_mut(&blk.index) {
+            info!("received blocks of fully requested piece {blk:?}");
+            debug_assert!(!self.partly_requested_pieces.0.contains_key(&blk.index));
+            debug_assert_eq!(blk.begin / BLOCK_SIZE, block_index);
+            if let BlockStatus::Received = p.block_map[block_index as usize] {
+                warn!(
+                    "received duplicated block piece {} block {}",
+                    blk.index,
+                    blk.begin >> 14
+                );
+            }
+            p.set_one_block_status(&blk, BlockStatus::Received);
+            let piece_received = p.is_all_received();
+            if piece_received {
+                self.fully_requested_pieces.remove(&blk.index);
+                self.fully_received_pieces.insert(blk.index);
+                Some(blk.index)
+            } else {
+                None
+            }
+        } else if self.fully_received_pieces.contains(&blk.index) {
+            warn!(
+                "received unrequested block piece {} block {} of fully received pieces",
+                blk.index,
+                blk.begin >> 14
+            );
+            Some(blk.index)
+        } else if self.heap.get_val(blk.index as usize).is_none() {
+            // block of an already checked piece
+            None // TODO: return none?
         } else {
             // some un-requested blocks come
             info!("received blocks of not requested piece {blk:?}");
             let n_blocks_in_piece = (self.piece_size >> 14) as usize;
             debug_assert_eq!(blk.begin / BLOCK_SIZE, block_index);
+
             let mut p = PartialRequestedPiece {
                 block_map: vec![BlockStatus::NotRequested; n_blocks_in_piece],
                 all_requested_before: 0,
@@ -874,6 +944,8 @@ impl HeapPiecePicker {
                     .remove(&blk.index)
                     .expect("blk.index should exist in fully requested pieces");
                 self.partly_requested_pieces.0.insert(blk.index, v);
+            } else if self.fully_received_pieces.contains(&blk.index) {
+                todo!("maybe move from received pieces to partial list?");
             } else {
                 // these blocks are never requested anyway
                 // why caller called this on never requested blocks?
@@ -895,10 +967,19 @@ impl HeapPiecePicker {
             self.partly_requested_pieces.0.len(),
             self.fully_requested_pieces.len()
         );
+        let in_partial = self.partly_requested_pieces.0.remove(&piece_index);
+        if in_partial.is_some() {
+            warn!("checked partial piece {piece_index}");
+        }
         let in_fully = self.fully_requested_pieces.remove(&piece_index);
         if in_fully.is_none() {
-            warn!("checked not request piece {piece_index}");
+            warn!("checked not fully request piece {piece_index}");
         }
+        let in_received = self.fully_received_pieces.remove(&piece_index);
+        if !in_received {
+            warn!("checked not received piece {piece_index}");
+        }
+
         let in_heap = self.heap.delete(piece_index as usize);
         if in_heap.is_none() {
             warn!("checked piece {piece_index} not in heap");
@@ -1068,16 +1149,6 @@ mod test {
         let blks = picker.pick_blocks(&addr1, 15);
 
         {
-            let mut complete = None;
-            for br in &blks.range {
-                for b in br.iter(LAST_PIECE_SIZE) {
-                    complete = complete.or(picker.block_received(b));
-                }
-            }
-            assert_eq!(complete, Some(PIECE_TOTAL - 1));
-        }
-
-        {
             // if picker not set complete, should also return piece index
             let mut complete = None;
             for br in &blks.range {
@@ -1087,6 +1158,11 @@ mod test {
             }
             assert_eq!(complete, Some(PIECE_TOTAL - 1));
         }
+    }
+
+    #[test]
+    fn test_block_received() {
+        todo!("test block receive fully/partial/duplicate(already received) cases")
     }
 
     #[test]

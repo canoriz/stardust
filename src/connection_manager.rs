@@ -397,6 +397,7 @@ where
     // TODO: if coming block is already received and checked,
     // then discard this block, don't alloc (if needed) piece buffer.
     // And there should be no piece buffer of this piece in pb_map
+
     let (mut block_ref, piece_buf) = {
         // must drop pb_map before await point
         // pb_map is not Send
@@ -425,6 +426,24 @@ where
         (block_ref, pb)
     };
 
+    let already_have = tmh.picker.lock().unwrap().have_block(&protocol::Request {
+        index: piece.index,
+        begin: piece.begin,
+        len: piece.len,
+    });
+
+    if already_have {
+        let mut drain = vec![0u8; piece.len as usize];
+        piece.read(&mut drain).await;
+        warn!(
+            "drain PIECE msg {} {} {}",
+            piece.index, piece.begin, piece.len
+        );
+        return;
+    }
+
+    // TODO: need a biglock. What if some peer else is doing operation now?
+    // i.e. operation between two locks?
     let block_buf = if let Some(mut bbuf) = block_ref {
         piece.read(bbuf.to_slice_len(piece.len as usize)).await;
         bbuf
