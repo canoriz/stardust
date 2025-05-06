@@ -1,6 +1,5 @@
-use std::net::SocketAddr;
-// use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use anyhow::{anyhow, Result};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::{sleep, Duration};
@@ -41,40 +40,79 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //     ip: None,
     // };
 
-    let torrent_f = include_bytes!("../ubuntu-24.10-desktop-amd64.iso.torrent");
-    // let torrent_f = include_bytes!("../31.torrent");
+    // let torrent_f = include_bytes!("../ubuntu-24.10-desktop-amd64.iso.torrent");
+    let torrent_f = include_bytes!("../31.torrent");
     let torrent = metadata::FileMetadata::load(torrent_f).unwrap();
 
     let (metadata, announce_list) = torrent.to_metadata();
-    let metadata_clone = metadata.clone();
     info!("{:?}", &announce_list);
 
     let ready = Arc::new(tokio::sync::Notify::new());
     let wait_ready = ready.clone();
-    let listener = net::TcpListener::bind("::0:35515").await?;
-    let server = tokio::spawn(async move {
-        let mut set = tokio::task::JoinSet::new();
-        ready.notify_one();
-        loop {
-            let (bt_stream, addr) = match listener.accept().await {
-                Ok((stream, addr)) => {
-                    info!("input from addr {}", addr);
-                    (protocol::BTStream::from(stream), addr)
-                }
-                Err(e) => {
-                    info!("accept error {}", e);
-                    continue;
-                }
-            };
-            let handle = set.spawn(handle_income_connection(
-                bt_stream,
-                addr,
-                metadata_clone.clone(),
-            ));
-        }
-        set.join_all().await;
-    });
-    tokio::spawn(server);
+    {
+        let metadata_clone = metadata.clone();
+        let listener = net::TcpListener::bind("::0:35515").await?;
+        let server = tokio::spawn(async move {
+            let mut set = tokio::task::JoinSet::new();
+            ready.notify_one();
+            loop {
+                let (bt_stream, addr) = match listener.accept().await {
+                    Ok((stream, addr)) => {
+                        info!("input from addr {}", addr);
+                        (protocol::BTStream::from(stream), addr)
+                    }
+                    Err(e) => {
+                        info!("accept error {}", e);
+                        continue;
+                    }
+                };
+                let total = metadata_clone.info.pieces.len() / 20;
+                let handle = set.spawn(handle_income_connection(
+                    bt_stream,
+                    addr,
+                    metadata_clone.clone(),
+                    vec![vec![false; total / 2], vec![true; total - total / 2]]
+                        .into_iter()
+                        .flatten()
+                        .collect(),
+                ));
+            }
+            set.join_all().await;
+        });
+    }
+    let ready2 = Arc::new(tokio::sync::Notify::new());
+    let wait_ready2 = ready2.clone();
+    {
+        let metadata_clone = metadata.clone();
+        let listener = net::TcpListener::bind("::0:35516").await?;
+        let server = tokio::spawn(async move {
+            let mut set = tokio::task::JoinSet::new();
+            ready2.notify_one();
+            loop {
+                let (bt_stream, addr) = match listener.accept().await {
+                    Ok((stream, addr)) => {
+                        info!("input from addr {}", addr);
+                        (protocol::BTStream::from(stream), addr)
+                    }
+                    Err(e) => {
+                        info!("accept error {}", e);
+                        continue;
+                    }
+                };
+                let total = metadata_clone.info.pieces.len() / 20;
+                let handle = set.spawn(handle_income_connection(
+                    bt_stream,
+                    addr,
+                    metadata_clone.clone(),
+                    vec![vec![true; total / 2], vec![false; total - total / 2]]
+                        .into_iter()
+                        .flatten()
+                        .collect(),
+                ));
+            }
+            set.join_all().await;
+        });
+    }
 
     let info_hash = metadata.info_hash;
     // let mut tm = TransmitManager::new(metadata).with_announce_list(announce_list);
@@ -82,6 +120,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // tm.send_announce_msg(announce_manager::Msg::AddUrl(announce_list[0].clone()));
     // tm.send_announce_msg(announce_manager::Msg::AddUrl(announce_list[1].clone()));
     wait_ready.notified().await;
+    wait_ready2.notified().await;
 
     if let Ok(mut conn) =
         // protocol::BTStream::connect_tcp("192.168.71.36:62227".parse().unwrap()).await
@@ -97,7 +136,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         conn.recv_handshake().await?;
         tm.send_msg(transmit_manager::Msg::NewPeer(conn));
     }
-    // tm.start().await;
+    if let Ok(mut conn) =
+        // protocol::BTStream::connect_tcp("192.168.71.36:62227".parse().unwrap()).await
+        protocol::BTStream::connect_tcp("127.0.0.1:35516".parse().unwrap()).await
+    {
+        info!("{info_hash:?}");
+        conn.send_handshake(&Handshake {
+            reserved: [0u8; 8],
+            client_id: HANDSHAKE.client_id,
+            torrent_hash: info_hash,
+        })
+        .await?;
+        conn.recv_handshake().await?;
+        tm.send_msg(transmit_manager::Msg::NewPeer(conn));
+    }
     time::sleep(Duration::from_secs(100000)).await;
     // tm.send_announce_msg(announce_manager::Msg::RemoveUrl(
     //     announce_list[0][0].clone(),
@@ -116,6 +168,7 @@ async fn handle_income_connection<T>(
     mut bt_stream: BTStream<T>,
     addr: SocketAddr,
     metadata: metadata::Metadata,
+    field: Vec<bool>,
 ) -> Result<()>
 where
     T: AsyncRead + AsyncWrite + Unpin + std::fmt::Debug, // TODO: maybe remove this Debug
@@ -128,8 +181,9 @@ where
     info!("handshake sent");
     let bitfield_total = metadata.info.pieces.len() / 20 / 8;
     info!("{bitfield_total}");
+    assert_eq!(field.len(), metadata.info.pieces.len() / 20);
     bt_stream
-        .send_bitfield(&protocol::BitField::new(vec![0xffu8; bitfield_total]))
+        .send_bitfield(&protocol::BitField::from(field))
         .await?;
     info!("bitfield sent");
     bt_stream.send_keepalive().await?;

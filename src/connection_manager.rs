@@ -218,7 +218,7 @@ async fn handle_peer_msg<'a, R>(
 where
     R: AsyncRead + Unpin,
 {
-    info!("handle_peer_msg {m:?}");
+    info!("handle_peer_msg from {addr} {m:?}");
     // TODO: send statistics to transmit handle
 
     // TODO: shall we use mpsc or just lock the manager and set it

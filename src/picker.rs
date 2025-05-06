@@ -501,7 +501,7 @@ fn pick_blocks_from_heap(
             // can pick nothing, just return
             return n_blocks;
         };
-        warn!("picked piece {chosen_piece} from heap");
+        warn!("picked piece {chosen_piece} from heap for {peer}");
 
         // calc n blocks base on last piece or not
         let (n_blocks_in_piece, piece_size) = if chosen_piece == last_piece_index {
@@ -1219,7 +1219,7 @@ mod test {
 
     #[test]
     fn test_block_received() {
-        // todo!("test block receive fully/partial/duplicate(already received) cases")
+        todo!("test block receive fully/partial/duplicate(already received) cases")
         // let now = time::Instant::now();
         // {
         //     const PIECE_TOTAL: u32 = 30;
