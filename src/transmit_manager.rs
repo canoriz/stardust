@@ -151,6 +151,7 @@ impl TransmitManager {
     //     self
     // }
     fn pick_blocks_for_all_peers(&mut self, n_blocks: usize) {
+        let now = std::time::Instant::now();
         for (addr, h) in &mut self.connected_peers {
             info!("peer status {addr}: {:?}", h.state);
             if h.state.peer_choke_status == ChokeStatus::Unchoked {
@@ -158,7 +159,7 @@ impl TransmitManager {
                     .piece_picker
                     .lock()
                     .unwrap() // TODO: fix unwrap
-                    .pick_blocks(addr, n_blocks);
+                    .pick_blocks(addr, n_blocks, now);
                 info!("aaa {n_blocks} {reqs:?}");
                 h.conn.send_stream_cmd(ConnMsg::RequestBlocks(reqs));
             }
@@ -167,13 +168,14 @@ impl TransmitManager {
 
     // TODO: returns num of blocks picked
     fn pick_blocks_for_peer(&mut self, addr: &SocketAddr, n_blocks: usize) {
+        let now = std::time::Instant::now();
         if let Some(h) = self.connected_peers.get(addr) {
             if h.state.peer_choke_status == ChokeStatus::Unchoked {
                 let reqs = self
                     .piece_picker
                     .lock()
                     .unwrap() // TODO: fix unwrap
-                    .pick_blocks(addr, n_blocks);
+                    .pick_blocks(addr, n_blocks, now);
                 h.conn.send_stream_cmd(ConnMsg::RequestBlocks(reqs));
             }
         }
