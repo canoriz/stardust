@@ -1,10 +1,11 @@
-use anyhow::{anyhow, Result};
 use std::net::SocketAddr;
+// use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use anyhow::{anyhow, Result};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::{sleep, Duration};
 use tokio::{net, time};
-use tracing::{info, Level};
+use tracing::{info, warn, Level};
 
 mod announce_manager;
 mod backfile;
@@ -45,6 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let torrent = metadata::FileMetadata::load(torrent_f).unwrap();
 
     let (metadata, announce_list) = torrent.to_metadata();
+    let metadata_clone = metadata.clone();
     info!("{:?}", &announce_list);
 
     let ready = Arc::new(tokio::sync::Notify::new());
@@ -148,7 +150,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .await?;
         conn.recv_handshake().await?;
-        tm.send_msg(transmit_manager::Msg::NewPeer(conn));
+        // tm.send_msg(transmit_manager::Msg::NewPeer(conn));
     }
     time::sleep(Duration::from_secs(100000)).await;
     // tm.send_announce_msg(announce_manager::Msg::RemoveUrl(
@@ -190,16 +192,20 @@ where
     bt_stream.send_keepalive().await?;
     bt_stream.send_keepalive().await?;
     info!("all keep alive sent");
-    let mut ticker = tokio::time::interval(time::Duration::from_millis(1500));
+    let mut ticker5 = tokio::time::interval(time::Duration::from_secs(10));
+    let mut ticker1 = tokio::time::interval(time::Duration::from_millis(1000));
     bt_stream.send_unchoke().await;
+    let limit = 50000 / 16;
+    let mut accum = 0;
+    let mut choked = false;
     loop {
         tokio::select! {
             msg = bt_stream.recv_msg_header() => {
                 let m = msg?;
                 match m {
                     Message::Request(r) => {
-                        let response: bool = rand::random();
-                        if true {
+                        if !choked && accum < limit {
+                            accum += 1;
                             info!("response");
                             let a = [0u8; 16384];
                             bt_stream
@@ -214,16 +220,20 @@ where
                     }
                 }
             }
-            // _ = ticker.tick() => {
-            //     let unchoke: bool = rand::random();
-            //     if unchoke {
-            //         info!("main unchoke");
+            // _ = ticker5.tick() => {
+            //     choked = rand::random();
+            //     if !choked {
+            //         info!("main {addr} unchoke");
             //         bt_stream.send_unchoke().await;
             //     } else {
-            //         info!("main choke");
+            //         info!("main {addr} choke");
             //         bt_stream.send_choke().await;
             //     }
             // }
+            _ = ticker1.tick() => {
+                warn!("in this period, {accum} blocks transferred");
+                accum = 0;
+            }
         };
     }
 }

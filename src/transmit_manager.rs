@@ -224,29 +224,36 @@ impl TransmitManager {
                 self.piece_picker.lock().unwrap().peer_add(addr, bitfield);
             }
             Msg::PeerChoke(peer) => {
-                info!("{peer} choked us");
+                warn!("{peer} choked us");
                 self.piece_picker
                     .lock()
                     .unwrap()
                     .peer_mark_not_requested(&peer);
-                self.connected_peers
-                    .entry(peer)
-                    .and_modify(|st| st.state.peer_choke_status = ChokeStatus::Choked);
+                self.connected_peers.entry(peer).and_modify(|st| {
+                    st.state.peer_choke_status = ChokeStatus::Choked;
+                    st.n_block_in_flight = 0;
+                });
                 assert_eq!(
                     self.connected_peers[&peer].state.peer_choke_status,
                     ChokeStatus::Choked
                 );
+                // TODO: record the ?stable transmit rate/ i.e. how many packets is in flight
+                // so we can recover to max speed (hopefully) once they unchoked us
             }
             Msg::PeerUnchoke(peer) => {
                 let n_first_pick = 10;
-                info!("{peer} unchoked us");
+                warn!("{peer} unchoked us");
                 self.connected_peers.entry(peer).and_modify(|st| {
                     st.state.peer_choke_status = ChokeStatus::Unchoked;
-                    st.n_block_in_flight = n_first_pick;
+                    st.n_block_in_flight += n_first_pick;
                 });
                 assert_eq!(
                     self.connected_peers[&peer].state.peer_choke_status,
                     ChokeStatus::Unchoked
+                );
+                warn!(
+                    "nblock in flight {}",
+                    self.connected_peers[&peer].n_block_in_flight
                 );
                 // TODO: are we interested in this peer?
                 self.pick_blocks_for_peer(&peer, n_first_pick as usize);
@@ -257,28 +264,44 @@ impl TransmitManager {
                 }
             }
             Msg::BlockReceived(peer, n) => {
-                info!("peer {peer} received {n} block in prev period");
+                // optimally
+                // n_packet_in_flight = (bandwidth * response_time) / packet_size
+                // response_time can be measured
+                // packet_size is known
+                // bandwitdh is unknown and ?difficult to measure
                 let conn_stat = self.connected_peers.get_mut(&peer).expect("should exist");
+                warn!(
+                    "peer {peer} received {n} block in prev period, in flight {}",
+                    conn_stat.n_block_in_flight
+                );
                 let n_blk = if n == 1 {
                     2
                 } else if conn_stat.n_block_in_flight <= n {
-                    (n as f32 * 1.5) as u32 + 1
+                    (n as f32 * 1.2) as u32 + 1
                 } else {
                     (n as f32 * 0.8) as u32 + 1
                 };
 
-                info!(
-                    "peer {peer} picking {n_blk} block in next period, {} in flight",
-                    conn_stat.n_block_in_flight
-                );
+                // TODO: peer may sends us more piece than requested, causing downflow
+                conn_stat.n_block_in_flight = if n >= conn_stat.n_block_in_flight {
+                    0
+                } else {
+                    conn_stat.n_block_in_flight - n
+                };
+
+                // conn_stat.n_block_in_flight -= n;
                 if conn_stat.state.peer_choke_status == ChokeStatus::Unchoked {
-                    // conn_stat.n_block_in_flight -= n;
-                    conn_stat.n_block_in_flight = n_blk;
+                    // TODO: if less than n_blk avaliable?
+                    warn!(
+                        "peer {peer} picking {n_blk} block in next period, {} in flight",
+                        conn_stat.n_block_in_flight
+                    );
+                    conn_stat.n_block_in_flight += n_blk;
+                    self.pick_blocks_for_peer(&peer, n_blk as usize);
                 }
 
                 // TODO: if peer is choking us?
 
-                self.pick_blocks_for_peer(&peer, n_blk as usize);
                 let pbl = self.self_handle.piece_buffer.lock().unwrap().len();
                 info!("piece buffer pending remains {pbl}");
             }

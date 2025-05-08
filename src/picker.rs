@@ -854,6 +854,8 @@ impl HeapPiecePicker {
         }
     }
 
+    // TODO: add test
+    // TODO: maybe rename this "want_this_block"
     #[must_use = "returns if this piece received or not"]
     pub fn have_block(&self, blk: &protocol::Request) -> bool {
         let block_index = blk.begin >> 14;
@@ -884,7 +886,7 @@ impl HeapPiecePicker {
                 false
             }
         } else {
-            false
+            self.heap.get_val(blk.index as usize).is_none()
         }
     }
 
@@ -1220,14 +1222,6 @@ mod test {
     #[test]
     fn test_block_received() {
         todo!("test block receive fully/partial/duplicate(already received) cases")
-        // let now = time::Instant::now();
-        // {
-        //     const PIECE_TOTAL: u32 = 30;
-        //     const TOTAL_LENGTH: usize =
-        //         (PIECE_TOTAL * BLOCK_SIZE * 14 - 3 * (BLOCK_SIZE + 1)) as usize;
-        //     // make a length not multiple of block size
-        //     let mut picker = HeapPiecePicker::new(TOTAL_LENGTH, BLOCK_SIZE * 14);
-        // }
     }
 
     fn concat_vec<T>(a: Vec<T>, b: Vec<T>) -> Vec<T> {
@@ -1671,6 +1665,8 @@ mod test {
                     len: BLOCK_SIZE,
                 },
             });
+            println!("partial {:?}", picker.partly_requested_pieces.0);
+            println!("fully {:?}", picker.fully_requested_pieces);
             assert_eq!(
                 picker.partly_requested_pieces.0,
                 BTreeMap::from([
@@ -1771,7 +1767,6 @@ mod test {
 
             picker.piece_checked(4);
             assert!(check_picker_partial_and_fully(&picker, [6, 7], [2, 3]));
-            // TODO: test partials and fullys
         }
 
         // check pick last piece
@@ -1800,7 +1795,6 @@ mod test {
                 [27],
                 [2, 3, 6, 7, 28, 29]
             ));
-            // TODO: test partials and fullys
         };
     }
 

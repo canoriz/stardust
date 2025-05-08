@@ -398,6 +398,24 @@ where
     // then discard this block, don't alloc (if needed) piece buffer.
     // And there should be no piece buffer of this piece in pb_map
 
+    let already_have = tmh.picker.lock().unwrap().have_block(&protocol::Request {
+        index: piece.index,
+        begin: piece.begin,
+        len: piece.len,
+    });
+
+    if already_have {
+        let mut drain = vec![0u8; piece.len as usize];
+        piece.read(&mut drain).await;
+        // TODO: why this happen (at testing)?
+        // seems we are requesting twice for each piece
+        warn!(
+            "drain PIECE msg {} {} {}",
+            piece.index, piece.begin, piece.len
+        );
+        return;
+    }
+
     let (mut block_ref, piece_buf) = {
         // must drop pb_map before await point
         // pb_map is not Send
@@ -425,22 +443,6 @@ where
         }
         (block_ref, pb)
     };
-
-    let already_have = tmh.picker.lock().unwrap().have_block(&protocol::Request {
-        index: piece.index,
-        begin: piece.begin,
-        len: piece.len,
-    });
-
-    if already_have {
-        let mut drain = vec![0u8; piece.len as usize];
-        piece.read(&mut drain).await;
-        warn!(
-            "drain PIECE msg {} {} {}",
-            piece.index, piece.begin, piece.len
-        );
-        return;
-    }
 
     // TODO: need a biglock. What if some peer else is doing operation now?
     // i.e. operation between two locks?
@@ -515,6 +517,11 @@ where
             info!("write piece {i} result {write_res:?}");
             // TODO: should really check sha1 of piece
             tmh.picker.lock().unwrap().piece_checked(i);
+            // TODO: check write succes or fail
+            let mut pb_map = tmh.piece_buffer.lock().unwrap();
+            pb_map.remove(&i);
+            warn!("write piece {i} done ,delete in cache");
+            // TODO: still have arc ref to buf
         }
     }
 }
