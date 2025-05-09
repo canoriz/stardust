@@ -128,6 +128,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     wait_ready.notified().await;
     wait_ready2.notified().await;
 
+    {
+        use sha1::{Digest, Sha1};
+        let mut hasher = Sha1::new();
+        // process input message
+        hasher.update(&[0u8; 100000]);
+    }
+
     if let Ok(mut conn) =
         // protocol::BTStream::connect_tcp("192.168.71.36:62227".parse().unwrap()).await
         protocol::BTStream::connect_tcp("127.0.0.1:35515".parse().unwrap()).await

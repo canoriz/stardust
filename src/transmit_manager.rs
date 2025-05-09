@@ -155,7 +155,7 @@ impl TransmitManager {
         for (addr, h) in &mut self.connected_peers {
             info!("peer status {addr}: {:?}", h.state);
             if h.state.peer_choke_status == ChokeStatus::Unchoked {
-                let reqs = self
+                let (reqs, n) = self
                     .piece_picker
                     .lock()
                     .unwrap() // TODO: fix unwrap
@@ -166,17 +166,17 @@ impl TransmitManager {
         }
     }
 
-    // TODO: returns num of blocks picked
     fn pick_blocks_for_peer(&mut self, addr: &SocketAddr, n_blocks: usize) {
         let now = std::time::Instant::now();
-        if let Some(h) = self.connected_peers.get(addr) {
+        if let Some(h) = self.connected_peers.get_mut(addr) {
             if h.state.peer_choke_status == ChokeStatus::Unchoked {
-                let reqs = self
+                let (reqs, n) = self
                     .piece_picker
                     .lock()
                     .unwrap() // TODO: fix unwrap
                     .pick_blocks(addr, n_blocks, now);
                 h.conn.send_stream_cmd(ConnMsg::RequestBlocks(reqs));
+                h.n_block_in_flight += n as u32;
             }
         }
     }
@@ -245,7 +245,6 @@ impl TransmitManager {
                 warn!("{peer} unchoked us");
                 self.connected_peers.entry(peer).and_modify(|st| {
                     st.state.peer_choke_status = ChokeStatus::Unchoked;
-                    st.n_block_in_flight += n_first_pick;
                 });
                 assert_eq!(
                     self.connected_peers[&peer].state.peer_choke_status,
@@ -274,6 +273,8 @@ impl TransmitManager {
                     "peer {peer} received {n} block in prev period, in flight {}",
                     conn_stat.n_block_in_flight
                 );
+
+                // TODO: this should not have a fix point (now is 5)
                 let n_blk = if n == 1 {
                     2
                 } else if conn_stat.n_block_in_flight <= n {
@@ -296,7 +297,6 @@ impl TransmitManager {
                         "peer {peer} picking {n_blk} block in next period, {} in flight",
                         conn_stat.n_block_in_flight
                     );
-                    conn_stat.n_block_in_flight += n_blk;
                     self.pick_blocks_for_peer(&peer, n_blk as usize);
                 }
 

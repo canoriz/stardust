@@ -690,10 +690,13 @@ impl HeapPiecePicker {
         peer: &SocketAddr,
         n_blocks: usize,
         now: time::Instant,
-    ) -> BlockRequests {
-        let mut n_blocks = n_blocks;
+    ) -> (BlockRequests, usize) {
+        let mut n_want_blocks = n_blocks;
         let mut picked = Vec::new();
 
+        // TODO: those timeout block requestes, corresponding peers' n_block_in_flight must be decreased
+        // maybe maintain n_block_in_flight in PiecePicker?
+        // or maybe revoke at a higher level?
         if now.duration_since(self.last_check_timeout) > time::Duration::from_secs(2) {
             let revoke_pieces: Vec<_> = self.partly_requested_pieces
                 .0
@@ -758,12 +761,12 @@ impl HeapPiecePicker {
         }
 
         if let Some(peer_field) = self.peer_field_map.get(peer) {
-            n_blocks = self
+            n_want_blocks = self
                 .partly_requested_pieces
                 .pick_blocks_from_partial_pieces(
                     peer,
                     peer_field,
-                    n_blocks,
+                    n_want_blocks,
                     self.piece_size,
                     self.piece_total - 1,
                     self.last_piece_size,
@@ -776,11 +779,11 @@ impl HeapPiecePicker {
                 self.partly_requested_pieces.0
             );
 
-            n_blocks = pick_blocks_from_heap(
+            n_want_blocks = pick_blocks_from_heap(
                 &mut self.heap,
                 peer,
                 peer_field,
-                n_blocks,
+                n_want_blocks,
                 self.piece_size,
                 self.piece_total - 1,
                 self.last_piece_size,
@@ -827,16 +830,22 @@ impl HeapPiecePicker {
                 self.piece_total,
             );
 
-            return BlockRequests {
-                piece_size: self.piece_size,
-                range: picked,
-            };
+            return (
+                BlockRequests {
+                    piece_size: self.piece_size,
+                    range: picked,
+                },
+                n_blocks - n_want_blocks,
+            );
         } else {
             warn!("request blocks of peer {peer} which not exist in field_map");
-            BlockRequests {
-                piece_size: self.piece_size,
-                range: Vec::new(),
-            }
+            (
+                BlockRequests {
+                    piece_size: self.piece_size,
+                    range: Vec::new(),
+                },
+                n_blocks - n_want_blocks,
+            )
         }
     }
 
@@ -1197,19 +1206,21 @@ mod test {
         let addr1 = generate_peer(1);
         picker.peer_add(
             addr1,
-            BitField::from({
-                let mut v = vec![false; PIECE_TOTAL as usize];
-                v[PIECE_TOTAL as usize - 1] = true;
-                assert_eq!(v.len(), PIECE_TOTAL as usize);
-                v
-            }),
+            BitField::from(
+                vec![vec![false; PIECE_TOTAL as usize - 1], vec![true; 1]]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>(),
+            ),
         );
 
         const LAST_PIECE_SIZE: u32 = TOTAL_LENGTH as u32 % (14 * BLOCK_SIZE);
 
         let now = time::Instant::now();
-        let blks = picker.pick_blocks(&addr1, 15, now);
+        let (blks, n) = picker.pick_blocks(&addr1, 15, now);
 
+        // last block has only 11 blocks
+        assert_eq!(n, 11);
         {
             // if picker not set complete, should also return piece index
             let mut complete = None;
@@ -1263,7 +1274,8 @@ mod test {
 
         // test choose one piece
         let first_pick_4 = {
-            let pick4 = picker.pick_blocks(&peers[4].0, 10, now);
+            let (pick4, n) = picker.pick_blocks(&peers[4].0, 10, now);
+            assert_eq!(n, 10);
             check_block_requests(&pick4, &[4], 10);
             assert_eq!(
                 picker.partly_requested_pieces.0,
@@ -1284,7 +1296,8 @@ mod test {
 
         // test choose from partial
         let pick_3blk_in_4 = {
-            let pick4 = picker.pick_blocks(&peers[4].0, 3, now);
+            let (pick4, n) = picker.pick_blocks(&peers[4].0, 3, now);
+            assert_eq!(n, 3);
             check_block_requests(&pick4, &[4], 3);
             assert_eq!(
                 picker.partly_requested_pieces.0,
@@ -1305,7 +1318,8 @@ mod test {
 
         {
             // test choose from partial and heap
-            let pick4 = picker.pick_blocks(&peers[4].0, 18, now);
+            let (pick4, n) = picker.pick_blocks(&peers[4].0, 18, now);
+            assert_eq!(n, 18);
             check_block_requests(&pick4, &[2, 3, 4], 18);
             assert_eq!(
                 picker.partly_requested_pieces.0,
@@ -1402,7 +1416,8 @@ mod test {
             // pick 20 more
             // picking piece2 remain, piece4 remain, piece1 6/14
             // piece 2,3,4 should be fully picked, piece 1 should be picked 6/14
-            let pick4 = picker.pick_blocks(&peers[4].0, 20, now);
+            let (pick4, n) = picker.pick_blocks(&peers[4].0, 20, now);
+            assert_eq!(n, 20);
             check_block_requests(&pick4, &[2, 4, 1], 20);
             assert!(check_picker_partial_and_fully(&picker, [1], [4, 2, 3]));
             assert_eq!(
@@ -1502,7 +1517,8 @@ mod test {
         // test another peer
         {
             // peer6 should first pick partial picked piece 2
-            let pick6 = picker.pick_blocks(&peers[6].0, 10, now);
+            let (pick6, n) = picker.pick_blocks(&peers[6].0, 10, now);
+            assert_eq!(n, 10);
             check_block_requests(&pick6, &[2], 10);
             assert!(check_picker_partial_and_fully(&picker, [2, 4], [3]));
 
@@ -1554,7 +1570,8 @@ mod test {
 
         {
             // peer6 should pick piece 2, 4 and 6
-            let pick6 = picker.pick_blocks(&peers[6].0, 10, now);
+            let (pick6, n) = picker.pick_blocks(&peers[6].0, 10, now);
+            assert_eq!(n, 10);
             assert_eq!(
                 picker.partly_requested_pieces.0,
                 BTreeMap::from([(
@@ -1776,7 +1793,8 @@ mod test {
         {
             println!("test pick last piece");
             let now = time::Instant::now();
-            let pick30 = picker.pick_blocks(&peers[29].0, 50, now);
+            let (pick30, n) = picker.pick_blocks(&peers[29].0, 50, now);
+            assert_eq!(n, 50);
             check_block_requests(&pick30, &[6, 7, 27, 29, 28], 50);
             let last_piece_length = TOTAL_LENGTH % ((BLOCK_SIZE as usize) * 14);
             let last_block_len = last_piece_length % (BLOCK_SIZE as usize);
