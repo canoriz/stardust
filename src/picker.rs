@@ -174,7 +174,7 @@ impl PartialRequestedPiece {
     fn is_all_received(&self) -> bool {
         self.block_map
             .iter()
-            .skip(self.all_requested_before)
+            .skip(self.all_received_before)
             .all(|b| *b == BlockStatus::Received)
     }
 
@@ -956,6 +956,9 @@ impl HeapPiecePicker {
             };
             p.set_one_block_status(&blk, BlockStatus::Received);
 
+            // TODO: change to is_all_received_or_requested
+            // otherwose half received half requested will ends in partials
+            // which is wrong
             let is_all_received = p.is_all_received();
             if is_all_received || p.is_all_requested() {
                 self.fully_requested_pieces.insert(blk.index, p);
@@ -2266,6 +2269,53 @@ mod test {
     fn test_update_flags_on_update() {
         let peer1 = generate_peer(1);
         let now = time::Instant::now();
+        {
+            let bs = PartialRequestedPiece {
+                all_requested_before: 0,
+                all_received_before: 0,
+                block_map: vec![
+                    BlockStatus::NotRequested,
+                    BlockStatus::NotRequested,
+                    BlockStatus::NotRequested,
+                    BlockStatus::NotRequested,
+                ],
+            };
+            assert!(!bs.is_all_received());
+            assert!(bs.is_none_requested());
+            assert!(!bs.is_all_requested());
+        }
+
+        {
+            let bs = PartialRequestedPiece {
+                all_requested_before: 0,
+                all_received_before: 0,
+                block_map: vec![
+                    BlockStatus::Received,
+                    BlockStatus::Received,
+                    BlockStatus::Received,
+                    BlockStatus::Received,
+                ],
+            };
+            assert!(bs.is_all_received());
+            assert!(!bs.is_none_requested());
+            assert!(!bs.is_all_requested());
+        }
+
+        {
+            let bs = PartialRequestedPiece {
+                all_requested_before: 0,
+                all_received_before: 0,
+                block_map: vec![
+                    BlockStatus::Requested(peer1, now),
+                    BlockStatus::Requested(peer1, now),
+                    BlockStatus::Requested(peer1, now),
+                    BlockStatus::Requested(peer1, now),
+                ],
+            };
+            assert!(!bs.is_all_received());
+            assert!(!bs.is_none_requested());
+            assert!(bs.is_all_requested());
+        }
 
         {
             let mut bs = PartialRequestedPiece {
@@ -2292,6 +2342,9 @@ mod test {
                     ],
                 }
             );
+            assert!(!bs.is_all_received());
+            assert!(!bs.is_none_requested());
+            assert!(!bs.is_all_requested());
         }
 
         {
@@ -2319,6 +2372,9 @@ mod test {
                     ],
                 }
             );
+            assert!(!bs.is_all_received());
+            assert!(!bs.is_none_requested());
+            assert!(!bs.is_all_requested());
         }
 
         {
@@ -2346,6 +2402,39 @@ mod test {
                     ],
                 }
             );
+            assert!(!bs.is_all_received());
+            assert!(!bs.is_none_requested());
+            assert!(!bs.is_all_requested());
+        }
+
+        {
+            let mut bs = PartialRequestedPiece {
+                all_requested_before: 3,
+                all_received_before: 1,
+                block_map: vec![
+                    BlockStatus::Received,
+                    BlockStatus::Requested(peer1, now),
+                    BlockStatus::Requested(peer1, now),
+                    BlockStatus::NotRequested,
+                ],
+            };
+            bs.set_one_block_status_by_block_index(3, BlockStatus::Requested(peer1, now));
+            assert_eq!(
+                bs,
+                PartialRequestedPiece {
+                    all_requested_before: 4,
+                    all_received_before: 1,
+                    block_map: vec![
+                        BlockStatus::Received,
+                        BlockStatus::Requested(peer1, now),
+                        BlockStatus::Requested(peer1, now),
+                        BlockStatus::Requested(peer1, now),
+                    ],
+                }
+            );
+            assert!(!bs.is_all_received());
+            assert!(!bs.is_none_requested());
+            assert!(bs.is_all_requested());
         }
     }
 

@@ -405,6 +405,7 @@ where
     });
 
     if already_have {
+        // TODO: make this persistent
         let mut drain = vec![0u8; piece.len as usize];
         piece.read(&mut drain).await;
         // TODO: why this happen (at testing)?

@@ -41,8 +41,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //     ip: None,
     // };
 
-    // let torrent_f = include_bytes!("../ubuntu-24.10-desktop-amd64.iso.torrent");
-    let torrent_f = include_bytes!("../31.torrent");
+    let torrent_f = include_bytes!("../ubuntu-24.10-desktop-amd64.iso.torrent");
+    // let torrent_f = include_bytes!("../31.torrent");
     let torrent = metadata::FileMetadata::load(torrent_f).unwrap();
 
     let (metadata, announce_list) = torrent.to_metadata();
@@ -73,6 +73,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     bt_stream,
                     addr,
                     metadata_clone.clone(),
+                    // vec![vec![true; 1], vec![false; total - 1]]
+                    //     .into_iter()
+                    //     .flatten()
+                    //     .collect(),
                     vec![vec![false; total / 2], vec![true; total - total / 2]]
                         .into_iter()
                         .flatten()
@@ -150,7 +154,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .await?;
         conn.recv_handshake().await?;
-        // tm.send_msg(transmit_manager::Msg::NewPeer(conn));
+        tm.send_msg(transmit_manager::Msg::NewPeer(conn));
     }
     time::sleep(Duration::from_secs(100000)).await;
     // tm.send_announce_msg(announce_manager::Msg::RemoveUrl(
@@ -181,7 +185,7 @@ where
     handshake.client_id = *CLIENT_ID;
     bt_stream.send_handshake(&handshake).await?;
     info!("handshake sent");
-    let bitfield_total = metadata.info.pieces.len() / 20 / 8;
+    let bitfield_total = (metadata.info.pieces.len() / 20).div_ceil(8);
     info!("{bitfield_total}");
     assert_eq!(field.len(), metadata.info.pieces.len() / 20);
     bt_stream
