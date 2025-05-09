@@ -41,8 +41,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //     ip: None,
     // };
 
-    let torrent_f = include_bytes!("../ubuntu-24.10-desktop-amd64.iso.torrent");
-    // let torrent_f = include_bytes!("../31.torrent");
+    // let torrent_f = include_bytes!("../ubuntu-24.10-desktop-amd64.iso.torrent");
+    let torrent_f = include_bytes!("../31.torrent");
     let torrent = metadata::FileMetadata::load(torrent_f).unwrap();
 
     let (metadata, announce_list) = torrent.to_metadata();
@@ -206,7 +206,7 @@ where
     let mut ticker5 = tokio::time::interval(time::Duration::from_secs(10));
     let mut ticker1 = tokio::time::interval(time::Duration::from_millis(1000));
     bt_stream.send_unchoke().await;
-    let limit = 50000 / 16;
+    let limit = 10000 / 16;
     let mut accum = 0;
     let mut choked = false;
     loop {
@@ -231,16 +231,16 @@ where
                     }
                 }
             }
-            // _ = ticker5.tick() => {
-            //     choked = rand::random();
-            //     if !choked {
-            //         info!("main {addr} unchoke");
-            //         bt_stream.send_unchoke().await;
-            //     } else {
-            //         info!("main {addr} choke");
-            //         bt_stream.send_choke().await;
-            //     }
-            // }
+            _ = ticker5.tick() => {
+                choked = rand::random();
+                if !choked {
+                    info!("main {addr} unchoke");
+                    bt_stream.send_unchoke().await;
+                } else {
+                    info!("main {addr} choke");
+                    bt_stream.send_choke().await;
+                }
+            }
             _ = ticker1.tick() => {
                 warn!("in this period, {accum} blocks transferred");
                 accum = 0;

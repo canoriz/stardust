@@ -99,6 +99,10 @@ impl BlockRange {
             br,
         }
     }
+
+    pub fn n_blk(&self) -> usize {
+        todo!()
+    }
 }
 
 pub struct BlockRangeIter {
@@ -263,9 +267,9 @@ impl PartialRequestedPiece {
     }
 
     // apply f to every block
-    fn map_block_status<F>(&mut self, f: F)
+    fn map_block_status<F>(&mut self, mut f: F)
     where
-        F: Fn(u32, &BlockStatus) -> BlockStatus,
+        F: FnMut(u32, &BlockStatus) -> BlockStatus,
     {
         for (i, bs) in self.block_map.iter_mut().enumerate() {
             *bs = f(i as u32, bs);
@@ -347,6 +351,8 @@ pub struct HeapPiecePicker {
     // ??fully is special since we have a received but not checked state
     fully_received_pieces: HashSet<u32>,
 
+    n_timeout: HashMap<SocketAddr, usize>,
+
     last_check_timeout: time::Instant,
 }
 
@@ -373,6 +379,8 @@ impl HeapPiecePicker {
             partly_requested_pieces: PartialRequestedPieces(BTreeMap::new()),
             fully_requested_pieces: HashMap::new(),
             fully_received_pieces: HashSet::new(),
+
+            n_timeout: HashMap::new(),
 
             last_check_timeout: time::Instant::now(),
         }
@@ -606,7 +614,7 @@ impl HeapPiecePicker {
                 };
                 v.map_block_status(mark_unreqested);
 
-                v.is_none_requested().then_some(*k)
+                v.is_none_requested().then_some(*k) // TODO: Optimize is_none_requested
             })
             .collect::<Vec<u32>>();
 
@@ -667,6 +675,7 @@ impl HeapPiecePicker {
                 }
             }
         }
+        self.n_timeout.remove(peer);
     }
 
     pub fn peer_remove(&mut self, peer: &SocketAddr) {
@@ -682,6 +691,7 @@ impl HeapPiecePicker {
         self.peer_field_map.remove(peer);
 
         self.peer_mark_not_requested(peer);
+        self.n_timeout.remove(peer);
     }
 
     // TODO: change this struct to reuse return request's Vec buffer?
@@ -698,60 +708,51 @@ impl HeapPiecePicker {
         // maybe maintain n_block_in_flight in PiecePicker?
         // or maybe revoke at a higher level?
         if now.duration_since(self.last_check_timeout) > time::Duration::from_secs(2) {
-            let revoke_pieces: Vec<_> = self.partly_requested_pieces
-                .0
-                .iter()
-                .flat_map(|(index, v)| {
-                    v.block_map.iter().enumerate().filter_map(|(i, b)| {
-                        // match b {
-                        // BlockStatus::Requested(_, req_t) => println!("partial piece {} block {i} {b:?}, since {:?}", *index, now.duration_since(*req_t)),
-                        // _ => {},
-                        //     }
-
-                        // TODO: use if let
-                        if matches!(
-                            b,
-                            BlockStatus::Requested(_, req_t) if now.duration_since(*req_t) > time::Duration::from_secs(15),
-                        ) {
+            let mut revoke_pieces: Vec<_> = vec![];
+            for (index, v) in self.partly_requested_pieces.0.iter() {
+                for (i, b) in v.block_map.iter().enumerate() {
+                    if let BlockStatus::Requested(p, req_t) = b {
+                        if now.duration_since(*req_t) > time::Duration::from_secs(15) {
                             let blk_req = protocol::Request {
                                 index: *index,
                                 begin: (i as u32) * BLOCK_SIZE,
                                 len: 1, // cannot use 0 here
                             };
-                            Some(BlockRange{
+                            self.n_timeout // TODO: optimize
+                                .entry(*p)
+                                .and_modify(|n| *n += 1)
+                                .or_insert(1);
+                            revoke_pieces.push(BlockRange {
+                                from: blk_req.clone(),
+                                to: blk_req,
+                            });
+                        }
+                    }
+                }
+            }
+
+            for (index, v) in self.fully_requested_pieces.iter() {
+                for (i, b) in v.block_map.iter().enumerate() {
+                    // TODO: use if let
+                    if let BlockStatus::Requested(p, req_t) = b {
+                        if now.duration_since(*req_t) > time::Duration::from_secs(15) {
+                            let blk_req = protocol::Request {
+                                index: *index,
+                                begin: (i as u32) * BLOCK_SIZE,
+                                len: 1, // cannot use 0 here
+                            };
+                            self.n_timeout
+                                .entry(*p)
+                                .and_modify(|n| *n += 1)
+                                .or_insert(1);
+                            revoke_pieces.push(BlockRange {
                                 from: blk_req.clone(),
                                 to: blk_req,
                             })
-                        } else {
-                            None
                         }
-                    })
-                }).chain(
-                    self.fully_requested_pieces
-                        .iter()
-                        .flat_map(|(index, v)| {
-                            v.block_map.iter().enumerate().filter_map(|(i, b)| {
-
-                        // TODO: use if let
-                                if matches!(
-                                    b,
-                                    BlockStatus::Requested(_, req_t) if now.duration_since(*req_t) > time::Duration::from_secs(15),
-                                ) {
-                                    let blk_req = protocol::Request {
-                                        index: *index,
-                                        begin: (i as u32) * BLOCK_SIZE,
-                                        len: 1, // cannot use 0 here
-                                    };
-                                    Some(BlockRange{
-                                        from: blk_req.clone(),
-                                        to: blk_req,
-                                    })
-                                } else {
-                                    None
-                                }
-                            })
-                        })
-                ).collect();
+                    }
+                }
+            }
 
             warn!("timeout revoke {revoke_pieces:?}");
             for br in revoke_pieces {
@@ -899,6 +900,7 @@ impl HeapPiecePicker {
         }
     }
 
+    // TODO: maybe let this function maintain n_blk_in_flight?
     // receive one block, returns if any piece is all received
     #[must_use = "returns fully received pieces"]
     pub fn block_received(&mut self, blk: protocol::Request) -> Option<u32> {
@@ -1052,6 +1054,17 @@ impl HeapPiecePicker {
         let in_heap = self.heap.delete(piece_index as usize);
         if in_heap.is_none() {
             warn!("checked piece {piece_index} not in heap");
+        }
+    }
+
+    pub fn get_and_reset_n_timeout(&mut self, peer: &SocketAddr) -> usize {
+        match self.n_timeout.get_mut(peer) {
+            Some(n) => {
+                let nn = *n;
+                *n = 0;
+                nn
+            }
+            None => 0,
         }
     }
 }

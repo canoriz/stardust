@@ -166,15 +166,25 @@ impl TransmitManager {
         }
     }
 
-    fn pick_blocks_for_peer(&mut self, addr: &SocketAddr, n_blocks: usize) {
+    // fn pick_blocks_for_peer(&mut self, addr: &SocketAddr, n_blocks: usize) {
+    // Fn: n_blk_received, n_blk_in_flight -> n_this_time_pick
+    fn pick_blocks_for_peer<F>(&mut self, addr: &SocketAddr, received: u32, pick_fn: F)
+    where
+        F: FnOnce(u32, u32) -> u32,
+    {
         let now = std::time::Instant::now();
         if let Some(h) = self.connected_peers.get_mut(addr) {
             if h.state.peer_choke_status == ChokeStatus::Unchoked {
-                let (reqs, n) = self
-                    .piece_picker
-                    .lock()
-                    .unwrap() // TODO: fix unwrap
-                    .pick_blocks(addr, n_blocks, now);
+                let mut picker = self.piece_picker.lock().unwrap(); // TODO: fix unwrap
+                let n_timeout = picker.get_and_reset_n_timeout(addr) as u32;
+                dbg!(h.n_block_in_flight, n_timeout);
+                h.n_block_in_flight -= n_timeout;
+                let n_blk = pick_fn(received, h.n_block_in_flight);
+                warn!(
+                    "peer {addr} picking {n_blk} block in next period, {} in flight",
+                    h.n_block_in_flight
+                );
+                let (reqs, n) = picker.pick_blocks(addr, n_blk as usize, now);
                 h.conn.send_stream_cmd(ConnMsg::RequestBlocks(reqs));
                 h.n_block_in_flight += n as u32;
             }
@@ -255,7 +265,7 @@ impl TransmitManager {
                     self.connected_peers[&peer].n_block_in_flight
                 );
                 // TODO: are we interested in this peer?
-                self.pick_blocks_for_peer(&peer, n_first_pick as usize);
+                self.pick_blocks_for_peer(&peer, 0, |_, _| n_first_pick);
             }
             Msg::PieceReceived(i) => {
                 for (_, h) in self.connected_peers.iter() {
@@ -275,29 +285,27 @@ impl TransmitManager {
                 );
 
                 // TODO: this should not have a fix point (now is 5)
-                let n_blk = if n == 1 {
-                    2
-                } else if conn_stat.n_block_in_flight <= n {
-                    (n as f32 * 1.2) as u32 + 1
-                } else {
-                    (n as f32 * 0.8) as u32 + 1
+                let n_blk_fn = |n_received, n_in_flight| {
+                    if n_received == 1 {
+                        2
+                    } else if n_in_flight <= n {
+                        (n_received as f32 * 1.2) as u32 + 1
+                    } else {
+                        (n_received as f32 * 0.8) as u32 + 1
+                    }
                 };
 
                 // TODO: peer may sends us more piece than requested, causing downflow
                 conn_stat.n_block_in_flight = if n >= conn_stat.n_block_in_flight {
                     0
                 } else {
+                    dbg!(conn_stat.n_block_in_flight);
                     conn_stat.n_block_in_flight - n
                 };
 
                 // conn_stat.n_block_in_flight -= n;
                 if conn_stat.state.peer_choke_status == ChokeStatus::Unchoked {
-                    // TODO: if less than n_blk avaliable?
-                    warn!(
-                        "peer {peer} picking {n_blk} block in next period, {} in flight",
-                        conn_stat.n_block_in_flight
-                    );
-                    self.pick_blocks_for_peer(&peer, n_blk as usize);
+                    self.pick_blocks_for_peer(&peer, n, n_blk_fn);
                 }
 
                 // TODO: if peer is choking us?
