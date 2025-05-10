@@ -411,11 +411,21 @@ where
         // TODO: why this happen (at testing)?
         // seems we are requesting twice for each piece
         warn!(
-            "drain PIECE msg {} {} {}",
-            piece.index, piece.begin, piece.len
+            "drain PIECE msg {} {} {} block index {}",
+            piece.index,
+            piece.begin,
+            piece.len,
+            piece.begin >> 14,
         );
         return;
     }
+    warn!(
+        "receive PIECE msg {} {} {} block index {}",
+        piece.index,
+        piece.begin,
+        piece.len,
+        piece.begin >> 14,
+    );
 
     let (mut block_ref, piece_buf) = {
         // must drop pb_map before await point

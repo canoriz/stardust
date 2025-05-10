@@ -42,91 +42,91 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // };
 
     // let torrent_f = include_bytes!("../ubuntu-24.10-desktop-amd64.iso.torrent");
-    let torrent_f = include_bytes!("../31.torrent");
+    let torrent_f = include_bytes!("../c8.torrent");
     let torrent = metadata::FileMetadata::load(torrent_f).unwrap();
 
     let (metadata, announce_list) = torrent.to_metadata();
     let metadata_clone = metadata.clone();
     info!("{:?}", &announce_list);
 
-    let ready = Arc::new(tokio::sync::Notify::new());
-    let wait_ready = ready.clone();
-    {
-        let metadata_clone = metadata.clone();
-        let listener = net::TcpListener::bind("::0:35515").await?;
-        let server = tokio::spawn(async move {
-            let mut set = tokio::task::JoinSet::new();
-            ready.notify_one();
-            loop {
-                let (bt_stream, addr) = match listener.accept().await {
-                    Ok((stream, addr)) => {
-                        info!("input from addr {}", addr);
-                        (protocol::BTStream::from(stream), addr)
-                    }
-                    Err(e) => {
-                        info!("accept error {}", e);
-                        continue;
-                    }
-                };
-                let total = metadata_clone.info.pieces.len() / 20;
-                let handle = set.spawn(handle_income_connection(
-                    bt_stream,
-                    addr,
-                    metadata_clone.clone(),
-                    // vec![vec![true; 1], vec![false; total - 1]]
-                    //     .into_iter()
-                    //     .flatten()
-                    //     .collect(),
-                    vec![vec![false; total / 2], vec![true; total - total / 2]]
-                        .into_iter()
-                        .flatten()
-                        .collect(),
-                ));
-            }
-            set.join_all().await;
-        });
-    }
-    let ready2 = Arc::new(tokio::sync::Notify::new());
-    let wait_ready2 = ready2.clone();
-    {
-        let metadata_clone = metadata.clone();
-        let listener = net::TcpListener::bind("::0:35516").await?;
-        let server = tokio::spawn(async move {
-            let mut set = tokio::task::JoinSet::new();
-            ready2.notify_one();
-            loop {
-                let (bt_stream, addr) = match listener.accept().await {
-                    Ok((stream, addr)) => {
-                        info!("input from addr {}", addr);
-                        (protocol::BTStream::from(stream), addr)
-                    }
-                    Err(e) => {
-                        info!("accept error {}", e);
-                        continue;
-                    }
-                };
-                let total = metadata_clone.info.pieces.len() / 20;
-                let handle = set.spawn(handle_income_connection(
-                    bt_stream,
-                    addr,
-                    metadata_clone.clone(),
-                    vec![vec![true; total / 2], vec![false; total - total / 2]]
-                        .into_iter()
-                        .flatten()
-                        .collect(),
-                ));
-            }
-            set.join_all().await;
-        });
-    }
+    // let ready = Arc::new(tokio::sync::Notify::new());
+    // let wait_ready = ready.clone();
+    // {
+    //     let metadata_clone = metadata.clone();
+    //     let listener = net::TcpListener::bind("::0:35515").await?;
+    //     let server = tokio::spawn(async move {
+    //         let mut set = tokio::task::JoinSet::new();
+    //         ready.notify_one();
+    //         loop {
+    //             let (bt_stream, addr) = match listener.accept().await {
+    //                 Ok((stream, addr)) => {
+    //                     info!("input from addr {}", addr);
+    //                     (protocol::BTStream::from(stream), addr)
+    //                 }
+    //                 Err(e) => {
+    //                     info!("accept error {}", e);
+    //                     continue;
+    //                 }
+    //             };
+    //             let total = metadata_clone.info.pieces.len() / 20;
+    //             let handle = set.spawn(handle_income_connection(
+    //                 bt_stream,
+    //                 addr,
+    //                 metadata_clone.clone(),
+    //                 // vec![vec![true; 1], vec![false; total - 1]]
+    //                 //     .into_iter()
+    //                 //     .flatten()
+    //                 //     .collect(),
+    //                 vec![vec![false; total / 2], vec![true; total - total / 2]]
+    //                     .into_iter()
+    //                     .flatten()
+    //                     .collect(),
+    //             ));
+    //         }
+    //         set.join_all().await;
+    //     });
+    // }
+    // let ready2 = Arc::new(tokio::sync::Notify::new());
+    // let wait_ready2 = ready2.clone();
+    // {
+    //     let metadata_clone = metadata.clone();
+    //     let listener = net::TcpListener::bind("::0:35516").await?;
+    //     let server = tokio::spawn(async move {
+    //         let mut set = tokio::task::JoinSet::new();
+    //         ready2.notify_one();
+    //         loop {
+    //             let (bt_stream, addr) = match listener.accept().await {
+    //                 Ok((stream, addr)) => {
+    //                     info!("input from addr {}", addr);
+    //                     (protocol::BTStream::from(stream), addr)
+    //                 }
+    //                 Err(e) => {
+    //                     info!("accept error {}", e);
+    //                     continue;
+    //                 }
+    //             };
+    //             let total = metadata_clone.info.pieces.len() / 20;
+    //             let handle = set.spawn(handle_income_connection(
+    //                 bt_stream,
+    //                 addr,
+    //                 metadata_clone.clone(),
+    //                 vec![vec![true; total / 2], vec![false; total - total / 2]]
+    //                     .into_iter()
+    //                     .flatten()
+    //                     .collect(),
+    //             ));
+    //         }
+    //         set.join_all().await;
+    //     });
+    // }
 
     let info_hash = metadata.info_hash;
     // let mut tm = TransmitManager::new(metadata).with_announce_list(announce_list);
     let mut tm = TorrentManagerHandle::new(Arc::new(metadata));
     // tm.send_announce_msg(announce_manager::Msg::AddUrl(announce_list[0].clone()));
     // tm.send_announce_msg(announce_manager::Msg::AddUrl(announce_list[1].clone()));
-    wait_ready.notified().await;
-    wait_ready2.notified().await;
+    // wait_ready.notified().await;
+    // wait_ready2.notified().await;
 
     {
         use sha1::{Digest, Sha1};
@@ -136,8 +136,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if let Ok(mut conn) =
-        // protocol::BTStream::connect_tcp("192.168.71.36:62227".parse().unwrap()).await
-        protocol::BTStream::connect_tcp("127.0.0.1:35515".parse().unwrap()).await
+        protocol::BTStream::connect_tcp("192.168.71.36:62227".parse().unwrap()).await
+    // protocol::BTStream::connect_tcp("127.0.0.1:35515".parse().unwrap()).await
     {
         info!("{info_hash:?}");
         conn.send_handshake(&Handshake {
@@ -149,20 +149,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         conn.recv_handshake().await?;
         tm.send_msg(transmit_manager::Msg::NewPeer(conn));
     }
-    if let Ok(mut conn) =
-        // protocol::BTStream::connect_tcp("192.168.71.36:62227".parse().unwrap()).await
-        protocol::BTStream::connect_tcp("127.0.0.1:35516".parse().unwrap()).await
-    {
-        info!("{info_hash:?}");
-        conn.send_handshake(&Handshake {
-            reserved: [0u8; 8],
-            client_id: HANDSHAKE.client_id,
-            torrent_hash: info_hash,
-        })
-        .await?;
-        conn.recv_handshake().await?;
-        tm.send_msg(transmit_manager::Msg::NewPeer(conn));
-    }
+    // if let Ok(mut conn) =
+    //     // protocol::BTStream::connect_tcp("192.168.71.36:62227".parse().unwrap()).await
+    //     protocol::BTStream::connect_tcp("127.0.0.1:35516".parse().unwrap()).await
+    // {
+    //     info!("{info_hash:?}");
+    //     conn.send_handshake(&Handshake {
+    //         reserved: [0u8; 8],
+    //         client_id: HANDSHAKE.client_id,
+    //         torrent_hash: info_hash,
+    //     })
+    //     .await?;
+    //     conn.recv_handshake().await?;
+    //     tm.send_msg(transmit_manager::Msg::NewPeer(conn));
+    // }
     time::sleep(Duration::from_secs(100000)).await;
     // tm.send_announce_msg(announce_manager::Msg::RemoveUrl(
     //     announce_list[0][0].clone(),

@@ -712,13 +712,15 @@ impl HeapPiecePicker {
             for (index, v) in self.partly_requested_pieces.0.iter() {
                 for (i, b) in v.block_map.iter().enumerate() {
                     if let BlockStatus::Requested(p, req_t) = b {
-                        if now.duration_since(*req_t) > time::Duration::from_secs(15) {
+                        if now.duration_since(*req_t) > time::Duration::from_secs(60) {
                             let blk_req = protocol::Request {
                                 index: *index,
                                 begin: (i as u32) * BLOCK_SIZE,
                                 len: 1, // cannot use 0 here
                             };
-                            self.n_timeout // TODO: optimize
+                            // TODO: optimize
+                            // though moved it here, but peer may still processing it
+                            self.n_timeout
                                 .entry(*p)
                                 .and_modify(|n| *n += 1)
                                 .or_insert(1);

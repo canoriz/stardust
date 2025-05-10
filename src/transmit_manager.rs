@@ -178,7 +178,11 @@ impl TransmitManager {
                 let mut picker = self.piece_picker.lock().unwrap(); // TODO: fix unwrap
                 let n_timeout = picker.get_and_reset_n_timeout(addr) as u32;
                 dbg!(h.n_block_in_flight, n_timeout);
-                h.n_block_in_flight -= n_timeout;
+                if h.n_block_in_flight < n_timeout {
+                    h.n_block_in_flight = 0;
+                } else {
+                    h.n_block_in_flight -= n_timeout;
+                }
                 let n_blk = pick_fn(received, h.n_block_in_flight);
                 warn!(
                     "peer {addr} picking {n_blk} block in next period, {} in flight",
@@ -251,7 +255,7 @@ impl TransmitManager {
                 // so we can recover to max speed (hopefully) once they unchoked us
             }
             Msg::PeerUnchoke(peer) => {
-                let n_first_pick = 10;
+                let n_first_pick = 3;
                 warn!("{peer} unchoked us");
                 self.connected_peers.entry(peer).and_modify(|st| {
                     st.state.peer_choke_status = ChokeStatus::Unchoked;
@@ -294,6 +298,14 @@ impl TransmitManager {
                         (n_received as f32 * 0.8) as u32 + 1
                     }
                 };
+                // TODO: peer may take longer than period to process,
+                // we need to estimate bandwidth
+                //
+                // n_block_in_flight = estimated_bandwidth * response_time
+                // response_time = RTT + process_time
+                // estimated_bandwidth = ALPHA * n_received_per_second
+                //
+                // so we can estimate response_time
 
                 // TODO: peer may sends us more piece than requested, causing downflow
                 conn_stat.n_block_in_flight = if n >= conn_stat.n_block_in_flight {
