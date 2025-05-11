@@ -581,6 +581,9 @@ where
     pub async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         assert!(buf.len() >= self.len as usize);
 
+        // TODO: Transmission sends data in seperate packets
+        // and 500ms after first packet
+        // maybe make this read() instead of read_exact
         self.handle
             .read_exact(&mut buf[..(self.len as usize)])
             .await

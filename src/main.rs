@@ -49,43 +49,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let metadata_clone = metadata.clone();
     info!("{:?}", &announce_list);
 
-    // let ready = Arc::new(tokio::sync::Notify::new());
-    // let wait_ready = ready.clone();
-    // {
-    //     let metadata_clone = metadata.clone();
-    //     let listener = net::TcpListener::bind("::0:35515").await?;
-    //     let server = tokio::spawn(async move {
-    //         let mut set = tokio::task::JoinSet::new();
-    //         ready.notify_one();
-    //         loop {
-    //             let (bt_stream, addr) = match listener.accept().await {
-    //                 Ok((stream, addr)) => {
-    //                     info!("input from addr {}", addr);
-    //                     (protocol::BTStream::from(stream), addr)
-    //                 }
-    //                 Err(e) => {
-    //                     info!("accept error {}", e);
-    //                     continue;
-    //                 }
-    //             };
-    //             let total = metadata_clone.info.pieces.len() / 20;
-    //             let handle = set.spawn(handle_income_connection(
-    //                 bt_stream,
-    //                 addr,
-    //                 metadata_clone.clone(),
-    //                 // vec![vec![true; 1], vec![false; total - 1]]
-    //                 //     .into_iter()
-    //                 //     .flatten()
-    //                 //     .collect(),
-    //                 vec![vec![false; total / 2], vec![true; total - total / 2]]
-    //                     .into_iter()
-    //                     .flatten()
-    //                     .collect(),
-    //             ));
-    //         }
-    //         set.join_all().await;
-    //     });
-    // }
+    let ready = Arc::new(tokio::sync::Notify::new());
+    let wait_ready = ready.clone();
+    {
+        let metadata_clone = metadata.clone();
+        let listener = net::TcpListener::bind("::0:35515").await?;
+        let server = tokio::spawn(async move {
+            let mut set = tokio::task::JoinSet::new();
+            ready.notify_one();
+            loop {
+                let (bt_stream, addr) = match listener.accept().await {
+                    Ok((stream, addr)) => {
+                        info!("input from addr {}", addr);
+                        (protocol::BTStream::from(stream), addr)
+                    }
+                    Err(e) => {
+                        info!("accept error {}", e);
+                        continue;
+                    }
+                };
+                let total = metadata_clone.info.pieces.len() / 20;
+                let handle = set.spawn(handle_income_connection(
+                    bt_stream,
+                    addr,
+                    metadata_clone.clone(),
+                    // vec![vec![true; 1], vec![false; total - 1]]
+                    //     .into_iter()
+                    //     .flatten()
+                    //     .collect(),
+                    vec![vec![false; total / 2], vec![true; total - total / 2]]
+                        .into_iter()
+                        .flatten()
+                        .collect(),
+                ));
+            }
+            set.join_all().await;
+        });
+    }
     // let ready2 = Arc::new(tokio::sync::Notify::new());
     // let wait_ready2 = ready2.clone();
     // {
@@ -125,7 +125,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut tm = TorrentManagerHandle::new(Arc::new(metadata));
     // tm.send_announce_msg(announce_manager::Msg::AddUrl(announce_list[0].clone()));
     // tm.send_announce_msg(announce_manager::Msg::AddUrl(announce_list[1].clone()));
-    // wait_ready.notified().await;
+    wait_ready.notified().await;
     // wait_ready2.notified().await;
 
     {
@@ -231,18 +231,18 @@ where
                     }
                 }
             }
-            _ = ticker5.tick() => {
-                choked = rand::random();
-                if !choked {
-                    info!("main {addr} unchoke");
-                    bt_stream.send_unchoke().await;
-                } else {
-                    info!("main {addr} choke");
-                    bt_stream.send_choke().await;
-                }
-            }
+            // _ = ticker5.tick() => {
+            //     choked = rand::random();
+            //     if !choked {
+            //         info!("main {addr} unchoke");
+            //         bt_stream.send_unchoke().await;
+            //     } else {
+            //         info!("main {addr} choke");
+            //         bt_stream.send_choke().await;
+            //     }
+            // }
             _ = ticker1.tick() => {
-                warn!("in this period, {accum} blocks transferred");
+                info!("in this period, {accum} blocks transferred");
                 accum = 0;
             }
         };

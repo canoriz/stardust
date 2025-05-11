@@ -352,8 +352,24 @@ pub struct HeapPiecePicker {
     fully_received_pieces: HashSet<u32>,
 
     n_timeout: HashMap<SocketAddr, usize>,
+    bandwidth_status: HashMap<SocketAddr, Bandwidth>,
 
     last_check_timeout: time::Instant,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct Bandwidth {
+    pub estm_bandwidth: f32, // n * 16k / second
+    pub response_time: time::Duration,
+}
+
+impl Default for Bandwidth {
+    fn default() -> Self {
+        Bandwidth {
+            estm_bandwidth: 1.0,
+            response_time: time::Duration::from_secs(10),
+        }
+    }
 }
 
 impl HeapPiecePicker {
@@ -381,6 +397,7 @@ impl HeapPiecePicker {
             fully_received_pieces: HashSet::new(),
 
             n_timeout: HashMap::new(),
+            bandwidth_status: HashMap::new(),
 
             last_check_timeout: time::Instant::now(),
         }
@@ -712,7 +729,7 @@ impl HeapPiecePicker {
             for (index, v) in self.partly_requested_pieces.0.iter() {
                 for (i, b) in v.block_map.iter().enumerate() {
                     if let BlockStatus::Requested(p, req_t) = b {
-                        if now.duration_since(*req_t) > time::Duration::from_secs(60) {
+                        if now.duration_since(*req_t) > time::Duration::from_secs(20) {
                             let blk_req = protocol::Request {
                                 index: *index,
                                 begin: (i as u32) * BLOCK_SIZE,
@@ -905,19 +922,40 @@ impl HeapPiecePicker {
     // TODO: maybe let this function maintain n_blk_in_flight?
     // receive one block, returns if any piece is all received
     #[must_use = "returns fully received pieces"]
-    pub fn block_received(&mut self, blk: protocol::Request) -> Option<u32> {
+    pub fn block_received(&mut self, peer: &SocketAddr, blk: protocol::Request) -> Option<u32> {
         let block_index = blk.begin >> 14;
+        let mut update_response_time = |status: BlockStatus| {
+            match status {
+                BlockStatus::Received => {
+                    warn!(
+                        "received duplicated block piece {} block {}",
+                        blk.index,
+                        blk.begin >> 14
+                    );
+                }
+                BlockStatus::Requested(p, t) if p == *peer => {
+                    let response_time = time::Instant::now().duration_since(t);
+                    self.bandwidth_status
+                        .entry(*peer)
+                        .and_modify(|b| {
+                            b.response_time =
+                                b.response_time.mul_f32(0.8) + response_time.mul_f32(0.2)
+                        })
+                        .or_insert(Bandwidth {
+                            response_time, // only keep last response time now
+                            ..Bandwidth::default()
+                        });
+                }
+                _ => {}
+            }
+        };
         if let Some(p) = self.partly_requested_pieces.0.get_mut(&blk.index) {
             info!("received blocks of partial requested piece {blk:?}");
             debug_assert_eq!(blk.begin / BLOCK_SIZE, block_index);
-            if let BlockStatus::Received = p.block_map[block_index as usize] {
-                warn!(
-                    "received duplicated block piece {} block {}",
-                    blk.index,
-                    blk.begin >> 14
-                );
-            }
+
+            update_response_time(p.block_map[block_index as usize]);
             p.set_one_block_status(&blk, BlockStatus::Received);
+
             let piece_received = p.is_all_received();
             if piece_received {
                 self.partly_requested_pieces.0.remove(&blk.index);
@@ -930,14 +968,10 @@ impl HeapPiecePicker {
             info!("received blocks of fully requested piece {blk:?}");
             debug_assert!(!self.partly_requested_pieces.0.contains_key(&blk.index));
             debug_assert_eq!(blk.begin / BLOCK_SIZE, block_index);
-            if let BlockStatus::Received = p.block_map[block_index as usize] {
-                warn!(
-                    "received duplicated block piece {} block {}",
-                    blk.index,
-                    blk.begin >> 14
-                );
-            }
+
+            update_response_time(p.block_map[block_index as usize]);
             p.set_one_block_status(&blk, BlockStatus::Received);
+
             let piece_received = p.is_all_received();
             if piece_received {
                 self.fully_requested_pieces.remove(&blk.index);
@@ -982,9 +1016,9 @@ impl HeapPiecePicker {
         }
     }
 
-    pub fn blocks_received(&mut self, block: &BlockRange) {
+    pub fn blocks_received(&mut self, peer: &SocketAddr, block: &BlockRange) {
         for blk in block.iter(self.piece_size) {
-            self.block_received(blk);
+            self.block_received(peer, blk);
         }
     }
 
@@ -1068,6 +1102,18 @@ impl HeapPiecePicker {
             }
             None => 0,
         }
+    }
+
+    pub fn get_bw_status(&self, peer: &SocketAddr) -> Bandwidth {
+        dbg!(&self.bandwidth_status);
+        self.bandwidth_status
+            .get(peer)
+            .copied()
+            .unwrap_or(Bandwidth::default())
+    }
+
+    pub fn update_bw_status(&mut self, peer: SocketAddr, bw: Bandwidth) {
+        self.bandwidth_status.insert(peer, bw);
     }
 }
 
@@ -1241,7 +1287,7 @@ mod test {
             let mut complete = None;
             for br in &blks.range {
                 for b in br.iter(LAST_PIECE_SIZE) {
-                    complete = complete.or(picker.block_received(b));
+                    complete = complete.or(picker.block_received(&addr1, b));
                 }
             }
             assert_eq!(complete, Some(PIECE_TOTAL - 1));
@@ -1646,18 +1692,21 @@ mod test {
         // test block received
         {
             // test receive un-requested block
-            picker.blocks_received(&BlockRange {
-                from: protocol::Request {
-                    index: 7,
-                    begin: 13 * BLOCK_SIZE,
-                    len: BLOCK_SIZE,
+            picker.blocks_received(
+                &peers[6].0,
+                &BlockRange {
+                    from: protocol::Request {
+                        index: 7,
+                        begin: 13 * BLOCK_SIZE,
+                        len: BLOCK_SIZE,
+                    },
+                    to: protocol::Request {
+                        index: 7,
+                        begin: 13 * BLOCK_SIZE,
+                        len: BLOCK_SIZE,
+                    },
                 },
-                to: protocol::Request {
-                    index: 7,
-                    begin: 13 * BLOCK_SIZE,
-                    len: BLOCK_SIZE,
-                },
-            });
+            );
             assert_eq!(
                 picker.partly_requested_pieces.0,
                 BTreeMap::from([
@@ -1688,18 +1737,21 @@ mod test {
             assert!(check_picker_partial_and_fully(&picker, [6, 7], [2, 4, 3]));
 
             // test receive block of partial piece
-            picker.blocks_received(&BlockRange {
-                from: protocol::Request {
-                    index: 6,
-                    begin: 1 * BLOCK_SIZE,
-                    len: BLOCK_SIZE,
+            picker.blocks_received(
+                &peers[6].0,
+                &BlockRange {
+                    from: protocol::Request {
+                        index: 6,
+                        begin: 1 * BLOCK_SIZE,
+                        len: BLOCK_SIZE,
+                    },
+                    to: protocol::Request {
+                        index: 6,
+                        begin: 1 * BLOCK_SIZE,
+                        len: BLOCK_SIZE,
+                    },
                 },
-                to: protocol::Request {
-                    index: 6,
-                    begin: 1 * BLOCK_SIZE,
-                    len: BLOCK_SIZE,
-                },
-            });
+            );
             println!("partial {:?}", picker.partly_requested_pieces.0);
             println!("fully {:?}", picker.fully_requested_pieces);
             assert_eq!(
@@ -1776,26 +1828,29 @@ mod test {
 
             for br in &pick_3blk_in_4.range {
                 println!("revoke {br:?}");
-                picker.blocks_received(br);
+                picker.blocks_received(&peers[6].0, br);
             }
             for br in &first_pick_4.range {
                 println!("revoke {br:?}");
-                picker.blocks_received(br);
+                picker.blocks_received(&peers[6].0, br);
             }
 
             // receive the last block of piece 4
-            picker.blocks_received(&BlockRange {
-                from: protocol::Request {
-                    index: 4,
-                    begin: 13 * BLOCK_SIZE,
-                    len: BLOCK_SIZE,
+            picker.blocks_received(
+                &peers[6].0,
+                &BlockRange {
+                    from: protocol::Request {
+                        index: 4,
+                        begin: 13 * BLOCK_SIZE,
+                        len: BLOCK_SIZE,
+                    },
+                    to: protocol::Request {
+                        index: 4,
+                        begin: 13 * BLOCK_SIZE,
+                        len: BLOCK_SIZE,
+                    },
                 },
-                to: protocol::Request {
-                    index: 4,
-                    begin: 13 * BLOCK_SIZE,
-                    len: BLOCK_SIZE,
-                },
-            });
+            );
 
             println!("partial {:?}", picker.partly_requested_pieces.0);
             println!("fully {:?}", picker.fully_requested_pieces);

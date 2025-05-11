@@ -161,6 +161,7 @@ async fn run_recv_stream<T>(
     let addr = conn.read_stream.peer_addr();
     loop {
         tokio::select! {
+            biased;
             _ = &mut cancel => {
                 info!("recv stream cancelled");
                 break;
@@ -169,23 +170,26 @@ async fn run_recv_stream<T>(
                 // TODO: use buffer and tokio::Notify
                 // info!("connection manager recv stream of {} received msg {msg:?}", &manager.conn);
             }
+            _ = ticker.tick() => {
+                // TODO: many ticks may come together, unfair
+                info!("recv conn ticker tick {} block received in this epoch", conn.blk_recv_count);
+                conn.transmit_handle.sender.send(TransmitMsg::BlockReceived(conn.read_stream.peer_addr(), conn.blk_recv_count));
+                conn.blk_recv_count = 0;
+            }
             r = conn.read_stream.recv_msg_header() => {
                 // r = receive_peer_msg(&mut conn.read_stream, &mut conn.transmit_handle) => {
                 match r {
                     Ok(hdr) => {
                         // (handle_peer_hdr(&mut conn, addr, hdr));
+                        warn!("read msg begin");
                         let n_blk = handle_peer_msg(&mut conn.transmit_handle, addr, hdr).await;
                         conn.blk_recv_count += n_blk;
+                        warn!("read msg end");
                     }
                     Err(e) => {
                         warn!("recv stream read header error {e}");
                     }
                 }
-            }
-            _ = ticker.tick() => {
-                info!("recv conn ticker tick {} block received in this epoch", conn.blk_recv_count);
-                conn.transmit_handle.sender.send(TransmitMsg::BlockReceived(conn.read_stream.peer_addr(), conn.blk_recv_count));
-                conn.blk_recv_count = 0;
             }
         };
     }
@@ -277,7 +281,7 @@ where
             0
         }
         Message::Piece(piece) => {
-            handle_piece_msg(tmh, piece).await;
+            handle_piece_msg(&addr, tmh, piece).await;
             1
         }
         Message::Cancel(request) => {
@@ -300,10 +304,9 @@ async fn run_send_stream<T>(
 
     loop {
         tokio::select! {
-            Some(msg) = conn.receiver.recv() => {
-                // TODO: maybe use buffer and Notify?
-                info!("send stream received {msg:?}");
-                conn.handle_cmd(msg).await;
+            _ = &mut cancel => {
+                info!("send stream cancelled");
+                break;
             }
             _ = interval.tick() => {
                 if let Err(e) = conn.write_stream.send_keepalive().await {
@@ -312,9 +315,10 @@ async fn run_send_stream<T>(
                     break;
                 }
             }
-            _ = &mut cancel => {
-                info!("send stream cancelled");
-                break;
+            Some(msg) = conn.receiver.recv() => {
+                // TODO: maybe use buffer and Notify?
+                info!("send stream received {msg:?}");
+                conn.handle_cmd(msg).await;
             }
         };
     }
@@ -384,8 +388,11 @@ where
 */
 
 // TODO: use &mut piece?
-async fn handle_piece_msg<T>(tmh: &mut TransmitManagerHandle, mut piece: protocol::Piece<'_, T>)
-where
+async fn handle_piece_msg<T>(
+    peer: &SocketAddr,
+    tmh: &mut TransmitManagerHandle,
+    mut piece: protocol::Piece<'_, T>,
+) where
     T: AsyncRead + Unpin,
 {
     // TODO:
@@ -457,6 +464,7 @@ where
 
     // TODO: need a biglock. What if some peer else is doing operation now?
     // i.e. operation between two locks?
+    warn!("prepare done");
     let block_buf = if let Some(mut bbuf) = block_ref {
         piece.read(bbuf.to_slice_len(piece.len as usize)).await;
         bbuf
@@ -474,15 +482,14 @@ where
         return;
     };
 
-    let received_piece = tmh
-        .picker
-        .lock()
-        .unwrap()
-        .block_received(protocol::Request {
+    let received_piece = tmh.picker.lock().unwrap().block_received(
+        peer,
+        protocol::Request {
             index: piece.index,
             begin: piece.begin,
             len: piece.len,
-        });
+        },
+    );
     if let Some(i) = received_piece {
         info!("piece {i} received");
         // TODO: maybe returns and let upper fn sends this message

@@ -168,22 +168,55 @@ impl TransmitManager {
 
     // fn pick_blocks_for_peer(&mut self, addr: &SocketAddr, n_blocks: usize) {
     // Fn: n_blk_received, n_blk_in_flight -> n_this_time_pick
-    fn pick_blocks_for_peer<F>(&mut self, addr: &SocketAddr, received: u32, pick_fn: F)
+    fn pick_blocks_for_peer<F>(&mut self, addr: &SocketAddr, n_received: u32, pick_fn: F)
     where
         F: FnOnce(u32, u32) -> u32,
     {
+        // n_block_in_flight = estimated_bandwidth * response_time
+        // response_time = RTT + process_time
+        // estimated_bandwidth = ALPHA * n_received_per_second
         let now = std::time::Instant::now();
         if let Some(h) = self.connected_peers.get_mut(addr) {
             if h.state.peer_choke_status == ChokeStatus::Unchoked {
                 let mut picker = self.piece_picker.lock().unwrap(); // TODO: fix unwrap
                 let n_timeout = picker.get_and_reset_n_timeout(addr) as u32;
-                dbg!(h.n_block_in_flight, n_timeout);
-                if h.n_block_in_flight < n_timeout {
-                    h.n_block_in_flight = 0;
-                } else {
-                    h.n_block_in_flight -= n_timeout;
+
+                let mut n_blk = 1;
+                if n_received > 0 {
+                    // bandwidth = 16k * estm_bandwidth / period_duration
+                    let period_duration = time::Duration::from_secs(1);
+                    let curr_bw = n_received as f32;
+                    let mut bw = picker.get_bw_status(addr);
+                    bw.estm_bandwidth = if bw.estm_bandwidth <= curr_bw * 1.1 + 0.3 {
+                        curr_bw * 1.3 + 0.3 // TODO: now only count this time, maybe use a weighted avg
+                    } else {
+                        bw.estm_bandwidth * 0.6
+                    };
+                    let optimal_n_in_flight = if bw.response_time > period_duration {
+                        let mut rt = time::Duration::from_secs(1);
+                        if rt > bw.response_time {
+                            rt = bw.response_time;
+                        }
+                        (rt.div_duration_f32(period_duration) * bw.estm_bandwidth).ceil() as u32
+                    } else {
+                        bw.estm_bandwidth.ceil() as u32
+                    };
+                    picker.update_bw_status(*addr, bw);
+                    dbg!(n_received, bw, optimal_n_in_flight);
+
+                    dbg!(h.n_block_in_flight, n_timeout);
+                    if h.n_block_in_flight < n_timeout {
+                        h.n_block_in_flight = 0;
+                    } else {
+                        h.n_block_in_flight -= n_timeout;
+                    }
+                    // let n_blk = pick_fn(n_received, h.n_block_in_flight);
+                    n_blk = if optimal_n_in_flight > h.n_block_in_flight {
+                        optimal_n_in_flight - h.n_block_in_flight
+                    } else {
+                        0
+                    };
                 }
-                let n_blk = pick_fn(received, h.n_block_in_flight);
                 warn!(
                     "peer {addr} picking {n_blk} block in next period, {} in flight",
                     h.n_block_in_flight
