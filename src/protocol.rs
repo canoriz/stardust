@@ -11,7 +11,7 @@ use tokio::io::{
 };
 use tokio::net;
 use tokio::net::tcp;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 pub trait Split {
     type R: AsyncRead + Send + Unpin + 'static;
@@ -756,6 +756,11 @@ async fn recv_msg_header<'a, T: AsyncRead + Unpin>(
     while state.filled < 4 {
         let n = handle.read(&mut state.field_len[state.filled..4]).await?;
         state.filled += n;
+        if n == 0 {
+            // Go has ZeroReadIsEof, in TCP, this should be true
+            // TODO: use custom error
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "!"));
+        }
     }
 
     let len = u32::from_be_bytes(state.field_len);
@@ -797,6 +802,11 @@ async fn recv_msg_header<'a, T: AsyncRead + Unpin>(
             while filled_len < 4 {
                 let n = handle.read(&mut state.field1[filled_len..4]).await?;
                 state.filled += n;
+                if n == 0 {
+                    // Go has ZeroReadIsEof, in TCP, this should be true
+                    // TODO: use custom error
+                    return Err(io::Error::new(io::ErrorKind::BrokenPipe, "!"));
+                }
                 filled_len += n;
             }
             state.filled = 0;
@@ -814,6 +824,11 @@ async fn recv_msg_header<'a, T: AsyncRead + Unpin>(
             while filled_len < 4 {
                 let n = handle.read(&mut state.field1[filled_len..4]).await?;
                 state.filled += n;
+                if n == 0 {
+                    // Go has ZeroReadIsEof, in TCP, this should be true
+                    // TODO: use custom error
+                    return Err(io::Error::new(io::ErrorKind::BrokenPipe, "!"));
+                }
                 filled_len += n;
             }
             let index = u32::from_be_bytes(state.field1);
@@ -823,6 +838,11 @@ async fn recv_msg_header<'a, T: AsyncRead + Unpin>(
             while filled_len < 4 {
                 let n = handle.read(&mut state.field2[filled_len..4]).await?;
                 state.filled += n;
+                if n == 0 {
+                    // Go has ZeroReadIsEof, in TCP, this should be true
+                    // TODO: use custom error
+                    return Err(io::Error::new(io::ErrorKind::BrokenPipe, "!"));
+                }
                 filled_len += n;
             }
             let begin = u32::from_be_bytes(state.field2);
@@ -832,6 +852,11 @@ async fn recv_msg_header<'a, T: AsyncRead + Unpin>(
             while filled_len < 4 {
                 let n = handle.read(&mut state.field3[filled_len..4]).await?;
                 state.filled += n;
+                if n == 0 {
+                    // Go has ZeroReadIsEof, in TCP, this should be true
+                    // TODO: use custom error
+                    return Err(io::Error::new(io::ErrorKind::BrokenPipe, "!"));
+                }
                 filled_len += n;
             }
             let len = u32::from_be_bytes(state.field3);
@@ -847,6 +872,11 @@ async fn recv_msg_header<'a, T: AsyncRead + Unpin>(
             while filled_len < 4 {
                 let n = handle.read(&mut state.field1[filled_len..4]).await?;
                 state.filled += n;
+                if n == 0 {
+                    // Go has ZeroReadIsEof, in TCP, this should be true
+                    // TODO: use custom error
+                    return Err(io::Error::new(io::ErrorKind::BrokenPipe, "!"));
+                }
                 filled_len += n;
             }
             let index = u32::from_be_bytes(state.field1);
@@ -856,6 +886,11 @@ async fn recv_msg_header<'a, T: AsyncRead + Unpin>(
             while filled_len < 4 {
                 let n = handle.read(&mut state.field2[filled_len..4]).await?;
                 state.filled += n;
+                if n == 0 {
+                    // Go has ZeroReadIsEof, in TCP, this should be true
+                    // TODO: use custom error
+                    return Err(io::Error::new(io::ErrorKind::BrokenPipe, "!"));
+                }
                 filled_len += n;
             }
             let begin = u32::from_be_bytes(state.field2);
@@ -875,6 +910,11 @@ async fn recv_msg_header<'a, T: AsyncRead + Unpin>(
             while filled_len < 4 {
                 let n = handle.read(&mut state.field1[filled_len..4]).await?;
                 state.filled += n;
+                if n == 0 {
+                    // Go has ZeroReadIsEof, in TCP, this should be true
+                    // TODO: use custom error
+                    return Err(io::Error::new(io::ErrorKind::BrokenPipe, "!"));
+                }
                 filled_len += n;
             }
             let index = u32::from_be_bytes(state.field1);
@@ -884,6 +924,11 @@ async fn recv_msg_header<'a, T: AsyncRead + Unpin>(
             while filled_len < 4 {
                 let n = handle.read(&mut state.field2[filled_len..4]).await?;
                 state.filled += n;
+                if n == 0 {
+                    // Go has ZeroReadIsEof, in TCP, this should be true
+                    // TODO: use custom error
+                    return Err(io::Error::new(io::ErrorKind::BrokenPipe, "!"));
+                }
                 filled_len += n;
             }
             let begin = u32::from_be_bytes(state.field2);
@@ -893,6 +938,11 @@ async fn recv_msg_header<'a, T: AsyncRead + Unpin>(
             while filled_len < 4 {
                 let n = handle.read(&mut state.field3[filled_len..4]).await?;
                 state.filled += n;
+                if n == 0 {
+                    // Go has ZeroReadIsEof, in TCP, this should be true
+                    // TODO: use custom error
+                    return Err(io::Error::new(io::ErrorKind::BrokenPipe, "!"));
+                }
                 filled_len += n;
             }
             let len = u32::from_be_bytes(state.field3);

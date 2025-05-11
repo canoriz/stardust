@@ -265,7 +265,7 @@ impl TransmitManager {
             }
             Msg::NewPeer(bt_conn) => {
                 info!("new outward connection {:?}", bt_conn);
-                if self.connected_peers.get(&bt_conn.local_addr()).is_none() {
+                if !self.connected_peers.contains_key(&bt_conn.peer_addr()) {
                     let peer_addr = bt_conn.peer_addr();
                     let cm = ConnectionManagerHandle::new(
                         bt_conn,
