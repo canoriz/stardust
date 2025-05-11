@@ -1,4 +1,5 @@
 use crate::metadata::{self, AnnounceResult, AnnounceType, Metadata, TrackerGet};
+use crate::transmit_manager;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,7 +21,7 @@ pub struct AnnounceManagerHandle {
 }
 
 impl AnnounceManagerHandle {
-    pub fn new(m: Arc<Metadata>) -> Self {
+    pub fn new(m: Arc<Metadata>, tx: mpsc::UnboundedSender<transmit_manager::Msg>) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
 
         let (cancel_tx, cancel_rx) = oneshot::channel();
@@ -33,9 +34,11 @@ impl AnnounceManagerHandle {
             ],
             receiver: cmd_rx,
 
+            transmit_mgr: tx,
             announce_timer: task::JoinSet::new(),
             url_list: HashMap::new(),
         };
+        // tokio::spawn(run_announce_manager::<metadata::Announcer>(
         tokio::spawn(run_announce_manager::<FakeAnnouncer>(
             manager, m, cancel_rx, done_tx,
         ));
@@ -59,7 +62,7 @@ impl AnnounceManagerHandle {
 struct AnnounceManager {
     announce_list: Vec<Vec<String>>,
     receiver: mpsc::UnboundedReceiver<Msg>,
-
+    transmit_mgr: mpsc::UnboundedSender<transmit_manager::Msg>,
     announce_timer: tokio::task::JoinSet<TimeUp>,
     url_list: HashMap<(AnnounceType, Arc<String>), tokio::task::AbortHandle>,
 }
@@ -206,6 +209,11 @@ async fn run_announce_manager<A>(
                         }
                     }
                 );
+
+                let send_res = manager.transmit_mgr.send(transmit_manager::Msg::AnnounceFinish(resp));
+                if send_res.is_err() {
+                    info!("send announce res to main error {send_res:?}");
+                }
             }
         };
     }
@@ -242,8 +250,8 @@ impl metadata::Announce for FakeAnnouncer {
             interval: 1800,
             peers: vec![metadata::Peer {
                 peer_id: "1384".into(),
-                ip: "192.168.71.36".into(),
-                port: 55236,
+                ip: "127.0.0.1".into(),
+                port: 35515,
             }],
         })
     }
@@ -267,7 +275,7 @@ async fn announce_task<A>(
     A: metadata::Announce,
 {
     let tg = TrackerGet {
-        peer_id: "1234".into(),
+        peer_id: "-ZS0405-qwerasdfzxcv",
         port: 4567,
         uploaded: 0,
         downloaded: 0,
@@ -278,8 +286,8 @@ async fn announce_task<A>(
         tokio::select! {
             r = rx.recv() => {
                 if let Some(req) = r{
-                    // A::announce_tier(net_type, req, torrent, url)
                     let resp = A::announce_tier(AnnounceType::V4, &tg, m.as_ref(), req.url.as_ref().clone()).await;
+                    info!("announce {} response result {resp:?}", &req.url);
                     output.send((resp, req));
                 } else {
                     info!("announce rx recv None");

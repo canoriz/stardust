@@ -351,6 +351,8 @@ pub struct HeapPiecePicker {
     // ??fully is special since we have a received but not checked state
     fully_received_pieces: HashSet<u32>,
 
+    want_pieces: HashSet<u32>,
+
     n_timeout: HashMap<SocketAddr, usize>,
     bandwidth_status: HashMap<SocketAddr, Bandwidth>,
 
@@ -384,6 +386,10 @@ impl HeapPiecePicker {
                 (total_length - full_piece_total_size) as u32,
             )
         };
+        let mut want_pieces = HashSet::new();
+        for i in 0..piece_total {
+            want_pieces.insert(i as u32);
+        }
 
         Self {
             heap: Heap::new(piece_total as usize),
@@ -395,6 +401,7 @@ impl HeapPiecePicker {
             partly_requested_pieces: PartialRequestedPieces(BTreeMap::new()),
             fully_requested_pieces: HashMap::new(),
             fully_received_pieces: HashSet::new(),
+            want_pieces,
 
             n_timeout: HashMap::new(),
             bandwidth_status: HashMap::new(),
@@ -506,6 +513,7 @@ fn pick_blocks_from_heap(
     partials: &mut PartialRequestedPieces,
     fullys: &mut HashMap<u32, PartialRequestedPiece>,
     fully_received: &HashSet<u32>,
+    want_pieces: &HashSet<u32>, // TODO: to many arguments, use a sturct to maintain piece maps
     now: time::Instant,
 ) -> usize {
     while n_blocks > 0 {
@@ -516,6 +524,7 @@ fn pick_blocks_from_heap(
                     && !partials.0.contains_key(&(i as u32))
                     && !fullys.contains_key(&(i as u32))
                     && !fully_received.contains(&(i as u32))
+                    && want_pieces.contains(&(i as u32))
             },
             None,
             None,
@@ -811,6 +820,7 @@ impl HeapPiecePicker {
                 &mut self.partly_requested_pieces,
                 &mut self.fully_requested_pieces,
                 &self.fully_received_pieces,
+                &self.want_pieces,
                 now,
             );
 
@@ -876,7 +886,7 @@ impl HeapPiecePicker {
         } else {
             // if this peer is not stored, assume it is a new peer
             // TODO: maybe need a method for creating bitfield with given length?
-            let mut b = BitField::new(vec![0u8; (self.piece_total >> 3) as usize]);
+            let mut b = BitField::from(vec![false; self.piece_total as usize]);
             b.set(piece);
             self.peer_add(*peer, b);
             warn!("set have for a un-stored peer, socket addr: {peer}");

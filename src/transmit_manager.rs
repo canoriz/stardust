@@ -37,6 +37,7 @@ pub(crate) enum Msg {
     PeerInterested,
     PeerUninterested,
     PeerBitField(SocketAddr, BitField),
+    PeerHave(SocketAddr, u32),
 
     PieceReceived(u32),
 
@@ -238,6 +239,26 @@ impl TransmitManager {
                 //         .collect(),
                 // );
                 // TODO
+                info!("announce finish");
+                for p in a.peers {
+                    let sock = format!("{}:{}", p.ip, p.port);
+                    let sockv6 = format!("[{}]:{}", p.ip, p.port);
+                    if let Ok(s) = sock.parse() {
+                        let h_clone = self.self_handle.clone();
+                        let m_clone = self.metadata.clone();
+                        // TODO: only try connect not-connected peer
+                        // TODO: store peers in a map, if cannot connect this time
+                        // try re-connect later
+                        tokio::spawn(connect_peer(h_clone, s, m_clone));
+                    } else if let Ok(s) = sockv6.parse() {
+                        let h_clone = self.self_handle.clone();
+                        let m_clone = self.metadata.clone();
+                        // TODO: only try connect not-connected peer
+                        // TODO: store peers in a map, if cannot connect this time
+                        // try re-connect later
+                        tokio::spawn(connect_peer(h_clone, s, m_clone));
+                    }
+                }
             }
             Msg::AnnounceFinish(Err(e)) => {
                 info!("announce error {}", e);
@@ -269,6 +290,10 @@ impl TransmitManager {
             Msg::PeerBitField(addr, bitfield) => {
                 info!("new BitField msg from peer {addr}");
                 self.piece_picker.lock().unwrap().peer_add(addr, bitfield);
+            }
+            Msg::PeerHave(peer, i) => {
+                info!("peer {peer} have piece {i}");
+                self.piece_picker.lock().unwrap().peer_have(&peer, i);
             }
             Msg::PeerChoke(peer) => {
                 warn!("{peer} choked us");
@@ -444,16 +469,32 @@ pub(crate) async fn run_transmit_manager(
     println!("transmit manager done");
 }
 
-async fn connect_peer(main_tx: TransmitManagerHandle, addr: SocketAddr) {
-    let conn = protocol::BTStream::connect_tcp(addr).await;
+async fn connect_peer(
+    main_tx: TransmitManagerHandle,
+    addr: SocketAddr,
+    m: Arc<Metadata>,
+) -> Result<(), std::io::Error> {
+    let mut conn = protocol::BTStream::connect_tcp(addr).await;
     match conn {
-        Ok(c) => {
+        Ok(mut c) => {
+            c.send_handshake(&protocol::Handshake {
+                reserved: [0u8; 8],
+                client_id: [
+                    0x54, 0x42, 0x54, 0x69, 0x21, 0x58, 0x21, 0x58, 0x68, 0x69, 0x93, 0x51, 0x54,
+                    0x42, 0x54, 0x69, 0x21, 0x58, 0x21, 0x58,
+                ],
+                torrent_hash: m.info_hash,
+            })
+            .await?;
+            c.recv_handshake().await?;
             if let Err(e) = main_tx.sender.send(Msg::NewPeer(c)) {
                 info!("send new peer to main {e}");
             }
+            Ok(())
         }
         Err(e) => {
             info!("tcp handshake {addr} error {e}");
+            Err(e)
         }
     }
 }

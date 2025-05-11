@@ -41,8 +41,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //     ip: None,
     // };
 
-    // let torrent_f = include_bytes!("../ubuntu-24.10-desktop-amd64.iso.torrent");
-    let torrent_f = include_bytes!("../c8.torrent");
+    let torrent_f = include_bytes!("../ubuntu-24.10-desktop-amd64.iso.torrent");
+    // let torrent_f = include_bytes!("../c8.torrent");
     let torrent = metadata::FileMetadata::load(torrent_f).unwrap();
 
     let (metadata, announce_list) = torrent.to_metadata();
@@ -123,8 +123,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let info_hash = metadata.info_hash;
     // let mut tm = TransmitManager::new(metadata).with_announce_list(announce_list);
     let mut tm = TorrentManagerHandle::new(Arc::new(metadata));
-    // tm.send_announce_msg(announce_manager::Msg::AddUrl(announce_list[0].clone()));
-    // tm.send_announce_msg(announce_manager::Msg::AddUrl(announce_list[1].clone()));
+    info!("{announce_list:?}");
+    for addr in announce_list {
+        tm.send_announce_msg(announce_manager::Msg::AddUrl(addr));
+    }
     wait_ready.notified().await;
     // wait_ready2.notified().await;
 
@@ -135,20 +137,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         hasher.update(&[0u8; 100000]);
     }
 
-    if let Ok(mut conn) =
-        protocol::BTStream::connect_tcp("192.168.71.36:62227".parse().unwrap()).await
-    // protocol::BTStream::connect_tcp("127.0.0.1:35515".parse().unwrap()).await
-    {
-        info!("{info_hash:?}");
-        conn.send_handshake(&Handshake {
-            reserved: [0u8; 8],
-            client_id: HANDSHAKE.client_id,
-            torrent_hash: info_hash,
-        })
-        .await?;
-        conn.recv_handshake().await?;
-        tm.send_msg(transmit_manager::Msg::NewPeer(conn));
-    }
+    // if let Ok(mut conn) =
+    //     protocol::BTStream::connect_tcp("192.168.71.36:62227".parse().unwrap()).await
+    // // protocol::BTStream::connect_tcp("127.0.0.1:35515".parse().unwrap()).await
+    // {
+    //     info!("{info_hash:?}");
+    //     conn.send_handshake(&Handshake {
+    //         reserved: [0u8; 8],
+    //         client_id: HANDSHAKE.client_id,
+    //         torrent_hash: info_hash,
+    //     })
+    //     .await?;
+    //     conn.recv_handshake().await?;
+    //     tm.send_msg(transmit_manager::Msg::NewPeer(conn));
+    // }
     // if let Ok(mut conn) =
     //     // protocol::BTStream::connect_tcp("192.168.71.36:62227".parse().unwrap()).await
     //     protocol::BTStream::connect_tcp("127.0.0.1:35516".parse().unwrap()).await

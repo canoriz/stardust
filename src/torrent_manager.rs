@@ -35,7 +35,7 @@ impl TorrentManagerHandle {
         let (done_transmit, done_transmit_rx) = oneshot::channel::<()>();
         tokio::spawn(run_transmit_manager(tm, cancel_transmit_rx, done_transmit));
 
-        let am = AnnounceManagerHandle::new(m);
+        let am = AnnounceManagerHandle::new(m, tx.clone());
         // let mut am = AnnounceManager::new()
         // tokio::spwan(run_announce_manager());
         Self {

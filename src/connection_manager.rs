@@ -260,9 +260,8 @@ where
             tmh.sender.send(TransmitMsg::PeerUninterested);
             0
         }
-        Message::Have(_) => {
-            // TODO: tell transmit manager
-            todo!();
+        Message::Have(i) => {
+            tmh.sender.send(TransmitMsg::PeerHave(addr, i));
             0
         }
         Message::BitField(mut bf_recv) => {

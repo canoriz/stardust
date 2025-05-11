@@ -174,7 +174,7 @@ pub fn write_worker(r: mpsc::Receiver<WriteJob>) {
             Ok(job) => {
                 // TODO: dead lock?
                 let mut bf = job.f.lock().unwrap();
-                // let r = bf.write(job.offset, job.buf);
+                let r = bf.write(job.offset, job.buf);
                 warn!(
                     "write offset {} len {} result {r:?}",
                     job.offset,

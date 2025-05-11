@@ -139,12 +139,12 @@ where
         let (read_end, write_end) = self.inner.split();
         (
             ReadStream {
-                inner: BufReader::new(read_end),
+                inner: BufReader::with_capacity(32768, read_end),
                 peer_addr,
                 partial_header: self.partial_header,
             },
             WriteStream {
-                inner: BufWriter::new(write_end),
+                inner: BufWriter::with_capacity(32768, write_end),
                 peer_addr,
             },
         )
