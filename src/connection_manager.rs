@@ -181,10 +181,8 @@ async fn run_recv_stream<T>(
                 match r {
                     Ok(hdr) => {
                         // (handle_peer_hdr(&mut conn, addr, hdr));
-                        warn!("read msg begin");
                         let n_blk = handle_peer_msg(&mut conn.transmit_handle, addr, hdr).await;
                         conn.blk_recv_count += n_blk;
-                        warn!("read msg end");
                     }
                     Err(e) => {
                         warn!("recv stream read header error {e}");

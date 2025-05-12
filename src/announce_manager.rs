@@ -221,20 +221,6 @@ async fn run_announce_manager<A>(
     let _ = done.send(());
 }
 
-// async fn connect_peer(main_tx: TransmitManagerHandle, addr: SocketAddr) {
-//     let conn = protocol::BTStream::connect_tcp(addr).await;
-//     match conn {
-//         Ok(c) => {
-//             if let Err(e) = main_tx.0.send(Msg::NewPeer(c)) {
-//                 info!("send new peer to main {e}");
-//             }
-//         }
-//         Err(e) => {
-//             info!("tcp handshake {addr} error {e}");
-//         }
-//     }
-// }
-
 struct FakeAnnouncer {}
 impl metadata::Announce for FakeAnnouncer {
     async fn announce_tier(
@@ -248,11 +234,18 @@ impl metadata::Announce for FakeAnnouncer {
         // ));
         Ok(metadata::AnnounceResp {
             interval: 1800,
-            peers: vec![metadata::Peer {
-                peer_id: "1384".into(),
-                ip: "127.0.0.1".into(),
-                port: 35515,
-            }],
+            peers: vec![
+                metadata::Peer {
+                    peer_id: "1384".into(),
+                    ip: "127.0.0.1".into(),
+                    port: 35515,
+                },
+                metadata::Peer {
+                    peer_id: "1384".into(),
+                    ip: "127.0.0.1".into(),
+                    port: 35516,
+                },
+            ],
         })
     }
 }

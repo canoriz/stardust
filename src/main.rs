@@ -86,39 +86,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             set.join_all().await;
         });
     }
-    // let ready2 = Arc::new(tokio::sync::Notify::new());
-    // let wait_ready2 = ready2.clone();
-    // {
-    //     let metadata_clone = metadata.clone();
-    //     let listener = net::TcpListener::bind("::0:35516").await?;
-    //     let server = tokio::spawn(async move {
-    //         let mut set = tokio::task::JoinSet::new();
-    //         ready2.notify_one();
-    //         loop {
-    //             let (bt_stream, addr) = match listener.accept().await {
-    //                 Ok((stream, addr)) => {
-    //                     info!("input from addr {}", addr);
-    //                     (protocol::BTStream::from(stream), addr)
-    //                 }
-    //                 Err(e) => {
-    //                     info!("accept error {}", e);
-    //                     continue;
-    //                 }
-    //             };
-    //             let total = metadata_clone.info.pieces.len() / 20;
-    //             let handle = set.spawn(handle_income_connection(
-    //                 bt_stream,
-    //                 addr,
-    //                 metadata_clone.clone(),
-    //                 vec![vec![true; total / 2], vec![false; total - total / 2]]
-    //                     .into_iter()
-    //                     .flatten()
-    //                     .collect(),
-    //             ));
-    //         }
-    //         set.join_all().await;
-    //     });
-    // }
+    let ready2 = Arc::new(tokio::sync::Notify::new());
+    let wait_ready2 = ready2.clone();
+    {
+        let metadata_clone = metadata.clone();
+        let listener = net::TcpListener::bind("::0:35516").await?;
+        let server = tokio::spawn(async move {
+            let mut set = tokio::task::JoinSet::new();
+            ready2.notify_one();
+            loop {
+                let (bt_stream, addr) = match listener.accept().await {
+                    Ok((stream, addr)) => {
+                        info!("input from addr {}", addr);
+                        (protocol::BTStream::from(stream), addr)
+                    }
+                    Err(e) => {
+                        info!("accept error {}", e);
+                        continue;
+                    }
+                };
+                let total = metadata_clone.info.pieces.len() / 20;
+                let handle = set.spawn(handle_income_connection(
+                    bt_stream,
+                    addr,
+                    metadata_clone.clone(),
+                    vec![vec![true; total / 2], vec![false; total - total / 2]]
+                        .into_iter()
+                        .flatten()
+                        .collect(),
+                ));
+            }
+            set.join_all().await;
+        });
+    }
 
     let info_hash = metadata.info_hash;
     // let mut tm = TransmitManager::new(metadata).with_announce_list(announce_list);
@@ -128,7 +128,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tm.send_announce_msg(announce_manager::Msg::AddUrl(addr));
     }
     wait_ready.notified().await;
-    // wait_ready2.notified().await;
+    wait_ready2.notified().await;
 
     {
         use sha1::{Digest, Sha1};
