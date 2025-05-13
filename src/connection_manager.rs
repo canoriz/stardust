@@ -461,7 +461,6 @@ async fn handle_piece_msg<T>(
 
     // TODO: need a biglock. What if some peer else is doing operation now?
     // i.e. operation between two locks?
-    warn!("prepare done");
     let block_buf = if let Some(mut bbuf) = block_ref {
         piece.read(bbuf.to_slice_len(piece.len as usize)).await;
         bbuf

@@ -252,6 +252,7 @@ where
     }
 }
 
+// TODO: write returns 0 means EOF, should return error
 impl<T> WriteStream<T>
 where
     T: AsyncWrite + Unpin,
@@ -759,6 +760,7 @@ async fn recv_msg_header<'a, T: AsyncRead + Unpin>(
         if n == 0 {
             // Go has ZeroReadIsEof, in TCP, this should be true
             // TODO: use custom error
+            warn!("closed conn");
             return Err(io::Error::new(io::ErrorKind::BrokenPipe, "!"));
         }
     }
@@ -827,6 +829,7 @@ async fn recv_msg_header<'a, T: AsyncRead + Unpin>(
                 if n == 0 {
                     // Go has ZeroReadIsEof, in TCP, this should be true
                     // TODO: use custom error
+                    warn!("closed conn");
                     return Err(io::Error::new(io::ErrorKind::BrokenPipe, "!"));
                 }
                 filled_len += n;
@@ -841,6 +844,7 @@ async fn recv_msg_header<'a, T: AsyncRead + Unpin>(
                 if n == 0 {
                     // Go has ZeroReadIsEof, in TCP, this should be true
                     // TODO: use custom error
+                    warn!("closed conn");
                     return Err(io::Error::new(io::ErrorKind::BrokenPipe, "!"));
                 }
                 filled_len += n;
@@ -855,6 +859,7 @@ async fn recv_msg_header<'a, T: AsyncRead + Unpin>(
                 if n == 0 {
                     // Go has ZeroReadIsEof, in TCP, this should be true
                     // TODO: use custom error
+                    warn!("closed conn");
                     return Err(io::Error::new(io::ErrorKind::BrokenPipe, "!"));
                 }
                 filled_len += n;
@@ -875,6 +880,7 @@ async fn recv_msg_header<'a, T: AsyncRead + Unpin>(
                 if n == 0 {
                     // Go has ZeroReadIsEof, in TCP, this should be true
                     // TODO: use custom error
+                    warn!("closed conn");
                     return Err(io::Error::new(io::ErrorKind::BrokenPipe, "!"));
                 }
                 filled_len += n;
@@ -889,6 +895,7 @@ async fn recv_msg_header<'a, T: AsyncRead + Unpin>(
                 if n == 0 {
                     // Go has ZeroReadIsEof, in TCP, this should be true
                     // TODO: use custom error
+                    warn!("closed conn");
                     return Err(io::Error::new(io::ErrorKind::BrokenPipe, "!"));
                 }
                 filled_len += n;
@@ -913,6 +920,7 @@ async fn recv_msg_header<'a, T: AsyncRead + Unpin>(
                 if n == 0 {
                     // Go has ZeroReadIsEof, in TCP, this should be true
                     // TODO: use custom error
+                    warn!("closed conn");
                     return Err(io::Error::new(io::ErrorKind::BrokenPipe, "!"));
                 }
                 filled_len += n;
@@ -927,6 +935,7 @@ async fn recv_msg_header<'a, T: AsyncRead + Unpin>(
                 if n == 0 {
                     // Go has ZeroReadIsEof, in TCP, this should be true
                     // TODO: use custom error
+                    warn!("closed conn");
                     return Err(io::Error::new(io::ErrorKind::BrokenPipe, "!"));
                 }
                 filled_len += n;
@@ -941,6 +950,7 @@ async fn recv_msg_header<'a, T: AsyncRead + Unpin>(
                 if n == 0 {
                     // Go has ZeroReadIsEof, in TCP, this should be true
                     // TODO: use custom error
+                    warn!("closed conn");
                     return Err(io::Error::new(io::ErrorKind::BrokenPipe, "!"));
                 }
                 filled_len += n;

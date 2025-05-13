@@ -180,7 +180,13 @@ impl TransmitManager {
         if let Some(h) = self.connected_peers.get_mut(addr) {
             if h.state.peer_choke_status == ChokeStatus::Unchoked {
                 let mut picker = self.piece_picker.lock().unwrap(); // TODO: fix unwrap
+
                 let n_timeout = picker.get_and_reset_n_timeout(addr) as u32;
+                if h.n_block_in_flight < n_timeout {
+                    h.n_block_in_flight = 0;
+                } else {
+                    h.n_block_in_flight -= n_timeout;
+                }
 
                 let mut n_blk = 1;
                 if n_received > 0 {
@@ -206,11 +212,6 @@ impl TransmitManager {
                     dbg!(n_received, bw, optimal_n_in_flight);
 
                     dbg!(h.n_block_in_flight, n_timeout);
-                    if h.n_block_in_flight < n_timeout {
-                        h.n_block_in_flight = 0;
-                    } else {
-                        h.n_block_in_flight -= n_timeout;
-                    }
                     // let n_blk = pick_fn(n_received, h.n_block_in_flight);
                     n_blk = if optimal_n_in_flight > h.n_block_in_flight {
                         optimal_n_in_flight - h.n_block_in_flight

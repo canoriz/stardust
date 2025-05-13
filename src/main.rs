@@ -214,22 +214,27 @@ where
     loop {
         tokio::select! {
             msg = bt_stream.recv_msg_header() => {
-                let m = msg?;
-                match m {
-                    Message::Request(r) => {
-                        if !choked && accum < limit {
-                            accum += 1;
-                            info!("response");
-                            let a = [0u8; 16384];
-                            bt_stream
-                                .send_piece(r.index, r.begin, &a)
-                                .await;
-                        } else {
-                            info!("not response");
+                match msg {
+                    Ok(m) => match m {
+                        Message::Request(r) => {
+                            if !choked && accum < limit {
+                                accum += 1;
+                                info!("response");
+                                let a = [0u8; 16384];
+                                bt_stream
+                                    .send_piece(r.index, r.begin, &a)
+                                    .await;
+                            } else {
+                                info!("not response");
+                            }
+                        }
+                        _ => {
+                            info!("received msg {:?} from {}", m, addr);
                         }
                     }
-                    _ => {
-                        info!("received msg {:?} from {}", m, addr);
+                    Err(e) => {
+                        warn!("main mock close conn {} {e}", addr);
+                        return Err(e.into());
                     }
                 }
             }
