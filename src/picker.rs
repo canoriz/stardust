@@ -329,6 +329,14 @@ impl PartialRequestedPieces {
     }
 }
 
+#[derive(Debug, Clone)]
+struct PeerStatus {
+    bitfield: BitField,
+    n_timeout: usize,
+    bandwidth: Bandwidth,
+    // TODO: n active requests
+}
+
 // TODO: change this to PiecePicker<Heap>
 // make piece picker a generic
 // i.e. this is actually a block picker
@@ -338,7 +346,7 @@ pub struct HeapPiecePicker {
     piece_total: u32,
     last_piece_size: u32,
 
-    peer_field_map: HashMap<SocketAddr, BitField>,
+    peer_status: HashMap<SocketAddr, PeerStatus>,
 
     // index -> Piece
     partly_requested_pieces: PartialRequestedPieces,
@@ -352,9 +360,6 @@ pub struct HeapPiecePicker {
     fully_received_pieces: HashSet<u32>,
 
     want_pieces: HashSet<u32>,
-
-    n_timeout: HashMap<SocketAddr, usize>,
-    bandwidth_status: HashMap<SocketAddr, Bandwidth>,
 
     last_check_timeout: time::Instant,
 }
@@ -395,16 +400,13 @@ impl HeapPiecePicker {
             heap: Heap::new(piece_total as usize),
             piece_size,
             piece_total: piece_total as u32,
-            peer_field_map: HashMap::new(),
+            peer_status: HashMap::new(),
             last_piece_size,
 
             partly_requested_pieces: PartialRequestedPieces(BTreeMap::new()),
             fully_requested_pieces: HashMap::new(),
             fully_received_pieces: HashSet::new(),
             want_pieces,
-
-            n_timeout: HashMap::new(),
-            bandwidth_status: HashMap::new(),
 
             last_check_timeout: time::Instant::now(),
         }
@@ -608,7 +610,7 @@ fn pick_blocks_from_heap(
 
 impl HeapPiecePicker {
     pub fn peer_add(&mut self, peer: SocketAddr, b: BitField) {
-        if self.peer_field_map.contains_key(&peer) {
+        if self.peer_status.contains_key(&peer) {
             // TODO: remove picker blocks first? And maintain picked blocks
             // new bitfield have?
             warn!("called peer_add of an existing peer {peer}");
@@ -622,7 +624,14 @@ impl HeapPiecePicker {
             .filter(|(_, v)| *v)
             .map(|(i, _)| i);
         self.heap.increment_bulk(field_map, 1);
-        self.peer_field_map.insert(peer, b);
+        self.peer_status.insert(
+            peer,
+            PeerStatus {
+                bitfield: b,
+                n_timeout: 0,
+                bandwidth: Bandwidth::default(),
+            },
+        );
     }
 
     pub fn peer_mark_not_requested(&mut self, peer: &SocketAddr) {
@@ -701,12 +710,15 @@ impl HeapPiecePicker {
                 }
             }
         }
-        self.n_timeout.remove(peer);
+        self.peer_status
+            .entry(*peer)
+            .and_modify(|s| s.n_timeout = 0);
     }
 
     pub fn peer_remove(&mut self, peer: &SocketAddr) {
-        if let Some(field_map) = self.peer_field_map.get(peer) {
-            let field_map = field_map
+        if let Some(status) = self.peer_status.get(peer) {
+            let field_map = status
+                .bitfield
                 .iter()
                 .take(self.piece_total as usize)
                 .enumerate()
@@ -714,10 +726,8 @@ impl HeapPiecePicker {
                 .map(|(i, _)| i);
             self.heap.decrement_bulk(field_map, 0);
         }
-        self.peer_field_map.remove(peer);
-
         self.peer_mark_not_requested(peer);
-        self.n_timeout.remove(peer);
+        self.peer_status.remove(peer);
     }
 
     // TODO: change this struct to reuse return request's Vec buffer?
@@ -744,12 +754,11 @@ impl HeapPiecePicker {
                                 begin: (i as u32) * BLOCK_SIZE,
                                 len: 1, // cannot use 0 here
                             };
-                            // TODO: optimize
-                            // though moved it here, but peer may still processing it
-                            self.n_timeout
-                                .entry(*p)
-                                .and_modify(|n| *n += 1)
-                                .or_insert(1);
+
+                            // ??? though moved it here, but peer may still processing it
+                            // TODO: will this peer always exist in peer_status?
+                            self.peer_status.entry(*p).and_modify(|s| s.n_timeout += 1);
+
                             revoke_pieces.push(BlockRange {
                                 from: blk_req.clone(),
                                 to: blk_req,
@@ -769,10 +778,10 @@ impl HeapPiecePicker {
                                 begin: (i as u32) * BLOCK_SIZE,
                                 len: 1, // cannot use 0 here
                             };
-                            self.n_timeout
-                                .entry(*p)
-                                .and_modify(|n| *n += 1)
-                                .or_insert(1);
+
+                            // TODO: will this peer always exist in peer_status?
+                            self.peer_status.entry(*p).and_modify(|s| s.n_timeout += 1);
+
                             revoke_pieces.push(BlockRange {
                                 from: blk_req.clone(),
                                 to: blk_req,
@@ -789,12 +798,12 @@ impl HeapPiecePicker {
             self.last_check_timeout = now;
         }
 
-        if let Some(peer_field) = self.peer_field_map.get(peer) {
+        if let Some(status) = self.peer_status.get(peer) {
             n_want_blocks = self
                 .partly_requested_pieces
                 .pick_blocks_from_partial_pieces(
                     peer,
-                    peer_field,
+                    &status.bitfield,
                     n_want_blocks,
                     self.piece_size,
                     self.piece_total - 1,
@@ -811,7 +820,7 @@ impl HeapPiecePicker {
             n_want_blocks = pick_blocks_from_heap(
                 &mut self.heap,
                 peer,
-                peer_field,
+                &status.bitfield,
                 n_want_blocks,
                 self.piece_size,
                 self.piece_total - 1,
@@ -880,8 +889,8 @@ impl HeapPiecePicker {
     }
 
     pub fn peer_have(&mut self, peer: &SocketAddr, piece: u32) {
-        if let Some(v) = self.peer_field_map.get_mut(peer) {
-            v.set(piece);
+        if let Some(s) = self.peer_status.get_mut(peer) {
+            s.bitfield.set(piece);
             self.heap.increment_or(piece as usize, 1);
         } else {
             // if this peer is not stored, assume it is a new peer
@@ -945,16 +954,12 @@ impl HeapPiecePicker {
                 }
                 BlockStatus::Requested(p, t) if p == *peer => {
                     let response_time = time::Instant::now().duration_since(t);
-                    self.bandwidth_status
-                        .entry(*peer)
-                        .and_modify(|b| {
-                            b.response_time =
-                                b.response_time.mul_f32(0.8) + response_time.mul_f32(0.2)
-                        })
-                        .or_insert(Bandwidth {
-                            response_time, // only keep last response time now
-                            ..Bandwidth::default()
-                        });
+
+                    // TODO: does p always exist in peer_status?
+                    self.peer_status.entry(*peer).and_modify(|s| {
+                        s.bandwidth.response_time =
+                            s.bandwidth.response_time.mul_f32(0.8) + response_time.mul_f32(0.2)
+                    });
                 }
                 _ => {}
             }
@@ -1104,10 +1109,10 @@ impl HeapPiecePicker {
     }
 
     pub fn get_and_reset_n_timeout(&mut self, peer: &SocketAddr) -> usize {
-        match self.n_timeout.get_mut(peer) {
-            Some(n) => {
-                let nn = *n;
-                *n = 0;
+        match self.peer_status.get_mut(peer) {
+            Some(s) => {
+                let nn = s.n_timeout;
+                s.n_timeout = 0;
                 nn
             }
             None => 0,
@@ -1115,15 +1120,17 @@ impl HeapPiecePicker {
     }
 
     pub fn get_bw_status(&self, peer: &SocketAddr) -> Bandwidth {
-        dbg!(&self.bandwidth_status);
-        self.bandwidth_status
+        dbg!(&self.peer_status);
+        self.peer_status
             .get(peer)
-            .copied()
+            .map(|s| s.bandwidth)
             .unwrap_or(Bandwidth::default())
     }
 
     pub fn update_bw_status(&mut self, peer: SocketAddr, bw: Bandwidth) {
-        self.bandwidth_status.insert(peer, bw);
+        self.peer_status
+            .entry(peer)
+            .and_modify(|s| s.bandwidth = bw);
     }
 }
 
