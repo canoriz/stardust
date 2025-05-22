@@ -1,12 +1,12 @@
 use crate::backfile;
 use crate::backfile::BackFile;
 use crate::backfile::WriteJob;
+use crate::cache::ArcCache;
 use crate::connection_manager::ConnectionManagerHandle;
 use crate::connection_manager::Msg as ConnMsg;
 use crate::metadata::{self, Metadata};
 use crate::picker::HeapPiecePicker;
 use crate::protocol::{self, BitField};
-use crate::storage::ArcCache;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;

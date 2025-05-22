@@ -10,11 +10,11 @@ use tracing::{info, warn};
 mod announce_manager;
 mod backfile;
 mod bandwidth;
+mod cache;
 mod connection_manager;
 mod metadata;
 mod picker;
 mod protocol;
-mod storage;
 mod torrent_manager;
 mod transmit_manager;
 

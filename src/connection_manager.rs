@@ -7,12 +7,12 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tracing::{info, warn};
 
 use crate::backfile::WriteJob;
+use crate::cache::ArcCache;
 use crate::metadata;
 use crate::picker::BlockRequests;
 use crate::protocol::{self, BTStream, Message, ReadStream, Split, WriteStream};
-use crate::storage::ArcCache;
 use crate::transmit_manager::Msg as TransmitMsg;
-use crate::transmit_manager::{TransmitManagerHandle};
+use crate::transmit_manager::TransmitManagerHandle;
 
 #[derive(Debug)]
 pub(crate) enum WakeUpOption {
