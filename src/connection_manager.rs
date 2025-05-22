@@ -423,7 +423,7 @@ async fn handle_piece_msg<T>(
         );
         return;
     }
-    warn!(
+    info!(
         "receive PIECE msg {} {} {} block index {}",
         piece.index,
         piece.begin,

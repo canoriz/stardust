@@ -9,6 +9,7 @@ use tracing::{info, warn, Level};
 
 mod announce_manager;
 mod backfile;
+mod bandwidth;
 mod connection_manager;
 mod metadata;
 mod picker;
@@ -205,10 +206,10 @@ where
     bt_stream.send_keepalive().await?;
     bt_stream.send_keepalive().await?;
     info!("all keep alive sent");
-    let mut ticker5 = tokio::time::interval(time::Duration::from_secs(10));
+    let mut ticker5 = tokio::time::interval(time::Duration::from_secs(3));
     let mut ticker1 = tokio::time::interval(time::Duration::from_millis(1000));
     bt_stream.send_unchoke().await;
-    let limit = 10000 / 16;
+    let limit = 200;
     let mut accum = 0;
     let mut choked = false;
     loop {
@@ -218,15 +219,16 @@ where
                     Ok(m) => match m {
                         Message::Request(r) => {
                             if !choked && accum < limit {
-                                accum += 1;
                                 info!("response");
-                                let a = [0u8; 16384];
-                                bt_stream
-                                    .send_piece(r.index, r.begin, &a)
-                                    .await;
                             } else {
-                                info!("not response");
+                                let _ = ticker1.tick().await;
+                                accum = 0;
                             }
+                            let a = [0u8; 16384];
+                            accum += 1;
+                            bt_stream
+                                .send_piece(r.index, r.begin, &a)
+                                .await;
                         }
                         _ => {
                             info!("received msg {:?} from {}", m, addr);
@@ -238,16 +240,16 @@ where
                     }
                 }
             }
-            // _ = ticker5.tick() => {
-            //     choked = rand::random();
-            //     if !choked {
-            //         info!("main {addr} unchoke");
-            //         bt_stream.send_unchoke().await;
-            //     } else {
-            //         info!("main {addr} choke");
-            //         bt_stream.send_choke().await;
-            //     }
-            // }
+            _ = ticker5.tick() => {
+                choked = rand::random();
+                if !choked {
+                    info!("main {addr} unchoke");
+                    bt_stream.send_unchoke().await;
+                } else {
+                    info!("main {addr} choke");
+                    bt_stream.send_choke().await;
+                }
+            }
             _ = ticker1.tick() => {
                 info!("in this period, {accum} blocks transferred");
                 accum = 0;

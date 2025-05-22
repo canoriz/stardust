@@ -70,7 +70,9 @@ struct PeerConn {
     conn: ConnectionManagerHandle,
     state: PeerStatus,
 
-    n_block_in_flight: u32,
+    last_pick_time: time::Instant,
+
+    n_block_in_flight: u32, // TODO: remove this
 }
 
 #[derive(Clone)]
@@ -169,10 +171,7 @@ impl TransmitManager {
 
     // fn pick_blocks_for_peer(&mut self, addr: &SocketAddr, n_blocks: usize) {
     // Fn: n_blk_received, n_blk_in_flight -> n_this_time_pick
-    fn pick_blocks_for_peer<F>(&mut self, addr: &SocketAddr, n_received: u32, pick_fn: F)
-    where
-        F: FnOnce(u32, u32) -> u32,
-    {
+    fn pick_blocks_for_peer(&mut self, addr: &SocketAddr, n_received: u32) {
         // n_block_in_flight = estimated_bandwidth * response_time
         // response_time = RTT + process_time
         // estimated_bandwidth = ALPHA * n_received_per_second
@@ -181,37 +180,32 @@ impl TransmitManager {
             if h.state.peer_choke_status == ChokeStatus::Unchoked {
                 let mut picker = self.piece_picker.lock().unwrap(); // TODO: fix unwrap
 
-                let n_timeout = picker.get_and_reset_n_timeout(addr) as u32;
-                if h.n_block_in_flight < n_timeout {
-                    h.n_block_in_flight = 0;
-                } else {
-                    h.n_block_in_flight -= n_timeout;
-                }
+                h.n_block_in_flight = picker
+                    .get_status(addr)
+                    .map(|s| s.n_in_flight as u32)
+                    .unwrap_or(0);
+                dbg!(h.n_block_in_flight);
 
                 let mut n_blk = 1;
                 if n_received > 0 {
-                    // bandwidth = 16k * estm_bandwidth / period_duration
-                    let period_duration = time::Duration::from_secs(1);
-                    let curr_bw = n_received as f32;
-                    let mut bw = picker.get_bw_status(addr);
-                    bw.estm_bandwidth = if bw.estm_bandwidth <= curr_bw * 1.1 + 0.3 {
-                        curr_bw * 1.3 + 0.3 // TODO: now only count this time, maybe use a weighted avg
+                    let period_duration = h.last_pick_time.elapsed();
+                    h.last_pick_time = time::Instant::now();
+                    let estm_bw_bps = if let Some(status) = picker.get_status(addr) {
+                        (status.bandwidth.count(period_duration) as f32)
+                            / period_duration.div_duration_f32(time::Duration::from_secs(1))
                     } else {
-                        bw.estm_bandwidth * 0.6
+                        0.0
                     };
-                    let optimal_n_in_flight = if bw.response_time > period_duration {
-                        let mut rt = time::Duration::from_secs(1);
-                        if rt > bw.response_time {
-                            rt = bw.response_time;
-                        }
-                        (rt.div_duration_f32(period_duration) * bw.estm_bandwidth).ceil() as u32
-                    } else {
-                        bw.estm_bandwidth.ceil() as u32
-                    };
-                    picker.update_bw_status(*addr, bw);
-                    dbg!(n_received, bw, optimal_n_in_flight);
 
-                    dbg!(h.n_block_in_flight, n_timeout);
+                    // TODO: now send 10 senconds in batch
+                    // maybe calculate this with response time
+                    let batch_seconds = 10.0;
+                    let mut optimal_n_in_flight = (estm_bw_bps * batch_seconds / 16384.0) as u32;
+                    optimal_n_in_flight = optimal_n_in_flight.min(500).max(16);
+
+                    dbg!(n_received, estm_bw_bps, optimal_n_in_flight);
+
+                    dbg!(h.n_block_in_flight);
                     // let n_blk = pick_fn(n_received, h.n_block_in_flight);
                     n_blk = if optimal_n_in_flight > h.n_block_in_flight {
                         optimal_n_in_flight - h.n_block_in_flight
@@ -225,7 +219,6 @@ impl TransmitManager {
                 );
                 let (reqs, n) = picker.pick_blocks(addr, n_blk as usize, now);
                 h.conn.send_stream_cmd(ConnMsg::RequestBlocks(reqs));
-                h.n_block_in_flight += n as u32;
             }
         }
     }
@@ -283,6 +276,7 @@ impl TransmitManager {
                                 peer_choke_status: ChokeStatus::Unknown,
                                 peer_interest_status: InterestStatus::Unknown,
                             },
+                            last_pick_time: time::Instant::now(),
                             n_block_in_flight: 0,
                         },
                     );
@@ -304,7 +298,6 @@ impl TransmitManager {
                     .peer_mark_not_requested(&peer);
                 self.connected_peers.entry(peer).and_modify(|st| {
                     st.state.peer_choke_status = ChokeStatus::Choked;
-                    st.n_block_in_flight = 0;
                 });
                 assert_eq!(
                     self.connected_peers[&peer].state.peer_choke_status,
@@ -328,7 +321,7 @@ impl TransmitManager {
                     self.connected_peers[&peer].n_block_in_flight
                 );
                 // TODO: are we interested in this peer?
-                self.pick_blocks_for_peer(&peer, 0, |_, _| n_first_pick);
+                self.pick_blocks_for_peer(&peer, 0);
             }
             Msg::PieceReceived(i) => {
                 for (_, h) in self.connected_peers.iter() {
@@ -347,16 +340,6 @@ impl TransmitManager {
                     conn_stat.n_block_in_flight
                 );
 
-                // TODO: this should not have a fix point (now is 5)
-                let n_blk_fn = |n_received, n_in_flight| {
-                    if n_received == 1 {
-                        2
-                    } else if n_in_flight <= n {
-                        (n_received as f32 * 1.2) as u32 + 1
-                    } else {
-                        (n_received as f32 * 0.8) as u32 + 1
-                    }
-                };
                 // TODO: peer may take longer than period to process,
                 // we need to estimate bandwidth
                 //
@@ -366,17 +349,8 @@ impl TransmitManager {
                 //
                 // so we can estimate response_time
 
-                // TODO: peer may sends us more piece than requested, causing downflow
-                conn_stat.n_block_in_flight = if n >= conn_stat.n_block_in_flight {
-                    0
-                } else {
-                    dbg!(conn_stat.n_block_in_flight);
-                    conn_stat.n_block_in_flight - n
-                };
-
-                // conn_stat.n_block_in_flight -= n;
                 if conn_stat.state.peer_choke_status == ChokeStatus::Unchoked {
-                    self.pick_blocks_for_peer(&peer, n, n_blk_fn);
+                    self.pick_blocks_for_peer(&peer, n);
                 }
 
                 // TODO: if peer is choking us?
