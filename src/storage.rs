@@ -1,10 +1,7 @@
 use std::{
-    any,
-    marker::PhantomData,
-    mem::{ManuallyDrop, MaybeUninit},
+    mem::ManuallyDrop,
     net::SocketAddr,
     slice,
-    sync::MutexGuard,
     vec,
 };
 
@@ -16,7 +13,7 @@ use loom::sync::{
 
 #[cfg(not(mloom))]
 use std::sync::{
-    atomic::{AtomicBool, AtomicU32, Ordering},
+    atomic::{AtomicBool, Ordering},
     Arc, Mutex,
 };
 
@@ -275,7 +272,7 @@ mod test {
     #[test]
     fn test_cache_disjoint_ref() {
         loom_test(|| {
-            let mut cache = ArcCache::new(BLOCKSIZE * 16);
+            let cache = ArcCache::new(BLOCKSIZE * 16);
             let ref5to7 = cache.get_part_ref(5 * BLOCKSIZE, 2 * BLOCKSIZE);
             let ref6to8 = cache.get_part_ref(6 * BLOCKSIZE, 2 * BLOCKSIZE);
             let ref9to11 = cache.get_part_ref(9 * BLOCKSIZE, 2 * BLOCKSIZE);

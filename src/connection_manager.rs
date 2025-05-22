@@ -1,18 +1,18 @@
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time;
-use tokio::sync::{mpsc, oneshot, Notify};
+use tokio::sync::{mpsc, oneshot};
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use tracing::{info, warn};
 
 use crate::backfile::WriteJob;
 use crate::metadata;
-use crate::picker::{BlockRange, BlockRequests};
+use crate::picker::BlockRequests;
 use crate::protocol::{self, BTStream, Message, ReadStream, Split, WriteStream};
 use crate::storage::ArcCache;
 use crate::transmit_manager::Msg as TransmitMsg;
-use crate::transmit_manager::{self, TransmitManagerHandle};
+use crate::transmit_manager::{TransmitManagerHandle};
 
 #[derive(Debug)]
 pub(crate) enum WakeUpOption {
@@ -431,7 +431,7 @@ async fn handle_piece_msg<T>(
         piece.begin >> 14,
     );
 
-    let (mut block_ref, piece_buf) = {
+    let (block_ref, piece_buf) = {
         // must drop pb_map before await point
         // pb_map is not Send
         let mut pb_map = tmh.piece_buffer.lock().unwrap();

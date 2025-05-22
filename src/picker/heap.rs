@@ -1,5 +1,4 @@
 pub use crate::protocol::BitField;
-use std::cmp;
 use std::mem;
 use std::net::SocketAddr;
 use std::ops::Add;

@@ -7,7 +7,6 @@ use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::LazyLock;
 use thiserror::Error;
-use tracing::{info, Level};
 
 // Metadata is a universal structure
 #[derive(Debug, Clone)]

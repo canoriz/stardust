@@ -1,13 +1,10 @@
 use bytes::BufMut;
 use core::fmt;
-use sha1::digest::crypto_common::Key;
 use std::fmt::Formatter;
-use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tokio::io::{
-    self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufStream, BufWriter,
-    ReadHalf, WriteHalf,
+    self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter,
 };
 use tokio::net;
 use tokio::net::tcp;
@@ -777,7 +774,7 @@ async fn recv_msg_header<'a, T: AsyncRead + Unpin>(
         state.filled += 1;
     }
 
-    let mut n_remain = len as usize - 1;
+    let n_remain = len as usize - 1;
 
     match state.field_ty {
         MsgTy::CHOKE => {
@@ -1381,7 +1378,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_msg_header_cancel_safe() {
-        let ((mut p1r, mut p1w), (mut p2r, mut p2w)) = make_ends_split();
+        let ((p1r, mut p1w), (mut p2r, p2w)) = make_ends_split();
         let request_msg = [
             0u8, 0, 0, 13, 6, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xa, 0xb, 0xc,
         ];

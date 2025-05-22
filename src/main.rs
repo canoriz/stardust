@@ -1,11 +1,11 @@
 use std::net::SocketAddr;
 // use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::time::{sleep, Duration};
+use tokio::time::Duration;
 use tokio::{net, time};
-use tracing::{info, warn, Level};
+use tracing::{info, warn};
 
 mod announce_manager;
 mod backfile;
@@ -18,8 +18,8 @@ mod storage;
 mod torrent_manager;
 mod transmit_manager;
 
-use protocol::{BTStream, Handshake, Message};
-use torrent_manager::{TorrentManagerHandle, TransmitManager};
+use protocol::{BTStream, Message};
+use torrent_manager::TorrentManagerHandle;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

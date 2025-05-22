@@ -1,20 +1,8 @@
 use crate::announce_manager::{self, AnnounceManagerHandle};
-use crate::connection_manager;
-use crate::metadata::{self, AnnounceType, Metadata, TrackerGet};
-use crate::protocol::{self, BTStream};
-use crate::transmit_manager::{self, run_transmit_manager, TransmitManagerHandle};
-use std::collections::HashMap;
-use std::future::{Future, IntoFuture};
-use std::io;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use crate::metadata::{Metadata};
+use crate::transmit_manager::{self, run_transmit_manager};
 use std::sync::Arc;
-use std::thread::JoinHandle;
-use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
-use tokio::time;
-use tracing::{debug_span, info, Instrument, Level, Span};
 
 pub use transmit_manager::TransmitManager;
 

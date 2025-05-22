@@ -3,22 +3,18 @@ use crate::backfile::BackFile;
 use crate::backfile::WriteJob;
 use crate::connection_manager::ConnectionManagerHandle;
 use crate::connection_manager::Msg as ConnMsg;
-use crate::metadata::{self, AnnounceType, Metadata, TrackerGet};
-use crate::picker::{BlockRequests, HeapPiecePicker};
-use crate::protocol::{self, BTStream, BitField};
+use crate::metadata::{self, Metadata};
+use crate::picker::HeapPiecePicker;
+use crate::protocol::{self, BitField};
 use crate::storage::ArcCache;
 
-use reqwest::header::OccupiedEntry;
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
-use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time;
-use tracing::{debug_span, info, warn, Instrument, Level, Span};
+use tracing::{info, warn};
 
 #[derive(Debug)]
 #[non_exhaustive]
@@ -449,7 +445,7 @@ async fn connect_peer(
     addr: SocketAddr,
     m: Arc<Metadata>,
 ) -> Result<(), std::io::Error> {
-    let mut conn = protocol::BTStream::connect_tcp(addr).await;
+    let conn = protocol::BTStream::connect_tcp(addr).await;
     match conn {
         Ok(mut c) => {
             c.send_handshake(&protocol::Handshake {
