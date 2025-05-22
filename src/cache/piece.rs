@@ -1,9 +1,4 @@
-use std::{
-    mem::ManuallyDrop,
-    net::SocketAddr,
-    slice,
-    vec,
-};
+use std::{mem::ManuallyDrop, net::SocketAddr, slice, vec};
 
 #[cfg(mloom)]
 use loom::sync::{
