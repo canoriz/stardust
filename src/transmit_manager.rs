@@ -2,6 +2,7 @@ use crate::backfile;
 use crate::backfile::BackFile;
 use crate::backfile::WriteJob;
 use crate::cache::ArcCache;
+use crate::cache::{PieceBuf, PieceBuffer};
 use crate::connection_manager::ConnectionManagerHandle;
 use crate::connection_manager::Msg as ConnMsg;
 use crate::metadata::{self, Metadata};
@@ -79,10 +80,12 @@ pub(crate) struct TransmitManagerHandle {
     // reduce contention?
     // TODO: using dyn <trait Picker>?
     pub picker: Arc<Mutex<HeapPiecePicker>>,
-    pub piece_buffer: Arc<Mutex<HashMap<u32, ArcCache>>>,
+    pub piece_buffer: Arc<Mutex<HashMap<u32, ArcCache<PieceBuf>>>>,
     pub piece_size: usize,
     pub back_file: Arc<Mutex<BackFile>>,
     pub write_worker: std::sync::mpsc::Sender<WriteJob<'static>>,
+
+    pub buffer_pool: PieceBuffer,
 }
 
 pub struct TransmitManager {
@@ -103,7 +106,7 @@ pub struct TransmitManager {
     connected_peers: HashMap<SocketAddr, PeerConn>,
 
     piece_picker: Arc<Mutex<HeapPiecePicker>>,
-    piece_buffer: Arc<Mutex<HashMap<u32, ArcCache>>>,
+    piece_buffer: Arc<Mutex<HashMap<u32, ArcCache<PieceBuf>>>>,
 }
 
 impl TransmitManager {
@@ -129,6 +132,7 @@ impl TransmitManager {
                 piece_size: piece_size as usize,
                 back_file: Arc::new(Mutex::new(BackFile::new(m))),
                 write_worker: job_tx,
+                buffer_pool: PieceBuffer::new(8 * 16 * 16384),
             },
             // announce_handle: None,
             // announce_tx: None,

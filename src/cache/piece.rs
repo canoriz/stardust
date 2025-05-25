@@ -1,4 +1,4 @@
-use std::{mem::ManuallyDrop, net::SocketAddr, slice, vec};
+use std::{mem::ManuallyDrop, net::SocketAddr, ops::Deref, slice, vec};
 
 #[cfg(mloom)]
 use loom::sync::{
@@ -28,20 +28,30 @@ struct State {
     ref_cnt: u32,
 }
 
+pub(crate) trait AsSlice<T> {
+    fn as_slice(&self) -> &[T];
+}
+
 impl State {
     // returns reference count after release
     // use very carefully, this must not be public api
-    fn release_ref(&mut self, r: &Ref) -> u32 {
+    fn release_ref<T>(&mut self, r: &Ref<T>) -> u32
+    where
+        T: AsRef<[u8]>,
+    {
         change_blockstate(&mut self.state, r.from, r.len, BlockState::Vacant);
         self.ref_cnt -= 1;
         self.ref_cnt
     }
 }
 
-struct Cache {
+/// something like a Arc<Vec<u8>>
+struct UnderlyingBuffer {}
+
+struct Cache<T> {
     allow_new_ref: AtomicBool,
     // ref_count: AtomicU32,
-    cache: Vec<u8>,
+    cache: Arc<T>,
 
     // TODO: since all jobs access to cache,
     // maybe split lock to smaller granularity to reduce contention
@@ -55,13 +65,16 @@ fn change_blockstate(v: &mut Vec<BlockState>, offset: usize, len: usize, state: 
     }
 }
 
-impl Cache {
+impl<T> Cache<T>
+where
+    T: AsRef<[u8]>,
+{
     fn change_state(&self, offset: usize, len: usize, state: BlockState) {
         let mut guard = self.state.lock().expect("should ok");
         change_blockstate(&mut guard.state, offset, len, state);
     }
 
-    fn release_ref(&self, r: &Ref) {
+    fn release_ref(&self, r: &Ref<T>) {
         let mut guard = self.state.lock().expect("should ok");
         if guard.release_ref(r) == 0 {
             self.allow_new_ref(true);
@@ -73,14 +86,26 @@ impl Cache {
     }
 }
 
-#[derive(Clone)]
-pub struct ArcCache {
-    inner: Arc<Cache>,
+pub struct ArcCache<T> {
+    inner: Arc<Cache<T>>,
 }
 
-impl ArcCache {
+impl<T> Clone for ArcCache<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl<T> ArcCache<T>
+where
+    T: AsRef<[u8]>,
+{
+    // TODO: is this safe? require T: AsRef and taking ownership of T
     // size must be multiple of 16384
-    pub fn new(size: usize) -> Self {
+    pub fn new(mut t: T) -> Self {
+        let size = t.as_ref().len();
         if size.trailing_zeros() < BLOCKSIZE.trailing_zeros() {
             // TODO: maybe not panic, fix size instead?
             panic!("cache size must be multiple of {BLOCKSIZE}")
@@ -89,7 +114,7 @@ impl ArcCache {
         Self {
             inner: Arc::new(Cache {
                 allow_new_ref: AtomicBool::new(true),
-                cache: vec![0u8; size],
+                cache: Arc::new(t),
                 state: Mutex::new(State {
                     state: vec![BlockState::Vacant; size >> BLOCKBITS],
                     ref_cnt: 0,
@@ -111,7 +136,7 @@ impl ArcCache {
     }
 
     // block_offset must be multiple of 16384
-    pub fn get_ref(&self, peer: Peer, piece_index: usize, block_offset: usize) -> Ref {
+    pub fn get_ref(&self, peer: Peer, piece_index: usize, block_offset: usize) -> Ref<T> {
         todo!()
     }
 
@@ -123,7 +148,7 @@ impl ArcCache {
     // (offset_mutlple_of(block), len_multiple_of(block))
     // TODO: this needs a lot of tests
     // TODO: FIXME: out of range panic
-    pub fn get_part_ref(&self, offset: usize, len: usize) -> Option<Ref> {
+    pub fn get_part_ref(&self, offset: usize, len: usize) -> Option<Ref<T>> {
         if len.trailing_zeros() < BLOCKSIZE.trailing_zeros() {
             // TODO: maybe not panic, fix size instead?
             panic!("should be multiple of {BLOCKSIZE}");
@@ -156,7 +181,7 @@ impl ArcCache {
 
         Some(Ref {
             from: offset,
-            ptr: unsafe { self.inner.cache.as_ptr().add(offset) },
+            ptr: unsafe { self.inner.cache.deref().as_ref().as_ptr().add(offset) },
             len,
             main_cache: ManuallyDrop::new(self.inner.clone()),
         })
@@ -169,17 +194,25 @@ impl ArcCache {
 
 // TODO: maybe implement Deref AsRef or something
 // but it contains a ref to the main cache
-pub struct Ref {
+pub struct Ref<T>
+where
+    T: AsRef<[u8]>,
+{
     from: usize,
     ptr: *const u8,
 
     len: usize,
-    main_cache: ManuallyDrop<Arc<Cache>>,
+
+    // manually_drop used in extend_to_entire()
+    main_cache: ManuallyDrop<Arc<Cache<T>>>,
 }
 
-unsafe impl Send for Ref {}
+unsafe impl<T> Send for Ref<T> where T: Send + AsRef<[u8]> {}
 
-impl Ref {
+impl<T> Ref<T>
+where
+    T: AsRef<[u8]>,
+{
     // TODO: is 'static safe? we are holding ref of arc, so
     // we can hold it as long as we want, so it's safe?
     pub fn to_slice(&mut self) -> &'static mut [u8] {
@@ -218,8 +251,8 @@ impl Ref {
         // println!("success: {success}");
         if success {
             c.from = 0;
-            c.ptr = c.main_cache.cache.as_ptr();
-            c.len = c.main_cache.cache.len();
+            c.ptr = c.main_cache.cache.deref().as_ref().as_ptr();
+            c.len = c.main_cache.cache.deref().as_ref().len();
             Some(ManuallyDrop::into_inner(c))
         } else {
             // println!("manually drop arc");
@@ -233,7 +266,10 @@ impl Ref {
     }
 }
 
-impl Drop for Ref {
+impl<T> Drop for Ref<T>
+where
+    T: AsRef<[u8]>,
+{
     fn drop(&mut self) {
         self.main_cache.release_ref(self);
         unsafe { ManuallyDrop::drop(&mut self.main_cache) };
@@ -267,7 +303,7 @@ mod test {
     #[test]
     fn test_cache_disjoint_ref() {
         loom_test(|| {
-            let cache = ArcCache::new(BLOCKSIZE * 16);
+            let cache = ArcCache::new(vec![0u8; BLOCKSIZE * 16]);
             let ref5to7 = cache.get_part_ref(5 * BLOCKSIZE, 2 * BLOCKSIZE);
             let ref6to8 = cache.get_part_ref(6 * BLOCKSIZE, 2 * BLOCKSIZE);
             let ref9to11 = cache.get_part_ref(9 * BLOCKSIZE, 2 * BLOCKSIZE);
@@ -306,7 +342,7 @@ mod test {
     #[test]
     fn test_concurrent_read_write() {
         loom_test(|| {
-            let a = ArcCache::new(30 * BLOCKSIZE);
+            let a = ArcCache::new(vec![0u8; 30 * BLOCKSIZE]);
 
             let a1 = a.clone();
             let h1 = thread::spawn(move || {
@@ -352,7 +388,7 @@ mod test {
     #[test]
     fn test_extend_ref() {
         loom_test(|| {
-            let cache = ArcCache::new(BLOCKSIZE * 16);
+            let cache = ArcCache::new(vec![0u8; BLOCKSIZE * 16]);
             let cache_clone = cache.clone();
             let cache_clone2 = cache.clone();
             let ref5to7 = cache.get_part_ref(5 * BLOCKSIZE, 2 * BLOCKSIZE).unwrap();
@@ -405,7 +441,7 @@ mod test {
     #[test]
     fn test_disable_new_ref() {
         loom_test(|| {
-            let cache = ArcCache::new(BLOCKSIZE * 16);
+            let cache = ArcCache::new(vec![0u8; BLOCKSIZE * 16]);
             let ref5to7 = cache.get_part_ref(5 * BLOCKSIZE, 2 * BLOCKSIZE).unwrap();
             let ref8to9 = cache.get_part_ref(8 * BLOCKSIZE, 2 * BLOCKSIZE).unwrap();
             cache.disable_new_ref();

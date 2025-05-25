@@ -1,18 +1,20 @@
+use core::slice;
 use std::collections::BTreeSet;
+use std::fmt::Debug;
+
+#[cfg(mloom)]
+use loom::sync::{Arc, Mutex};
+use tracing::warn;
+
+#[cfg(not(mloom))]
+use std::sync::{Arc, Mutex};
+
+use tokio::io::split;
 
 const MIN_ALLOC_SIZE: usize = 256 * 1024;
 const MIN_ALLOC_SIZE_POWER: u32 = MIN_ALLOC_SIZE.ilog2();
 
-fn prev_power_of_two(s: usize) -> usize {
-    if s == 0 {
-        panic!("s == 0");
-    }
-    if s.is_power_of_two() {
-        s
-    } else {
-        s.next_power_of_two() >> 1
-    }
-}
+const _: () = assert!(MIN_ALLOC_SIZE.next_power_of_two() == MIN_ALLOC_SIZE);
 
 /// session cache
 /// targets:
@@ -22,51 +24,114 @@ fn prev_power_of_two(s: usize) -> usize {
 /// 4. calculate memory fragmentation ratio
 /// 5. defragmentation when memory is fragmentated
 /// 6. expand/shrink size of cache
+#[derive(Clone)]
 pub(crate) struct Cache {
-    buf: Vec<u8>,
-    blk: Vec<BlockList>,
+    inner: Arc<CacheImpl>,
 }
 
-pub(crate) struct PieceBuf {}
+struct CacheImpl {
+    buf: Vec<u8>,
+    block_tree: Mutex<BlockTree>,
+}
+
+// TODO: maybe change a name
+pub(crate) struct PieceBuf {
+    b: FreeBlock,
+    len: usize,
+    main_cache: Arc<CacheImpl>,
+}
+
+impl Debug for PieceBuf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PieceBuf")
+            .field("free_block", &self.b)
+            .field("len", &self.len)
+            .finish()
+    }
+}
+
+unsafe impl Send for PieceBuf {}
+
+// TODO: is this safe?
+unsafe impl Sync for PieceBuf {}
+
+#[derive(Debug)]
+struct FreeBlock {
+    // TODO: offset and ptr is same thing? only store one?
+    offset: usize,
+    power: u32,
+
+    ptr: *const u8,
+}
 
 impl Cache {
+    pub fn new(size: usize) -> Self {
+        Self {
+            inner: Arc::new(CacheImpl::new(size)),
+        }
+    }
+
+    /// alloc PieceBuf
+    pub fn alloc(&self, size: usize) -> Option<PieceBuf> {
+        self.inner.alloc(size).map(|fb| PieceBuf {
+            b: fb,
+            len: size,
+            main_cache: self.inner.clone(),
+        })
+    }
+}
+
+impl CacheImpl {
     fn new(size: usize) -> Self {
         let size_fixed = size.next_multiple_of(MIN_ALLOC_SIZE);
 
         Self {
             buf: vec![0u8; size_fixed],
-            blk: init_block_list(size_fixed),
+            block_tree: Mutex::new(init_block_tree(size_fixed)),
         }
     }
 
-    fn alloc(&mut self, size: usize) -> Option<PieceBuf> {
-        let size_fixed = size.next_multiple_of(MIN_ALLOC_SIZE);
+    /// alloc FreeBlock
+    fn alloc(&self, size: usize) -> Option<FreeBlock> {
+        let size_fixed = if size < MIN_ALLOC_SIZE {
+            MIN_ALLOC_SIZE
+        } else {
+            size.next_power_of_two()
+        };
+        debug_assert_eq!(size_fixed % MIN_ALLOC_SIZE, 0);
         let power = size_fixed.ilog2();
 
-        let vacant_blk_id = (|| {
-            for (p, b) in self
-                .blk
-                .iter()
-                .enumerate()
-                .skip((power - MIN_ALLOC_SIZE_POWER) as usize)
-            {
-                if b.blk.last().is_some() {
-                    return Some(p);
-                }
-            }
-            None
-        })();
-
-        if let Some(i) = vacant_blk_id {
-            split_down(&mut self.blk, i, size_fixed);
-            Some(PieceBuf {})
-        } else {
-            None
-        }
+        let mut blk_tree = self.block_tree.lock().expect("alloc lock should OK");
+        blk_tree.split_down(power).map(|(offset, power)| FreeBlock {
+            offset,
+            power,
+            ptr: unsafe { self.buf.as_ptr().add(offset) },
+        })
     }
 
-    fn return_piece(&mut self, p: PieceBuf) {
-        todo!()
+    /// returns PieceBuf
+    fn free(&self, b: &FreeBlock) {
+        let mut blk_tree = self.block_tree.lock().expect("alloc lock should OK");
+        blk_tree.merge_up(b.offset, b.power);
+    }
+}
+
+impl Drop for PieceBuf {
+    fn drop(&mut self) {
+        warn!("free {:?}", self);
+        self.main_cache.free(&self.b);
+    }
+}
+
+impl PieceBuf {
+    pub fn as_mut_slice(&mut self) -> &'static mut [u8] {
+        unsafe { slice::from_raw_parts_mut(self.b.ptr as *mut _, self.len) }
+    }
+}
+
+impl AsRef<[u8]> for PieceBuf {
+    fn as_ref(&self) -> &[u8] {
+        unsafe { slice::from_raw_parts(self.b.ptr, self.len) }
     }
 }
 
@@ -76,10 +141,82 @@ struct BlockList {
     blk: BTreeSet<usize>,
 }
 
-fn init_block_list(total_size: usize) -> Vec<BlockList> {
+#[derive(Debug, Eq, PartialEq)]
+struct BlockTree {
+    // TODO: perf: maybe use a data structure more efficient than BTreeSet
+    tree: Vec<BlockList>,
+}
+
+type OffsetPower = (usize, u32);
+
+impl BlockTree {
+    /// target_power must >= MIN_ALLOC_SIZE_POWER
+    fn split_down(&mut self, target_power: u32) -> Option<OffsetPower> {
+        let (mut now_offset, mut now_order) =
+            if let Some(v) = pop_first_vacant(&mut self.tree, target_power) {
+                v
+            } else {
+                return None;
+            };
+
+        let mut now_size = 1usize << (now_order as u32 + MIN_ALLOC_SIZE_POWER);
+        let target_order = (target_power - MIN_ALLOC_SIZE_POWER) as usize;
+
+        while now_order > target_order {
+            // split this block then push this block to list of smaller blocks
+            let left_blk = now_offset;
+            now_order -= 1;
+            self.tree[now_order].blk.insert(left_blk);
+            now_size >>= 1;
+            now_offset += now_size;
+        }
+        Some((now_offset, target_power))
+        // unreachable!("should always find a hole");
+    }
+
+    /// returns a block and merges up
+    fn merge_up(&mut self, offset: usize, block_size_power: u32) {
+        let mut now_size = 1usize << block_size_power;
+        let mut now_idx = (block_size_power - MIN_ALLOC_SIZE_POWER) as usize;
+        let mut now_offset = offset;
+
+        while now_idx < self.tree.len() {
+            let buddy_blk = buddy_blk_of(now_offset, now_size);
+            if self.tree[now_idx as usize].blk.remove(&buddy_blk) {
+                now_size <<= 1;
+                now_idx += 1;
+                now_offset = now_offset.min(buddy_blk);
+            } else {
+                self.tree[now_idx as usize].blk.insert(now_offset);
+                return;
+            };
+        }
+        unreachable!("should always find a hole");
+    }
+}
+
+fn pop_first_vacant(list: &mut Vec<BlockList>, target_power: u32) -> Option<(usize, usize)> {
+    for (p, b) in list
+        .iter_mut()
+        .enumerate()
+        .skip((target_power - MIN_ALLOC_SIZE_POWER) as usize)
+    {
+        if let Some(vacant_blk) = b.blk.pop_last() {
+            return Some((vacant_blk, p));
+        }
+    }
+    None
+}
+
+/// total_size must be multiple of MIN_ALLOC_SIZE
+fn init_block_tree(total_size: usize) -> BlockTree {
+    debug_assert_eq!(total_size % MIN_ALLOC_SIZE, 0);
+
+    // TODO: maybe can use bit shift right loop, but this is init
+    // so overhead is not a problem
     let max_block_size = prev_power_of_two(total_size);
     let max_power = max_block_size.ilog2();
-    let mut v: Vec<BlockList> = (MIN_ALLOC_SIZE_POWER..=max_power)
+    let mut t: Vec<BlockList> = (MIN_ALLOC_SIZE_POWER..=max_power)
         .into_iter()
         .map(|power| BlockList {
             size: 1usize << power,
@@ -92,7 +229,7 @@ fn init_block_list(total_size: usize) -> Vec<BlockList> {
     let mut offset = 0usize;
     while power >= MIN_ALLOC_SIZE_POWER {
         while offset + block_size <= total_size {
-            v[(power - MIN_ALLOC_SIZE_POWER) as usize]
+            t[(power - MIN_ALLOC_SIZE_POWER) as usize]
                 .blk
                 .insert(offset);
             offset += block_size;
@@ -100,35 +237,7 @@ fn init_block_list(total_size: usize) -> Vec<BlockList> {
         power -= 1;
         block_size >>= 1;
     }
-    v
-}
-
-fn split_down(
-    list: &mut Vec<BlockList>,
-    since: usize,
-    target_block_size: usize,
-) -> Option<PieceBuf> {
-    let now_size = 1usize << ((since as u32) + MIN_ALLOC_SIZE_POWER);
-    let cur_offset = if let Some(b) = list[since].blk.pop_last() {
-        b
-    } else {
-        return None;
-    };
-    let mut cur_blk = (cur_offset, now_size);
-
-    while cur_blk.1 >= MIN_ALLOC_SIZE {
-        let now_size = cur_blk.1;
-
-        if now_size == target_block_size {
-            return Some(PieceBuf {});
-        } else {
-            // split this block then push this block to list of smaller blocks
-            let left_blk = cur_blk.0;
-            cur_blk = (cur_blk.0 + now_size, now_size >> 1);
-            list[since - 1].blk.insert(left_blk);
-        }
-    }
-    unreachable!("should always find a hole");
+    BlockTree { tree: t }
 }
 
 // block_size must be power of 2
@@ -140,23 +249,16 @@ fn buddy_blk_of(offset: usize, block_size: usize) -> usize {
     offset ^ block_size
 }
 
-fn merge_up(list: &mut Vec<BlockList>, offset: usize, block_size_power: u32) {
-    let mut now_size = 1usize << block_size_power;
-    let mut now_idx = (block_size_power - MIN_ALLOC_SIZE_POWER) as usize;
-    let mut now_offset = offset;
-
-    while now_idx < list.len() {
-        let buddy_blk = buddy_blk_of(now_offset, now_size);
-        if list[now_idx as usize].blk.remove(&buddy_blk) {
-            now_size <<= 1;
-            now_idx += 1;
-            now_offset = now_offset.min(buddy_blk);
-        } else {
-            list[now_idx as usize].blk.insert(now_offset);
-            return;
-        };
+#[inline]
+fn prev_power_of_two(s: usize) -> usize {
+    if s == 0 {
+        panic!("s == 0");
     }
-    unreachable!("should always find a hole");
+    if s.is_power_of_two() {
+        s
+    } else {
+        s.next_power_of_two() >> 1
+    }
 }
 
 #[cfg(test)]
@@ -182,152 +284,93 @@ mod test {
 
     #[test]
     fn test_init_block_list() {
-        let r = init_block_list(11 * MIN_ALLOC_SIZE);
+        let r = init_block_tree(11 * MIN_ALLOC_SIZE);
         assert_eq!(
             r,
-            vec![
-                BlockList {
-                    size: MIN_ALLOC_SIZE,
-                    blk: BTreeSet::from([10 * MIN_ALLOC_SIZE])
-                },
-                BlockList {
-                    size: MIN_ALLOC_SIZE << 1,
-                    blk: BTreeSet::from([8 * MIN_ALLOC_SIZE])
-                },
-                BlockList {
-                    size: MIN_ALLOC_SIZE << 2,
-                    blk: BTreeSet::from([])
-                },
-                BlockList {
-                    size: MIN_ALLOC_SIZE << 3,
-                    blk: BTreeSet::from([0])
-                },
-            ]
+            BlockTree {
+                tree: vec![
+                    BlockList {
+                        size: MIN_ALLOC_SIZE,
+                        blk: BTreeSet::from([10 * MIN_ALLOC_SIZE])
+                    },
+                    BlockList {
+                        size: MIN_ALLOC_SIZE << 1,
+                        blk: BTreeSet::from([8 * MIN_ALLOC_SIZE])
+                    },
+                    BlockList {
+                        size: MIN_ALLOC_SIZE << 2,
+                        blk: BTreeSet::from([])
+                    },
+                    BlockList {
+                        size: MIN_ALLOC_SIZE << 3,
+                        blk: BTreeSet::from([0])
+                    },
+                ]
+            }
         )
     }
 
     #[test]
     fn test_split() {
-        let mut v = vec![
-            BlockList {
-                size: MIN_ALLOC_SIZE,
-                blk: BTreeSet::from([1, 3, 8].map(|i| i * MIN_ALLOC_SIZE)),
-            },
-            BlockList {
-                size: MIN_ALLOC_SIZE << 1,
-                blk: BTreeSet::from([]),
-            },
-            BlockList {
-                size: MIN_ALLOC_SIZE << 2,
-                blk: BTreeSet::from([4].map(|i| i * MIN_ALLOC_SIZE)),
-            },
-            BlockList {
-                size: MIN_ALLOC_SIZE << 3,
-                blk: BTreeSet::from([]),
-            },
-        ];
-
-        let r = split_down(&mut v, 2, 2 * MIN_ALLOC_SIZE);
-        assert_eq!(
-            v,
-            vec![
+        let mut t = BlockTree {
+            tree: vec![
                 BlockList {
                     size: MIN_ALLOC_SIZE,
                     blk: BTreeSet::from([1, 3, 8].map(|i| i * MIN_ALLOC_SIZE)),
                 },
                 BlockList {
                     size: MIN_ALLOC_SIZE << 1,
-                    blk: BTreeSet::from([4].map(|i| i * MIN_ALLOC_SIZE)),
+                    blk: BTreeSet::from([]),
                 },
                 BlockList {
                     size: MIN_ALLOC_SIZE << 2,
-                    blk: BTreeSet::from([]),
+                    blk: BTreeSet::from([4].map(|i| i * MIN_ALLOC_SIZE)),
                 },
                 BlockList {
                     size: MIN_ALLOC_SIZE << 3,
                     blk: BTreeSet::from([]),
                 },
-            ]
+            ],
+        };
+
+        let r = t.split_down(MIN_ALLOC_SIZE_POWER + 1);
+        assert_eq!(r, Some((6 * MIN_ALLOC_SIZE, MIN_ALLOC_SIZE_POWER + 1)));
+        assert_eq!(
+            t,
+            BlockTree {
+                tree: vec![
+                    BlockList {
+                        size: MIN_ALLOC_SIZE,
+                        blk: BTreeSet::from([1, 3, 8].map(|i| i * MIN_ALLOC_SIZE)),
+                    },
+                    BlockList {
+                        size: MIN_ALLOC_SIZE << 1,
+                        blk: BTreeSet::from([4].map(|i| i * MIN_ALLOC_SIZE)),
+                    },
+                    BlockList {
+                        size: MIN_ALLOC_SIZE << 2,
+                        blk: BTreeSet::from([]),
+                    },
+                    BlockList {
+                        size: MIN_ALLOC_SIZE << 3,
+                        blk: BTreeSet::from([]),
+                    },
+                ]
+            }
         )
     }
 
     #[test]
-    fn test_merge() {
-        let mut v = vec![
-            BlockList {
-                size: MIN_ALLOC_SIZE,
-                blk: BTreeSet::from([1, 3, 8].map(|i| i * MIN_ALLOC_SIZE)),
-            },
-            BlockList {
-                size: MIN_ALLOC_SIZE << 1,
-                blk: BTreeSet::from([4].map(|i| i * MIN_ALLOC_SIZE)),
-            },
-            BlockList {
-                size: MIN_ALLOC_SIZE << 2,
-                blk: BTreeSet::from([]),
-            },
-            BlockList {
-                size: MIN_ALLOC_SIZE << 3,
-                blk: BTreeSet::from([]),
-            },
-        ];
-
-        merge_up(&mut v, 6 * MIN_ALLOC_SIZE, MIN_ALLOC_SIZE_POWER + 1);
-        assert_eq!(
-            v,
-            vec![
+    fn test_split2() {
+        let mut v = BlockTree {
+            tree: vec![
                 BlockList {
                     size: MIN_ALLOC_SIZE,
-                    blk: BTreeSet::from([1, 3, 8].map(|i| i * MIN_ALLOC_SIZE)),
+                    blk: BTreeSet::from([]),
                 },
                 BlockList {
                     size: MIN_ALLOC_SIZE << 1,
                     blk: BTreeSet::from([]),
-                },
-                BlockList {
-                    size: MIN_ALLOC_SIZE << 2,
-                    blk: BTreeSet::from([4].map(|i| i * MIN_ALLOC_SIZE)),
-                },
-                BlockList {
-                    size: MIN_ALLOC_SIZE << 3,
-                    blk: BTreeSet::from([]),
-                }
-            ],
-        );
-    }
-
-    #[test]
-    fn test_merge2() {
-        let mut v = vec![
-            BlockList {
-                size: MIN_ALLOC_SIZE,
-                blk: BTreeSet::from([4, 10].map(|i| i * MIN_ALLOC_SIZE)),
-            },
-            BlockList {
-                size: MIN_ALLOC_SIZE << 1,
-                blk: BTreeSet::from([6, 8].map(|i| i * MIN_ALLOC_SIZE)),
-            },
-            BlockList {
-                size: MIN_ALLOC_SIZE << 2,
-                blk: BTreeSet::from([0].map(|i| i * MIN_ALLOC_SIZE)),
-            },
-            BlockList {
-                size: MIN_ALLOC_SIZE << 3,
-                blk: BTreeSet::from([]),
-            },
-        ];
-
-        merge_up(&mut v, 5 * MIN_ALLOC_SIZE, MIN_ALLOC_SIZE_POWER);
-        assert_eq!(
-            v,
-            vec![
-                BlockList {
-                    size: MIN_ALLOC_SIZE,
-                    blk: BTreeSet::from([10].map(|i| i * MIN_ALLOC_SIZE)),
-                },
-                BlockList {
-                    size: MIN_ALLOC_SIZE << 1,
-                    blk: BTreeSet::from([1, 3, 8].map(|i| i * MIN_ALLOC_SIZE)),
                 },
                 BlockList {
                     size: MIN_ALLOC_SIZE << 2,
@@ -336,8 +379,132 @@ mod test {
                 BlockList {
                     size: MIN_ALLOC_SIZE << 3,
                     blk: BTreeSet::from([0]),
-                }
+                },
             ],
+        };
+
+        let r = v.split_down(MIN_ALLOC_SIZE_POWER);
+        assert_eq!(r, Some((7 * MIN_ALLOC_SIZE, MIN_ALLOC_SIZE_POWER)));
+        assert_eq!(
+            v,
+            BlockTree {
+                tree: vec![
+                    BlockList {
+                        size: MIN_ALLOC_SIZE,
+                        blk: BTreeSet::from([6].map(|i| i * MIN_ALLOC_SIZE)),
+                    },
+                    BlockList {
+                        size: MIN_ALLOC_SIZE << 1,
+                        blk: BTreeSet::from([4].map(|i| i * MIN_ALLOC_SIZE)),
+                    },
+                    BlockList {
+                        size: MIN_ALLOC_SIZE << 2,
+                        blk: BTreeSet::from([0].map(|i| i * MIN_ALLOC_SIZE)),
+                    },
+                    BlockList {
+                        size: MIN_ALLOC_SIZE << 3,
+                        blk: BTreeSet::from([]),
+                    },
+                ]
+            }
+        )
+    }
+
+    #[test]
+    fn test_merge() {
+        let mut v = BlockTree {
+            tree: vec![
+                BlockList {
+                    size: MIN_ALLOC_SIZE,
+                    blk: BTreeSet::from([1, 3, 8].map(|i| i * MIN_ALLOC_SIZE)),
+                },
+                BlockList {
+                    size: MIN_ALLOC_SIZE << 1,
+                    blk: BTreeSet::from([4].map(|i| i * MIN_ALLOC_SIZE)),
+                },
+                BlockList {
+                    size: MIN_ALLOC_SIZE << 2,
+                    blk: BTreeSet::from([]),
+                },
+                BlockList {
+                    size: MIN_ALLOC_SIZE << 3,
+                    blk: BTreeSet::from([]),
+                },
+            ],
+        };
+
+        v.merge_up(6 * MIN_ALLOC_SIZE, MIN_ALLOC_SIZE_POWER + 1);
+        assert_eq!(
+            v,
+            BlockTree {
+                tree: vec![
+                    BlockList {
+                        size: MIN_ALLOC_SIZE,
+                        blk: BTreeSet::from([1, 3, 8].map(|i| i * MIN_ALLOC_SIZE)),
+                    },
+                    BlockList {
+                        size: MIN_ALLOC_SIZE << 1,
+                        blk: BTreeSet::from([]),
+                    },
+                    BlockList {
+                        size: MIN_ALLOC_SIZE << 2,
+                        blk: BTreeSet::from([4].map(|i| i * MIN_ALLOC_SIZE)),
+                    },
+                    BlockList {
+                        size: MIN_ALLOC_SIZE << 3,
+                        blk: BTreeSet::from([]),
+                    }
+                ]
+            },
+        );
+    }
+
+    #[test]
+    fn test_merge2() {
+        let mut v = BlockTree {
+            tree: vec![
+                BlockList {
+                    size: MIN_ALLOC_SIZE,
+                    blk: BTreeSet::from([4, 10].map(|i| i * MIN_ALLOC_SIZE)),
+                },
+                BlockList {
+                    size: MIN_ALLOC_SIZE << 1,
+                    blk: BTreeSet::from([6, 8].map(|i| i * MIN_ALLOC_SIZE)),
+                },
+                BlockList {
+                    size: MIN_ALLOC_SIZE << 2,
+                    blk: BTreeSet::from([0].map(|i| i * MIN_ALLOC_SIZE)),
+                },
+                BlockList {
+                    size: MIN_ALLOC_SIZE << 3,
+                    blk: BTreeSet::from([]),
+                },
+            ],
+        };
+
+        v.merge_up(5 * MIN_ALLOC_SIZE, MIN_ALLOC_SIZE_POWER);
+        assert_eq!(
+            v,
+            BlockTree {
+                tree: vec![
+                    BlockList {
+                        size: MIN_ALLOC_SIZE,
+                        blk: BTreeSet::from([10].map(|i| i * MIN_ALLOC_SIZE)),
+                    },
+                    BlockList {
+                        size: MIN_ALLOC_SIZE << 1,
+                        blk: BTreeSet::from([8].map(|i| i * MIN_ALLOC_SIZE)),
+                    },
+                    BlockList {
+                        size: MIN_ALLOC_SIZE << 2,
+                        blk: BTreeSet::from([]),
+                    },
+                    BlockList {
+                        size: MIN_ALLOC_SIZE << 3,
+                        blk: BTreeSet::from([0]),
+                    }
+                ]
+            },
         );
     }
 
@@ -361,5 +528,77 @@ mod test {
             buddy_blk_of(0 * MIN_ALLOC_SIZE, 4 * MIN_ALLOC_SIZE),
             4 * MIN_ALLOC_SIZE
         );
+    }
+
+    #[cfg(mloom)]
+    use loom::thread;
+
+    #[cfg(not(mloom))]
+    use std::thread;
+
+    fn loom_test<F>(f: F)
+    where
+        F: Fn() + Sync + Send + 'static,
+    {
+        #[cfg(not(mloom))]
+        f();
+
+        #[cfg(mloom)]
+        loom::model(f);
+    }
+
+    #[test]
+    fn test_piece_buf() {
+        loom_test(|| {
+            let c = Cache::new(15 * MIN_ALLOC_SIZE);
+            let sz1 = 4114;
+            let sz2 = 5 * MIN_ALLOC_SIZE - 411;
+            let mut b1 = c.alloc(sz1).unwrap();
+            let mut b2 = c.alloc(sz2).unwrap();
+            assert_eq!(b1.len, sz1);
+            assert_eq!(b2.len, sz2);
+            assert_eq!(b1.as_mut_slice().len(), sz1);
+            for b in b1.as_mut_slice().iter_mut() {
+                *b = 0xff;
+            }
+            for b in c.inner.buf.iter().skip(b1.b.offset).take(sz1) {
+                assert_eq!(*b, 0xff);
+            }
+        });
+    }
+
+    #[test]
+    fn test_concurrent_piece_buf() {
+        loom_test(|| {
+            let c = Cache::new(15 * MIN_ALLOC_SIZE);
+            let sz = 3 * MIN_ALLOC_SIZE - 112;
+
+            let c1 = c.clone();
+            let h1 = thread::spawn(move || {
+                let mut pb = c1.alloc(sz).unwrap();
+                for b in pb.as_mut_slice().iter_mut() {
+                    *b = 0xff;
+                }
+                pb
+            });
+
+            let c2 = c.clone();
+            let h2 = thread::spawn(move || {
+                let mut pb = c2.alloc(sz).unwrap();
+                for b in pb.as_mut_slice().iter_mut() {
+                    *b = 0xcc;
+                }
+                pb
+            });
+            let pb1 = h1.join().unwrap();
+            let pb2 = h2.join().unwrap();
+
+            for b in c.inner.buf.iter().skip(pb1.b.offset).take(sz) {
+                assert_eq!(*b, 0xff);
+            }
+            for b in c.inner.buf.iter().skip(pb2.b.offset).take(sz) {
+                assert_eq!(*b, 0xcc);
+            }
+        });
     }
 }

@@ -1,3 +1,4 @@
+use std::mem::MaybeUninit;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time;
@@ -7,7 +8,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tracing::{info, warn};
 
 use crate::backfile::WriteJob;
-use crate::cache::ArcCache;
+use crate::cache::{ArcCache, PieceBuf};
 use crate::metadata;
 use crate::picker::BlockRequests;
 use crate::protocol::{self, BTStream, Message, ReadStream, Split, WriteStream};
@@ -435,14 +436,22 @@ async fn handle_piece_msg<T>(
         // must drop pb_map before await point
         // pb_map is not Send
         let mut pb_map = tmh.piece_buffer.lock().unwrap();
-        let pb = match pb_map.get(&piece.index) {
-            Some(pb) => pb.clone(),
-            None => {
-                let pb = ArcCache::new(tmh.piece_size);
-                pb_map.insert(piece.index, pb.clone());
-                pb
-            }
-        };
+        let pb = pb_map
+            .entry(piece.index)
+            .or_insert_with(|| {
+                if let Some(pb) = tmh.buffer_pool.alloc(tmh.piece_size) {
+                    warn!("alloc OK {:?}", pb);
+                    ArcCache::new(pb)
+                } else {
+                    panic!("piece buffer alloc failed")
+                }
+            })
+            .clone();
+
+        // TODO: would be great if std has a get_or_insert which returns immutable ref
+        // make this immutable reference so we can clone this and drop pb_map
+        // thus drop mutex and across await point
+        // let pb = pb_map.get(&piece.index).unwrap();
 
         let block_ref = pb.get_part_ref(
             piece.begin as usize,
