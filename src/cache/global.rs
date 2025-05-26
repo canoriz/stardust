@@ -1,6 +1,8 @@
 use core::slice;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::fmt::Debug;
+use std::future::Future;
+use std::task::{Poll, Waker};
 
 #[cfg(mloom)]
 use loom::sync::{Arc, Mutex};
@@ -8,8 +10,6 @@ use tracing::warn;
 
 #[cfg(not(mloom))]
 use std::sync::{Arc, Mutex};
-
-use tokio::io::split;
 
 const MIN_ALLOC_SIZE: usize = 256 * 1024;
 const MIN_ALLOC_SIZE_POWER: u32 = MIN_ALLOC_SIZE.ilog2();
@@ -32,6 +32,7 @@ pub(crate) struct PieceBufPool {
 struct PieceBufPoolImpl {
     buf: Vec<u8>,
     block_tree: Mutex<BlockTree>,
+    waiting_alloc: Mutex<VecDeque<AllocReq>>,
 }
 
 // This is !Clone
@@ -82,6 +83,18 @@ impl PieceBufPool {
             main_cache: self.inner.clone(),
         })
     }
+
+    /// async alloc PieceBuf
+    /// wait until enough free space
+    /// as long as size <= max size of buffer, waits until
+    /// enough space, else return None
+    pub fn async_alloc(&self, size: usize) -> AllocPieceBufFut {
+        AllocPieceBufFut {
+            size,
+            pool: self,
+            waiting: false,
+        }
+    }
 }
 
 impl PieceBufPoolImpl {
@@ -91,6 +104,7 @@ impl PieceBufPoolImpl {
         Self {
             buf: vec![0u8; size_fixed],
             block_tree: Mutex::new(init_block_tree(size_fixed)),
+            waiting_alloc: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -114,8 +128,20 @@ impl PieceBufPoolImpl {
 
     /// returns PieceBuf
     fn free(&self, b: &FreeBlock) {
-        let mut blk_tree = self.block_tree.lock().expect("alloc lock should OK");
-        blk_tree.merge_up(b.offset, b.power);
+        {
+            let mut blk_tree = self.block_tree.lock().expect("alloc lock should OK");
+            blk_tree.merge_up(b.offset, b.power);
+            // blk_tree's lock dropped here, prevents dead_lock
+        }
+
+        let mut waiting_alloc = self
+            .waiting_alloc
+            .lock()
+            .expect("waiting alloc lock should OK");
+        if let Some(v) = waiting_alloc.pop_front() {
+            // TODO: maybe add an atomic, only wake one pending alloc request
+            v.waker.wake();
+        }
     }
 }
 
@@ -135,6 +161,56 @@ impl PieceBuf {
 impl AsRef<[u8]> for PieceBuf {
     fn as_ref(&self) -> &[u8] {
         unsafe { slice::from_raw_parts(self.b.ptr, self.len) }
+    }
+}
+
+struct AllocReq {
+    waker: Waker,
+}
+
+pub(crate) struct AllocPieceBufFut<'a> {
+    pool: &'a PieceBufPool,
+    waiting: bool,
+    size: usize,
+}
+
+impl Future for AllocPieceBufFut<'_> {
+    type Output = PieceBuf;
+
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        let fut = self.get_mut();
+
+        let mut waiting_alloc = fut.pool.inner.waiting_alloc.lock().unwrap();
+        if !fut.waiting {
+            if !waiting_alloc.is_empty() {
+                waiting_alloc.push_back(AllocReq {
+                    waker: cx.waker().clone(),
+                });
+                fut.waiting = true;
+                return Poll::Pending;
+            }
+            if let Some(bf) = fut.pool.alloc(fut.size) {
+                // this holds both lock of block_tree and waiting_alloc
+                Poll::Ready(bf)
+            } else {
+                waiting_alloc.push_back(AllocReq {
+                    waker: cx.waker().clone(),
+                });
+                fut.waiting = true;
+                Poll::Pending
+            }
+        } else if let Some(bf) = fut.pool.alloc(fut.size) {
+            if let Some(v) = waiting_alloc.pop_front() {
+                // TODO: maybe add an atomic, only wake one pending alloc request
+                v.waker.wake();
+            }
+            Poll::Ready(bf)
+        } else {
+            waiting_alloc.push_front(AllocReq {
+                waker: cx.waker().clone(),
+            }); // try to be the first
+            Poll::Pending
+        }
     }
 }
 
@@ -609,5 +685,21 @@ mod test {
                 assert_eq!(*b, 0xcc);
             }
         });
+    }
+
+    #[tokio::test]
+    async fn test_async_piece_buf() {
+        let c = PieceBufPool::new(2 * MIN_ALLOC_SIZE);
+        let all = c.async_alloc(2 * MIN_ALLOC_SIZE).await;
+        assert!(c.alloc(2 * MIN_ALLOC_SIZE).is_none());
+        drop(all);
+        let _half1 = c.async_alloc(1 * MIN_ALLOC_SIZE).await;
+        let half2 = c.async_alloc(1 * MIN_ALLOC_SIZE).await;
+        assert!(c.alloc(1 * MIN_ALLOC_SIZE).is_none());
+        drop(half2);
+        let half3 = c.async_alloc(1 * MIN_ALLOC_SIZE).await;
+        assert!(c.alloc(1 * MIN_ALLOC_SIZE).is_none());
+        drop(half3);
+        assert!(c.alloc(1 * MIN_ALLOC_SIZE).is_some());
     }
 }

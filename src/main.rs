@@ -206,12 +206,12 @@ where
     bt_stream.send_keepalive().await?;
     bt_stream.send_keepalive().await?;
     info!("all keep alive sent");
-    let mut ticker5 = tokio::time::interval(time::Duration::from_secs(3));
+    let ticker5 = tokio::time::interval(time::Duration::from_secs(3));
     let mut ticker1 = tokio::time::interval(time::Duration::from_millis(1000));
     bt_stream.send_unchoke().await;
-    let limit = 2000;
+    let limit = 200;
     let mut accum = 0;
-    let mut choked = false;
+    let choked = false;
     loop {
         tokio::select! {
             msg = bt_stream.recv_msg_header() => {

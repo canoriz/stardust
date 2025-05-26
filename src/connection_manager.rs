@@ -1,4 +1,3 @@
-use std::mem::MaybeUninit;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time;
@@ -8,7 +7,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tracing::{info, warn};
 
 use crate::backfile::WriteJob;
-use crate::cache::{ArcCache, PieceBuf};
+use crate::cache::ArcCache;
 use crate::metadata;
 use crate::picker::BlockRequests;
 use crate::protocol::{self, BTStream, Message, ReadStream, Split, WriteStream};
@@ -432,26 +431,31 @@ async fn handle_piece_msg<T>(
         piece.begin >> 14,
     );
 
-    let (block_ref, piece_buf) = {
+    let maybe_pb = {
         // must drop pb_map before await point
         // pb_map is not Send
-        let mut pb_map = tmh.piece_buffer.lock().unwrap();
-        let pb = pb_map
-            .entry(piece.index)
-            .or_insert_with(|| {
-                if let Some(pb) = tmh.buffer_pool.alloc(tmh.piece_size) {
-                    warn!("alloc OK {:?}", pb);
-                    ArcCache::new(pb)
-                } else {
-                    panic!("piece buffer alloc failed")
-                }
-            })
-            .clone();
+        let pb_map = tmh.piece_buffer.lock().unwrap();
+        pb_map.get(&piece.index).map(|v| v.clone())
+    };
 
-        // TODO: would be great if std has a get_or_insert which returns immutable ref
-        // make this immutable reference so we can clone this and drop pb_map
-        // thus drop mutex and across await point
-        // let pb = pb_map.get(&piece.index).unwrap();
+    let (block_ref, piece_buf) = {
+        let pb = if let Some(pb) = maybe_pb {
+            pb
+        } else {
+            // TODO: many peer may all want to write piece i and all of them
+            // allocating new buffer, which is wasting memory and affects other
+            // buffer(other buffer being pushed out?)
+            // Maybe async_alloc can store info about piece and wake up all waiting
+            // tasks when the requested piece buffer is allocated, which avoids
+            // deplicating allocates buffer
+            let piece_buffer = tmh.buffer_pool.async_alloc(tmh.piece_size).await;
+            let pb = ArcCache::new(piece_buffer);
+
+            // if this piece buffer already exists(allocated by other peer handler),
+            // use exist one
+            let mut pb_map = tmh.piece_buffer.lock().unwrap();
+            pb_map.entry(piece.index).or_insert(pb).clone()
+        };
 
         let block_ref = pb.get_part_ref(
             piece.begin as usize,
