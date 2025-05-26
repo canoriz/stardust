@@ -132,7 +132,7 @@ impl TransmitManager {
                 piece_size: piece_size as usize,
                 back_file: Arc::new(Mutex::new(BackFile::new(m))),
                 write_worker: job_tx,
-                buffer_pool: PieceBufPool::new(3 * 16 * 16384),
+                buffer_pool: PieceBufPool::new(80 * 16 * 16384),
             },
             // announce_handle: None,
             // announce_tx: None,

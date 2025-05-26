@@ -106,6 +106,7 @@ impl ConnectionManagerHandle {
     //     // send task notify
     // }
 
+    // TODO: when dropped, send_stream and recv_stream should be closed
     pub async fn stop(self) {
         self.recv_stream.cancel.send(());
         self.recv_stream.done.await;
@@ -186,6 +187,7 @@ async fn run_recv_stream<T>(
                     }
                     Err(e) => {
                         warn!("recv stream read header error {e}");
+                        break;
                     }
                 }
             }
