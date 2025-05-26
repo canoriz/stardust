@@ -104,7 +104,7 @@ where
 {
     // TODO: is this safe? require T: AsRef and taking ownership of T
     // size must be multiple of 16384
-    pub fn new(mut t: T) -> Self {
+    pub fn new(t: T) -> Self {
         let size = t.as_ref().len();
         if size.trailing_zeros() < BLOCKSIZE.trailing_zeros() {
             // TODO: maybe not panic, fix size instead?
@@ -203,7 +203,8 @@ where
 
     len: usize,
 
-    // manually_drop used in extend_to_entire()
+    // manually_drop is used in extend_to_entire()
+    // extend_or_entire acts as a "Drop"
     main_cache: ManuallyDrop<Arc<Cache<T>>>,
 }
 

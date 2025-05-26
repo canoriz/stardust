@@ -25,21 +25,27 @@ const _: () = assert!(MIN_ALLOC_SIZE.next_power_of_two() == MIN_ALLOC_SIZE);
 /// 5. defragmentation when memory is fragmentated
 /// 6. expand/shrink size of cache
 #[derive(Clone)]
-pub(crate) struct Cache {
-    inner: Arc<CacheImpl>,
+pub(crate) struct PieceBufPool {
+    inner: Arc<PieceBufPoolImpl>,
 }
 
-struct CacheImpl {
+struct PieceBufPoolImpl {
     buf: Vec<u8>,
     block_tree: Mutex<BlockTree>,
 }
 
-// TODO: maybe change a name
+// This is !Clone
 pub(crate) struct PieceBuf {
     b: FreeBlock,
     len: usize,
-    main_cache: Arc<CacheImpl>,
+    main_cache: Arc<PieceBufPoolImpl>,
 }
+
+// SAFETY: the reference of free buffer can be sent across threads.
+// and dropped by a different thread than created one.
+unsafe impl Send for PieceBuf {}
+// SAFETY: PieceBuf's interface is read only
+unsafe impl Sync for PieceBuf {}
 
 impl Debug for PieceBuf {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -50,11 +56,8 @@ impl Debug for PieceBuf {
     }
 }
 
-unsafe impl Send for PieceBuf {}
-
-// TODO: is this safe?
-unsafe impl Sync for PieceBuf {}
-
+// FreeBlock is NOT Clone. It's fundamentally a owned reference to
+// free buffer
 #[derive(Debug)]
 struct FreeBlock {
     // TODO: offset and ptr is same thing? only store one?
@@ -64,10 +67,10 @@ struct FreeBlock {
     ptr: *const u8,
 }
 
-impl Cache {
+impl PieceBufPool {
     pub fn new(size: usize) -> Self {
         Self {
-            inner: Arc::new(CacheImpl::new(size)),
+            inner: Arc::new(PieceBufPoolImpl::new(size)),
         }
     }
 
@@ -81,7 +84,7 @@ impl Cache {
     }
 }
 
-impl CacheImpl {
+impl PieceBufPoolImpl {
     fn new(size: usize) -> Self {
         let size_fixed = size.next_multiple_of(MIN_ALLOC_SIZE);
 
@@ -550,7 +553,7 @@ mod test {
     #[test]
     fn test_piece_buf() {
         loom_test(|| {
-            let c = Cache::new(15 * MIN_ALLOC_SIZE);
+            let c = PieceBufPool::new(15 * MIN_ALLOC_SIZE);
             let sz1 = 4114;
             let sz2 = 5 * MIN_ALLOC_SIZE - 411;
             let mut b1 = c.alloc(sz1).unwrap();
@@ -561,8 +564,14 @@ mod test {
             for b in b1.as_mut_slice().iter_mut() {
                 *b = 0xff;
             }
+            for b in b2.as_mut_slice().iter_mut() {
+                *b = 0xcc;
+            }
             for b in c.inner.buf.iter().skip(b1.b.offset).take(sz1) {
                 assert_eq!(*b, 0xff);
+            }
+            for b in c.inner.buf.iter().skip(b2.b.offset).take(sz2) {
+                assert_eq!(*b, 0xcc);
             }
         });
     }
@@ -570,7 +579,7 @@ mod test {
     #[test]
     fn test_concurrent_piece_buf() {
         loom_test(|| {
-            let c = Cache::new(15 * MIN_ALLOC_SIZE);
+            let c = PieceBufPool::new(15 * MIN_ALLOC_SIZE);
             let sz = 3 * MIN_ALLOC_SIZE - 112;
 
             let c1 = c.clone();

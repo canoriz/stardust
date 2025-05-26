@@ -209,7 +209,7 @@ where
     let mut ticker5 = tokio::time::interval(time::Duration::from_secs(3));
     let mut ticker1 = tokio::time::interval(time::Duration::from_millis(1000));
     bt_stream.send_unchoke().await;
-    let limit = 200;
+    let limit = 2000;
     let mut accum = 0;
     let mut choked = false;
     loop {
@@ -240,16 +240,16 @@ where
                     }
                 }
             }
-            _ = ticker5.tick() => {
-                choked = rand::random();
-                if !choked {
-                    info!("main {addr} unchoke");
-                    bt_stream.send_unchoke().await;
-                } else {
-                    info!("main {addr} choke");
-                    bt_stream.send_choke().await;
-                }
-            }
+            // _ = ticker5.tick() => {
+            //     choked = rand::random();
+            //     if !choked {
+            //         info!("main {addr} unchoke");
+            //         bt_stream.send_unchoke().await;
+            //     } else {
+            //         info!("main {addr} choke");
+            //         bt_stream.send_choke().await;
+            //     }
+            // }
             _ = ticker1.tick() => {
                 info!("in this period, {accum} blocks transferred");
                 accum = 0;

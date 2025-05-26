@@ -2,7 +2,7 @@ use crate::backfile;
 use crate::backfile::BackFile;
 use crate::backfile::WriteJob;
 use crate::cache::ArcCache;
-use crate::cache::{PieceBuf, PieceBuffer};
+use crate::cache::{PieceBuf, PieceBufPool};
 use crate::connection_manager::ConnectionManagerHandle;
 use crate::connection_manager::Msg as ConnMsg;
 use crate::metadata::{self, Metadata};
@@ -85,7 +85,7 @@ pub(crate) struct TransmitManagerHandle {
     pub back_file: Arc<Mutex<BackFile>>,
     pub write_worker: std::sync::mpsc::Sender<WriteJob<'static>>,
 
-    pub buffer_pool: PieceBuffer,
+    pub buffer_pool: PieceBufPool,
 }
 
 pub struct TransmitManager {
@@ -132,7 +132,7 @@ impl TransmitManager {
                 piece_size: piece_size as usize,
                 back_file: Arc::new(Mutex::new(BackFile::new(m))),
                 write_worker: job_tx,
-                buffer_pool: PieceBuffer::new(8 * 16 * 16384),
+                buffer_pool: PieceBufPool::new(8 * 16 * 16384),
             },
             // announce_handle: None,
             // announce_tx: None,
