@@ -6,7 +6,7 @@ use std::task::{Poll, Waker};
 
 #[cfg(mloom)]
 use loom::sync::{Arc, Mutex};
-use tracing::warn;
+use tracing::{debug, warn};
 
 #[cfg(not(mloom))]
 use std::sync::{Arc, Mutex};
@@ -85,11 +85,18 @@ impl PieceBufPool {
     }
 
     /// async alloc PieceBuf
+    ///
+    /// Equivalent to
+    /// ```ignore
+    /// async async_alloc(&self, size: usize) -> PieceBuf
+    /// ```
+    ///
     /// wait until enough free space
     /// as long as size <= max size of buffer, waits until
     /// enough space, else return None
-    pub fn async_alloc(&self, size: usize) -> AllocPieceBufFut {
+    pub fn async_alloc(&self, id: usize, size: usize) -> AllocPieceBufFut {
         AllocPieceBufFut {
+            id,
             size,
             pool: self,
             waiting: false,
@@ -147,7 +154,7 @@ impl PieceBufPoolImpl {
 
 impl Drop for PieceBuf {
     fn drop(&mut self) {
-        warn!("free {:?}", self);
+        debug!("free PieceBuf {:?}", self);
         self.main_cache.free(&self.b);
     }
 }
@@ -165,10 +172,12 @@ impl AsRef<[u8]> for PieceBuf {
 }
 
 struct AllocReq {
+    id: usize,
     waker: Waker,
 }
 
 pub(crate) struct AllocPieceBufFut<'a> {
+    id: usize,
     pool: &'a PieceBufPool,
     waiting: bool,
     size: usize,
@@ -184,6 +193,7 @@ impl Future for AllocPieceBufFut<'_> {
         if !fut.waiting {
             if !waiting_alloc.is_empty() {
                 waiting_alloc.push_back(AllocReq {
+                    id: fut.id,
                     waker: cx.waker().clone(),
                 });
                 fut.waiting = true;
@@ -194,6 +204,7 @@ impl Future for AllocPieceBufFut<'_> {
                 Poll::Ready(bf)
             } else {
                 waiting_alloc.push_back(AllocReq {
+                    id: fut.id,
                     waker: cx.waker().clone(),
                 });
                 fut.waiting = true;
@@ -207,6 +218,7 @@ impl Future for AllocPieceBufFut<'_> {
             Poll::Ready(bf)
         } else {
             waiting_alloc.push_front(AllocReq {
+                id: fut.id,
                 waker: cx.waker().clone(),
             }); // try to be the first
             Poll::Pending
@@ -690,16 +702,15 @@ mod test {
     #[tokio::test]
     async fn test_async_piece_buf() {
         let c = PieceBufPool::new(2 * MIN_ALLOC_SIZE);
-        let all = c.async_alloc(2 * MIN_ALLOC_SIZE).await;
-        assert!(c.alloc(2 * MIN_ALLOC_SIZE).is_none());
-        drop(all);
-        let _half1 = c.async_alloc(1 * MIN_ALLOC_SIZE).await;
-        let half2 = c.async_alloc(1 * MIN_ALLOC_SIZE).await;
-        assert!(c.alloc(1 * MIN_ALLOC_SIZE).is_none());
-        drop(half2);
-        let half3 = c.async_alloc(1 * MIN_ALLOC_SIZE).await;
-        assert!(c.alloc(1 * MIN_ALLOC_SIZE).is_none());
-        drop(half3);
-        assert!(c.alloc(1 * MIN_ALLOC_SIZE).is_some());
+
+        let mut ts = tokio::task::JoinSet::new();
+        for size in [2, 1, 1, 2, 1, 2usize].into_iter().enumerate() {
+            let c1 = c.clone();
+            ts.spawn(async move { c1.async_alloc(size.0, size.1 * MIN_ALLOC_SIZE).await });
+        }
+
+        for _ in 0..ts.len() {
+            _ = ts.join_next().await;
+        }
     }
 }

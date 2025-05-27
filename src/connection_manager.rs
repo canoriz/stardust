@@ -450,7 +450,7 @@ async fn handle_piece_msg<T>(
             // Maybe async_alloc can store info about piece and wake up all waiting
             // tasks when the requested piece buffer is allocated, which avoids
             // deplicating allocates buffer
-            let piece_buffer = tmh.buffer_pool.async_alloc(tmh.piece_size).await;
+            let piece_buffer = tmh.buffer_pool.async_alloc(1, tmh.piece_size).await;
             let pb = ArcCache::new(piece_buffer);
 
             // if this piece buffer already exists(allocated by other peer handler),
