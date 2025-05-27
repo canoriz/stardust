@@ -3,9 +3,7 @@ use core::fmt;
 use std::fmt::Formatter;
 use std::mem::MaybeUninit;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use tokio::io::{
-    self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter,
-};
+use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net;
 use tokio::net::tcp;
 use tracing::{info, warn};
@@ -1393,6 +1391,7 @@ mod tests {
             fn wake(self: Arc<Self>) {}
         }
 
+        // TODO: maybe using tokio_test's Future
         let waker = Arc::new(MockWaker).into();
         let mut cx = Context::from_waker(&waker);
 
