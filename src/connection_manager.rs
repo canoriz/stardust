@@ -4,6 +4,7 @@ use std::time;
 use tokio::sync::{mpsc, oneshot};
 
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{info, warn};
 
 use crate::backfile::WriteJob;
@@ -42,13 +43,8 @@ impl ConnectionManagerHandle {
         let (read_stream, write_stream) = conn.split();
 
         let (recv_tx, recv_rx) = mpsc::unbounded_channel();
-        let (recv_cancel_tx, recv_cancel_rx) = oneshot::channel();
         let (recv_done_tx, recv_done_rx) = oneshot::channel();
-        let recv_stream_handle = RecvStreamHandle {
-            sender: recv_tx,
-            cancel: recv_cancel_tx,
-            done: recv_done_rx,
-        };
+        let recv_cancel = CancellationToken::new();
         let recv_stream: RecvStream<T> = RecvStream {
             receiver: recv_rx,
             read_stream: read_stream,
@@ -57,19 +53,33 @@ impl ConnectionManagerHandle {
         };
 
         let (send_tx, send_rx) = mpsc::unbounded_channel();
-        let (send_cancel_tx, send_cancel_rx) = oneshot::channel();
+        let send_cancel = CancellationToken::new();
         let (send_done_tx, send_done_rx) = oneshot::channel();
-        let send_stream_handle = SendStreamHandle {
-            sender: send_tx,
-            cancel: send_cancel_tx,
-            done: send_done_rx,
-        };
         let send_stream: SendStream<T> = SendStream {
             receiver: send_rx,
             write_stream: write_stream,
         };
-        tokio::spawn(run_recv_stream(recv_stream, recv_cancel_rx, recv_done_tx));
-        tokio::spawn(run_send_stream(send_stream, send_cancel_rx, send_done_tx));
+
+        tokio::spawn(run_recv_stream(
+            recv_stream,
+            recv_cancel.clone(),
+            recv_done_tx,
+        ));
+        tokio::spawn(run_send_stream(
+            send_stream,
+            send_cancel.clone(),
+            send_done_tx,
+        ));
+        let recv_stream_handle = RecvStreamHandle {
+            sender: recv_tx,
+            cancel: recv_cancel.drop_guard(),
+            done: recv_done_rx,
+        };
+        let send_stream_handle = SendStreamHandle {
+            sender: send_tx,
+            cancel: send_cancel.drop_guard(),
+            done: send_done_rx,
+        };
 
         Self {
             recv_stream: recv_stream_handle,
@@ -105,20 +115,18 @@ impl ConnectionManagerHandle {
     //     let piece_length = self.metadata.info.piece_length;
     //     // send task notify
     // }
-
-    // TODO: when dropped, send_stream and recv_stream should be closed
-    pub async fn stop(self) {
-        self.recv_stream.cancel.send(());
-        self.recv_stream.done.await;
-        self.send_stream.cancel.send(());
-        self.send_stream.done.await;
+    pub async fn stop_wait(self) {
+        self.recv_stream.cancel.disarm().cancel();
+        self.send_stream.cancel.disarm().cancel();
+        _ = self.send_stream.done.await;
+        _ = self.recv_stream.done.await;
         info!("connection manager cancelled");
     }
 }
 
 struct RecvStreamHandle {
     sender: mpsc::UnboundedSender<Msg>,
-    cancel: oneshot::Sender<()>,
+    cancel: DropGuard,
     done: oneshot::Receiver<()>,
 }
 
@@ -135,7 +143,7 @@ where
 
 struct SendStreamHandle {
     sender: mpsc::UnboundedSender<Msg>,
-    cancel: oneshot::Sender<()>,
+    cancel: DropGuard,
     done: oneshot::Receiver<()>,
 }
 
@@ -152,7 +160,7 @@ where
 
 async fn run_recv_stream<T>(
     mut conn: RecvStream<T>,
-    mut cancel: oneshot::Receiver<()>,
+    cancel: CancellationToken,
     done: oneshot::Sender<()>,
 ) where
     T: Split,
@@ -163,7 +171,7 @@ async fn run_recv_stream<T>(
     loop {
         tokio::select! {
             biased;
-            _ = &mut cancel => {
+            _ = cancel.cancelled() => {
                 info!("recv stream cancelled");
                 break;
             }
@@ -293,7 +301,7 @@ where
 
 async fn run_send_stream<T>(
     mut conn: SendStream<T>,
-    mut cancel: oneshot::Receiver<()>,
+    cancel: CancellationToken,
     done: oneshot::Sender<()>,
 ) where
     T: Split,
@@ -303,7 +311,7 @@ async fn run_send_stream<T>(
 
     loop {
         tokio::select! {
-            _ = &mut cancel => {
+            _ = cancel.cancelled() => {
                 info!("send stream cancelled");
                 break;
             }

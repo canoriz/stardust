@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 #[derive(Debug)]
@@ -121,6 +122,7 @@ impl TransmitManager {
         let piece_buffer = Arc::new(Mutex::new(HashMap::new()));
 
         let (job_tx, job_rx) = std::sync::mpsc::channel();
+        // TODO: let cancellation token cancel this
         tokio::task::spawn_blocking(move || backfile::write_worker(job_rx));
         Self {
             metadata: m.clone(),
@@ -413,7 +415,7 @@ impl TransmitManager {
 
 pub(crate) async fn run_transmit_manager(
     mut transmit: TransmitManager,
-    mut cancel: oneshot::Receiver<()>,
+    cancel: CancellationToken,
     done: oneshot::Sender<()>,
 ) {
     // let mut ticker = tokio::time::interval(time::Duration::from_millis(1000));
@@ -430,11 +432,7 @@ pub(crate) async fn run_transmit_manager(
             //     let pbl = transmit.self_handle.piece_buffer.lock().unwrap().len();
             //     warn!("piece buffer pending remains {pbl}");
             // }
-            _ = &mut cancel => {
-                for (addr, conn) in transmit.connected_peers.drain() {
-                    info!("stopping connection to {addr}");
-                    conn.conn.stop().await;
-                };
+            _ = cancel.cancelled() => {
                 info!("transmit manager cancelled");
                 break;
             }

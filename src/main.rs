@@ -166,7 +166,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //     conn.recv_handshake().await?;
     //     tm.send_msg(transmit_manager::Msg::NewPeer(conn));
     // }
-    time::sleep(Duration::from_secs(100000)).await;
+    time::sleep(Duration::from_secs(4)).await;
     // tm.send_announce_msg(announce_manager::Msg::RemoveUrl(
     //     announce_list[0][0].clone(),
     // ));
@@ -175,7 +175,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ));
     // time::sleep(Duration::from_secs(1000)).await;
     println!("before wait close");
-    tm.wait_close().await;
+    tm.stop_wait().await;
     println!("after wait close");
     Ok(())
 }

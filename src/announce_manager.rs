@@ -6,6 +6,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task;
 use tokio::time;
+use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::info;
 
 #[derive(Debug)]
@@ -16,7 +17,7 @@ pub enum Msg {
 
 pub struct AnnounceManagerHandle {
     cmd_tx: mpsc::UnboundedSender<Msg>,
-    cancel: oneshot::Sender<()>,
+    cancel: DropGuard,
     done: oneshot::Receiver<()>,
 }
 
@@ -24,7 +25,7 @@ impl AnnounceManagerHandle {
     pub fn new(m: Arc<Metadata>, tx: mpsc::UnboundedSender<transmit_manager::Msg>) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
 
-        let (cancel_tx, cancel_rx) = oneshot::channel();
+        let cancel = CancellationToken::new();
         let (done_tx, done_rx) = oneshot::channel();
 
         let manager = AnnounceManager {
@@ -40,11 +41,14 @@ impl AnnounceManagerHandle {
         };
         // tokio::spawn(run_announce_manager::<metadata::Announcer>(
         tokio::spawn(run_announce_manager::<FakeAnnouncer>(
-            manager, m, cancel_rx, done_tx,
+            manager,
+            m,
+            cancel.clone(),
+            done_tx,
         ));
         Self {
             cmd_tx,
-            cancel: cancel_tx,
+            cancel: cancel.drop_guard(),
             done: done_rx,
         }
     }
@@ -53,8 +57,8 @@ impl AnnounceManagerHandle {
         self.cmd_tx.send(msg);
     }
 
-    pub async fn stop(self) {
-        self.cancel.send(());
+    pub async fn stop_wait(self) {
+        self.cancel.disarm().cancel();
         self.done.await;
     }
 }
@@ -128,7 +132,7 @@ impl AnnounceManager {
 async fn run_announce_manager<A>(
     mut manager: AnnounceManager,
     m: Arc<Metadata>,
-    mut cancel: oneshot::Receiver<()>,
+    cancel: CancellationToken,
     done: oneshot::Sender<()>,
 ) where
     A: metadata::Announce + 'static,
@@ -150,10 +154,15 @@ async fn run_announce_manager<A>(
     // }
     let (announce_task_tx, announce_task_rx) = mpsc::unbounded_channel();
     let (output_tx, mut output_rx) = mpsc::unbounded_channel();
-    tokio::spawn(announce_task::<A>(announce_task_rx, output_tx, m));
+    tokio::spawn(announce_task::<A>(
+        announce_task_rx,
+        output_tx,
+        cancel.child_token(),
+        m,
+    ));
     loop {
         tokio::select! {
-            _ = &mut cancel => {
+            _ = cancel.cancelled() => {
                 info!("announce manager cancelled");
                 break;
             }
@@ -262,6 +271,7 @@ struct TimeUp {
 async fn announce_task<A>(
     mut rx: mpsc::UnboundedReceiver<TimeUp>,
     output: mpsc::UnboundedSender<(AnnounceResult, TimeUp)>,
+    cancel: CancellationToken,
     m: Arc<Metadata>,
     // timers: &mut task::JoinSet<TimeUp>,
 ) where
@@ -286,6 +296,10 @@ async fn announce_task<A>(
                     info!("announce rx recv None");
                     break;
                 }
+            }
+            _ = cancel.cancelled() => {
+                info!("announce task cancelled");
+                break;
             }
         }
     }
