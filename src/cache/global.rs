@@ -160,7 +160,7 @@ impl Drop for PieceBuf {
 }
 
 impl PieceBuf {
-    pub fn as_mut_slice(&mut self) -> &'static mut [u8] {
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
         unsafe { slice::from_raw_parts_mut(self.b.ptr as *mut _, self.len) }
     }
 }

@@ -526,9 +526,7 @@ async fn handle_piece_msg<T>(
             // will leaving completed block not written to disk.
             // i.e. some Ref may not call extend_to_entire because the piece
             // did not complete from their views.
-            if let Some(mut entire_block) = block_buf.extend_to_entire() {
-                let pbuf_s = entire_block.to_slice();
-
+            if let Some(entire_block) = block_buf.extend_to_entire() {
                 let bf_copy = tmh.back_file.clone();
                 let piece_size = tmh.piece_size;
                 tmh.piece_buffer.lock().expect("lock should ok").remove(&i);
@@ -536,7 +534,7 @@ async fn handle_piece_msg<T>(
                 Some(WriteJob {
                     f: bf_copy,
                     offset: (i as usize) * piece_size,
-                    buf: pbuf_s,
+                    buf: entire_block,
                     write_tx,
                 })
             } else {

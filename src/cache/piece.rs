@@ -214,14 +214,12 @@ impl<T> Ref<T>
 where
     T: AsRef<[u8]>,
 {
-    // TODO: is 'static safe? we are holding ref of arc, so
-    // we can hold it as long as we want, so it's safe?
-    pub fn to_slice(&mut self) -> &'static mut [u8] {
+    pub fn to_slice(&mut self) -> &mut [u8] {
         // TODO: is this safe? is ptr valid (will inner address in arc change?)
         unsafe { slice::from_raw_parts_mut(self.ptr as *mut _, self.len) }
     }
 
-    pub fn to_slice_len(&mut self, len: usize) -> &'static mut [u8] {
+    pub fn to_slice_len(&mut self, len: usize) -> &mut [u8] {
         assert!(len <= self.len);
         // TODO: is this safe? is ptr valid (will inner address in arc change?)
         unsafe { slice::from_raw_parts_mut(self.ptr as *mut _, len) }

@@ -84,7 +84,7 @@ pub(crate) struct TransmitManagerHandle {
     pub piece_buffer: Arc<Mutex<HashMap<u32, ArcCache<PieceBuf>>>>,
     pub piece_size: usize,
     pub back_file: Arc<Mutex<BackFile>>,
-    pub write_worker: std::sync::mpsc::Sender<WriteJob<'static>>,
+    pub write_worker: std::sync::mpsc::Sender<WriteJob<PieceBuf>>,
 
     pub buffer_pool: PieceBufPool,
 }

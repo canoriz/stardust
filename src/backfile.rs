@@ -4,6 +4,7 @@ use std::io::Result;
 use std::sync::{mpsc, Mutex};
 use std::{path::Path, sync::Arc};
 
+use crate::cache::Ref;
 use crate::metadata::Metadata;
 
 #[cfg(unix)]
@@ -161,20 +162,26 @@ struct FileWriteOp<'a> {
 //     }
 // }
 
-pub struct WriteJob<'a> {
+pub struct WriteJob<T>
+where
+    T: AsRef<[u8]>,
+{
     pub f: Arc<Mutex<BackFile>>,
     pub offset: usize,
-    pub buf: &'a [u8],
+    pub buf: Ref<T>,
     pub write_tx: tokio::sync::oneshot::Sender<std::io::Result<()>>,
 }
 
-pub fn write_worker(r: mpsc::Receiver<WriteJob>) {
+pub fn write_worker<T>(r: mpsc::Receiver<WriteJob<T>>)
+where
+    T: AsRef<[u8]>,
+{
     loop {
         match r.recv() {
-            Ok(job) => {
+            Ok(mut job) => {
                 // TODO: dead lock?
-                let bf = job.f.lock().unwrap();
-                // let r = bf.write(job.offset, job.buf);
+                let mut bf = job.f.lock().unwrap();
+                let r = bf.write(job.offset, job.buf.to_slice());
                 warn!(
                     "write offset {} len {} result {r:?}",
                     job.offset,
