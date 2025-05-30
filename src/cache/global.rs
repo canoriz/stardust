@@ -2,6 +2,7 @@ use core::slice;
 use std::collections::{BTreeSet, VecDeque};
 use std::fmt::Debug;
 use std::future::Future;
+use std::ops::{Deref, DerefMut};
 use std::task::{Poll, Waker};
 
 #[cfg(mloom)]
@@ -29,9 +30,13 @@ pub(crate) struct PieceBufPool {
     inner: Arc<PieceBufPoolImpl>,
 }
 
-struct PieceBufPoolImpl {
+struct BufTree {
     buf: Vec<u8>,
-    block_tree: Mutex<BlockTree>,
+    blk_tree: BlockTree,
+}
+
+struct PieceBufPoolImpl {
+    buf_tree: Mutex<BufTree>,
     waiting_alloc: Mutex<VecDeque<AllocReq>>,
 }
 
@@ -65,7 +70,7 @@ struct FreeBlock {
     offset: usize,
     power: u32,
 
-    ptr: *const u8,
+    ptr: *mut u8,
 }
 
 impl PieceBufPool {
@@ -109,8 +114,10 @@ impl PieceBufPoolImpl {
         let size_fixed = size.next_multiple_of(MIN_ALLOC_SIZE);
 
         Self {
-            buf: vec![0u8; size_fixed],
-            block_tree: Mutex::new(init_block_tree(size_fixed)),
+            buf_tree: Mutex::new(BufTree {
+                buf: vec![0u8; size_fixed],
+                blk_tree: init_block_tree(size_fixed),
+            }),
             waiting_alloc: Mutex::new(VecDeque::new()),
         }
     }
@@ -125,20 +132,21 @@ impl PieceBufPoolImpl {
         debug_assert_eq!(size_fixed % MIN_ALLOC_SIZE, 0);
         let power = size_fixed.ilog2();
 
-        let mut blk_tree = self.block_tree.lock().expect("alloc lock should OK");
+        let mut buf_tree_guard = self.buf_tree.lock().expect("alloc lock should OK");
+        let blk_tree = &mut buf_tree_guard.blk_tree;
         blk_tree.split_down(power).map(|(offset, power)| FreeBlock {
             offset,
             power,
-            ptr: unsafe { self.buf.as_ptr().add(offset) },
+            ptr: unsafe { buf_tree_guard.buf.as_mut_ptr().add(offset) },
         })
     }
 
     /// returns PieceBuf
     fn free(&self, b: &FreeBlock) {
         {
-            let mut blk_tree = self.block_tree.lock().expect("alloc lock should OK");
-            blk_tree.merge_up(b.offset, b.power);
-            // blk_tree's lock dropped here, prevents dead_lock
+            let mut buf_tree = self.buf_tree.lock().expect("alloc lock should OK");
+            buf_tree.blk_tree.merge_up(b.offset, b.power);
+            // buf_tree's lock dropped here, prevents deadlock
         }
 
         let mut waiting_alloc = self
@@ -159,15 +167,29 @@ impl Drop for PieceBuf {
     }
 }
 
-impl PieceBuf {
-    pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        unsafe { slice::from_raw_parts_mut(self.b.ptr as *mut _, self.len) }
+impl AsMut<[u8]> for PieceBuf {
+    fn as_mut(&mut self) -> &mut [u8] {
+        unsafe { slice::from_raw_parts_mut(self.b.ptr, self.len) }
     }
 }
 
 impl AsRef<[u8]> for PieceBuf {
     fn as_ref(&self) -> &[u8] {
         unsafe { slice::from_raw_parts(self.b.ptr, self.len) }
+    }
+}
+
+impl Deref for PieceBuf {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_ref()
+    }
+}
+
+impl DerefMut for PieceBuf {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        self.as_mut()
     }
 }
 
@@ -643,17 +665,19 @@ mod test {
             let mut b2 = c.alloc(sz2).unwrap();
             assert_eq!(b1.len, sz1);
             assert_eq!(b2.len, sz2);
-            assert_eq!(b1.as_mut_slice().len(), sz1);
-            for b in b1.as_mut_slice().iter_mut() {
+            assert_eq!(b1.as_mut().len(), sz1);
+            for b in b1.as_mut().iter_mut() {
                 *b = 0xff;
             }
-            for b in b2.as_mut_slice().iter_mut() {
+            for b in b2.as_mut().iter_mut() {
                 *b = 0xcc;
             }
-            for b in c.inner.buf.iter().skip(b1.b.offset).take(sz1) {
+
+            let guard = c.inner.buf_tree.lock().unwrap();
+            for b in guard.buf.iter().skip(b1.b.offset).take(sz1) {
                 assert_eq!(*b, 0xff);
             }
-            for b in c.inner.buf.iter().skip(b2.b.offset).take(sz2) {
+            for b in guard.buf.iter().skip(b2.b.offset).take(sz2) {
                 assert_eq!(*b, 0xcc);
             }
         });
@@ -668,7 +692,7 @@ mod test {
             let c1 = c.clone();
             let h1 = thread::spawn(move || {
                 let mut pb = c1.alloc(sz).unwrap();
-                for b in pb.as_mut_slice().iter_mut() {
+                for b in pb.as_mut().iter_mut() {
                     *b = 0xff;
                 }
                 pb
@@ -677,7 +701,7 @@ mod test {
             let c2 = c.clone();
             let h2 = thread::spawn(move || {
                 let mut pb = c2.alloc(sz).unwrap();
-                for b in pb.as_mut_slice().iter_mut() {
+                for b in pb.as_mut().iter_mut() {
                     *b = 0xcc;
                 }
                 pb
@@ -685,15 +709,17 @@ mod test {
             let pb1 = h1.join().unwrap();
             let pb2 = h2.join().unwrap();
 
-            for b in c.inner.buf.iter().skip(pb1.b.offset).take(sz) {
+            let guard = c.inner.buf_tree.lock().unwrap();
+            for b in guard.buf.iter().skip(pb1.b.offset).take(sz) {
                 assert_eq!(*b, 0xff);
             }
-            for b in c.inner.buf.iter().skip(pb2.b.offset).take(sz) {
+            for b in guard.buf.iter().skip(pb2.b.offset).take(sz) {
                 assert_eq!(*b, 0xcc);
             }
         });
     }
 
+    #[cfg(not(mloom))]
     #[tokio::test]
     async fn test_async_piece_buf() {
         let c = PieceBufPool::new(2 * MIN_ALLOC_SIZE);

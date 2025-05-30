@@ -164,7 +164,7 @@ struct FileWriteOp<'a> {
 
 pub struct WriteJob<T>
 where
-    T: AsRef<[u8]>,
+    T: AsMut<[u8]>,
 {
     pub f: Arc<Mutex<BackFile>>,
     pub offset: usize,
@@ -174,14 +174,14 @@ where
 
 pub fn write_worker<T>(r: mpsc::Receiver<WriteJob<T>>)
 where
-    T: AsRef<[u8]>,
+    T: AsMut<[u8]>,
 {
     loop {
         match r.recv() {
-            Ok(mut job) => {
+            Ok(job) => {
                 // TODO: dead lock?
                 let mut bf = job.f.lock().unwrap();
-                let r = bf.write(job.offset, job.buf.to_slice());
+                let r = bf.write(job.offset, &job.buf);
                 warn!(
                     "write offset {} len {} result {r:?}",
                     job.offset,

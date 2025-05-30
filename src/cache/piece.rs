@@ -1,4 +1,9 @@
-use std::{mem::ManuallyDrop, net::SocketAddr, ops::Deref, slice, vec};
+use std::{
+    mem::ManuallyDrop,
+    net::SocketAddr,
+    ops::{Deref, DerefMut},
+    slice, vec,
+};
 
 #[cfg(mloom)]
 use loom::sync::{
@@ -28,16 +33,12 @@ struct State {
     ref_cnt: u32,
 }
 
-pub(crate) trait AsSlice<T> {
-    fn as_slice(&self) -> &[T];
-}
-
 impl State {
     // returns reference count after release
     // use very carefully, this must not be public api
     fn release_ref<T>(&mut self, r: &Ref<T>) -> u32
     where
-        T: AsRef<[u8]>,
+        T: AsMut<[u8]>,
     {
         change_blockstate(&mut self.state, r.from, r.len, BlockState::Vacant);
         self.ref_cnt -= 1;
@@ -45,21 +46,20 @@ impl State {
     }
 }
 
-/// something like a Arc<Vec<u8>>
-struct UnderlyingBuffer {}
+struct BufState<T> {
+    cache: T,
+    state: State,
+}
 
 struct Cache<T> {
     allow_new_ref: AtomicBool,
-    // ref_count: AtomicU32,
-    cache: Arc<T>,
 
     // TODO: since all jobs access to cache,
     // maybe split lock to smaller granularity to reduce contention
-    state: Mutex<State>,
-    // _t: PhantomData<T>,
+    buf: Mutex<BufState<T>>,
 }
 
-fn change_blockstate(v: &mut Vec<BlockState>, offset: usize, len: usize, state: BlockState) {
+fn change_blockstate(v: &mut [BlockState], offset: usize, len: usize, state: BlockState) {
     for s in v[offset >> BLOCKBITS..(offset >> BLOCKBITS) + (len >> BLOCKBITS)].iter_mut() {
         *s = state;
     }
@@ -67,16 +67,17 @@ fn change_blockstate(v: &mut Vec<BlockState>, offset: usize, len: usize, state: 
 
 impl<T> Cache<T>
 where
-    T: AsRef<[u8]>,
+    T: AsMut<[u8]>,
 {
-    fn change_state(&self, offset: usize, len: usize, state: BlockState) {
-        let mut guard = self.state.lock().expect("should ok");
-        change_blockstate(&mut guard.state, offset, len, state);
-    }
-
     fn release_ref(&self, r: &Ref<T>) {
-        let mut guard = self.state.lock().expect("should ok");
-        if guard.release_ref(r) == 0 {
+        if self
+            .buf
+            .lock()
+            .expect("release ref should lock OK")
+            .state
+            .release_ref(r)
+            == 0
+        {
             self.allow_new_ref(true);
         }
     }
@@ -100,24 +101,26 @@ impl<T> Clone for ArcCache<T> {
 
 impl<T> ArcCache<T>
 where
-    T: AsRef<[u8]>,
+    T: AsMut<[u8]>,
 {
-    // TODO: is this safe? require T: AsRef and taking ownership of T
+    // TODO: is this safe? require T: AsMut and taking ownership of T
     // size must be multiple of 16384
-    pub fn new(t: T) -> Self {
-        let size = t.as_ref().len();
+    pub fn new(mut t: T) -> Self {
+        let size = t.as_mut().len();
         if size.trailing_zeros() < BLOCKSIZE.trailing_zeros() {
             // TODO: maybe not panic, fix size instead?
             panic!("cache size must be multiple of {BLOCKSIZE}")
         }
-        let size = size.next_multiple_of(BLOCKSIZE as usize);
+        assert_eq!(size % BLOCKSIZE, 0);
         Self {
             inner: Arc::new(Cache {
                 allow_new_ref: AtomicBool::new(true),
-                cache: Arc::new(t),
-                state: Mutex::new(State {
-                    state: vec![BlockState::Vacant; size >> BLOCKBITS],
-                    ref_cnt: 0,
+                buf: Mutex::new(BufState {
+                    cache: t,
+                    state: State {
+                        state: vec![BlockState::Vacant; size >> BLOCKBITS],
+                        ref_cnt: 0,
+                    },
                 }),
             }),
         }
@@ -158,48 +161,43 @@ where
             return None;
         }
 
-        let mut range_state = self.inner.state.lock().expect("should no error");
-        if !self.inner.allow_new_ref.load(Ordering::Relaxed) {
-            return None;
-        }
-        range_state.ref_cnt += 1;
+        let mut buf_guard = self.inner.buf.lock().expect("get part ref lock should OK");
+        {
+            let range_state = &mut buf_guard.state;
+            range_state.ref_cnt += 1;
 
-        let any_block_not_vacant = range_state.state
-            [offset >> BLOCKBITS..(offset + len) >> BLOCKBITS]
-            .iter()
-            .any(|s| *s != BlockState::Vacant);
-        if any_block_not_vacant {
-            return None;
-        }
-
-        for s in range_state.state[offset >> BLOCKBITS..(offset + len) >> BLOCKBITS].iter_mut() {
-            if *s != BlockState::Vacant {
+            let any_block_not_vacant = range_state.state
+                [offset >> BLOCKBITS..(offset + len) >> BLOCKBITS]
+                .iter()
+                .any(|s| *s != BlockState::Vacant);
+            if any_block_not_vacant {
                 return None;
             }
-            *s = BlockState::InUse;
+
+            for s in range_state.state[offset >> BLOCKBITS..(offset + len) >> BLOCKBITS].iter_mut()
+            {
+                if *s != BlockState::Vacant {
+                    return None;
+                }
+                *s = BlockState::InUse;
+            }
         }
 
         Some(Ref {
             from: offset,
-            ptr: unsafe { self.inner.cache.deref().as_ref().as_ptr().add(offset) },
+            ptr: unsafe { buf_guard.cache.as_mut().as_mut_ptr().add(offset) },
             len,
             main_cache: ManuallyDrop::new(self.inner.clone()),
         })
     }
-
-    fn change_state(&self, offset: usize, len: usize, state: BlockState) {
-        self.inner.change_state(offset, len, state);
-    }
 }
 
-// TODO: maybe implement Deref AsRef or something
-// but it contains a ref to the main cache
 pub struct Ref<T>
 where
-    T: AsRef<[u8]>,
+    T: AsMut<[u8]>,
 {
     from: usize,
-    ptr: *const u8,
+    ptr: *mut u8,
 
     len: usize,
 
@@ -208,21 +206,58 @@ where
     main_cache: ManuallyDrop<Arc<Cache<T>>>,
 }
 
-unsafe impl<T> Send for Ref<T> where T: Send + AsRef<[u8]> {}
+impl<T> Deref for Ref<T>
+where
+    T: AsMut<[u8]>,
+{
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_ref()
+    }
+}
+impl<T> DerefMut for Ref<T>
+where
+    T: AsMut<[u8]>,
+{
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.as_mut()
+    }
+}
+
+impl<T> AsMut<[u8]> for Ref<T>
+where
+    T: AsMut<[u8]>,
+{
+    fn as_mut(&mut self) -> &mut [u8] {
+        unsafe { slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
+impl<T> AsRef<[u8]> for Ref<T>
+where
+    T: AsMut<[u8]>,
+{
+    fn as_ref(&self) -> &[u8] {
+        unsafe { slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+unsafe impl<T> Send for Ref<T> where T: Send + AsMut<[u8]> {}
 
 impl<T> Ref<T>
 where
-    T: AsRef<[u8]>,
+    T: AsMut<[u8]>,
 {
-    pub fn to_slice(&mut self) -> &mut [u8] {
+    pub fn as_alice(&mut self) -> &mut [u8] {
         // TODO: is this safe? is ptr valid (will inner address in arc change?)
-        unsafe { slice::from_raw_parts_mut(self.ptr as *mut _, self.len) }
+        unsafe { slice::from_raw_parts_mut(self.ptr, self.len) }
     }
 
-    pub fn to_slice_len(&mut self, len: usize) -> &mut [u8] {
+    pub fn as_slice_len(&mut self, len: usize) -> &mut [u8] {
         assert!(len <= self.len);
         // TODO: is this safe? is ptr valid (will inner address in arc change?)
-        unsafe { slice::from_raw_parts_mut(self.ptr as *mut _, len) }
+        unsafe { slice::from_raw_parts_mut(self.ptr, len) }
     }
 
     // extend block ref's length to full ref
@@ -230,28 +265,35 @@ where
         let mut c = ManuallyDrop::new(self);
         // println!("enter");
         let success = {
-            let mut state = c.main_cache.state.lock().unwrap();
+            let mut buf_guard = c
+                .main_cache
+                .buf
+                .lock()
+                .expect("extend to entire should lock OK");
+            let state = &mut buf_guard.state;
             // println!("{:?}", self.main_cache.ref_count);
             // let ref_cnt = self.main_cache.ref_count.load(Ordering::Acquire);
             // println!("cnt {}", state.ref_cnt);
             if state.ref_cnt != 1 {
                 // println!("extend ref_cnt stop");
                 state.release_ref(&c);
-                false
+                None
             } else {
                 // println!("extend ref_cnt go ahead {}", state.ref_cnt);
 
                 for s in state.state.iter_mut() {
                     *s = BlockState::InUse;
                 }
-                true
+                let ptr = buf_guard.cache.as_mut().as_mut_ptr();
+                let len = buf_guard.cache.as_mut().len();
+                Some((ptr, len))
             }
         };
         // println!("success: {success}");
-        if success {
+        if let Some((ptr, len)) = success {
             c.from = 0;
-            c.ptr = c.main_cache.cache.deref().as_ref().as_ptr();
-            c.len = c.main_cache.cache.deref().as_ref().len();
+            c.ptr = ptr;
+            c.len = len;
             Some(ManuallyDrop::into_inner(c))
         } else {
             // println!("manually drop arc");
@@ -267,7 +309,7 @@ where
 
 impl<T> Drop for Ref<T>
 where
-    T: AsRef<[u8]>,
+    T: AsMut<[u8]>,
 {
     fn drop(&mut self) {
         self.main_cache.release_ref(self);
@@ -275,8 +317,6 @@ where
         // println!("real drop");
     }
 }
-
-trait BackFile {}
 
 #[cfg(test)]
 mod test {
@@ -309,11 +349,13 @@ mod test {
             assert!(ref5to7.is_some());
             assert!(ref6to8.is_none());
             assert!(ref9to11.is_some());
+
             cache
                 .inner
-                .state
+                .buf
                 .lock()
                 .unwrap()
+                .state
                 .state
                 .iter()
                 .enumerate()
@@ -328,9 +370,10 @@ mod test {
             drop(ref9to11);
             cache
                 .inner
-                .state
+                .buf
                 .lock()
                 .unwrap()
+                .state
                 .state
                 .iter()
                 .enumerate()
@@ -346,7 +389,7 @@ mod test {
             let a1 = a.clone();
             let h1 = thread::spawn(move || {
                 let mut s_ref = a1.get_part_ref(0, 2 * BLOCKSIZE).expect("ok");
-                let s = s_ref.to_slice();
+                let s = s_ref.as_alice();
                 for b in s.iter_mut() {
                     *b = 1u8;
                 }
@@ -355,7 +398,7 @@ mod test {
             let a2 = a.clone();
             let h2 = thread::spawn(move || {
                 let mut s_ref = a2.get_part_ref(4 * BLOCKSIZE, 2 * BLOCKSIZE).expect("ok");
-                let s = s_ref.to_slice();
+                let s = s_ref.as_alice();
                 for b in s.iter_mut() {
                     *b = 3u8;
                 }
@@ -363,18 +406,13 @@ mod test {
             let _ = h1.join();
             let _ = h2.join();
 
-            a.inner
-                .state
-                .lock()
-                .unwrap()
-                .state
-                .iter()
-                .enumerate()
-                .for_each(|(i, s)| {
-                    assert_eq!((i, *s), (i, BlockState::Vacant));
-                });
+            let guard = a.inner.buf.lock().unwrap();
 
-            for (i, s) in a.inner.cache.iter().enumerate() {
+            guard.state.state.iter().enumerate().for_each(|(i, s)| {
+                assert_eq!((i, *s), (i, BlockState::Vacant));
+            });
+
+            for (i, s) in guard.cache.iter().enumerate() {
                 if (4 * BLOCKSIZE..6 * BLOCKSIZE).contains(&i) {
                     assert_eq!((i, *s), (i, 3u8))
                 } else if (0..2 * BLOCKSIZE).contains(&i) {
@@ -394,9 +432,10 @@ mod test {
             let ref8to9 = cache.get_part_ref(8 * BLOCKSIZE, 2 * BLOCKSIZE).unwrap();
             cache
                 .inner
-                .state
+                .buf
                 .lock()
                 .unwrap()
+                .state
                 .state
                 .iter()
                 .enumerate()
@@ -419,21 +458,15 @@ mod test {
             assert!(ex1.is_some() ^ ex2.is_some());
 
             let entire = ex1.or(ex2).unwrap();
-            cache
-                .inner
-                .state
-                .lock()
-                .unwrap()
-                .state
-                .iter()
-                .enumerate()
-                .for_each(|(i, s)| {
-                    assert_eq!((i, *s), (i, BlockState::InUse));
-                });
+            let mut guard = cache.inner.buf.lock().unwrap();
 
-            assert_eq!(entire.ptr, cache.inner.cache.as_ptr());
+            guard.state.state.iter().enumerate().for_each(|(i, s)| {
+                assert_eq!((i, *s), (i, BlockState::InUse));
+            });
+
+            assert_eq!(entire.ptr, guard.cache.as_mut_ptr());
             assert_eq!(entire.from, 0);
-            assert_eq!(entire.len, cache.inner.cache.len());
+            assert_eq!(entire.len, guard.cache.len());
         });
     }
 
