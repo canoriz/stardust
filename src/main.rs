@@ -2,6 +2,7 @@ use std::net::SocketAddr;
 // use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use anyhow::Result;
 use std::sync::Arc;
+use tokio::io::BufStream;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::Duration;
 use tokio::{net, time};
@@ -24,14 +25,14 @@ use torrent_manager::TorrentManagerHandle;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Hello, world!");
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .event_format(
-            tracing_subscriber::fmt::format()
-                .with_file(true)
-                .with_line_number(true),
-        )
-        .init();
+    // tracing_subscriber::fmt()
+    //     .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+    //     .event_format(
+    //         tracing_subscriber::fmt::format()
+    //             .with_file(true)
+    //             .with_line_number(true),
+    //     )
+    //     .init();
 
     // let announce_req = metadata::TrackerGet {
     //     peer_id: "-ZS0405-qwerasdfzxcv",
@@ -62,7 +63,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let (bt_stream, addr) = match listener.accept().await {
                     Ok((stream, addr)) => {
                         info!("input from addr {}", addr);
-                        (protocol::BTStream::from(stream), addr)
+                        (
+                            protocol::BTStream::from(BufStream::with_capacity(
+                                32768, 32768, stream,
+                            )),
+                            addr,
+                        )
                     }
                     Err(e) => {
                         info!("accept error {}", e);
@@ -166,7 +172,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //     conn.recv_handshake().await?;
     //     tm.send_msg(transmit_manager::Msg::NewPeer(conn));
     // }
-    time::sleep(Duration::from_secs(4)).await;
+    time::sleep(Duration::from_secs(100000)).await;
     // tm.send_announce_msg(announce_manager::Msg::RemoveUrl(
     //     announce_list[0][0].clone(),
     // ));
@@ -212,6 +218,7 @@ where
     let limit = 200;
     let mut accum = 0;
     let choked = false;
+    const A: [u8; 16384] = [0u8; 16384];
     loop {
         tokio::select! {
             msg = bt_stream.recv_msg_header() => {
@@ -224,10 +231,9 @@ where
                                 let _ = ticker1.tick().await;
                                 accum = 0;
                             }
-                            let a = [0u8; 16384];
                             accum += 1;
                             bt_stream
-                                .send_piece(r.index, r.begin, &a)
+                                .send_piece(r.index, r.begin, &A)
                                 .await;
                         }
                         _ => {

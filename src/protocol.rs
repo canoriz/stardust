@@ -45,6 +45,7 @@ pub struct BTStream<T> {
     partial_header: PartialHeader,
 }
 
+#[derive(Debug)]
 pub struct ReadStream<T> {
     inner: BufReader<T>,
     peer_addr: SocketAddr,
@@ -55,6 +56,7 @@ pub struct ReadStream<T> {
 
 // store partial received header,
 // Cancel Safe for read_msg_header
+#[derive(Debug)]
 struct PartialHeader {
     field_len: [u8; 4],
     field_ty: u8,
@@ -725,7 +727,14 @@ async fn discard_remain<T: AsyncRead + Unpin>(
     // there should not be many unread bytes, 1024 should be enough
     #[allow(invalid_value)]
     #[allow(clippy::uninit_assumed_init)]
-    let mut buf = unsafe { MaybeUninit::<[u8; 1024]>::uninit().assume_init() };
+    #[allow(clippy::uninit_vec)]
+    let mut buf = {
+        let mut v = Vec::with_capacity(1024);
+        unsafe {
+            v.set_len(1024);
+        }
+        v
+    };
 
     while state.discard_remain > 0 {
         let n_read = if state.discard_remain > buf.len() {

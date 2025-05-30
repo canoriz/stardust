@@ -6,7 +6,7 @@ use std::task::{Poll, Waker};
 
 #[cfg(mloom)]
 use loom::sync::{Arc, Mutex};
-use tracing::{debug, warn};
+use tracing::debug;
 
 #[cfg(not(mloom))]
 use std::sync::{Arc, Mutex};
@@ -243,12 +243,7 @@ type OffsetPower = (usize, u32);
 impl BlockTree {
     /// target_power must >= MIN_ALLOC_SIZE_POWER
     fn split_down(&mut self, target_power: u32) -> Option<OffsetPower> {
-        let (mut now_offset, mut now_order) =
-            if let Some(v) = pop_first_vacant(&mut self.tree, target_power) {
-                v
-            } else {
-                return None;
-            };
+        let (mut now_offset, mut now_order) = pop_first_vacant(&mut self.tree, target_power)?;
 
         let mut now_size = 1usize << (now_order as u32 + MIN_ALLOC_SIZE_POWER);
         let target_order = (target_power - MIN_ALLOC_SIZE_POWER) as usize;
