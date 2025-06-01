@@ -1,8 +1,10 @@
 use core::slice;
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt::Debug;
 use std::future::Future;
+use std::hash::{Hash, Hasher};
 use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Poll, Waker};
 
 #[cfg(mloom)]
@@ -30,9 +32,63 @@ pub(crate) struct PieceBufPool {
     inner: Arc<PieceBufPoolImpl>,
 }
 
+// FreeBlock is NOT Clone. It's fundamentally a owned reference to
+// free buffer
+#[derive(Debug)]
+struct FreeBlock {
+    valid: Arc<AtomicBool>,
+    // TODO: offset and ptr is same thing? only store one?
+    offset: usize,
+    power: u32,
+
+    ptr: *mut u8,
+}
+
+impl FreeBlock {
+    // This is essentially Clone, use very carefully
+    fn dup(&self) -> Self {
+        Self {
+            valid: self.valid.clone(),
+            offset: self.offset,
+            power: self.power,
+            ptr: self.ptr,
+        }
+    }
+}
+
+// TODO: maybe just use FreeBlock?
+struct FreeBlockHandle {
+    // This is only a "reference", stores where this handle controlls,
+    // we don't own this memory
+    free_block: FreeBlock,
+    invalidate_waker: Vec<Waker>,
+}
+
+impl Eq for FreeBlock {}
+impl PartialEq for FreeBlock {
+    fn eq(&self, other: &Self) -> bool {
+        // only compare value, not valid
+        self.offset == other.offset && self.power == other.power && self.ptr == other.ptr
+    }
+}
+impl Hash for FreeBlock {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.offset.hash(state);
+        self.power.hash(state);
+        self.ptr.hash(state);
+    }
+}
+
+unsafe impl Send for FreeBlock {}
+unsafe impl Sync for FreeBlock {}
+
 struct BufTree {
     buf: Vec<u8>,
     blk_tree: BlockTree,
+
+    // TODO: maybe use a more efficient DS
+    // TODO: maybe use HashMap<FreeBlock, handle>
+    alloced: HashMap<FreeBlock, FreeBlockHandle>,
 }
 
 struct PieceBufPoolImpl {
@@ -62,17 +118,6 @@ impl Debug for PieceBuf {
     }
 }
 
-// FreeBlock is NOT Clone. It's fundamentally a owned reference to
-// free buffer
-#[derive(Debug)]
-struct FreeBlock {
-    // TODO: offset and ptr is same thing? only store one?
-    offset: usize,
-    power: u32,
-
-    ptr: *mut u8,
-}
-
 impl PieceBufPool {
     pub fn new(size: usize) -> Self {
         Self {
@@ -99,6 +144,7 @@ impl PieceBufPool {
     /// wait until enough free space
     /// as long as size <= max size of buffer, waits until
     /// enough space, else return None
+    // TODO: make this async fn, and make real impl to PieceBufPoolImpl
     pub fn async_alloc(&self, id: usize, size: usize) -> AllocPieceBufFut {
         AllocPieceBufFut {
             id,
@@ -106,6 +152,10 @@ impl PieceBufPool {
             pool: self,
             waiting: false,
         }
+    }
+
+    async fn invalidate(&self, f: FreeBlock) {
+        self.inner.invalidate(f).await;
     }
 }
 
@@ -117,6 +167,7 @@ impl PieceBufPoolImpl {
             buf_tree: Mutex::new(BufTree {
                 buf: vec![0u8; size_fixed],
                 blk_tree: init_block_tree(size_fixed),
+                alloced: HashMap::new(),
             }),
             waiting_alloc: Mutex::new(VecDeque::new()),
         }
@@ -134,29 +185,88 @@ impl PieceBufPoolImpl {
 
         let mut buf_tree_guard = self.buf_tree.lock().expect("alloc lock should OK");
         let blk_tree = &mut buf_tree_guard.blk_tree;
-        blk_tree.split_down(power).map(|(offset, power)| FreeBlock {
-            offset,
-            power,
-            ptr: unsafe { buf_tree_guard.buf.as_mut_ptr().add(offset) },
+        blk_tree.split_down(power).map(|(offset, power)| {
+            let fb = FreeBlock {
+                valid: Arc::new(AtomicBool::new(true)),
+                offset,
+                power,
+                ptr: unsafe { buf_tree_guard.buf.as_mut_ptr().add(offset) },
+            };
+            buf_tree_guard.alloced.insert(
+                fb.dup(),
+                FreeBlockHandle {
+                    free_block: fb.dup(),
+                    invalidate_waker: Vec::new(),
+                },
+            );
+            fb
         })
     }
 
     /// returns PieceBuf
     fn free(&self, b: &FreeBlock) {
         {
-            let mut buf_tree = self.buf_tree.lock().expect("alloc lock should OK");
-            buf_tree.blk_tree.merge_up(b.offset, b.power);
+            let mut buf_tree_guard = self.buf_tree.lock().expect("alloc lock should OK");
+            buf_tree_guard.blk_tree.merge_up(b.offset, b.power);
+
+            let mut fh = buf_tree_guard
+                .alloced
+                .remove(b)
+                .expect("free should see piecebuf in alloced list");
+            for waker in fh.invalidate_waker.drain(0..) {
+                // wake waker waiting on this block to be invalidated
+                waker.wake();
+            }
             // buf_tree's lock dropped here, prevents deadlock
         }
 
-        let mut waiting_alloc = self
-            .waiting_alloc
-            .lock()
-            .expect("waiting alloc lock should OK");
-        if let Some(v) = waiting_alloc.pop_front() {
-            // TODO: maybe add an atomic, only wake one pending alloc request
-            v.waker.wake();
+        {
+            let mut waiting_alloc = self
+                .waiting_alloc
+                .lock()
+                .expect("waiting alloc lock should OK");
+            if let Some(v) = waiting_alloc.pop_front() {
+                // TODO: maybe add an atomic, only wake one pending alloc request
+                v.waker.wake();
+            }
         }
+    }
+
+    fn invalidate(&self, f: FreeBlock) -> InvalidateFut {
+        InvalidateFut {
+            handle: f,
+            pool: self,
+            waiting: false,
+        }
+    }
+}
+
+struct InvalidateFut<'a> {
+    handle: FreeBlock,
+    pool: &'a PieceBufPoolImpl,
+    waiting: bool,
+}
+
+impl Future for InvalidateFut<'_> {
+    type Output = ();
+
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        let f = self.get_mut();
+        if !f.waiting {
+            let mut buf_tree_guard = f.pool.buf_tree.lock().expect("invalidate lock should OK");
+            if let Some(fbh) = buf_tree_guard.alloced.get_mut(&f.handle) {
+                fbh.free_block.valid.store(false, Ordering::Relaxed);
+                fbh.invalidate_waker.push(cx.waker().clone());
+                Poll::Pending
+            } else {
+                Poll::Ready(())
+            }
+        } else {
+            let buf_tree_guard = f.pool.buf_tree.lock().expect("invalidate lock should OK");
+            assert!(!buf_tree_guard.alloced.contains_key(&f.handle));
+            Poll::Ready(())
+        }
+        // TODO: wait all reference to this block exits
     }
 }
 
@@ -733,5 +843,21 @@ mod test {
         for _ in 0..ts.len() {
             _ = ts.join_next().await;
         }
+    }
+
+    #[cfg(not(mloom))]
+    #[tokio::test]
+    async fn test_invalidate_piece_buf() {
+        let c = PieceBufPool::new(10 * MIN_ALLOC_SIZE);
+
+        let mut piece = c.async_alloc(0, 2 * MIN_ALLOC_SIZE).await;
+        let fb = piece.b.dup();
+        tokio::spawn(async move {
+            let _ = piece.as_mut();
+            println!("piece dropped");
+        });
+        c.invalidate(fb.dup()).await;
+        println!("invalidated");
+        c.invalidate(fb.dup()).await;
     }
 }

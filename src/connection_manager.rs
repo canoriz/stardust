@@ -1,3 +1,4 @@
+use futures::future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time;
@@ -485,7 +486,9 @@ async fn handle_piece_msg<T>(
     // TODO: need a biglock. What if some peer else is doing operation now?
     // i.e. operation between two locks?
     let block_buf = if let Some(mut bbuf) = block_ref {
-        piece.read(bbuf.as_slice_len(piece.len as usize)).await;
+        let read_fut = piece.read(bbuf.as_slice_len(piece.len as usize));
+        let (abortable_read, abort_handle) = future::abortable(read_fut);
+        abortable_read.await;
         bbuf
     } else {
         let mut drain = vec![0u8; piece.len as usize];
