@@ -9,7 +9,7 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{info, warn};
 
 use crate::backfile::WriteJob;
-use crate::cache::ArcCache;
+use crate::cache::{ArcCache, PieceBuf, Ref};
 use crate::metadata;
 use crate::picker::BlockRequests;
 use crate::protocol::{self, BTStream, Message, ReadStream, Split, WriteStream};
@@ -460,6 +460,7 @@ async fn handle_piece_msg<T>(
             // tasks when the requested piece buffer is allocated, which avoids
             // deplicating allocates buffer
             let piece_buffer = tmh.buffer_pool.async_alloc(1, tmh.piece_size).await;
+            // let piece_buffer = tmh.buffer_pool.async_alloc_abort::<ArcCache>(1, tmh.piece_size).await;
             let pb = ArcCache::new(piece_buffer);
 
             // if this piece buffer already exists(allocated by other peer handler),
@@ -486,9 +487,12 @@ async fn handle_piece_msg<T>(
     // TODO: need a biglock. What if some peer else is doing operation now?
     // i.e. operation between two locks?
     let block_buf = if let Some(mut bbuf) = block_ref {
-        let read_fut = piece.read(bbuf.as_slice_len(piece.len as usize));
-        let (abortable_read, abort_handle) = future::abortable(read_fut);
-        abortable_read.await;
+        // TODO: piece.read should be cancel safe to use with abortable
+        // TODO: check length
+        let read_fut =
+            bbuf.abortable_work(|r: &mut [u8]| piece.read(&mut r[..(piece.len as usize)]));
+
+        read_fut.await;
         bbuf
     } else {
         let mut drain = vec![0u8; piece.len as usize];
