@@ -6,6 +6,7 @@ use std::{
     net::SocketAddr,
     ops::{Deref, DerefMut},
     slice,
+    sync::Weak,
     task::{Poll, Waker},
     vec,
 };
@@ -94,7 +95,7 @@ where
         if buf_guard.state.release_ref(r) == 0 {
             for waiter in buf_guard.abort_waiter.drain(0..) {
                 // assert_eq!(buf_guard.allow_new_ref.load(Ordering::Relaxed), false);
-                waiter.notify_waiters();
+                waiter.notify_one();
             }
         }
     }
@@ -181,7 +182,9 @@ impl FromPieceBuf for ArcCache<PieceBuf> {
             Self {
                 inner: inner.clone(),
             },
-            SubAbortHandle { cache: inner },
+            SubAbortHandle {
+                cache: Arc::downgrade(&inner),
+            },
         )
     }
 }
@@ -301,7 +304,7 @@ where
 }
 
 pub struct SubAbortHandle<T> {
-    cache: Arc<Cache<T>>,
+    cache: Weak<Cache<T>>,
 }
 
 impl<T> Clone for SubAbortHandle<T> {
@@ -317,7 +320,9 @@ where
     T: AsMut<[u8]>,
 {
     pub async fn abort_all(&self) {
-        self.cache.abort_all().await
+        if let Some(a) = self.cache.upgrade() {
+            a.abort_all().await
+        }
     }
 }
 

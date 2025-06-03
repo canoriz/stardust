@@ -65,7 +65,7 @@ struct FreeBlockHandle {
     // This is only a "reference", stores where this handle controlls,
     // we don't own this memory
     free_block: FreeBlock,
-    invalidate_waiter: Option<Arc<Notify>>,
+    invalidate_waiter: Vec<Arc<Notify>>,
     sub_manager_handle: Option<SubAbortHandle<PieceBuf>>,
 }
 
@@ -109,7 +109,7 @@ impl BufTree {
                 fb.dup(),
                 FreeBlockHandle {
                     free_block: fb.dup(),
-                    invalidate_waiter: None,
+                    invalidate_waiter: Vec::new(),
                     sub_manager_handle: None,
                 },
             );
@@ -288,8 +288,14 @@ impl PieceBufPoolImpl {
                 .alloced
                 .remove(b)
                 .expect("free should see piecebuf in alloced list");
-            if let Some(w) = fh.invalidate_waiter.take() {
-                w.notify_waiters();
+
+            #[cfg(test)]
+            println!("free piecebuf");
+
+            for w in fh.invalidate_waiter.drain(0..) {
+                #[cfg(test)]
+                println!("invalidate_waker some {:?}", w);
+                w.notify_one();
             }
             // buf_tree's lock dropped here, prevents deadlock
         }
@@ -306,19 +312,19 @@ impl PieceBufPoolImpl {
         }
     }
 
+    // TODO: after invalidate, the block should not be allocated before
+    // further operations like flush to disk / migrate
     async fn invalidate(&self, f: FreeBlock) {
         let (wait_invalid, wait_abort) = {
             let mut buf_tree_guard = self.buf_tree.lock().expect("invalidate lock should OK");
             if let Some(fbh) = buf_tree_guard.alloced.get_mut(&f) {
                 fbh.free_block.valid.store(false, Ordering::Relaxed); // TODO: ordering, loom test
                 let aborter = fbh.sub_manager_handle.clone();
-                if let Some(ref waiter) = fbh.invalidate_waiter {
-                    (waiter.clone(), aborter)
-                } else {
-                    let waiter = Arc::new(Notify::new());
-                    fbh.invalidate_waiter = Some(waiter.clone());
-                    (waiter, aborter)
-                }
+                #[cfg(test)]
+                println!("add wait_invalid");
+                let waiter = Arc::new(Notify::new());
+                fbh.invalidate_waiter.push(waiter.clone());
+                (waiter, aborter)
             } else {
                 return;
             }
@@ -328,6 +334,8 @@ impl PieceBufPoolImpl {
         if let Some(aborter) = wait_abort {
             aborter.abort_all().await;
         }
+        #[cfg(test)]
+        println!("waiting wait_invalid {:?}", wait_invalid);
         wait_invalid.notified().await;
         // let buf_tree_guard = self.buf_tree.lock().expect("invalidate lock should OK");
         // assert!(!buf_tree_guard.alloced.contains_key(&f));
@@ -610,6 +618,7 @@ mod test {
     use crate::cache::ArcCache;
 
     use super::*;
+    use futures::future;
     use tokio_test::task;
 
     #[test]
@@ -984,7 +993,6 @@ mod test {
         let fb = piece.b.dup();
         let ref_work = task::spawn(async move {
             let _ = piece.as_mut();
-            println!("piece dropped");
         });
         let mut invalid_fut1 = task::spawn(c.invalidate(fb.dup()));
         let mut invalid_fut2 = task::spawn(c.invalidate(fb.dup()));
@@ -1002,28 +1010,89 @@ mod test {
     #[tokio::test]
     async fn test_alloc_abort() {
         let c = PieceBufPool::new(10 * MIN_ALLOC_SIZE);
-        let fb1 = {
+        let (fb1, fb2) = {
             let p1 = c
                 .async_alloc_abort::<ArcCache<_>>(1, 2 * MIN_ALLOC_SIZE)
                 .await;
-            // let p2 = c
-            //     .async_alloc_abort::<ArcCache<_>>(1, 1 * MIN_ALLOC_SIZE)
-            //     .await;
+            let p2 = c
+                .async_alloc_abort::<ArcCache<_>>(1, 1 * MIN_ALLOC_SIZE)
+                .await;
             // let p3 = c
             //     .async_alloc_abort::<ArcCache<_>>(1, 4 * MIN_ALLOC_SIZE)
             //     .await;
             let mut ref11 = p1.get_part_ref(0, 16384).unwrap();
             let mut ref12 = p1.get_part_ref(16384, 16384).unwrap();
             let mut ref13 = p1.get_part_ref(2 * 16384, 16384).unwrap();
-            // tokio::spawn(async move { ref11.abortable_work(|_| pending::<()>()).await });
-            // tokio::spawn(async move { ref12.abortable_work(|_| pending::<()>()).await });
-            // tokio::spawn(async move { ref13.abortable_work(|_| pending::<()>()).await });
+            let mut ref21 = p2.get_part_ref(2 * 16384, 16384).unwrap();
+            tokio::spawn(async move {
+                let r = ref11.abortable_work(|_| pending::<()>()).await;
+                assert_eq!(r, Err(future::Aborted));
+            });
+            tokio::spawn(async move {
+                let r = ref12.abortable_work(|_| pending::<()>()).await;
+                assert_eq!(r, Err(future::Aborted));
+            });
+            tokio::spawn(async move {
+                let r = ref13.abortable_work(|_| pending::<()>()).await;
+                assert_eq!(r, Err(future::Aborted));
+            });
+            tokio::spawn(async move {
+                let r = ref21.abortable_work(|_| pending::<()>()).await;
+                assert_eq!(r, Err(future::Aborted));
+            });
 
-            let v = p1.piece_detail(|p| p.b.dup());
-            drop(p1);
-            v
+            (
+                p1.piece_detail(|p| p.b.dup()),
+                p2.piece_detail(|p| p.b.dup()),
+            )
         };
-        println!("{:?}", c.inner.buf_tree.lock().unwrap().alloced.keys());
-        // c.invalidate(fb1).await;
+        c.invalidate(fb2).await;
+        c.invalidate(fb1).await;
+    }
+
+    #[tokio::test]
+    async fn test_alloc_abort2() {
+        let c = PieceBufPool::new(10 * MIN_ALLOC_SIZE);
+        let (fb1, fb2, mut t1, mut t2) = {
+            let p1 = c
+                .async_alloc_abort::<ArcCache<_>>(1, 2 * MIN_ALLOC_SIZE)
+                .await;
+            let p2 = c
+                .async_alloc_abort::<ArcCache<_>>(1, 1 * MIN_ALLOC_SIZE)
+                .await;
+            // let p3 = c
+            //     .async_alloc_abort::<ArcCache<_>>(1, 4 * MIN_ALLOC_SIZE)
+            //     .await;
+            let mut ref11 = p1.get_part_ref(0, 16384).unwrap();
+            let mut ref21 = p2.get_part_ref(2 * 16384, 16384).unwrap();
+            let mut t1 = task::spawn(async move {
+                let r = ref11.abortable_work(|_| pending::<()>()).await;
+                assert_eq!(r, Err(future::Aborted));
+            });
+            let mut t2 = task::spawn(async move {
+                let r = ref21.abortable_work(|_| pending::<()>()).await;
+                assert_eq!(r, Err(future::Aborted));
+            });
+            assert_eq!(t1.poll(), Poll::Pending);
+            assert_eq!(t2.poll(), Poll::Pending);
+
+            (
+                p1.piece_detail(|p| p.b.dup()),
+                p2.piece_detail(|p| p.b.dup()),
+                t1,
+                t2,
+            )
+        };
+        assert_eq!(t1.poll(), Poll::Pending);
+        assert_eq!(t2.poll(), Poll::Pending);
+        let mut inv2 = task::spawn(c.invalidate(fb2));
+        let mut inv1 = task::spawn(c.invalidate(fb1));
+        assert_eq!(inv2.poll(), Poll::Pending);
+        assert_eq!(inv2.poll(), Poll::Pending);
+        t2.await;
+        assert_eq!(inv2.poll(), Poll::Ready(()));
+        assert_eq!(inv1.poll(), Poll::Pending);
+        t1.await;
+        inv1.await;
     }
 }
