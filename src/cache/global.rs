@@ -1,11 +1,11 @@
 use core::slice;
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fmt::Debug;
 use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::task::{Poll, Waker};
 
 #[cfg(mloom)]
@@ -229,6 +229,7 @@ impl PieceBufPool {
             size,
             pool: self,
             waiting: false,
+            valid: Arc::new(AtomicU32::new(VALID)),
         }
     }
 
@@ -241,6 +242,7 @@ impl PieceBufPool {
             size,
             pool: self,
             waiting: false,
+            valid: Arc::new(AtomicU32::new(VALID)),
             _t: PhantomData,
         }
     }
@@ -305,9 +307,15 @@ impl PieceBufPoolImpl {
                 .waiting_alloc
                 .lock()
                 .expect("waiting alloc lock should OK");
-            if let Some(v) = waiting_alloc.pop_front() {
-                // TODO: maybe add an atomic, only wake one pending alloc request
-                v.waker.wake();
+            while let Some(v) = waiting_alloc.pop_front() {
+                #[cfg(test)]
+                println!("try wake f {}", v.id);
+                if v.valid.load(Ordering::Relaxed) == VALID {
+                    v.waker.wake();
+                    #[cfg(test)]
+                    println!("wake f {}", v.id);
+                    break;
+                }
             }
         }
     }
@@ -386,20 +394,30 @@ impl PieceBuf {
 struct AllocReq {
     id: usize,
     waker: Waker,
+    valid: Arc<AtomicU32>,
 }
+
+const INVALID: u32 = 0x1;
+const VALID: u32 = 0;
 
 pub(crate) struct AllocPieceBufFut<'a> {
     id: usize,
     pool: &'a PieceBufPool,
     waiting: bool,
+    valid: Arc<AtomicU32>,
     size: usize,
 }
 
 impl Future for AllocPieceBufFut<'_> {
     type Output = PieceBuf;
 
+    // TODO: pending future dropped
+    // TODO: FIXME: ?re-wake resolved future
     fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
         let fut = self.get_mut();
+
+        #[cfg(test)]
+        println!("poll id {}", fut.id);
 
         let mut waiting_alloc = fut.pool.inner.waiting_alloc.lock().unwrap();
         if !fut.waiting {
@@ -407,34 +425,74 @@ impl Future for AllocPieceBufFut<'_> {
                 waiting_alloc.push_back(AllocReq {
                     id: fut.id,
                     waker: cx.waker().clone(),
+                    valid: fut.valid.clone(),
                 });
+
+                #[cfg(test)]
+                println!("poll id {} pending 1", fut.id);
+
                 fut.waiting = true;
                 return Poll::Pending;
             }
             if let Some(bf) = fut.pool.alloc(fut.size) {
                 // this holds both lock of block_tree and waiting_alloc
+                let old = fut.valid.swap(INVALID, Ordering::Release);
+                debug_assert_eq!(old, VALID);
+                #[cfg(test)]
+                println!("poll id {} ready 2", fut.id);
                 Poll::Ready(bf)
             } else {
                 waiting_alloc.push_back(AllocReq {
                     id: fut.id,
                     waker: cx.waker().clone(),
+                    valid: fut.valid.clone(),
                 });
                 fut.waiting = true;
+                #[cfg(test)]
+                println!("poll id {} pending 3", fut.id);
                 Poll::Pending
             }
         } else if let Some(bf) = fut.pool.alloc(fut.size) {
-            if let Some(v) = waiting_alloc.pop_front() {
-                // TODO: maybe add an atomic, only wake one pending alloc request
-                v.waker.wake();
+            let old = fut.valid.swap(INVALID, Ordering::Release);
+            debug_assert_eq!(old, VALID);
+
+            while let Some(v) = waiting_alloc.pop_front() {
+                #[cfg(test)]
+                println!("try wake 4 {}", v.id);
+                if v.valid.load(Ordering::Relaxed) == VALID {
+                    v.waker.wake();
+                    #[cfg(test)]
+                    println!("wake 4 {}", v.id);
+                    break;
+                }
             }
+            #[cfg(test)]
+            println!("poll id {} ready 4", fut.id);
             Poll::Ready(bf)
         } else {
             waiting_alloc.push_front(AllocReq {
                 id: fut.id,
                 waker: cx.waker().clone(),
+                valid: fut.valid.clone(),
             }); // try to be the first
+            #[cfg(test)]
+            println!("poll id {} pending 5", fut.id);
             Poll::Pending
         }
+    }
+}
+
+impl Drop for AllocPieceBufFut<'_> {
+    fn drop(&mut self) {
+        // simplicity let's hold the mutex
+        // TODO: optimize this
+        let mut _waiting_alloc = self.pool.inner.waiting_alloc.lock().unwrap();
+        let old = self.valid.swap(INVALID, Ordering::Relaxed);
+
+        #[cfg(test)]
+        println!("drop AllocPieceBufFut id {}, old {}", self.id, old);
+
+        drop(_waiting_alloc);
     }
 }
 
@@ -443,6 +501,7 @@ pub(crate) struct AllocPieceBufAbortFut<'a, T> {
     pool: &'a PieceBufPool,
     waiting: bool,
     size: usize,
+    valid: Arc<AtomicU32>,
     _t: PhantomData<T>,
 }
 
@@ -461,34 +520,51 @@ where
                 waiting_alloc.push_back(AllocReq {
                     id: fut.id,
                     waker: cx.waker().clone(),
+                    valid: fut.valid.clone(),
                 });
                 fut.waiting = true;
                 return Poll::Pending;
             }
             if let Some(t) = fut.pool.alloc_abort::<T>(fut.size) {
+                let old = fut.valid.swap(INVALID, Ordering::Release);
                 // this holds both lock of block_tree and waiting_alloc
                 Poll::Ready(t)
             } else {
                 waiting_alloc.push_back(AllocReq {
                     id: fut.id,
                     waker: cx.waker().clone(),
+                    valid: fut.valid.clone(),
                 });
                 fut.waiting = true;
                 Poll::Pending
             }
         } else if let Some(t) = fut.pool.alloc_abort(fut.size) {
-            if let Some(v) = waiting_alloc.pop_front() {
-                // TODO: maybe add an atomic, only wake one pending alloc request
-                v.waker.wake();
+            let old = fut.valid.swap(INVALID, Ordering::Release);
+            while let Some(v) = waiting_alloc.pop_front() {
+                if v.valid.load(Ordering::Relaxed) == VALID {
+                    v.waker.wake();
+                    break;
+                }
             }
             Poll::Ready(t)
         } else {
             waiting_alloc.push_front(AllocReq {
                 id: fut.id,
                 waker: cx.waker().clone(),
+                valid: fut.valid.clone(),
             }); // try to be the first
             Poll::Pending
         }
+    }
+}
+
+impl<T> Drop for AllocPieceBufAbortFut<'_, T> {
+    fn drop(&mut self) {
+        // simplicity let's hold the mutex
+        // TODO: optimize this
+        let mut _waiting_alloc = self.pool.inner.waiting_alloc.lock().unwrap();
+        self.valid.swap(INVALID, Ordering::Relaxed);
+        drop(_waiting_alloc);
     }
 }
 
@@ -970,7 +1046,7 @@ mod test {
 
     #[cfg(not(mloom))]
     #[tokio::test]
-    async fn test_async_piece_buf() {
+    async fn test_async_alloc_wakeup() {
         let c = PieceBufPool::new(2 * MIN_ALLOC_SIZE);
 
         let mut ts = tokio::task::JoinSet::new();
@@ -981,6 +1057,113 @@ mod test {
 
         for _ in 0..ts.len() {
             _ = ts.join_next().await;
+        }
+    }
+
+    #[cfg(not(mloom))]
+    #[tokio::test]
+    async fn test_async_alloc_abort_wakeup() {
+        let c = PieceBufPool::new(2 * MIN_ALLOC_SIZE);
+
+        let mut ts = tokio::task::JoinSet::new();
+        for size in [2, 1, 1, 2, 1, 2usize].into_iter().enumerate() {
+            let c1 = c.clone();
+            ts.spawn(async move {
+                c1.async_alloc_abort::<ArcCache<_>>(size.0, size.1 * MIN_ALLOC_SIZE)
+                    .await
+            });
+        }
+
+        for _ in 0..ts.len() {
+            _ = ts.join_next().await;
+        }
+    }
+
+    #[cfg(not(mloom))]
+    #[tokio::test]
+    async fn test_async_alloc_drop_future() {
+        let c = PieceBufPool::new(2 * MIN_ALLOC_SIZE);
+        let (c0, c1, c2, c3, c4, c5) = (
+            c.clone(),
+            c.clone(),
+            c.clone(),
+            c.clone(),
+            c.clone(),
+            c.clone(),
+        );
+
+        let h0 = tokio::spawn(async move { c0.async_alloc(0, 2 * MIN_ALLOC_SIZE).await });
+        let r0 = h0.await;
+
+        let h1 = tokio::spawn(async move { c1.async_alloc(1, 1 * MIN_ALLOC_SIZE).await });
+        let mut h2 = task::spawn(async move { c2.async_alloc(2, 1 * MIN_ALLOC_SIZE).await });
+        let mut h3 = task::spawn(async move { c3.async_alloc(3, 2 * MIN_ALLOC_SIZE).await });
+        let h4 = tokio::spawn(async move { c4.async_alloc(4, 1 * MIN_ALLOC_SIZE).await });
+        let h5 = tokio::spawn(async move { c5.async_alloc(5, 2 * MIN_ALLOC_SIZE).await });
+        assert!(h2.poll().is_pending());
+        drop(h2);
+        assert!(h3.poll().is_pending());
+        drop(h3);
+        drop(r0);
+        {
+            assert!(h1.await.is_ok());
+            assert!(h4.await.is_ok());
+        }
+        {
+            assert!(h5.await.is_ok());
+        }
+    }
+
+    #[cfg(not(mloom))]
+    #[tokio::test]
+    async fn test_async_alloc_abort_drop_future() {
+        let c = PieceBufPool::new(2 * MIN_ALLOC_SIZE);
+        let (c0, c1, c2, c3, c4, c5) = (
+            c.clone(),
+            c.clone(),
+            c.clone(),
+            c.clone(),
+            c.clone(),
+            c.clone(),
+        );
+
+        let h0 = tokio::spawn(async move {
+            c0.async_alloc_abort::<ArcCache<_>>(0, 2 * MIN_ALLOC_SIZE)
+                .await
+        });
+        let r0 = h0.await;
+
+        let h1 = tokio::spawn(async move {
+            c1.async_alloc_abort::<ArcCache<_>>(1, 1 * MIN_ALLOC_SIZE)
+                .await
+        });
+        let mut h2 = task::spawn(async move {
+            c2.async_alloc_abort::<ArcCache<_>>(2, 1 * MIN_ALLOC_SIZE)
+                .await
+        });
+        let mut h3 = task::spawn(async move {
+            c3.async_alloc_abort::<ArcCache<_>>(3, 2 * MIN_ALLOC_SIZE)
+                .await
+        });
+        let h4 = tokio::spawn(async move {
+            c4.async_alloc_abort::<ArcCache<_>>(4, 1 * MIN_ALLOC_SIZE)
+                .await
+        });
+        let h5 = tokio::spawn(async move {
+            c5.async_alloc_abort::<ArcCache<_>>(5, 2 * MIN_ALLOC_SIZE)
+                .await
+        });
+        assert!(h2.poll().is_pending());
+        drop(h2);
+        assert!(h3.poll().is_pending());
+        drop(h3);
+        drop(r0);
+        {
+            assert!(h1.await.is_ok());
+            assert!(h4.await.is_ok());
+        }
+        {
+            assert!(h5.await.is_ok());
         }
     }
 
