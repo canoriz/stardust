@@ -5,13 +5,17 @@ use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::pin::Pin;
 use std::task::{Poll, Waker};
 
 #[cfg(mloom)]
 use loom::sync::{Arc, Mutex};
 use tokio::sync::Notify;
-use tracing::debug;
+
+#[cfg(mloom)]
+use loom::atomic::{AtomicBool, AtomicU32, Ordering};
+#[cfg(not(mloom))]
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 #[cfg(not(mloom))]
 use std::sync::{Arc, Mutex};
@@ -225,11 +229,13 @@ impl PieceBufPool {
     // TODO: make this async fn, and make real impl to PieceBufPoolImpl
     pub fn async_alloc(&self, id: usize, size: usize) -> AllocPieceBufFut {
         AllocPieceBufFut {
-            id,
-            size,
-            pool: self,
-            waiting: false,
-            valid: Arc::new(AtomicU32::new(VALID)),
+            inner: AllocFutInner {
+                id,
+                size,
+                pool: self,
+                waiting: false,
+                valid: Arc::new(AtomicU32::new(WAITING)),
+            },
         }
     }
 
@@ -238,11 +244,13 @@ impl PieceBufPool {
         T: FromPieceBuf + Unpin,
     {
         AllocPieceBufAbortFut {
-            id,
-            size,
-            pool: self,
-            waiting: false,
-            valid: Arc::new(AtomicU32::new(VALID)),
+            inner: AllocFutInner {
+                id,
+                size,
+                pool: self,
+                waiting: false,
+                valid: Arc::new(AtomicU32::new(WAITING)),
+            },
             _t: PhantomData,
         }
     }
@@ -307,16 +315,8 @@ impl PieceBufPoolImpl {
                 .waiting_alloc
                 .lock()
                 .expect("waiting alloc lock should OK");
-            while let Some(v) = waiting_alloc.pop_front() {
-                #[cfg(test)]
-                println!("try wake f {}", v.id);
-                if v.valid.load(Ordering::Relaxed) == VALID {
-                    v.waker.wake();
-                    #[cfg(test)]
-                    println!("wake f {}", v.id);
-                    break;
-                }
-            }
+
+            wake_next_waiting_alloc(&mut waiting_alloc);
         }
     }
 
@@ -397,10 +397,39 @@ struct AllocReq {
     valid: Arc<AtomicU32>,
 }
 
-const INVALID: u32 = 0x1;
-const VALID: u32 = 0;
+const DROPPED: u32 = 0b01;
+const DONE: u32 = 0b010; // TODO: really need this?
+const WAITING: u32 = 0;
+const WAKING: u32 = 0b100;
 
-pub(crate) struct AllocPieceBufFut<'a> {
+fn wake_next_waiting_alloc(waiting_alloc: &mut VecDeque<AllocReq>) {
+    while let Some(v) = waiting_alloc.pop_front() {
+        #[cfg(test)]
+        println!("try waking {}", v.id);
+        match v
+            .valid
+            .compare_exchange(WAITING, WAKING, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => {
+                v.waker.wake();
+                #[cfg(test)]
+                println!("wake waiting {}", v.id);
+                break;
+            }
+            Err(actual) => {
+                // if DONE, this future is Ready
+                // if DROPPED, no one waiting future
+                // pick next one
+                debug_assert!(actual == DROPPED || actual == DONE || actual == WAKING);
+
+                #[cfg(test)]
+                println!("no wake {} because actual state {actual}", v.id);
+            }
+        }
+    }
+}
+
+struct AllocFutInner<'a> {
     id: usize,
     pool: &'a PieceBufPool,
     waiting: bool,
@@ -408,12 +437,19 @@ pub(crate) struct AllocPieceBufFut<'a> {
     size: usize,
 }
 
-impl Future for AllocPieceBufFut<'_> {
-    type Output = PieceBuf;
-
-    // TODO: pending future dropped
-    // TODO: FIXME: ?re-wake resolved future
-    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+impl AllocFutInner<'_> {
+    fn poll_alloc<F, T>(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        alloc_fn: F,
+    ) -> Poll<T>
+    where
+        // since we only alloc at most once, use most relaxed FnOnce here
+        // if we need to call alloc_fn more than once, use FnMut
+        // technically we are all using member functions, not even closures
+        // so Fn would be enough
+        F: FnOnce(&PieceBufPool, usize) -> Option<T>,
+    {
         let fut = self.get_mut();
 
         #[cfg(test)]
@@ -432,12 +468,14 @@ impl Future for AllocPieceBufFut<'_> {
                 println!("poll id {} pending 1", fut.id);
 
                 fut.waiting = true;
+                fut.valid.swap(WAITING, Ordering::Release);
                 return Poll::Pending;
             }
-            if let Some(bf) = fut.pool.alloc(fut.size) {
-                // this holds both lock of block_tree and waiting_alloc
-                let old = fut.valid.swap(INVALID, Ordering::Release);
-                debug_assert_eq!(old, VALID);
+
+            // alloc() holds both lock of block_tree and waiting_alloc
+            if let Some(bf) = alloc_fn(&mut fut.pool, fut.size) {
+                let old = fut.valid.swap(DONE, Ordering::Release);
+                debug_assert_eq!(old, WAITING);
                 #[cfg(test)]
                 println!("poll id {} ready 2", fut.id);
                 Poll::Ready(bf)
@@ -450,22 +488,16 @@ impl Future for AllocPieceBufFut<'_> {
                 fut.waiting = true;
                 #[cfg(test)]
                 println!("poll id {} pending 3", fut.id);
+
+                fut.valid.swap(WAITING, Ordering::Release);
                 Poll::Pending
             }
-        } else if let Some(bf) = fut.pool.alloc(fut.size) {
-            let old = fut.valid.swap(INVALID, Ordering::Release);
-            debug_assert_eq!(old, VALID);
+        } else if let Some(bf) = alloc_fn(&mut fut.pool, fut.size) {
+            let old = fut.valid.swap(DONE, Ordering::Release);
+            debug_assert!(old == WAITING || old == WAKING);
 
-            while let Some(v) = waiting_alloc.pop_front() {
-                #[cfg(test)]
-                println!("try wake 4 {}", v.id);
-                if v.valid.load(Ordering::Relaxed) == VALID {
-                    v.waker.wake();
-                    #[cfg(test)]
-                    println!("wake 4 {}", v.id);
-                    break;
-                }
-            }
+            wake_next_waiting_alloc(&mut waiting_alloc);
+
             #[cfg(test)]
             println!("poll id {} ready 4", fut.id);
             Poll::Ready(bf)
@@ -477,31 +509,49 @@ impl Future for AllocPieceBufFut<'_> {
             }); // try to be the first
             #[cfg(test)]
             println!("poll id {} pending 5", fut.id);
+
+            fut.valid.swap(WAITING, Ordering::Release);
             Poll::Pending
         }
     }
 }
 
-impl Drop for AllocPieceBufFut<'_> {
+impl Drop for AllocFutInner<'_> {
     fn drop(&mut self) {
-        // simplicity let's hold the mutex
         // TODO: optimize this
-        let mut _waiting_alloc = self.pool.inner.waiting_alloc.lock().unwrap();
-        let old = self.valid.swap(INVALID, Ordering::Relaxed);
+        let state = self.valid.swap(DROPPED, Ordering::Acquire);
 
         #[cfg(test)]
-        println!("drop AllocPieceBufFut id {}, old {}", self.id, old);
+        println!("drop AllocPieceBufFut id {}, old-state {}", self.id, state);
 
-        drop(_waiting_alloc);
+        match state {
+            WAKING => {
+                // executor wants to wake us, but we are dropped before
+                // being polled (if polled, state can't be WAKING)
+                // wake another one
+                let mut waiting_alloc = self.pool.inner.waiting_alloc.lock().unwrap();
+                wake_next_waiting_alloc(&mut waiting_alloc);
+            }
+            w => debug_assert!(w == WAITING || w == DONE),
+        }
+    }
+}
+
+pub(crate) struct AllocPieceBufFut<'a> {
+    inner: AllocFutInner<'a>,
+}
+
+impl Future for AllocPieceBufFut<'_> {
+    type Output = PieceBuf;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        let inner_fut = Pin::new(&mut self.get_mut().inner);
+        inner_fut.poll_alloc(cx, PieceBufPool::alloc)
     }
 }
 
 pub(crate) struct AllocPieceBufAbortFut<'a, T> {
-    id: usize,
-    pool: &'a PieceBufPool,
-    waiting: bool,
-    size: usize,
-    valid: Arc<AtomicU32>,
+    inner: AllocFutInner<'a>,
     _t: PhantomData<T>,
 }
 
@@ -511,60 +561,9 @@ where
 {
     type Output = T;
 
-    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
-        let fut = self.get_mut();
-
-        let mut waiting_alloc = fut.pool.inner.waiting_alloc.lock().unwrap();
-        if !fut.waiting {
-            if !waiting_alloc.is_empty() {
-                waiting_alloc.push_back(AllocReq {
-                    id: fut.id,
-                    waker: cx.waker().clone(),
-                    valid: fut.valid.clone(),
-                });
-                fut.waiting = true;
-                return Poll::Pending;
-            }
-            if let Some(t) = fut.pool.alloc_abort::<T>(fut.size) {
-                let old = fut.valid.swap(INVALID, Ordering::Release);
-                // this holds both lock of block_tree and waiting_alloc
-                Poll::Ready(t)
-            } else {
-                waiting_alloc.push_back(AllocReq {
-                    id: fut.id,
-                    waker: cx.waker().clone(),
-                    valid: fut.valid.clone(),
-                });
-                fut.waiting = true;
-                Poll::Pending
-            }
-        } else if let Some(t) = fut.pool.alloc_abort(fut.size) {
-            let old = fut.valid.swap(INVALID, Ordering::Release);
-            while let Some(v) = waiting_alloc.pop_front() {
-                if v.valid.load(Ordering::Relaxed) == VALID {
-                    v.waker.wake();
-                    break;
-                }
-            }
-            Poll::Ready(t)
-        } else {
-            waiting_alloc.push_front(AllocReq {
-                id: fut.id,
-                waker: cx.waker().clone(),
-                valid: fut.valid.clone(),
-            }); // try to be the first
-            Poll::Pending
-        }
-    }
-}
-
-impl<T> Drop for AllocPieceBufAbortFut<'_, T> {
-    fn drop(&mut self) {
-        // simplicity let's hold the mutex
-        // TODO: optimize this
-        let mut _waiting_alloc = self.pool.inner.waiting_alloc.lock().unwrap();
-        self.valid.swap(INVALID, Ordering::Relaxed);
-        drop(_waiting_alloc);
+    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        let inner_fut = Pin::new(&mut self.get_mut().inner);
+        inner_fut.poll_alloc(cx, PieceBufPool::alloc_abort)
     }
 }
 
