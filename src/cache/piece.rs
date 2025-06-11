@@ -260,7 +260,6 @@ where
     // TODO: maybe not use (offset,length) but use
     // (offset_mutlple_of(block), len_multiple_of(block))
     // TODO: this needs a lot of tests
-    // TODO: FIXME: out of range panic
     pub fn get_part_ref(&self, offset: usize, len: usize) -> Option<Ref<T>> {
         if len.trailing_zeros() < BLOCKSIZE.trailing_zeros() {
             // TODO: maybe not panic, fix size instead?
@@ -272,6 +271,60 @@ where
             return None;
         }
         {
+            if len + offset > buf_guard.cache.as_mut().len() {
+                // TODO: return error code
+                return None;
+            }
+
+            let range_state = &mut buf_guard.state;
+            range_state.ref_cnt += 1;
+
+            let any_block_not_vacant = range_state.state
+                [offset >> BLOCKBITS..(offset + len) >> BLOCKBITS]
+                .iter()
+                .any(|s| *s != BlockState::Vacant);
+            if any_block_not_vacant {
+                return None;
+            }
+
+            for s in range_state.state[offset >> BLOCKBITS..(offset + len) >> BLOCKBITS].iter_mut()
+            {
+                if *s != BlockState::Vacant {
+                    return None;
+                }
+                *s = BlockState::InUse;
+            }
+        }
+
+        Some(Ref {
+            offset: RefOffset {
+                from: offset,
+                ptr: unsafe { buf_guard.cache.as_mut().as_mut_ptr().add(offset) },
+                len,
+            },
+            main_cache: ManuallyDrop::new(self.inner.clone()),
+        })
+    }
+
+    // TODO: maybe not use (offset,length) but use
+    // (offset_mutlple_of(block), len_multiple_of(block))
+    // TODO: this needs a lot of tests
+    pub async fn async_get_part_ref(&self, offset: usize, len: usize) -> Option<Ref<T>> {
+        if len.trailing_zeros() < BLOCKSIZE.trailing_zeros() {
+            // TODO: maybe not panic, fix size instead?
+            panic!("should be multiple of {BLOCKSIZE}");
+        }
+
+        let mut buf_guard = self.inner.buf.lock().expect("get part ref lock should OK");
+        if !buf_guard.allow_new_ref.load(Ordering::Acquire) {
+            return None;
+        }
+        {
+            if len + offset > buf_guard.cache.as_mut().len() {
+                // TODO: return error code
+                return None;
+            }
+
             let range_state = &mut buf_guard.state;
             range_state.ref_cnt += 1;
 

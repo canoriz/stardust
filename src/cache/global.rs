@@ -120,6 +120,14 @@ impl BufTree {
         })
     }
 
+    fn free(&mut self, b: &FreeBlock) -> FreeBlockHandle {
+        self.blk_tree.merge_up(b.offset, b.power);
+
+        self.alloced
+            .remove(b)
+            .expect("free should see piecebuf in alloced list")
+    }
+
     fn count_blk_of_power(&self) -> Vec<usize> {
         let mut alloc_n = vec![0; self.blk_tree.tree.len()];
         for (b, _) in self.alloced.iter() {
@@ -152,11 +160,73 @@ impl BufTree {
     }
 
     fn migrate(&mut self) {
-        let alloc_n = self.count_blk_of_power();
+        // clear all blk_tree
+        self.blk_tree = init_block_tree(self.buf.len());
 
-        for (fb, fbh) in self.alloced.iter_mut() {
-            fb.
+        let mut migrate_map = vec![0usize; self.buf.len() >> MIN_ALLOC_SIZE_POWER];
 
+        let mut block_powers: Vec<Vec<(FreeBlock, FreeBlockHandle)>> = Vec::new();
+        for _ in 0..self.blk_tree.tree.len() {
+            block_powers.push(vec![]);
+        }
+
+        for (fb, fbh) in self.alloced.drain() {
+            let power_index = (fb.power - MIN_ALLOC_SIZE_POWER) as usize;
+            block_powers[power_index].push((fb, fbh));
+        }
+
+        let mut new_alloced = HashMap::new();
+        for p in block_powers.into_iter() {
+            for (fb, mut fbh) in p.into_iter() {
+                //NOTE: self.alloc will modify self.alloced, but we not use the modified "alloced"
+                // variable anyway, we will replace a new one
+                let new_fb = self.alloc(fb.power).expect("migrate alloc should ok");
+                fbh.free_block = new_fb.dup();
+
+                let begin_block_idx = fb.offset >> MIN_ALLOC_SIZE_POWER;
+                for (i, block) in (begin_block_idx
+                    ..begin_block_idx + (1 << (fb.power - MIN_ALLOC_SIZE_POWER)))
+                    .enumerate()
+                {
+                    migrate_map[block] = (new_fb.offset >> MIN_ALLOC_SIZE_POWER) + i;
+                }
+
+                new_alloced.insert(new_fb, fbh);
+                // TODO: need call SubHandle.migrate()?
+            }
+        }
+        self.alloced = new_alloced;
+
+        #[cfg(test)]
+        self.blk_tree.print();
+
+        let mut blk_offset = 0;
+        while blk_offset < self.buf.len() >> MIN_ALLOC_SIZE_POWER {
+            let dest = migrate_map[blk_offset];
+            if dest == blk_offset || dest == 0 {
+                blk_offset += 1;
+            } else {
+                if migrate_map[dest] == 0 {
+                    // dest is not used
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            self.buf.as_mut_ptr().add(blk_offset * MIN_ALLOC_SIZE),
+                            self.buf.as_mut_ptr().add(dest * MIN_ALLOC_SIZE),
+                            MIN_ALLOC_SIZE,
+                        );
+                    }
+                } else {
+                    // dest used
+                    unsafe {
+                        std::ptr::swap_nonoverlapping(
+                            self.buf.as_mut_ptr().add(blk_offset * MIN_ALLOC_SIZE),
+                            self.buf.as_mut_ptr().add(dest * MIN_ALLOC_SIZE),
+                            MIN_ALLOC_SIZE,
+                        );
+                    }
+                }
+                migrate_map.swap(blk_offset, dest);
+            }
         }
     }
 }
@@ -295,7 +365,7 @@ impl PieceBufPool {
         }
     }
 
-    pub async fn invalidate(&self, f: FreeBlock) {
+    async fn invalidate(&self, f: FreeBlock) {
         self.inner.invalidate(f).await;
     }
 }
@@ -333,12 +403,7 @@ impl PieceBufPoolImpl {
     fn free(&self, b: &FreeBlock) {
         {
             let mut buf_tree_guard = self.buf_tree.lock().expect("alloc lock should OK");
-            buf_tree_guard.blk_tree.merge_up(b.offset, b.power);
-
-            let mut fh = buf_tree_guard
-                .alloced
-                .remove(b)
-                .expect("free should see piecebuf in alloced list");
+            let mut fh = buf_tree_guard.free(b);
 
             #[cfg(test)]
             println!("free piecebuf");
@@ -694,6 +759,13 @@ impl BlockTree {
         }
         unreachable!("should always find a hole");
     }
+
+    #[cfg(test)]
+    fn print(&self) {
+        for (i, blk) in self.tree.iter().enumerate() {
+            println!("power {}, {:?}", i as u32 + MIN_ALLOC_SIZE_POWER, blk);
+        }
+    }
 }
 
 fn pop_first_vacant(list: &mut Vec<BlockList>, target_power: u32) -> Option<(usize, usize)> {
@@ -1021,13 +1093,24 @@ mod test {
         }
     }
 
+    fn fb_and_fbh(f: FreeBlock) -> (FreeBlock, FreeBlockHandle) {
+        (
+            f.dup(),
+            FreeBlockHandle {
+                free_block: f,
+                invalidate_waiter: Vec::new(),
+                sub_manager_handle: None,
+            },
+        )
+    }
+
     #[test]
     fn test_optimal_n() {
         // - : occupied
         // * : vacant
         // - * - * * * - - * - -
         // 0 1 2 3 4 5 6 7 8 9 10
-        let mut v = BlockTree {
+        let v = BlockTree {
             tree: vec![
                 BlockList {
                     size: MIN_ALLOC_SIZE,
@@ -1050,74 +1133,46 @@ mod test {
 
         let mut buf = vec![0u8; 10 * MIN_ALLOC_SIZE];
         let base_ptr = buf.as_mut_ptr();
-        let mock_fbh = FreeBlockHandle {
-            free_block: FreeBlock {
-                valid: Arc::new(AtomicBool::new(true)),
-                offset: 0,
-                power: MIN_ALLOC_SIZE_POWER,
-                ptr: base_ptr, // NOTE: this is wrong, should not be used, only for place holder
-            },
-            invalidate_waiter: Vec::new(),
-            sub_manager_handle: None,
-        };
         let mut b = BufTree {
             buf,
             blk_tree: v,
             alloced: HashMap::from([
-                (
-                    FreeBlock {
-                        valid: Arc::new(AtomicBool::new(true)),
-                        offset: 0,
-                        power: MIN_ALLOC_SIZE_POWER,
-                        ptr: base_ptr,
-                    },
-                    dup_free_block_handle(&mock_fbh),
-                ),
-                (
-                    FreeBlock {
-                        valid: Arc::new(AtomicBool::new(true)),
-                        offset: 2 * MIN_ALLOC_SIZE,
-                        power: MIN_ALLOC_SIZE_POWER,
-                        ptr: unsafe { base_ptr.add(2 * MIN_ALLOC_SIZE) },
-                    },
-                    dup_free_block_handle(&mock_fbh),
-                ),
-                (
-                    FreeBlock {
-                        valid: Arc::new(AtomicBool::new(true)),
-                        offset: 6 * MIN_ALLOC_SIZE,
-                        power: MIN_ALLOC_SIZE_POWER,
-                        ptr: unsafe { base_ptr.add(6 * MIN_ALLOC_SIZE) },
-                    },
-                    dup_free_block_handle(&mock_fbh),
-                ),
-                (
-                    FreeBlock {
-                        valid: Arc::new(AtomicBool::new(true)),
-                        offset: 7 * MIN_ALLOC_SIZE,
-                        power: MIN_ALLOC_SIZE_POWER,
-                        ptr: unsafe { base_ptr.add(7 * MIN_ALLOC_SIZE) },
-                    },
-                    dup_free_block_handle(&mock_fbh),
-                ),
-                (
-                    FreeBlock {
-                        valid: Arc::new(AtomicBool::new(true)),
-                        offset: 9 * MIN_ALLOC_SIZE,
-                        power: MIN_ALLOC_SIZE_POWER,
-                        ptr: unsafe { base_ptr.add(9 * MIN_ALLOC_SIZE) },
-                    },
-                    dup_free_block_handle(&mock_fbh),
-                ),
-                (
-                    FreeBlock {
-                        valid: Arc::new(AtomicBool::new(true)),
-                        offset: 10 * MIN_ALLOC_SIZE,
-                        power: MIN_ALLOC_SIZE_POWER,
-                        ptr: unsafe { base_ptr.add(10 * MIN_ALLOC_SIZE) },
-                    },
-                    dup_free_block_handle(&mock_fbh),
-                ),
+                fb_and_fbh(FreeBlock {
+                    valid: Arc::new(AtomicBool::new(true)),
+                    offset: 0,
+                    power: MIN_ALLOC_SIZE_POWER,
+                    ptr: base_ptr,
+                }),
+                fb_and_fbh(FreeBlock {
+                    valid: Arc::new(AtomicBool::new(true)),
+                    offset: 2 * MIN_ALLOC_SIZE,
+                    power: MIN_ALLOC_SIZE_POWER,
+                    ptr: unsafe { base_ptr.add(2 * MIN_ALLOC_SIZE) },
+                }),
+                fb_and_fbh(FreeBlock {
+                    valid: Arc::new(AtomicBool::new(true)),
+                    offset: 6 * MIN_ALLOC_SIZE,
+                    power: MIN_ALLOC_SIZE_POWER,
+                    ptr: unsafe { base_ptr.add(6 * MIN_ALLOC_SIZE) },
+                }),
+                fb_and_fbh(FreeBlock {
+                    valid: Arc::new(AtomicBool::new(true)),
+                    offset: 7 * MIN_ALLOC_SIZE,
+                    power: MIN_ALLOC_SIZE_POWER,
+                    ptr: unsafe { base_ptr.add(7 * MIN_ALLOC_SIZE) },
+                }),
+                fb_and_fbh(FreeBlock {
+                    valid: Arc::new(AtomicBool::new(true)),
+                    offset: 9 * MIN_ALLOC_SIZE,
+                    power: MIN_ALLOC_SIZE_POWER,
+                    ptr: unsafe { base_ptr.add(9 * MIN_ALLOC_SIZE) },
+                }),
+                fb_and_fbh(FreeBlock {
+                    valid: Arc::new(AtomicBool::new(true)),
+                    offset: 10 * MIN_ALLOC_SIZE,
+                    power: MIN_ALLOC_SIZE_POWER,
+                    ptr: unsafe { base_ptr.add(10 * MIN_ALLOC_SIZE) },
+                }),
             ]),
         };
 
@@ -1132,7 +1187,7 @@ mod test {
         // * : vacant
         // - - * * - - * * - - -
         // 0 1 2 3 4 5 6 7 8 9 10
-        let mut v = BlockTree {
+        let v = BlockTree {
             tree: vec![
                 BlockList {
                     size: MIN_ALLOC_SIZE,
@@ -1155,56 +1210,34 @@ mod test {
 
         let mut buf = vec![0u8; 11 * MIN_ALLOC_SIZE];
         let base_ptr = buf.as_mut_ptr();
-        let mock_fbh = FreeBlockHandle {
-            free_block: FreeBlock {
-                valid: Arc::new(AtomicBool::new(true)),
-                offset: 0,
-                power: MIN_ALLOC_SIZE_POWER,
-                ptr: base_ptr, // NOTE: this is wrong, should not be used, only for place holder
-            },
-            invalidate_waiter: Vec::new(),
-            sub_manager_handle: None,
-        };
         let mut b = BufTree {
             buf,
             blk_tree: v,
             alloced: HashMap::from([
-                (
-                    FreeBlock {
-                        valid: Arc::new(AtomicBool::new(true)),
-                        offset: 0,
-                        power: MIN_ALLOC_SIZE_POWER + 1,
-                        ptr: base_ptr,
-                    },
-                    dup_free_block_handle(&mock_fbh),
-                ),
-                (
-                    FreeBlock {
-                        valid: Arc::new(AtomicBool::new(true)),
-                        offset: 4 * MIN_ALLOC_SIZE,
-                        power: MIN_ALLOC_SIZE_POWER + 1,
-                        ptr: unsafe { base_ptr.add(4 * MIN_ALLOC_SIZE) },
-                    },
-                    dup_free_block_handle(&mock_fbh),
-                ),
-                (
-                    FreeBlock {
-                        valid: Arc::new(AtomicBool::new(true)),
-                        offset: 8 * MIN_ALLOC_SIZE,
-                        power: MIN_ALLOC_SIZE_POWER + 1,
-                        ptr: unsafe { base_ptr.add(8 * MIN_ALLOC_SIZE) },
-                    },
-                    dup_free_block_handle(&mock_fbh),
-                ),
-                (
-                    FreeBlock {
-                        valid: Arc::new(AtomicBool::new(true)),
-                        offset: 10 * MIN_ALLOC_SIZE,
-                        power: MIN_ALLOC_SIZE_POWER,
-                        ptr: unsafe { base_ptr.add(10 * MIN_ALLOC_SIZE) },
-                    },
-                    dup_free_block_handle(&mock_fbh),
-                ),
+                fb_and_fbh(FreeBlock {
+                    valid: Arc::new(AtomicBool::new(true)),
+                    offset: 0,
+                    power: MIN_ALLOC_SIZE_POWER + 1,
+                    ptr: base_ptr,
+                }),
+                fb_and_fbh(FreeBlock {
+                    valid: Arc::new(AtomicBool::new(true)),
+                    offset: 4 * MIN_ALLOC_SIZE,
+                    power: MIN_ALLOC_SIZE_POWER + 1,
+                    ptr: unsafe { base_ptr.add(4 * MIN_ALLOC_SIZE) },
+                }),
+                fb_and_fbh(FreeBlock {
+                    valid: Arc::new(AtomicBool::new(true)),
+                    offset: 8 * MIN_ALLOC_SIZE,
+                    power: MIN_ALLOC_SIZE_POWER + 1,
+                    ptr: unsafe { base_ptr.add(8 * MIN_ALLOC_SIZE) },
+                }),
+                fb_and_fbh(FreeBlock {
+                    valid: Arc::new(AtomicBool::new(true)),
+                    offset: 10 * MIN_ALLOC_SIZE,
+                    power: MIN_ALLOC_SIZE_POWER,
+                    ptr: unsafe { base_ptr.add(10 * MIN_ALLOC_SIZE) },
+                }),
             ]),
         };
 
@@ -1219,7 +1252,7 @@ mod test {
         // * : vacant
         // * - * - * - * - * - -
         // 0 1 2 3 4 5 6 7 8 9 10
-        let mut v = BlockTree {
+        let v = BlockTree {
             tree: vec![
                 BlockList {
                     size: MIN_ALLOC_SIZE,
@@ -1242,74 +1275,46 @@ mod test {
 
         let mut buf = vec![0u8; 11 * MIN_ALLOC_SIZE];
         let base_ptr = buf.as_mut_ptr();
-        let mock_fbh = FreeBlockHandle {
-            free_block: FreeBlock {
-                valid: Arc::new(AtomicBool::new(true)),
-                offset: 0,
-                power: MIN_ALLOC_SIZE_POWER,
-                ptr: base_ptr, // NOTE: this is wrong, should not be used, only for place holder
-            },
-            invalidate_waiter: Vec::new(),
-            sub_manager_handle: None,
-        };
         let mut b = BufTree {
             buf,
             blk_tree: v,
             alloced: HashMap::from([
-                (
-                    FreeBlock {
-                        valid: Arc::new(AtomicBool::new(true)),
-                        offset: 1,
-                        power: MIN_ALLOC_SIZE_POWER,
-                        ptr: base_ptr,
-                    },
-                    dup_free_block_handle(&mock_fbh),
-                ),
-                (
-                    FreeBlock {
-                        valid: Arc::new(AtomicBool::new(true)),
-                        offset: 3 * MIN_ALLOC_SIZE,
-                        power: MIN_ALLOC_SIZE_POWER,
-                        ptr: unsafe { base_ptr.add(3 * MIN_ALLOC_SIZE) },
-                    },
-                    dup_free_block_handle(&mock_fbh),
-                ),
-                (
-                    FreeBlock {
-                        valid: Arc::new(AtomicBool::new(true)),
-                        offset: 5 * MIN_ALLOC_SIZE,
-                        power: MIN_ALLOC_SIZE_POWER,
-                        ptr: unsafe { base_ptr.add(5 * MIN_ALLOC_SIZE) },
-                    },
-                    dup_free_block_handle(&mock_fbh),
-                ),
-                (
-                    FreeBlock {
-                        valid: Arc::new(AtomicBool::new(true)),
-                        offset: 7 * MIN_ALLOC_SIZE,
-                        power: MIN_ALLOC_SIZE_POWER,
-                        ptr: unsafe { base_ptr.add(7 * MIN_ALLOC_SIZE) },
-                    },
-                    dup_free_block_handle(&mock_fbh),
-                ),
-                (
-                    FreeBlock {
-                        valid: Arc::new(AtomicBool::new(true)),
-                        offset: 9 * MIN_ALLOC_SIZE,
-                        power: MIN_ALLOC_SIZE_POWER,
-                        ptr: unsafe { base_ptr.add(9 * MIN_ALLOC_SIZE) },
-                    },
-                    dup_free_block_handle(&mock_fbh),
-                ),
-                (
-                    FreeBlock {
-                        valid: Arc::new(AtomicBool::new(true)),
-                        offset: 10 * MIN_ALLOC_SIZE,
-                        power: MIN_ALLOC_SIZE_POWER,
-                        ptr: unsafe { base_ptr.add(10 * MIN_ALLOC_SIZE) },
-                    },
-                    dup_free_block_handle(&mock_fbh),
-                ),
+                fb_and_fbh(FreeBlock {
+                    valid: Arc::new(AtomicBool::new(true)),
+                    offset: 1,
+                    power: MIN_ALLOC_SIZE_POWER,
+                    ptr: base_ptr,
+                }),
+                fb_and_fbh(FreeBlock {
+                    valid: Arc::new(AtomicBool::new(true)),
+                    offset: 3 * MIN_ALLOC_SIZE,
+                    power: MIN_ALLOC_SIZE_POWER,
+                    ptr: unsafe { base_ptr.add(3 * MIN_ALLOC_SIZE) },
+                }),
+                fb_and_fbh(FreeBlock {
+                    valid: Arc::new(AtomicBool::new(true)),
+                    offset: 5 * MIN_ALLOC_SIZE,
+                    power: MIN_ALLOC_SIZE_POWER,
+                    ptr: unsafe { base_ptr.add(5 * MIN_ALLOC_SIZE) },
+                }),
+                fb_and_fbh(FreeBlock {
+                    valid: Arc::new(AtomicBool::new(true)),
+                    offset: 7 * MIN_ALLOC_SIZE,
+                    power: MIN_ALLOC_SIZE_POWER,
+                    ptr: unsafe { base_ptr.add(7 * MIN_ALLOC_SIZE) },
+                }),
+                fb_and_fbh(FreeBlock {
+                    valid: Arc::new(AtomicBool::new(true)),
+                    offset: 9 * MIN_ALLOC_SIZE,
+                    power: MIN_ALLOC_SIZE_POWER,
+                    ptr: unsafe { base_ptr.add(9 * MIN_ALLOC_SIZE) },
+                }),
+                fb_and_fbh(FreeBlock {
+                    valid: Arc::new(AtomicBool::new(true)),
+                    offset: 10 * MIN_ALLOC_SIZE,
+                    power: MIN_ALLOC_SIZE_POWER,
+                    ptr: unsafe { base_ptr.add(10 * MIN_ALLOC_SIZE) },
+                }),
             ]),
         };
 
@@ -1319,6 +1324,29 @@ mod test {
         assert_eq!(can_fit, 1);
         let can_fit = b.can_fit_n_if_migrated(MIN_ALLOC_SIZE_POWER + 1);
         assert_eq!(can_fit, 2);
+
+        // before migrate
+        // - : occupied
+        // * : vacant
+        // * - * - * - * - * - -
+        // 0 1 2 3 4 5 6 7 8 9 10
+        //
+        // after migrate
+        // - : occupied
+        // * : vacant
+        // * * * * * - - - - - -
+        // 0 1 2 3 4 5 6 7 8 9 10
+        b.migrate();
+        {
+            let res = b.alloc(MIN_ALLOC_SIZE_POWER + 2).unwrap();
+            b.free(&res);
+        }
+        {
+            let res1 = b.alloc(MIN_ALLOC_SIZE_POWER + 1).unwrap();
+            let res2 = b.alloc(MIN_ALLOC_SIZE_POWER + 1).unwrap();
+            assert!(b.alloc(MIN_ALLOC_SIZE_POWER + 1).is_none());
+            assert!(b.alloc(MIN_ALLOC_SIZE_POWER).is_some());
+        }
     }
 
     #[test]
