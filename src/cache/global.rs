@@ -6,7 +6,8 @@ use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut, Div};
 use std::pin::Pin;
-use std::task::{Poll, Waker};
+use std::sync::MutexGuard;
+use std::task::{Context, Poll, Waker};
 
 #[cfg(mloom)]
 use loom::sync::{Arc, Mutex};
@@ -16,6 +17,8 @@ use tokio::sync::Notify;
 use loom::atomic::{AtomicBool, AtomicU32, Ordering};
 #[cfg(not(mloom))]
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use tokio::task::JoinHandle;
+use tracing::warn;
 
 #[cfg(not(mloom))]
 use std::sync::{Arc, Mutex};
@@ -44,11 +47,11 @@ pub(crate) struct PieceBufPool {
 // free buffer
 #[derive(Debug)]
 struct FreeBlock {
-    valid: Arc<AtomicBool>,
     // TODO: offset and ptr is same thing? only store one?
     offset: usize,
     power: u32,
 
+    // ptr is the pointer to buf[offset]
     ptr: *mut u8,
 }
 
@@ -56,7 +59,6 @@ impl FreeBlock {
     // This is essentially Clone, use very carefully
     fn dup(&self) -> Self {
         Self {
-            valid: self.valid.clone(),
             offset: self.offset,
             power: self.power,
             ptr: self.ptr,
@@ -68,6 +70,7 @@ struct FreeBlockHandle {
     // This is only a "reference", stores where this handle controlls,
     // we don't own this memory
     free_block: FreeBlock,
+    // waits for FreeBlock drops
     invalidate_waiter: Vec<Arc<Notify>>,
     sub_manager_handle: Option<SubAbortHandle<PieceBuf>>,
 }
@@ -91,6 +94,7 @@ unsafe impl Send for FreeBlock {}
 unsafe impl Sync for FreeBlock {}
 
 struct BufTree {
+    migrating: bool, // TODO: Maybe use atomic and move out of BufTree
     buf: Vec<u8>,
     blk_tree: BlockTree,
 
@@ -101,9 +105,21 @@ struct BufTree {
 
 impl BufTree {
     fn alloc(&mut self, power: u32) -> Option<FreeBlock> {
+        // Can not alloc when concurrently migrating.
+        // migrate_task() requires all use of PieceBuf stop, And pause is an async
+        // operation, which means it does not always hold lock.
+        // If pause done, but now a new PieceBuf is allocated, this PieceBuf
+        // may be used, which violates the assumption of migrate_task() that all
+        // uses are stopped.
+        if self.migrating {
+            return None;
+        }
+        self.migrating_alloc(power)
+    }
+
+    fn migrating_alloc(&mut self, power: u32) -> Option<FreeBlock> {
         self.blk_tree.split_down(power).map(|(offset, power)| {
             let fb = FreeBlock {
-                valid: Arc::new(AtomicBool::new(true)),
                 offset,
                 power,
                 ptr: unsafe { self.buf.as_mut_ptr().add(offset) },
@@ -159,7 +175,10 @@ impl BufTree {
         can_fit
     }
 
-    fn migrate(&mut self) {
+    // WARN: only called after pause_all_before_migrate() returns
+    // when all buf ref is freed
+    // TODO: longterm: optimize this
+    unsafe fn migrate(&mut self) {
         // clear all blk_tree
         self.blk_tree = init_block_tree(self.buf.len());
 
@@ -180,7 +199,9 @@ impl BufTree {
             for (fb, mut fbh) in p.into_iter() {
                 //NOTE: self.alloc will modify self.alloced, but we not use the modified "alloced"
                 // variable anyway, we will replace a new one
-                let new_fb = self.alloc(fb.power).expect("migrate alloc should ok");
+                let new_fb = self
+                    .migrating_alloc(fb.power)
+                    .expect("migrate alloc should ok");
                 fbh.free_block = new_fb.dup();
 
                 let begin_block_idx = fb.offset >> MIN_ALLOC_SIZE_POWER;
@@ -191,8 +212,11 @@ impl BufTree {
                     migrate_map[block] = (new_fb.offset >> MIN_ALLOC_SIZE_POWER) + i;
                 }
 
+                fbh.sub_manager_handle
+                    .as_ref()
+                    .expect("should have handle")
+                    .migrate(new_fb.offset);
                 new_alloced.insert(new_fb, fbh);
-                // TODO: need call SubHandle.migrate()?
             }
         }
         self.alloced = new_alloced;
@@ -228,12 +252,35 @@ impl BufTree {
                 migrate_map.swap(blk_offset, dest);
             }
         }
+
+        // now restore all PieceBuf to valid for creating new refs
+        // be careful not to re-enable new ref if is invalidating in progress
+        // If a piece is now invalidating, the allow_new_ref should be true
+        // restoring pause_new_ref won't make new refs created
+        for (fb, fbh) in self.alloced.iter() {
+            let handle = fbh.sub_manager_handle.as_ref().expect("should have handle");
+            handle.reenable();
+        }
     }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum MigrateErr {
+    Unabortable,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum InvalidateErr {
+    MigrateInProgress,
+    Unabortable,
 }
 
 struct PieceBufPoolImpl {
     buf_tree: Mutex<BufTree>,
     waiting_alloc: Mutex<VecDeque<AllocReq>>,
+
+    // TODO: maybe move into buf_tree
+    // TODO: is this used?
     invalidating: AtomicU32,
 }
 
@@ -283,11 +330,30 @@ impl PieceBufPool {
 
     /// alloc PieceBuf
     pub fn alloc(&self, size: usize) -> Option<PieceBuf> {
-        self.inner.alloc(size).map(|fb| PieceBuf {
-            b: fb,
-            len: size,
-            main_cache: self.inner.clone(),
-        })
+        let size_fixed = if size < MIN_ALLOC_SIZE {
+            MIN_ALLOC_SIZE
+        } else {
+            size.next_power_of_two()
+        };
+        debug_assert_eq!(size_fixed % MIN_ALLOC_SIZE, 0);
+        let power = size_fixed.ilog2();
+
+        let mut buf_tree_guard = self.inner.buf_tree.lock().expect("alloc lock should OK");
+        if let Some(fb) = buf_tree_guard.alloc(power) {
+            Some(PieceBuf {
+                b: fb,
+                len: size,
+                main_cache: self.inner.clone(),
+            })
+        } else if !buf_tree_guard.migrating && buf_tree_guard.can_fit_n_if_migrated(power) > 0 {
+            // TODO: do we need a from_async flag, so that only fire migrate_task
+            // when calling inside a async environment?
+            let pool_impl = self.inner.clone();
+            start_migrate_task(buf_tree_guard, pool_impl);
+            None
+        } else {
+            None
+        }
     }
 
     /// alloc PieceBuf
@@ -321,6 +387,12 @@ impl PieceBufPool {
                 .expect("just alloced should exist");
             fbh.sub_manager_handle = Some(abort_handle);
             Some(ret)
+        } else if !buf_tree_guard.migrating && buf_tree_guard.can_fit_n_if_migrated(power) > 0 {
+            // TODO: do we need a from_async flag, so that only fire migrate_task
+            // when calling inside a async environment?
+            let pool_impl = self.inner.clone();
+            start_migrate_task(buf_tree_guard, pool_impl);
+            None
         } else {
             None
         }
@@ -365,8 +437,8 @@ impl PieceBufPool {
         }
     }
 
-    async fn invalidate(&self, f: FreeBlock) {
-        self.inner.invalidate(f).await;
+    async fn invalidate(&self, f: FreeBlock) -> Result<(), InvalidateErr> {
+        self.inner.invalidate(f).await
     }
 }
 
@@ -376,6 +448,7 @@ impl PieceBufPoolImpl {
 
         Self {
             buf_tree: Mutex::new(BufTree {
+                migrating: false,
                 buf: vec![0u8; size_fixed],
                 blk_tree: init_block_tree(size_fixed),
                 alloced: HashMap::new(),
@@ -428,12 +501,16 @@ impl PieceBufPoolImpl {
 
     // TODO: after invalidate, the block should not be allocated before
     // further operations like flush to disk / migrate
-    async fn invalidate(&self, f: FreeBlock) {
+    // TODO: what if this gets dropped?
+    async fn invalidate(&self, f: FreeBlock) -> Result<(), InvalidateErr> {
         self.invalidating.fetch_add(1, Ordering::Acquire);
         let (wait_invalid, wait_abort) = {
             let mut buf_tree_guard = self.buf_tree.lock().expect("invalidate lock should OK");
+            if buf_tree_guard.migrating {
+                // TODO: FIXME: is this a must?
+                return Err(InvalidateErr::MigrateInProgress);
+            }
             if let Some(fbh) = buf_tree_guard.alloced.get_mut(&f) {
-                fbh.free_block.valid.store(false, Ordering::Relaxed); // TODO: ordering, loom test
                 let aborter = fbh.sub_manager_handle.clone();
                 #[cfg(test)]
                 println!("add wait_invalid");
@@ -441,20 +518,61 @@ impl PieceBufPoolImpl {
                 fbh.invalidate_waiter.push(waiter.clone());
                 (waiter, aborter)
             } else {
-                return;
+                return Ok(());
             }
             // TODO: tell this piece to stop all use of reference (async read/write)
             // need a reference to allocated PieceBuf
         };
         if let Some(aborter) = wait_abort {
-            aborter.abort_all().await;
+            aborter.invalidate_all().await;
+        } else {
+            #[cfg(test)]
+            println!("try to wait unabortable piece");
+            // TODO: what if try to invalidate unabortable piece?
         }
         #[cfg(test)]
         println!("waiting wait_invalid {:?}", wait_invalid);
         wait_invalid.notified().await;
         self.invalidating.fetch_sub(1, Ordering::Release);
+        Ok(())
         // let buf_tree_guard = self.buf_tree.lock().expect("invalidate lock should OK");
         // assert!(!buf_tree_guard.alloced.contains_key(&f));
+    }
+
+    async fn pause_all_before_migrate(&self) -> Result<(), MigrateErr> {
+        let wait_abort = {
+            let mut buf_tree_guard = self.buf_tree.lock().expect("pause lock should OK");
+            assert_eq!(buf_tree_guard.migrating, true);
+            let mut aborters = Vec::new();
+            for (fb, fbh) in buf_tree_guard.alloced.iter_mut() {
+                #[cfg(test)]
+                println!("add wait_invalid");
+
+                let aborter = fbh.sub_manager_handle.clone();
+                match aborter {
+                    Some(a) => {
+                        aborters.push(a);
+                    }
+                    None => {
+                        #[cfg(test)]
+                        println!("block cannot abort fb {:?}", fb);
+
+                        return Err(MigrateErr::Unabortable);
+                    }
+                }
+            }
+            aborters
+        };
+
+        let mut ts = tokio::task::JoinSet::new();
+        for a in wait_abort.into_iter() {
+            ts.spawn(async move { a.abort_all().await });
+        }
+        ts.join_all().await;
+
+        #[cfg(test)]
+        println!("all aborted(paused)");
+        Ok(())
     }
 
     // fn frag_status(&self) -> Option<f32> {
@@ -525,15 +643,27 @@ impl DerefMut for PieceBuf {
 }
 
 impl PieceBuf {
-    fn stop_all_ref(&self) {
-        todo!()
+    // reset the underlying buf offset. only use this when you know
+    // the offset(also ptr) is valid and "allocated" to this Piece
+    // otherwise causing racing / wild pointer
+    //
+    // TODO: fixme: this should be private
+    // maybe merge global.rs and piece.rs together
+    pub(crate) unsafe fn reset_offset(&mut self, new_offset: usize) {
+        // TODO: FIXME: check new_offset in range
+
+        #[cfg(test)]
+        println!("PieceBuf: migrate from {} to {}", self.b.offset, new_offset);
+
+        self.b.ptr = self.b.ptr.sub(self.b.offset).add(new_offset);
+        self.b.offset = new_offset;
     }
 }
 
-struct AllocReq {
-    id: usize,
-    waker: Waker,
-    valid: Arc<AtomicU32>,
+pub(crate) struct AllocReq {
+    pub id: usize,
+    pub waker: Waker,
+    pub valid: Arc<AtomicU32>,
 }
 
 const DROPPED: u32 = 0b01;
@@ -541,7 +671,7 @@ const DONE: u32 = 0b010; // TODO: really need this?
 const WAITING: u32 = 0;
 const WAKING: u32 = 0b100;
 
-fn wake_next_waiting_alloc(waiting_alloc: &mut VecDeque<AllocReq>) {
+pub(crate) fn wake_next_waiting_alloc(waiting_alloc: &mut VecDeque<AllocReq>) {
     while let Some(v) = waiting_alloc.pop_front() {
         #[cfg(test)]
         println!("try waking {}", v.id);
@@ -612,7 +742,7 @@ impl AllocFutInner<'_> {
             }
 
             // alloc() holds both lock of block_tree and waiting_alloc
-            if let Some(bf) = alloc_fn(&mut fut.pool, fut.size) {
+            if let Some(bf) = alloc_fn(&fut.pool, fut.size) {
                 let old = fut.valid.swap(DONE, Ordering::Release);
                 debug_assert_eq!(old, WAITING);
                 #[cfg(test)]
@@ -631,7 +761,7 @@ impl AllocFutInner<'_> {
                 fut.valid.swap(WAITING, Ordering::Release);
                 Poll::Pending
             }
-        } else if let Some(bf) = alloc_fn(&mut fut.pool, fut.size) {
+        } else if let Some(bf) = alloc_fn(&fut.pool, fut.size) {
             let old = fut.valid.swap(DONE, Ordering::Release);
             debug_assert!(old == WAITING || old == WAKING);
 
@@ -680,10 +810,73 @@ pub(crate) struct AllocPieceBufFut<'a> {
     inner: AllocFutInner<'a>,
 }
 
+async fn migrate_task(pool_impl: Arc<PieceBufPoolImpl>) {
+    // TODO: SAFETY: make sure all PieceBuf is migratable.
+    if let Err(e) = pool_impl.pause_all_before_migrate().await {
+        warn!("pause failed: {e:?}");
+        #[cfg(test)]
+        println!("pause failed: {e:?}");
+
+        // pause failed, maybe some unabortable task
+        // just wake one pending alloc request
+        {
+            let mut guard = pool_impl
+                .buf_tree
+                .lock()
+                .expect("invalidate task lock should OK");
+            guard.migrating = false;
+        }
+        {
+            let mut waiting_alloc = pool_impl
+                .waiting_alloc
+                .lock()
+                .expect("migrate task lock waiting alloc should OK");
+            wake_next_waiting_alloc(&mut waiting_alloc);
+        }
+    } else {
+        // all paused
+
+        #[cfg(test)]
+        println!("migrate_task: paused all pieceBufs");
+
+        {
+            let mut buf_tree_guard = pool_impl
+                .buf_tree
+                .lock()
+                .expect("invalidate task lock should OK");
+            unsafe {
+                buf_tree_guard.migrate();
+            }
+
+            buf_tree_guard.migrating = false;
+        }
+        {
+            // migrate done, now wake up one pending alloc request
+
+            #[cfg(test)]
+            println!("migrate_task: migrating done, wake up one pending alloc request");
+
+            let mut waiting_alloc = pool_impl
+                .waiting_alloc
+                .lock()
+                .expect("migrate task lock waiting alloc should OK");
+            wake_next_waiting_alloc(&mut waiting_alloc);
+        }
+    }
+}
+
+fn start_migrate_task(mut buf_tree: MutexGuard<'_, BufTree>, pool_impl: Arc<PieceBufPoolImpl>) {
+    // must set migrating in sync code
+    // so at most one migrate_task can run
+    buf_tree.migrating = true;
+    drop(buf_tree);
+    tokio::spawn(migrate_task(pool_impl));
+}
+
 impl Future for AllocPieceBufFut<'_> {
     type Output = PieceBuf;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let inner_fut = Pin::new(&mut self.get_mut().inner);
         inner_fut.poll_alloc(cx, PieceBufPool::alloc)
     }
@@ -700,7 +893,7 @@ where
 {
     type Output = T;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let inner_fut = Pin::new(&mut self.get_mut().inner);
         inner_fut.poll_alloc(cx, PieceBufPool::alloc_abort)
     }
@@ -1134,41 +1327,36 @@ mod test {
         let mut buf = vec![0u8; 10 * MIN_ALLOC_SIZE];
         let base_ptr = buf.as_mut_ptr();
         let mut b = BufTree {
+            migrating: false,
             buf,
             blk_tree: v,
             alloced: HashMap::from([
                 fb_and_fbh(FreeBlock {
-                    valid: Arc::new(AtomicBool::new(true)),
                     offset: 0,
                     power: MIN_ALLOC_SIZE_POWER,
                     ptr: base_ptr,
                 }),
                 fb_and_fbh(FreeBlock {
-                    valid: Arc::new(AtomicBool::new(true)),
                     offset: 2 * MIN_ALLOC_SIZE,
                     power: MIN_ALLOC_SIZE_POWER,
                     ptr: unsafe { base_ptr.add(2 * MIN_ALLOC_SIZE) },
                 }),
                 fb_and_fbh(FreeBlock {
-                    valid: Arc::new(AtomicBool::new(true)),
                     offset: 6 * MIN_ALLOC_SIZE,
                     power: MIN_ALLOC_SIZE_POWER,
                     ptr: unsafe { base_ptr.add(6 * MIN_ALLOC_SIZE) },
                 }),
                 fb_and_fbh(FreeBlock {
-                    valid: Arc::new(AtomicBool::new(true)),
                     offset: 7 * MIN_ALLOC_SIZE,
                     power: MIN_ALLOC_SIZE_POWER,
                     ptr: unsafe { base_ptr.add(7 * MIN_ALLOC_SIZE) },
                 }),
                 fb_and_fbh(FreeBlock {
-                    valid: Arc::new(AtomicBool::new(true)),
                     offset: 9 * MIN_ALLOC_SIZE,
                     power: MIN_ALLOC_SIZE_POWER,
                     ptr: unsafe { base_ptr.add(9 * MIN_ALLOC_SIZE) },
                 }),
                 fb_and_fbh(FreeBlock {
-                    valid: Arc::new(AtomicBool::new(true)),
                     offset: 10 * MIN_ALLOC_SIZE,
                     power: MIN_ALLOC_SIZE_POWER,
                     ptr: unsafe { base_ptr.add(10 * MIN_ALLOC_SIZE) },
@@ -1211,29 +1399,26 @@ mod test {
         let mut buf = vec![0u8; 11 * MIN_ALLOC_SIZE];
         let base_ptr = buf.as_mut_ptr();
         let mut b = BufTree {
+            migrating: false,
             buf,
             blk_tree: v,
             alloced: HashMap::from([
                 fb_and_fbh(FreeBlock {
-                    valid: Arc::new(AtomicBool::new(true)),
                     offset: 0,
                     power: MIN_ALLOC_SIZE_POWER + 1,
                     ptr: base_ptr,
                 }),
                 fb_and_fbh(FreeBlock {
-                    valid: Arc::new(AtomicBool::new(true)),
                     offset: 4 * MIN_ALLOC_SIZE,
                     power: MIN_ALLOC_SIZE_POWER + 1,
                     ptr: unsafe { base_ptr.add(4 * MIN_ALLOC_SIZE) },
                 }),
                 fb_and_fbh(FreeBlock {
-                    valid: Arc::new(AtomicBool::new(true)),
                     offset: 8 * MIN_ALLOC_SIZE,
                     power: MIN_ALLOC_SIZE_POWER + 1,
                     ptr: unsafe { base_ptr.add(8 * MIN_ALLOC_SIZE) },
                 }),
                 fb_and_fbh(FreeBlock {
-                    valid: Arc::new(AtomicBool::new(true)),
                     offset: 10 * MIN_ALLOC_SIZE,
                     power: MIN_ALLOC_SIZE_POWER,
                     ptr: unsafe { base_ptr.add(10 * MIN_ALLOC_SIZE) },
@@ -1276,41 +1461,36 @@ mod test {
         let mut buf = vec![0u8; 11 * MIN_ALLOC_SIZE];
         let base_ptr = buf.as_mut_ptr();
         let mut b = BufTree {
+            migrating: false,
             buf,
             blk_tree: v,
             alloced: HashMap::from([
                 fb_and_fbh(FreeBlock {
-                    valid: Arc::new(AtomicBool::new(true)),
                     offset: 1,
                     power: MIN_ALLOC_SIZE_POWER,
                     ptr: base_ptr,
                 }),
                 fb_and_fbh(FreeBlock {
-                    valid: Arc::new(AtomicBool::new(true)),
                     offset: 3 * MIN_ALLOC_SIZE,
                     power: MIN_ALLOC_SIZE_POWER,
                     ptr: unsafe { base_ptr.add(3 * MIN_ALLOC_SIZE) },
                 }),
                 fb_and_fbh(FreeBlock {
-                    valid: Arc::new(AtomicBool::new(true)),
                     offset: 5 * MIN_ALLOC_SIZE,
                     power: MIN_ALLOC_SIZE_POWER,
                     ptr: unsafe { base_ptr.add(5 * MIN_ALLOC_SIZE) },
                 }),
                 fb_and_fbh(FreeBlock {
-                    valid: Arc::new(AtomicBool::new(true)),
                     offset: 7 * MIN_ALLOC_SIZE,
                     power: MIN_ALLOC_SIZE_POWER,
                     ptr: unsafe { base_ptr.add(7 * MIN_ALLOC_SIZE) },
                 }),
                 fb_and_fbh(FreeBlock {
-                    valid: Arc::new(AtomicBool::new(true)),
                     offset: 9 * MIN_ALLOC_SIZE,
                     power: MIN_ALLOC_SIZE_POWER,
                     ptr: unsafe { base_ptr.add(9 * MIN_ALLOC_SIZE) },
                 }),
                 fb_and_fbh(FreeBlock {
-                    valid: Arc::new(AtomicBool::new(true)),
                     offset: 10 * MIN_ALLOC_SIZE,
                     power: MIN_ALLOC_SIZE_POWER,
                     ptr: unsafe { base_ptr.add(10 * MIN_ALLOC_SIZE) },
@@ -1336,7 +1516,9 @@ mod test {
         // * : vacant
         // * * * * * - - - - - -
         // 0 1 2 3 4 5 6 7 8 9 10
-        b.migrate();
+        unsafe {
+            b.migrate();
+        }
         {
             let res = b.alloc(MIN_ALLOC_SIZE_POWER + 2).unwrap();
             b.free(&res);
@@ -1490,6 +1672,61 @@ mod test {
 
     #[cfg(not(mloom))]
     #[tokio::test]
+    async fn test_async_alloc_abort_migrate() {
+        let c = PieceBufPool::new(4 * MIN_ALLOC_SIZE);
+        let p1 = c.async_alloc_abort::<ArcCache<_>>(1, MIN_ALLOC_SIZE).await;
+        let p2 = c.async_alloc_abort::<ArcCache<_>>(2, MIN_ALLOC_SIZE).await;
+        let p3 = c.async_alloc_abort::<ArcCache<_>>(3, MIN_ALLOC_SIZE).await;
+        let p4 = c.async_alloc_abort::<ArcCache<_>>(4, MIN_ALLOC_SIZE).await;
+        {
+            let mut ref2 = p2.get_part_ref(0, MIN_ALLOC_SIZE).unwrap();
+            for i in ref2.as_mut() {
+                *i = 0x22;
+            }
+            let mut ref4 = p4.get_part_ref(0, MIN_ALLOC_SIZE).unwrap();
+            for i in ref4.as_mut() {
+                *i = 0x44;
+            }
+
+            tokio::spawn(async move {
+                let r = ref2.abortable_work(|_| pending::<()>()).await;
+                assert_eq!(r, Err(future::Aborted));
+            });
+            tokio::spawn(async move {
+                let r = ref4.abortable_work(|_| pending::<()>()).await;
+                assert_eq!(r, Err(future::Aborted));
+            });
+        }
+        drop(p1);
+        drop(p3);
+
+        // no enough space for consecutive 2 * MIN_ALLOC_SIZE
+        // this sync alloc should return None
+        // but a async task will be created and migrating blocks
+        assert!(c.alloc(2 * MIN_ALLOC_SIZE).is_none());
+        let p5 = c
+            .async_alloc_abort::<ArcCache<_>>(5, 2 * MIN_ALLOC_SIZE)
+            .await;
+        {
+            let ref2 = p2.get_part_ref(0, MIN_ALLOC_SIZE).unwrap();
+            for i in ref2.as_ref() {
+                assert_eq!(*i, 0x22);
+            }
+            let ref4 = p4.get_part_ref(0, MIN_ALLOC_SIZE).unwrap();
+            for i in ref4.as_ref() {
+                assert_eq!(*i, 0x44);
+            }
+        }
+        drop(p2);
+        drop(p4);
+        let p6 = c
+            .async_alloc_abort::<ArcCache<_>>(6, 2 * MIN_ALLOC_SIZE)
+            .await;
+        drop(p5);
+    }
+
+    #[cfg(not(mloom))]
+    #[tokio::test]
     async fn test_async_alloc_drop_future() {
         let c = PieceBufPool::new(2 * MIN_ALLOC_SIZE);
         let (c0, c1, c2, c3, c4, c5) = (
@@ -1593,25 +1830,26 @@ mod test {
         assert_eq!(invalid_fut1.poll(), Poll::Pending);
         assert_eq!(invalid_fut2.poll(), Poll::Pending);
         ref_work.await;
-        assert_eq!(invalid_fut1.poll(), Poll::Ready(()));
-        assert_eq!(invalid_fut2.poll(), Poll::Ready(()));
+        assert_eq!(invalid_fut1.poll(), Poll::Ready(Ok(())));
+        assert_eq!(invalid_fut2.poll(), Poll::Ready(Ok(())));
         println!("invalidated");
-        c.invalidate(fb.dup()).await;
+        assert!(c.invalidate(fb.dup()).await.is_ok());
     }
 
     #[tokio::test]
     async fn test_alloc_abort() {
         let c = PieceBufPool::new(10 * MIN_ALLOC_SIZE);
+
+        let p1 = c
+            .async_alloc_abort::<ArcCache<_>>(1, 2 * MIN_ALLOC_SIZE)
+            .await;
+        let p2 = c
+            .async_alloc_abort::<ArcCache<_>>(1, 1 * MIN_ALLOC_SIZE)
+            .await;
+        // let p3 = c
+        //     .async_alloc_abort::<ArcCache<_>>(1, 4 * MIN_ALLOC_SIZE)
+        //     .await;
         let (fb1, fb2) = {
-            let p1 = c
-                .async_alloc_abort::<ArcCache<_>>(1, 2 * MIN_ALLOC_SIZE)
-                .await;
-            let p2 = c
-                .async_alloc_abort::<ArcCache<_>>(1, 1 * MIN_ALLOC_SIZE)
-                .await;
-            // let p3 = c
-            //     .async_alloc_abort::<ArcCache<_>>(1, 4 * MIN_ALLOC_SIZE)
-            //     .await;
             let mut ref11 = p1.get_part_ref(0, 16384).unwrap();
             let mut ref12 = p1.get_part_ref(16384, 16384).unwrap();
             let mut ref13 = p1.get_part_ref(2 * 16384, 16384).unwrap();
@@ -1634,24 +1872,28 @@ mod test {
             });
 
             (
-                p1.piece_detail(|p| p.b.dup()),
-                p2.piece_detail(|p| p.b.dup()),
+                p1.piece_detail(|p| p.b.dup()).unwrap(),
+                p2.piece_detail(|p| p.b.dup()).unwrap(),
             )
         };
+
         c.invalidate(fb2).await;
         c.invalidate(fb1).await;
+
+        // TODO: test p1, p2's inner Cache is None
+        assert!(p1.get_part_ref(16384, 16384).is_none());
     }
 
     #[tokio::test]
     async fn test_alloc_abort2() {
         let c = PieceBufPool::new(10 * MIN_ALLOC_SIZE);
+        let p1 = c
+            .async_alloc_abort::<ArcCache<_>>(1, 2 * MIN_ALLOC_SIZE)
+            .await;
+        let p2 = c
+            .async_alloc_abort::<ArcCache<_>>(1, 1 * MIN_ALLOC_SIZE)
+            .await;
         let (fb1, fb2, mut t1, mut t2) = {
-            let p1 = c
-                .async_alloc_abort::<ArcCache<_>>(1, 2 * MIN_ALLOC_SIZE)
-                .await;
-            let p2 = c
-                .async_alloc_abort::<ArcCache<_>>(1, 1 * MIN_ALLOC_SIZE)
-                .await;
             // let p3 = c
             //     .async_alloc_abort::<ArcCache<_>>(1, 4 * MIN_ALLOC_SIZE)
             //     .await;
@@ -1669,8 +1911,8 @@ mod test {
             assert_eq!(t2.poll(), Poll::Pending);
 
             (
-                p1.piece_detail(|p| p.b.dup()),
-                p2.piece_detail(|p| p.b.dup()),
+                p1.piece_detail(|p| p.b.dup()).unwrap(),
+                p2.piece_detail(|p| p.b.dup()).unwrap(),
                 t1,
                 t2,
             )
@@ -1682,7 +1924,7 @@ mod test {
         assert_eq!(inv2.poll(), Poll::Pending);
         assert_eq!(inv2.poll(), Poll::Pending);
         t2.await;
-        assert_eq!(inv2.poll(), Poll::Ready(()));
+        assert_eq!(inv2.poll(), Poll::Ready(Ok(())));
         assert_eq!(inv1.poll(), Poll::Pending);
         t1.await;
         inv1.await;

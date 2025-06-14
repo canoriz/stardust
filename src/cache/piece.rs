@@ -61,9 +61,11 @@ impl State {
 }
 
 struct BufState<T> {
-    allow_new_ref: AtomicBool, // TODO: maybe out of Mutex
+    // TODO: maybe out of mutex and combind allow_new_ref, pause_new_ref together
+    allow_new_ref: AtomicBool,
+    pause_new_ref: AtomicBool,
 
-    cache: T,
+    cache: Option<T>,
     state: State,
     abort_handle: HashMap<RefOffset, AbortHandle>,
 
@@ -128,10 +130,14 @@ where
     async fn abort_all(&self) {
         let wait_abort = {
             let mut buf_guard = self.buf.lock().expect("abort all work");
-            buf_guard.allow_new_ref.store(false, Ordering::Relaxed);
+            buf_guard.pause_new_ref.store(true, Ordering::Relaxed);
             for (_, handle) in buf_guard.abort_handle.drain() {
                 handle.abort();
             }
+
+            #[cfg(test)]
+            println!("in abort all ref_cnf {}", buf_guard.state.ref_cnt);
+
             if buf_guard.state.ref_cnt == 0 {
                 return;
             } else {
@@ -141,6 +147,17 @@ where
             }
         };
         wait_abort.notified().await;
+    }
+
+    fn drop_piecebuf(&self) {
+        let mut buf_guard = self.buf.lock().expect("drop piecebuf lock should OK");
+        assert!(buf_guard.pause_new_ref.load(Ordering::Relaxed));
+        assert_eq!(buf_guard.state.ref_cnt, 0);
+
+        #[cfg(test)]
+        println!("drop inner pieceBuf");
+
+        buf_guard.cache.take();
     }
 }
 
@@ -169,7 +186,9 @@ impl FromPieceBuf for ArcCache<PieceBuf> {
         let inner = Arc::new(Cache {
             buf: Mutex::new(BufState {
                 allow_new_ref: AtomicBool::new(true),
-                cache: t,
+                pause_new_ref: AtomicBool::new(false),
+
+                cache: Some(t),
                 state: State {
                     state: vec![BlockState::Vacant; size >> BLOCKBITS],
                     ref_cnt: 0,
@@ -190,16 +209,17 @@ impl FromPieceBuf for ArcCache<PieceBuf> {
 }
 
 impl ArcCache<PieceBuf> {
-    pub(crate) fn piece_detail<T, F>(&self, f: F) -> T
+    pub(crate) fn piece_detail<T, F>(&self, f: F) -> Option<T>
     where
         F: FnOnce(&PieceBuf) -> T,
     {
-        f(&self
-            .inner
+        self.inner
             .buf
             .lock()
             .expect("piece detail lock should OK")
-            .cache)
+            .cache
+            .as_ref()
+            .map(|p| f(p))
     }
 }
 
@@ -220,7 +240,9 @@ where
             inner: Arc::new(Cache {
                 buf: Mutex::new(BufState {
                     allow_new_ref: AtomicBool::new(true),
-                    cache: t,
+                    pause_new_ref: AtomicBool::new(false),
+
+                    cache: Some(t),
                     state: State {
                         state: vec![BlockState::Vacant; size >> BLOCKBITS],
                         ref_cnt: 0,
@@ -260,6 +282,7 @@ where
     // TODO: maybe not use (offset,length) but use
     // (offset_mutlple_of(block), len_multiple_of(block))
     // TODO: this needs a lot of tests
+    // TODO: maybe use Result to return fail reason(inuse/invalidated/paused/new ref disallowed)
     pub fn get_part_ref(&self, offset: usize, len: usize) -> Option<Ref<T>> {
         if len.trailing_zeros() < BLOCKSIZE.trailing_zeros() {
             // TODO: maybe not panic, fix size instead?
@@ -270,13 +293,18 @@ where
         if !buf_guard.allow_new_ref.load(Ordering::Acquire) {
             return None;
         }
-        {
-            if len + offset > buf_guard.cache.as_mut().len() {
+        if buf_guard.pause_new_ref.load(Ordering::Relaxed) {
+            return None;
+        }
+
+        let buf = buf_guard.deref_mut();
+        if let Some(ref mut cache) = buf.cache {
+            if len + offset > cache.as_mut().len() {
                 // TODO: return error code
                 return None;
             }
 
-            let range_state = &mut buf_guard.state;
+            let range_state = &mut buf.state;
             range_state.ref_cnt += 1;
 
             let any_block_not_vacant = range_state.state
@@ -294,16 +322,18 @@ where
                 }
                 *s = BlockState::InUse;
             }
-        }
 
-        Some(Ref {
-            offset: RefOffset {
-                from: offset,
-                ptr: unsafe { buf_guard.cache.as_mut().as_mut_ptr().add(offset) },
-                len,
-            },
-            main_cache: ManuallyDrop::new(self.inner.clone()),
-        })
+            Some(Ref {
+                offset: RefOffset {
+                    from: offset,
+                    ptr: unsafe { cache.as_mut().as_mut_ptr().add(offset) },
+                    len,
+                },
+                main_cache: ManuallyDrop::new(self.inner.clone()),
+            })
+        } else {
+            None
+        }
     }
 
     // TODO: maybe not use (offset,length) but use
@@ -319,13 +349,18 @@ where
         if !buf_guard.allow_new_ref.load(Ordering::Acquire) {
             return None;
         }
-        {
-            if len + offset > buf_guard.cache.as_mut().len() {
+        if buf_guard.pause_new_ref.load(Ordering::Relaxed) {
+            return None;
+        }
+
+        let buf = buf_guard.deref_mut();
+        if let Some(ref mut cache) = buf.cache {
+            if len + offset > cache.as_mut().len() {
                 // TODO: return error code
                 return None;
             }
 
-            let range_state = &mut buf_guard.state;
+            let range_state = &mut buf.state;
             range_state.ref_cnt += 1;
 
             let any_block_not_vacant = range_state.state
@@ -343,16 +378,17 @@ where
                 }
                 *s = BlockState::InUse;
             }
+            Some(Ref {
+                offset: RefOffset {
+                    from: offset,
+                    ptr: unsafe { cache.as_mut().as_mut_ptr().add(offset) },
+                    len,
+                },
+                main_cache: ManuallyDrop::new(self.inner.clone()),
+            })
+        } else {
+            None
         }
-
-        Some(Ref {
-            offset: RefOffset {
-                from: offset,
-                ptr: unsafe { buf_guard.cache.as_mut().as_mut_ptr().add(offset) },
-                len,
-            },
-            main_cache: ManuallyDrop::new(self.inner.clone()),
-        })
     }
 }
 
@@ -372,9 +408,52 @@ impl<T> SubAbortHandle<T>
 where
     T: AsMut<[u8]>,
 {
+    // abort all pending read and reject all future get_ref request
+    // drop inner Buf
+    pub async fn invalidate_all(&self) {
+        if let Some(a) = self.cache.upgrade() {
+            a.allow_new_ref(false);
+            a.abort_all().await;
+            a.drop_piecebuf();
+        } else {
+            panic!("invalidate upgrade failed, will this happen?");
+        }
+    }
+
+    // abort all pending read and reject all future get_ref request
     pub async fn abort_all(&self) {
         if let Some(a) = self.cache.upgrade() {
-            a.abort_all().await
+            a.abort_all().await;
+        } else {
+            panic!("abort upgrade failed, will this happen?");
+        }
+    }
+
+    // migrating done reenable get_ref request
+    pub fn reenable(&self) {
+        if let Some(a) = self.cache.upgrade() {
+            a.buf
+                .lock()
+                .expect("reenable lock should OK")
+                .pause_new_ref
+                .store(false, Ordering::Relaxed);
+        } else {
+            panic!("reenable upgrade failed, will this happen?");
+        }
+    }
+}
+
+impl SubAbortHandle<PieceBuf> {
+    pub fn migrate(&self, new_offset: usize) {
+        if let Some(a) = self.cache.upgrade() {
+            let mut guard = a.buf.lock().expect("abort handle migrate lock should OK");
+            unsafe {
+                guard
+                    .cache
+                    .as_mut()
+                    .expect("at migrate, the piece should be valid")
+                    .reset_offset(new_offset)
+            };
         }
     }
 }
@@ -429,6 +508,7 @@ where
     }
 }
 
+// TODO: this may be changed to AsMut<MaybeUninit<[u8]>>
 impl<T> AsMut<[u8]> for Ref<T>
 where
     T: AsMut<[u8]>,
@@ -516,8 +596,18 @@ where
                 }
                 let offset = RefOffset {
                     from: 0,
-                    ptr: buf_guard.cache.as_mut().as_mut_ptr(),
-                    len: buf_guard.cache.as_mut().len(),
+                    ptr: buf_guard
+                        .cache
+                        .as_mut()
+                        .expect("at extend should be Some")
+                        .as_mut()
+                        .as_mut_ptr(),
+                    len: buf_guard
+                        .cache
+                        .as_mut()
+                        .expect("at extend should be Some")
+                        .as_mut()
+                        .len(),
                 };
                 assert_eq!(buf_guard.abort_handle.len(), 0);
                 Some(offset)
@@ -648,7 +738,7 @@ mod test {
                 assert_eq!((i, *s), (i, BlockState::Vacant));
             });
 
-            for (i, s) in guard.cache.iter().enumerate() {
+            for (i, s) in guard.cache.as_ref().unwrap().iter().enumerate() {
                 if (4 * BLOCKSIZE..6 * BLOCKSIZE).contains(&i) {
                     assert_eq!((i, *s), (i, 3u8))
                 } else if (0..2 * BLOCKSIZE).contains(&i) {
@@ -700,9 +790,12 @@ mod test {
                 assert_eq!((i, *s), (i, BlockState::InUse));
             });
 
-            assert_eq!(entire.offset.ptr, guard.cache.as_mut_ptr());
+            assert_eq!(
+                entire.offset.ptr,
+                guard.cache.as_mut().unwrap().as_mut_ptr()
+            );
             assert_eq!(entire.offset.from, 0);
-            assert_eq!(entire.offset.len, guard.cache.len());
+            assert_eq!(entire.offset.len, guard.cache.as_mut().unwrap().len());
         });
     }
 
