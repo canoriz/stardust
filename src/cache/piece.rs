@@ -1,12 +1,12 @@
 use futures::future::{self, AbortHandle};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     future::{Future, IntoFuture},
     mem::ManuallyDrop,
     net::SocketAddr,
     ops::{Deref, DerefMut},
     slice,
-    sync::Weak,
+    sync::{atomic::AtomicU32, Weak},
     task::{Poll, Waker},
     vec,
 };
@@ -25,6 +25,8 @@ use std::sync::{
 };
 
 use super::{global::FromPieceBuf, PieceBuf};
+use super::{wake_next_waiting_alloc, AllocReq};
+use super::{DONE, DROPPED, WAITING, WAKING};
 
 type Peer = SocketAddr;
 const BLOCKBITS: usize = 14;
@@ -76,6 +78,7 @@ struct Cache<T> {
     // TODO: since all jobs access to cache,
     // maybe split lock to smaller granularity to reduce contention
     buf: Mutex<BufState<T>>,
+    waiting_reqs: Mutex<VecDeque<AllocReq>>,
 }
 
 fn change_blockstate(v: &mut [BlockState], offset: usize, len: usize, state: BlockState) {
@@ -159,6 +162,44 @@ where
 
         buf_guard.cache.take();
     }
+
+    fn reenable(&self) {
+        self.buf
+            .lock()
+            .expect("reenable lock should OK")
+            .pause_new_ref
+            .store(false, Ordering::Relaxed);
+
+        let mut waiting_reqs = self
+            .waiting_reqs
+            .lock()
+            .expect("reenable lock waiting_reqs should OK");
+
+        for w in waiting_reqs.drain(0..) {
+            #[cfg(test)]
+            println!("try waking {}", w.id);
+            match w
+                .valid
+                .compare_exchange(WAITING, WAKING, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => {
+                    w.waker.wake();
+                    #[cfg(test)]
+                    println!("wake waiting {}", w.id);
+                    break;
+                }
+                Err(actual) => {
+                    // if DONE, this future is Ready
+                    // if DROPPED, no one waiting future
+                    // pick next one
+                    debug_assert!(actual == DROPPED || actual == DONE || actual == WAKING);
+
+                    #[cfg(test)]
+                    println!("no wake {} because actual state {actual}", w.id);
+                }
+            }
+        }
+    }
 }
 
 pub struct ArcCache<T> {
@@ -196,6 +237,7 @@ impl FromPieceBuf for ArcCache<PieceBuf> {
                 abort_handle: HashMap::new(),
                 abort_waiter: Vec::new(),
             }),
+            waiting_reqs: Mutex::new(VecDeque::new()),
         });
         (
             Self {
@@ -250,6 +292,7 @@ where
                     abort_handle: HashMap::new(),
                     abort_waiter: Vec::new(),
                 }),
+                waiting_reqs: Mutex::new(VecDeque::new()),
             }),
         }
     }
@@ -339,55 +382,116 @@ where
     // TODO: maybe not use (offset,length) but use
     // (offset_mutlple_of(block), len_multiple_of(block))
     // TODO: this needs a lot of tests
-    pub async fn async_get_part_ref(&self, offset: usize, len: usize) -> Option<Ref<T>> {
-        if len.trailing_zeros() < BLOCKSIZE.trailing_zeros() {
+    pub fn async_get_part_ref(&self, offset: usize, len: usize) -> AsyncPartRefFut<T> {
+        AsyncPartRefFut {
+            offset,
+            len,
+            valid: Arc::new(AtomicU32::new(WAITING)),
+            cache: self,
+        }
+    }
+}
+
+pub struct AsyncPartRefFut<'a, T> {
+    offset: usize,
+    len: usize,
+    valid: Arc<AtomicU32>,
+    cache: &'a ArcCache<T>,
+}
+
+impl<T> Future for AsyncPartRefFut<'_, T>
+where
+    T: AsMut<[u8]>,
+{
+    type Output = Option<Ref<T>>;
+
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        let fut = self.get_mut();
+        if fut.len.trailing_zeros() < BLOCKSIZE.trailing_zeros() {
             // TODO: maybe not panic, fix size instead?
             panic!("should be multiple of {BLOCKSIZE}");
         }
 
-        let mut buf_guard = self.inner.buf.lock().expect("get part ref lock should OK");
+        let mut buf_guard = fut
+            .cache
+            .inner
+            .buf
+            .lock()
+            .expect("get part ref lock should OK");
         if !buf_guard.allow_new_ref.load(Ordering::Acquire) {
-            return None;
+            return Poll::Ready(None);
         }
         if buf_guard.pause_new_ref.load(Ordering::Relaxed) {
-            return None;
+            fut.cache
+                .inner
+                .waiting_reqs
+                .lock()
+                .expect("async_get_part lock waiting_reqs should OK")
+                .push_back(AllocReq {
+                    id: 0,
+                    waker: cx.waker().clone(),
+                    valid: fut.valid.clone(),
+                });
+            return Poll::Pending;
         }
 
         let buf = buf_guard.deref_mut();
         if let Some(ref mut cache) = buf.cache {
-            if len + offset > cache.as_mut().len() {
+            if fut.len + fut.offset > cache.as_mut().len() {
                 // TODO: return error code
-                return None;
+                return Poll::Ready(None);
             }
 
             let range_state = &mut buf.state;
             range_state.ref_cnt += 1;
 
             let any_block_not_vacant = range_state.state
-                [offset >> BLOCKBITS..(offset + len) >> BLOCKBITS]
+                [fut.offset >> BLOCKBITS..(fut.offset + fut.len) >> BLOCKBITS]
                 .iter()
                 .any(|s| *s != BlockState::Vacant);
             if any_block_not_vacant {
-                return None;
+                return Poll::Ready(None);
             }
 
-            for s in range_state.state[offset >> BLOCKBITS..(offset + len) >> BLOCKBITS].iter_mut()
+            for s in range_state.state[fut.offset >> BLOCKBITS..(fut.offset + fut.len) >> BLOCKBITS]
+                .iter_mut()
             {
                 if *s != BlockState::Vacant {
-                    return None;
+                    return Poll::Ready(None);
                 }
                 *s = BlockState::InUse;
             }
-            Some(Ref {
+            Poll::Ready(Some(Ref {
                 offset: RefOffset {
-                    from: offset,
-                    ptr: unsafe { cache.as_mut().as_mut_ptr().add(offset) },
-                    len,
+                    from: fut.offset,
+                    ptr: unsafe { cache.as_mut().as_mut_ptr().add(fut.offset) },
+                    len: fut.len,
                 },
-                main_cache: ManuallyDrop::new(self.inner.clone()),
-            })
+                main_cache: ManuallyDrop::new(fut.cache.inner.clone()),
+            }))
         } else {
-            None
+            Poll::Ready(None)
+        }
+    }
+}
+
+impl<T> Drop for AsyncPartRefFut<'_, T> {
+    fn drop(&mut self) {
+        // TODO: optimize this
+        let state = self.valid.swap(DROPPED, Ordering::Acquire);
+
+        #[cfg(test)]
+        println!("drop AllocPartRefFut, old-state {}", state);
+
+        match state {
+            WAKING => {
+                // executor wants to wake us, but we are dropped before
+                // being polled (if polled, state can't be WAKING)
+                // wake another one
+                let mut waiting_alloc = self.cache.inner.waiting_reqs.lock().unwrap();
+                wake_next_waiting_alloc(&mut waiting_alloc);
+            }
+            w => debug_assert!(w == WAITING || w == DONE),
         }
     }
 }
@@ -437,6 +541,36 @@ where
                 .expect("reenable lock should OK")
                 .pause_new_ref
                 .store(false, Ordering::Relaxed);
+
+            let mut waiting_reqs = a
+                .waiting_reqs
+                .lock()
+                .expect("reenable lock waiting_reqs should OK");
+
+            for w in waiting_reqs.drain(0..) {
+                #[cfg(test)]
+                println!("try waking {}", w.id);
+                match w
+                    .valid
+                    .compare_exchange(WAITING, WAKING, Ordering::AcqRel, Ordering::Acquire)
+                {
+                    Ok(_) => {
+                        w.waker.wake();
+                        #[cfg(test)]
+                        println!("wake waiting {}", w.id);
+                        break;
+                    }
+                    Err(actual) => {
+                        // if DONE, this future is Ready
+                        // if DROPPED, no one waiting future
+                        // pick next one
+                        debug_assert!(actual == DROPPED || actual == DONE || actual == WAKING);
+
+                        #[cfg(test)]
+                        println!("no wake {} because actual state {actual}", w.id);
+                    }
+                }
+            }
         } else {
             panic!("reenable upgrade failed, will this happen?");
         }
@@ -705,6 +839,136 @@ mod test {
                 .enumerate()
                 .for_each(|(i, s)| assert_eq!((i, *s), (i, BlockState::Vacant)));
         })
+    }
+
+    #[tokio::test]
+    async fn test_cache_async_get_ref_manual_runtime() {
+        use tokio_test::task;
+
+        let cache = ArcCache::new(vec![0u8; BLOCKSIZE * 16]);
+        let ref5to7 = cache.async_get_part_ref(5 * BLOCKSIZE, 2 * BLOCKSIZE).await;
+        assert!(ref5to7.is_some());
+
+        // mock migrating
+        cache
+            .inner
+            .buf
+            .lock()
+            .unwrap()
+            .pause_new_ref
+            .store(true, Ordering::Relaxed);
+
+        let mut ref6to8 = task::spawn(cache.async_get_part_ref(6 * BLOCKSIZE, 2 * BLOCKSIZE));
+
+        let mut ref9to11 = task::spawn(cache.async_get_part_ref(9 * BLOCKSIZE, 2 * BLOCKSIZE));
+        let mut ref12to13 = task::spawn(cache.async_get_part_ref(12 * BLOCKSIZE, 1 * BLOCKSIZE));
+
+        // poll will return pending
+        assert!(matches!(ref9to11.poll(), Poll::Pending));
+        assert!(matches!(ref12to13.poll(), Poll::Pending));
+        assert!(matches!(ref9to11.poll(), Poll::Pending));
+        assert!(matches!(ref12to13.poll(), Poll::Pending));
+        assert!(matches!(ref6to8.poll(), Poll::Pending));
+
+        cache.inner.reenable();
+
+        assert!(matches!(ref6to8.poll(), Poll::Ready(None)));
+        let r1213 = ref12to13.await;
+        let r911 = ref9to11.await;
+
+        cache
+            .inner
+            .buf
+            .lock()
+            .unwrap()
+            .state
+            .state
+            .iter()
+            .enumerate()
+            .for_each(|(i, s)| {
+                if i >= 5 && i < 7 || i >= 9 && i < 11 || i >= 12 && i < 13 {
+                    assert_eq!((i, *s), (i, BlockState::InUse))
+                } else {
+                    assert_ne!((i, *s), (i, BlockState::InUse))
+                }
+            });
+        drop(ref5to7);
+        drop(r1213);
+        drop(r911);
+        cache
+            .inner
+            .buf
+            .lock()
+            .unwrap()
+            .state
+            .state
+            .iter()
+            .enumerate()
+            .for_each(|(i, s)| assert_eq!((i, *s), (i, BlockState::Vacant)));
+    }
+
+    #[tokio::test]
+    async fn test_cache_async_get_ref() {
+        use tokio_test::task;
+
+        let cache = ArcCache::new(vec![0u8; BLOCKSIZE * 16]);
+        let ref5to7 = cache.async_get_part_ref(5 * BLOCKSIZE, 2 * BLOCKSIZE).await;
+        assert!(ref5to7.is_some());
+
+        // mock migrating
+        cache
+            .inner
+            .buf
+            .lock()
+            .unwrap()
+            .pause_new_ref
+            .store(true, Ordering::Relaxed);
+
+        let c = cache.clone();
+        let mut ref6to8 =
+            tokio::spawn(async move { c.async_get_part_ref(6 * BLOCKSIZE, 2 * BLOCKSIZE).await });
+        let c = cache.clone();
+        let mut ref9to11 =
+            tokio::spawn(async move { c.async_get_part_ref(9 * BLOCKSIZE, 2 * BLOCKSIZE).await });
+        let c = cache.clone();
+        let mut ref12to13 =
+            tokio::spawn(async move { c.async_get_part_ref(12 * BLOCKSIZE, 1 * BLOCKSIZE).await });
+
+        cache.inner.reenable();
+
+        assert!(ref6to8.await.unwrap().is_none());
+        let r1213 = ref12to13.await.unwrap();
+        let r911 = ref9to11.await.unwrap();
+
+        cache
+            .inner
+            .buf
+            .lock()
+            .unwrap()
+            .state
+            .state
+            .iter()
+            .enumerate()
+            .for_each(|(i, s)| {
+                if i >= 5 && i < 7 || i >= 9 && i < 11 || i >= 12 && i < 13 {
+                    assert_eq!((i, *s), (i, BlockState::InUse))
+                } else {
+                    assert_ne!((i, *s), (i, BlockState::InUse))
+                }
+            });
+        drop(ref5to7);
+        drop(r1213);
+        drop(r911);
+        cache
+            .inner
+            .buf
+            .lock()
+            .unwrap()
+            .state
+            .state
+            .iter()
+            .enumerate()
+            .for_each(|(i, s)| assert_eq!((i, *s), (i, BlockState::Vacant)));
     }
 
     #[test]

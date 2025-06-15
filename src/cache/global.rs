@@ -742,7 +742,7 @@ impl AllocFutInner<'_> {
             }
 
             // alloc() holds both lock of block_tree and waiting_alloc
-            if let Some(bf) = alloc_fn(&fut.pool, fut.size) {
+            if let Some(bf) = alloc_fn(fut.pool, fut.size) {
                 let old = fut.valid.swap(DONE, Ordering::Release);
                 debug_assert_eq!(old, WAITING);
                 #[cfg(test)]
@@ -761,7 +761,7 @@ impl AllocFutInner<'_> {
                 fut.valid.swap(WAITING, Ordering::Release);
                 Poll::Pending
             }
-        } else if let Some(bf) = alloc_fn(&fut.pool, fut.size) {
+        } else if let Some(bf) = alloc_fn(fut.pool, fut.size) {
             let old = fut.valid.swap(DONE, Ordering::Release);
             debug_assert!(old == WAITING || old == WAKING);
 
