@@ -1727,6 +1727,83 @@ mod test {
 
     #[cfg(not(mloom))]
     #[tokio::test]
+    async fn test_async_alloc_abort_migrate_2() {
+        let c = PieceBufPool::new(11 * MIN_ALLOC_SIZE);
+        let p1 = c.async_alloc_abort::<ArcCache<_>>(1, MIN_ALLOC_SIZE).await; // at 10
+        let p2 = c
+            .async_alloc_abort::<ArcCache<_>>(2, 4 * MIN_ALLOC_SIZE)
+            .await; // at 4-7
+        let p3 = c
+            .async_alloc_abort::<ArcCache<_>>(3, 2 * MIN_ALLOC_SIZE)
+            .await; // at 8-9
+        let p4 = c
+            .async_alloc_abort::<ArcCache<_>>(4, 2 * MIN_ALLOC_SIZE)
+            .await; // at 2-3
+        {
+            let mut ref1 = p1.get_part_ref(0, MIN_ALLOC_SIZE).unwrap();
+            for i in ref1.as_mut() {
+                *i = 0x11;
+            }
+            let mut ref41 = p4.get_part_ref(0, 1 * MIN_ALLOC_SIZE).unwrap();
+            for i in ref41.as_mut() {
+                *i = 0x41;
+            }
+            let mut ref42 = p4
+                .get_part_ref(1 * MIN_ALLOC_SIZE, 1 * MIN_ALLOC_SIZE)
+                .unwrap();
+            for i in ref42.as_mut() {
+                *i = 0x42;
+            }
+
+            tokio::spawn(async move {
+                let r = ref1.abortable_work(|_| pending::<()>()).await;
+                assert_eq!(r, Err(future::Aborted));
+            });
+            tokio::spawn(async move {
+                let r = ref41.abortable_work(|_| pending::<()>()).await;
+                assert_eq!(r, Err(future::Aborted));
+            });
+            tokio::spawn(async move {
+                let r = ref42.abortable_work(|_| pending::<()>()).await;
+                assert_eq!(r, Err(future::Aborted));
+            });
+        }
+        drop(p2);
+        drop(p3);
+
+        // no enough space for consecutive 8 * MIN_ALLOC_SIZE
+        // this sync alloc should return None
+        // but a async task will be created and migrating blocks
+        assert!(c.alloc(8 * MIN_ALLOC_SIZE).is_none());
+        let p5 = c
+            .async_alloc_abort::<ArcCache<_>>(5, 8 * MIN_ALLOC_SIZE)
+            .await;
+        {
+            let ref1 = p1.get_part_ref(0, MIN_ALLOC_SIZE).unwrap();
+            for i in ref1.as_ref() {
+                assert_eq!(*i, 0x11);
+            }
+            let ref4 = p4.get_part_ref(0, 1 * MIN_ALLOC_SIZE).unwrap();
+            for i in ref4.as_ref() {
+                assert_eq!(*i, 0x41);
+            }
+            let ref4 = p4
+                .get_part_ref(1 * MIN_ALLOC_SIZE, 1 * MIN_ALLOC_SIZE)
+                .unwrap();
+            for i in ref4.as_ref() {
+                assert_eq!(*i, 0x42);
+            }
+        }
+        drop(p1);
+        drop(p4);
+        let p6 = c
+            .async_alloc_abort::<ArcCache<_>>(6, 2 * MIN_ALLOC_SIZE)
+            .await;
+        drop(p5);
+    }
+
+    #[cfg(not(mloom))]
+    #[tokio::test]
     async fn test_async_alloc_drop_future() {
         let c = PieceBufPool::new(2 * MIN_ALLOC_SIZE);
         let (c0, c1, c2, c3, c4, c5) = (

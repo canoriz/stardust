@@ -136,7 +136,7 @@ where
             }
 
             #[cfg(test)]
-            println!("in abort all ref_cnf {}", buf_guard.state.ref_cnt);
+            println!("in abort all ref_cnt {}", buf_guard.state.ref_cnt);
 
             if buf_guard.state.ref_cnt == 0 {
                 return;
