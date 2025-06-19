@@ -404,6 +404,7 @@ where
     }
 }
 
+#[must_use = "futures do nothing unless you poll them"]
 pub struct AsyncPartRefFut<'a, T> {
     offset: usize,
     len: usize,

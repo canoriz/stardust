@@ -812,6 +812,7 @@ impl Drop for AllocFutInner<'_> {
     }
 }
 
+#[must_use = "futures do nothing unless you poll them"]
 pub(crate) struct AllocPieceBufFut<'a> {
     inner: AllocFutInner<'a>,
 }
@@ -888,6 +889,7 @@ impl Future for AllocPieceBufFut<'_> {
     }
 }
 
+#[must_use = "futures do nothing unless you poll them"]
 pub(crate) struct AllocPieceBufAbortFut<'a, T> {
     inner: AllocFutInner<'a>,
     _t: PhantomData<T>,
