@@ -1,4 +1,3 @@
-use futures::future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time;
@@ -9,10 +8,10 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{info, warn};
 
 use crate::backfile::WriteJob;
-use crate::cache::{ArcCache, PieceBuf, Ref};
+use crate::cache::{AbortErr, ArcCache, PieceBuf, Ref};
 use crate::metadata;
 use crate::picker::BlockRequests;
-use crate::protocol::{self, BTStream, Message, ReadStream, Split, WriteStream};
+use crate::protocol::{self, BTStream, Message, Piece, ReadStream, Split, WriteStream};
 use crate::transmit_manager::Msg as TransmitMsg;
 use crate::transmit_manager::TransmitManagerHandle;
 
@@ -400,7 +399,8 @@ async fn handle_piece_msg<T>(
     peer: &SocketAddr,
     tmh: &mut TransmitManagerHandle,
     mut piece: protocol::Piece<'_, T>,
-) where
+) -> Result<(), ()>
+where
     T: AsyncRead + Unpin,
 {
     // TODO:
@@ -422,7 +422,7 @@ async fn handle_piece_msg<T>(
     if already_have {
         // TODO: make this persistent
         let mut drain = vec![0u8; piece.len as usize];
-        piece.read(&mut drain).await;
+        piece.read_exact(&mut drain).await;
         // TODO: why this happen (at testing)?
         // seems we are requesting twice for each piece
         warn!(
@@ -432,7 +432,7 @@ async fn handle_piece_msg<T>(
             piece.len,
             piece.begin >> 14,
         );
-        return;
+        return Ok(());
     }
     info!(
         "receive PIECE msg {} {} {} block index {}",
@@ -442,71 +442,7 @@ async fn handle_piece_msg<T>(
         piece.begin >> 14,
     );
 
-    let maybe_pb = {
-        // must drop pb_map before await point
-        // pb_map is not Send
-        let pb_map = tmh.piece_buffer.lock().unwrap();
-        pb_map.get(&piece.index).map(|v| v.clone())
-    };
-
-    let (block_ref, piece_buf) = {
-        let pb = if let Some(pb) = maybe_pb {
-            pb
-        } else {
-            // TODO: many peer may all want to write piece i and all of them
-            // allocating new buffer, which is wasting memory and affects other
-            // buffer(other buffer being pushed out?)
-            // Maybe async_alloc can store info about piece and wake up all waiting
-            // tasks when the requested piece buffer is allocated, which avoids
-            // deplicating allocates buffer
-            let piece_buffer = tmh.buffer_pool.async_alloc(1, tmh.piece_size).await;
-            // let piece_buffer = tmh.buffer_pool.async_alloc_abort::<ArcCache>(1, tmh.piece_size).await;
-            let pb = ArcCache::new(piece_buffer);
-
-            // if this piece buffer already exists(allocated by other peer handler),
-            // use exist one
-            let mut pb_map = tmh.piece_buffer.lock().unwrap();
-            pb_map.entry(piece.index).or_insert(pb).clone()
-        };
-
-        let block_ref = pb.get_part_ref(
-            piece.begin as usize,
-            // TODO: change 16384 to const
-            (piece.len.next_multiple_of(16384)) as usize,
-        );
-
-        if block_ref.is_none() {
-            warn!(
-                "error get block buf of piece {} block offset {}",
-                piece.index, piece.begin
-            );
-        }
-        (block_ref, pb)
-    };
-
-    // TODO: need a biglock. What if some peer else is doing operation now?
-    // i.e. operation between two locks?
-    let block_buf = if let Some(mut bbuf) = block_ref {
-        // TODO: piece.read should be cancel safe to use with abortable
-        // TODO: check length
-        let read_fut =
-            bbuf.abortable_work(|r: &mut [u8]| piece.read(&mut r[..(piece.len as usize)]));
-
-        read_fut.await;
-        bbuf
-    } else {
-        let mut drain = vec![0u8; piece.len as usize];
-        piece.read(&mut drain).await;
-        warn!(
-            "drain PIECE msg {} {} {}",
-            piece.index, piece.begin, piece.len
-        );
-        // TODO: what should we do now?
-        // we don't have that space
-        // maybe reads to supplementary buffer?
-        // just return now
-        return;
-    };
+    let (piece_buf, block_buf) = read_block_from_peer(tmh, &mut piece).await?;
 
     let received_piece = tmh.picker.lock().unwrap().block_received(
         peer,
@@ -565,5 +501,101 @@ async fn handle_piece_msg<T>(
             warn!("write piece {i} done ,delete in cache");
             // TODO: still have arc ref to buf
         }
+    }
+    Ok(())
+}
+
+async fn read_block_from_peer<'a, T>(
+    tmh: &mut TransmitManagerHandle,
+    piece: &mut Piece<'a, T>,
+) -> Result<(ArcCache<PieceBuf>, Ref<PieceBuf>), ()>
+where
+    T: AsyncRead + Unpin,
+{
+    let mut written = 0usize;
+    let target_len = piece.len as usize;
+    'outer: loop {
+        let maybe_pb = {
+            // must drop pb_map before await point
+            // pb_map is not Send
+            let pb_map = tmh.piece_buffer.lock().unwrap();
+            pb_map.get(&piece.index).map(|v| v.clone())
+        };
+
+        let (block_ref, piece_buf) = {
+            let pb = if let Some(pb) = maybe_pb {
+                pb
+            } else {
+                // TODO: many peer may all want to write piece i and all of them
+                // allocating new buffer, which is wasting memory and affects other
+                // buffer(other buffer being pushed out?)
+                // Maybe async_alloc can store info about piece and wake up all waiting
+                // tasks when the requested piece buffer is allocated, which avoids
+                // deplicating allocates buffer
+                let piece_buffer = tmh.buffer_pool.async_alloc(1, tmh.piece_size).await;
+                // let piece_buffer = tmh.buffer_pool.async_alloc_abort::<ArcCache>(1, tmh.piece_size).await;
+                let pb = ArcCache::new(piece_buffer);
+
+                // if this piece buffer already exists(allocated by other peer handler),
+                // use exist one
+                let mut pb_map = tmh.piece_buffer.lock().unwrap();
+                pb_map.entry(piece.index).or_insert(pb).clone()
+            };
+
+            let block_ref = pb
+                .async_get_part_ref(
+                    piece.begin as usize,
+                    // TODO: change 16384 to const
+                    (piece.len.next_multiple_of(16384)) as usize,
+                )
+                .await;
+
+            if block_ref.is_none() {
+                warn!(
+                    "error get block buf of piece {} block offset {}",
+                    piece.index, piece.begin
+                );
+            }
+            (block_ref, pb)
+        };
+
+        // TODO: need a biglock. What if some peer else is doing operation now?
+        // i.e. operation between two locks?
+        if let Some(mut bbuf) = block_ref {
+            while written < target_len {
+                let read_fut = piece.read_to_ref(bbuf, written);
+                match read_fut.await {
+                    Ok((n, bbuf_alive)) => {
+                        written += n;
+                        bbuf = bbuf_alive;
+                    }
+                    Err(AbortErr::IO(e)) => {
+                        // not aborted, but underlying read error
+                        // TODO: do something
+                        warn!("error while receiving piece {e}");
+                        return Err(()); // TODO: return error code
+                    }
+                    Err(e) => {
+                        // go to next round
+                        continue 'outer;
+                    }
+                }
+            }
+            assert_eq!(written, target_len);
+            return Ok((piece_buf, bbuf));
+        } else {
+            let mut drain = vec![0u8; target_len];
+            let _ = piece.read_exact(&mut drain).await; // TODO: FIXME: use result
+
+            warn!(
+                "drain PIECE msg {} {} {}",
+                piece.index, piece.begin, piece.len
+            );
+            // TODO: what should we do now?
+            // we don't have that space
+            // maybe reads to supplementary buffer?
+            // just return now
+            return Err(());
+        };
     }
 }

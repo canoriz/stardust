@@ -11,6 +11,7 @@ bt_bencode = "0.8.2"
 bytes = "1.10.1"
 futures = "0.3.31"
 percent-encoding = "2.3.1"
+pin-project = "1.1.10"
 rand = { version = "0.9.0", features = ["thread_rng"] }
 reqwest = "0.12.11"
 serde = { version = "1.0.217", features = ["derive"] }

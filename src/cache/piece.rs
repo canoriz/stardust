@@ -1,15 +1,20 @@
-use futures::future::{self, AbortHandle};
+use futures::task::AtomicWaker;
+use pin_project::{pin_project, pinned_drop};
 use std::{
     collections::{HashMap, VecDeque},
-    future::{Future, IntoFuture},
+    future::Future,
+    io,
+    marker::PhantomPinned,
     mem::ManuallyDrop,
     net::SocketAddr,
     ops::{Deref, DerefMut},
+    pin::{pin, Pin},
     slice,
     sync::{atomic::AtomicU32, Weak},
-    task::{Poll, Waker},
+    task::{Context, Poll},
     vec,
 };
+use tokio::io::{AsyncRead, ReadBuf};
 use tokio::sync::Notify;
 
 #[cfg(mloom)]
@@ -113,9 +118,14 @@ where
             .store(allow_new_ref, Ordering::Release);
     }
 
+    /// returns if allowed to add this work
+    /// if return false, means this work is aborted now
     fn add_abortable_work(&self, offset: RefOffset, handle: AbortHandle) -> bool {
         let mut buf_guard = self.buf.lock().expect("add abortable work lock should OK");
         if !buf_guard.allow_new_ref.load(Ordering::Relaxed) {
+            return false;
+        }
+        if buf_guard.pause_new_ref.load(Ordering::Relaxed) {
             return false;
         }
         buf_guard.abort_handle.insert(offset, handle);
@@ -592,6 +602,8 @@ impl SubAbortHandle<PieceBuf> {
     }
 }
 
+// this is a Writeable Ref
+// TODO: maybe need a ReadOnly Ref
 pub struct Ref<T>
 where
     T: AsMut<[u8]>,
@@ -678,32 +690,6 @@ where
     //     unsafe { slice::from_raw_parts_mut(self.ptr, len) }
     // }
 
-    // SAFETY: fut ?must be CANCEL SAFE
-    // Cancel unsafe will abort, but leaving a half-done state
-    pub async fn abortable_work<'a, F, U>(
-        &'a mut self,
-        work: F,
-    ) -> Result<<U as IntoFuture>::Output, future::Aborted>
-    where
-        F: FnOnce(&'a mut [u8]) -> U,
-        U: IntoFuture,
-    {
-        let offset = self.offset.clone();
-        let (abort_fut, handle) =
-            future::abortable(work(unsafe { self.offset.as_mut() }).into_future());
-        // TODO: FIXME: when abort, no new ref should be created
-        if self.main_cache.add_abortable_work(offset.clone(), handle) {
-            let res = abort_fut.await;
-            self.main_cache.rm_abortable_work(&offset);
-            res
-        } else {
-            Err(future::Aborted)
-        }
-
-        // TODO: will some new abortable work be created before rm_abortable_work?
-        // we are holding &mut Ref so no new work?
-    }
-
     // extend block ref's length to full ref
     pub fn extend_to_entire(self) -> Option<Self> {
         let mut c = ManuallyDrop::new(self);
@@ -775,6 +761,231 @@ where
         unsafe { ManuallyDrop::drop(&mut self.main_cache) };
     }
 }
+
+/// A handle to an `Abortable` task.
+#[derive(Debug, Clone)]
+pub struct AbortHandle {
+    inner: Arc<AbortInner>,
+}
+
+impl AbortHandle {
+    /// Creates an (`AbortHandle`, `AbortRegistration`) pair which can be used
+    /// to abort a running future or stream.
+    ///
+    /// This function is usually paired with a call to [`Abortable::new`].
+    pub fn new_pair() -> (Self, AbortRegistration) {
+        let inner = Arc::new(AbortInner {
+            waker: AtomicWaker::new(),
+            aborted: AtomicBool::new(false),
+        });
+
+        (
+            Self {
+                inner: inner.clone(),
+            },
+            AbortRegistration { inner },
+        )
+    }
+
+    /// Abort the `Abortable` stream/future associated with this handle.
+    ///
+    /// Notifies the Abortable task associated with this handle that it
+    /// should abort. Note that if the task is currently being polled on
+    /// another thread, it will not immediately stop running. Instead, it will
+    /// continue to run until its poll method returns.
+    pub fn abort(&self) {
+        self.inner.aborted.store(true, Ordering::Relaxed);
+        self.inner.waker.wake();
+    }
+
+    /// Checks whether [`AbortHandle::abort`] was *called* on any associated
+    /// [`AbortHandle`]s, which includes all the [`AbortHandle`]s linked with
+    /// the same [`AbortRegistration`]. This means that it will return `true`
+    /// even if:
+    /// * `abort` was called after the task had completed.
+    /// * `abort` was called while the task was being polled - the task may still be running and
+    ///   will not be stopped until `poll` returns.
+    ///
+    /// This operation has a Relaxed ordering.
+    pub fn is_aborted(&self) -> bool {
+        self.inner.aborted.load(Ordering::Relaxed)
+    }
+}
+
+/// A registration handle for an `Abortable` task.
+/// Values of this type can be acquired from `AbortHandle::new` and are used
+/// in calls to `Abortable::new`.
+#[derive(Debug)]
+pub struct AbortRegistration {
+    pub(crate) inner: Arc<AbortInner>,
+}
+
+impl AbortRegistration {
+    /// Create an [`AbortHandle`] from the given [`AbortRegistration`].
+    ///
+    /// The created [`AbortHandle`] is functionally the same as any other
+    /// [`AbortHandle`]s that are associated with the same [`AbortRegistration`],
+    /// such as the one created by [`AbortHandle::new_pair`].
+    pub fn handle(&self) -> AbortHandle {
+        AbortHandle {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+pub enum AbortErr<T> {
+    Aborted,
+    IO(T),
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct Aborted {}
+// impl std::error::Error for Aborted {}
+
+#[pin_project(PinnedDrop)]
+#[must_use = "futures/streams do nothing unless you poll them"]
+pub(crate) struct AbortableRead<'a, T: ?Sized, U>
+where
+    U: AsMut<[u8]>,
+{
+    reader: &'a mut T,
+    buf: &'a mut Ref<U>,
+    offset: usize,
+    inner: Arc<AbortInner>,
+
+    need_rm_abort_handle: bool,
+
+    #[pin]
+    _pin: PhantomPinned,
+}
+
+#[pinned_drop]
+impl<T: ?Sized, U> PinnedDrop for AbortableRead<'_, T, U>
+where
+    U: AsMut<[u8]>,
+{
+    fn drop(self: Pin<&mut Self>) {
+        let me = self.project();
+        if *me.need_rm_abort_handle {
+            me.buf.main_cache.rm_abortable_work(&me.buf.offset);
+        }
+    }
+}
+
+// Inner type storing the waker to awaken and a bool indicating that it
+// should be aborted.
+#[derive(Debug)]
+pub(crate) struct AbortInner {
+    pub(crate) waker: AtomicWaker,
+    pub(crate) aborted: AtomicBool,
+}
+
+impl AbortInner {
+    pub fn is_aborted(&self) -> bool {
+        self.aborted.load(Ordering::Relaxed)
+    }
+}
+
+impl<T, U> AbortableRead<'_, T, U>
+where
+    // TODO: use pin-project and lift Unpin restriction?
+    T: AsyncRead + Unpin,
+    U: AsMut<[u8]>,
+{
+    pub fn is_aborted(&self) -> bool {
+        self.inner.is_aborted()
+    }
+
+    fn try_poll(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<usize, AbortErr<io::Error>>> {
+        // Check if the task has been aborted
+        if self.is_aborted() {
+            return Poll::Ready(Err(AbortErr::Aborted));
+        }
+
+        let me = self.project();
+        // attempt to complete the task
+
+        // TODO: use uninit ReadBuf?
+        let mut buf = ReadBuf::new(&mut me.buf.as_mut()[*me.offset..]);
+        if let Poll::Ready(r) = Pin::new(me.reader).poll_read(cx, &mut buf) {
+            match r {
+                Ok(_) => return Poll::Ready(Ok(buf.filled().len())),
+                Err(e) => return Poll::Ready(Err(AbortErr::IO(e))),
+            }
+        }
+
+        // Register to receive a wakeup if the task is aborted in the future
+        me.inner.waker.register(cx.waker());
+
+        // Check to see if the task was aborted between the first check and
+        // registration.
+        // Checking with `is_aborted` which uses `Relaxed` is sufficient because
+        // `register` introduces an `AcqRel` barrier.
+        if me.inner.is_aborted() {
+            return Poll::Ready(Err(AbortErr::Aborted));
+        }
+
+        Poll::Pending
+    }
+}
+
+impl<T, U> Future for AbortableRead<'_, T, U>
+where
+    // TODO: use pin-project and lift Unpin restriction?
+    T: AsyncRead + Unpin,
+    U: AsMut<[u8]>,
+{
+    type Output = Result<usize, AbortErr<io::Error>>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.try_poll(cx)
+    }
+}
+
+pub trait AsyncAbortRead: AsyncRead {
+    fn read_abort<'a, T>(
+        &'a mut self,
+        buf: &'a mut Ref<T>,
+        offset: usize,
+    ) -> AbortableRead<'a, Self, T>
+    where
+        T: AsMut<[u8]>,
+        Self: AsyncRead,
+    {
+        let (handle, reg) = AbortHandle::new_pair();
+
+        if buf
+            .main_cache
+            .add_abortable_work(buf.offset.clone(), handle.clone())
+        {
+            AbortableRead {
+                reader: self,
+                buf,
+                offset,
+                need_rm_abort_handle: true,
+
+                inner: reg.inner,
+                _pin: PhantomPinned,
+            }
+        } else {
+            handle.abort();
+            AbortableRead {
+                reader: self,
+                buf,
+                offset,
+                need_rm_abort_handle: false,
+
+                inner: reg.inner,
+                _pin: PhantomPinned,
+            }
+        }
+    }
+}
+
+impl<R: AsyncRead + ?Sized> AsyncAbortRead for R {}
 
 #[cfg(test)]
 mod test {

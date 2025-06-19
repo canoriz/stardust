@@ -2,6 +2,7 @@ mod global;
 mod piece;
 pub(crate) use global::{wake_next_waiting_alloc, AllocReq};
 pub(crate) use global::{PieceBuf, PieceBufPool};
+pub(crate) use piece::AsyncAbortRead;
 pub(crate) use piece::*;
 
 const DROPPED: u32 = 0b01;

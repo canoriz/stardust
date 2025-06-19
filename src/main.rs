@@ -26,14 +26,14 @@ use torrent_manager::TorrentManagerHandle;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Hello, world!");
-    // tracing_subscriber::fmt()
-    //     .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-    //     .event_format(
-    //         tracing_subscriber::fmt::format()
-    //             .with_file(true)
-    //             .with_line_number(true),
-    //     )
-    //     .init();
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .event_format(
+            tracing_subscriber::fmt::format()
+                .with_file(true)
+                .with_line_number(true),
+        )
+        .init();
 
     // let announce_req = metadata::TrackerGet {
     //     peer_id: "-ZS0405-qwerasdfzxcv",

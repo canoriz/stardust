@@ -1,3 +1,5 @@
+use crate::cache::{AbortErr, AsyncAbortRead, Ref};
+
 use bytes::BufMut;
 use core::fmt;
 use std::fmt::Formatter;
@@ -566,6 +568,8 @@ pub struct Piece<'a, T> {
     pub begin: u32,
     pub len: u32,
 
+    read: u32,
+
     handle: &'a mut T,
 }
 
@@ -577,14 +581,43 @@ where
     // read should be called once, buf.len should
     // be large enough to store the entire block
     pub async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        assert!(buf.len() >= self.len as usize);
+        // TODO: test the limit part
+        let remain = (self.len - self.read) as usize;
+        let limit = remain.min(buf.len());
 
         // TODO: Transmission sends data in seperate packets
         // and 500ms after first packet
         // maybe make this read() instead of read_exact
-        self.handle
-            .read_exact(&mut buf[..(self.len as usize)])
-            .await
+        let res = self.handle.read(&mut buf[..limit]).await?;
+        self.read += res as u32;
+        Ok(res)
+    }
+
+    pub async fn read_to_ref<U>(
+        &mut self,
+        mut buf: Ref<U>,
+        offset: usize,
+    ) -> Result<(usize, Ref<U>), AbortErr<io::Error>>
+    where
+        T: AsyncRead,
+        U: AsMut<[u8]>,
+    {
+        match self.handle.read_abort(&mut buf, offset).await {
+            Ok(n) => Ok((n, buf)),
+            Err(e) => Err(e),
+        }
+    }
+
+    // read until buf is full or all the "PIECE" message received
+    pub async fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let remain = (self.len - self.read) as usize;
+        let limit = remain.min(buf.len());
+        assert!(buf.len() >= remain);
+
+        // TODO: Transmission sends data in seperate packets
+        // and 500ms after first packet
+        // maybe make this read() instead of read_exact
+        self.handle.read_exact(&mut buf[..limit]).await
     }
 }
 
@@ -911,6 +944,7 @@ async fn recv_msg_header<'a, T: AsyncRead + Unpin>(
                 index,
                 begin,
                 len: capacity as u32,
+                read: 0,
                 handle,
             }))
         }
@@ -1318,7 +1352,7 @@ mod tests {
         assert_eq!(piece.len, random_bytes.len() as u32);
 
         let mut buf = [0u8; 143];
-        let n = piece.read(&mut buf).await;
+        let n = piece.read_exact(&mut buf).await;
         assert!(matches!(n, Ok(143)));
         assert_eq!(random_bytes, buf);
 
@@ -1337,7 +1371,7 @@ mod tests {
         assert_eq!(piece.len, random_bytes.len() as u32);
 
         let mut buf = [0u8; 143];
-        let n = piece.read(&mut buf).await;
+        let n = piece.read_exact(&mut buf).await;
         assert!(matches!(n, Ok(143)));
         assert_eq!(random_bytes, buf);
         // TODO: test long piece are dropped

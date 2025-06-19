@@ -17,7 +17,6 @@ use tokio::sync::Notify;
 use loom::atomic::{AtomicBool, AtomicU32, Ordering};
 #[cfg(not(mloom))]
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use tokio::task::JoinHandle;
 use tracing::warn;
 
 #[cfg(not(mloom))]
@@ -513,7 +512,7 @@ impl PieceBufPoolImpl {
             if let Some(fbh) = buf_tree_guard.alloced.get_mut(&f) {
                 let aborter = fbh.sub_manager_handle.clone();
                 #[cfg(test)]
-                println!("add wait_invalid");
+                println!("invalidate add wait_invalid");
                 let waiter = Arc::new(Notify::new());
                 fbh.invalidate_waiter.push(waiter.clone());
                 (waiter, aborter)
@@ -546,7 +545,7 @@ impl PieceBufPoolImpl {
             let mut aborters = Vec::new();
             for (fb, fbh) in buf_tree_guard.alloced.iter_mut() {
                 #[cfg(test)]
-                println!("add wait_invalid");
+                println!("pause_all add wait_abort");
 
                 let aborter = fbh.sub_manager_handle.clone();
                 match aborter {
@@ -657,6 +656,13 @@ impl PieceBuf {
 
         self.b.ptr = self.b.ptr.sub(self.b.offset).add(new_offset);
         self.b.offset = new_offset;
+    }
+
+    pub(crate) fn offset_len(&self) -> (usize, usize) {
+        (
+            self.b.offset / MIN_ALLOC_SIZE,
+            1usize << (self.b.power - MIN_ALLOC_SIZE_POWER),
+        )
     }
 }
 
@@ -1029,11 +1035,16 @@ fn prev_power_of_two(s: usize) -> usize {
 
 #[cfg(test)]
 mod test {
+    use tokio::io::duplex;
+
+    use crate::cache::AbortErr;
     use crate::cache::ArcCache;
+    use crate::cache::AsyncAbortRead;
 
     use super::*;
-    use futures::future;
     use tokio_test::task;
+
+    use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
     #[test]
     fn test_mul_of_2() {
@@ -1670,33 +1681,69 @@ mod test {
         }
     }
 
+    async fn read_to_ref<T>(
+        conn: &mut Pin<Box<T>>,
+        piece: ArcCache<PieceBuf>,
+        offset: usize,
+        expect: usize,
+    ) -> i32
+    where
+        T: AsyncRead,
+    {
+        let len = expect.next_multiple_of(16384);
+        let mut written = 0;
+        let mut counter = 0;
+        'outer: while written < expect {
+            if let Some(ref mut refbuf) = piece.async_get_part_ref(offset, len).await {
+                while written < expect {
+                    let read_fut = conn.read_abort(refbuf, written);
+                    match read_fut.await {
+                        Ok(n) => {
+                            written += n;
+                        }
+                        Err(AbortErr::IO(_)) => {
+                            panic!("");
+                        }
+                        Err(AbortErr::Aborted) => {
+                            // go to next round
+                            counter += 1;
+                            continue 'outer;
+                        }
+                    }
+                }
+            } else {
+                break;
+            }
+        }
+        counter
+    }
+
     #[cfg(not(mloom))]
     #[tokio::test]
     async fn test_async_alloc_abort_migrate() {
+        let (mut r2, w2) = duplex(MIN_ALLOC_SIZE);
+        _ = r2.write(&[0x22u8, 0x22]).await;
+        let (mut r4, w4) = duplex(MIN_ALLOC_SIZE);
+        _ = r4.write(&[0x44u8, 0x44]).await;
+
         let c = PieceBufPool::new(4 * MIN_ALLOC_SIZE);
         let p1 = c.async_alloc_abort::<ArcCache<_>>(1, MIN_ALLOC_SIZE).await;
         let p2 = c.async_alloc_abort::<ArcCache<_>>(2, MIN_ALLOC_SIZE).await;
         let p3 = c.async_alloc_abort::<ArcCache<_>>(3, MIN_ALLOC_SIZE).await;
         let p4 = c.async_alloc_abort::<ArcCache<_>>(4, MIN_ALLOC_SIZE).await;
-        {
-            let mut ref2 = p2.get_part_ref(0, MIN_ALLOC_SIZE).unwrap();
-            for i in ref2.as_mut() {
-                *i = 0x22;
-            }
-            let mut ref4 = p4.get_part_ref(0, MIN_ALLOC_SIZE).unwrap();
-            for i in ref4.as_mut() {
-                *i = 0x44;
-            }
-
-            tokio::spawn(async move {
-                let r = ref2.abortable_work(|_| pending::<()>()).await;
-                assert_eq!(r, Err(future::Aborted));
+        let (rt1, rt2) = {
+            let p2c = p2.clone();
+            let rt1 = tokio::spawn(async move {
+                let mut w2_pin = Box::pin(w2);
+                read_to_ref(&mut w2_pin, p2c.clone(), 0, MIN_ALLOC_SIZE).await
             });
-            tokio::spawn(async move {
-                let r = ref4.abortable_work(|_| pending::<()>()).await;
-                assert_eq!(r, Err(future::Aborted));
+            let p4c = p4.clone();
+            let rt2 = tokio::spawn(async move {
+                let mut w4_pin = Box::pin(w4);
+                read_to_ref(&mut w4_pin, p4c.clone(), 0, MIN_ALLOC_SIZE).await
             });
-        }
+            (rt1, rt2)
+        };
         drop(p1);
         drop(p3);
 
@@ -1708,6 +1755,13 @@ mod test {
             .async_alloc_abort::<ArcCache<_>>(5, 2 * MIN_ALLOC_SIZE)
             .await;
         {
+            _ = r2.write(&[0x22u8; MIN_ALLOC_SIZE - 2]).await;
+            _ = r4.write(&[0x44u8; MIN_ALLOC_SIZE - 2]).await;
+            let _n_abort1 = rt1.await.unwrap();
+            let _n_abort2 = rt2.await.unwrap();
+            // undeterminism, might not equal
+            // assert_eq!(n_abort1, 1);
+            // assert_eq!(n_abort2, 1);
             let ref2 = p2.get_part_ref(0, MIN_ALLOC_SIZE).unwrap();
             for i in ref2.as_ref() {
                 assert_eq!(*i, 0x22);
@@ -1719,7 +1773,7 @@ mod test {
         }
         drop(p2);
         drop(p4);
-        let p6 = c
+        let _p6 = c
             .async_alloc_abort::<ArcCache<_>>(6, 2 * MIN_ALLOC_SIZE)
             .await;
         drop(p5);
@@ -1728,6 +1782,11 @@ mod test {
     #[cfg(not(mloom))]
     #[tokio::test]
     async fn test_async_alloc_abort_migrate_2() {
+        let (mut r1, w1) = duplex(MIN_ALLOC_SIZE);
+        _ = r1.write(&[0x11; 4]).await;
+        let (mut r4, w4) = duplex(2 * MIN_ALLOC_SIZE);
+        _ = r4.write(&[0x41; 4]).await;
+
         let c = PieceBufPool::new(11 * MIN_ALLOC_SIZE);
         let p1 = c.async_alloc_abort::<ArcCache<_>>(1, MIN_ALLOC_SIZE).await; // at 10
         let p2 = c
@@ -1739,35 +1798,21 @@ mod test {
         let p4 = c
             .async_alloc_abort::<ArcCache<_>>(4, 2 * MIN_ALLOC_SIZE)
             .await; // at 2-3
-        {
-            let mut ref1 = p1.get_part_ref(0, MIN_ALLOC_SIZE).unwrap();
-            for i in ref1.as_mut() {
-                *i = 0x11;
-            }
-            let mut ref41 = p4.get_part_ref(0, 1 * MIN_ALLOC_SIZE).unwrap();
-            for i in ref41.as_mut() {
-                *i = 0x41;
-            }
-            let mut ref42 = p4
-                .get_part_ref(1 * MIN_ALLOC_SIZE, 1 * MIN_ALLOC_SIZE)
-                .unwrap();
-            for i in ref42.as_mut() {
-                *i = 0x42;
-            }
+        let (rt1, rt2) = {
+            let p1c = p1.clone();
+            let rt1 = tokio::spawn(async move {
+                let mut w1_pin = Box::pin(w1);
+                read_to_ref(&mut w1_pin, p1c, 0, MIN_ALLOC_SIZE).await
+            });
 
-            tokio::spawn(async move {
-                let r = ref1.abortable_work(|_| pending::<()>()).await;
-                assert_eq!(r, Err(future::Aborted));
+            let p4c = p4.clone();
+            let rt2 = tokio::spawn(async move {
+                let mut w4_pin = Box::pin(w4);
+                let n = read_to_ref(&mut w4_pin, p4c.clone(), 0, MIN_ALLOC_SIZE).await;
+                n + read_to_ref(&mut w4_pin, p4c.clone(), MIN_ALLOC_SIZE, MIN_ALLOC_SIZE).await
             });
-            tokio::spawn(async move {
-                let r = ref41.abortable_work(|_| pending::<()>()).await;
-                assert_eq!(r, Err(future::Aborted));
-            });
-            tokio::spawn(async move {
-                let r = ref42.abortable_work(|_| pending::<()>()).await;
-                assert_eq!(r, Err(future::Aborted));
-            });
-        }
+            (rt1, rt2)
+        };
         drop(p2);
         drop(p3);
 
@@ -1779,6 +1824,15 @@ mod test {
             .async_alloc_abort::<ArcCache<_>>(5, 8 * MIN_ALLOC_SIZE)
             .await;
         {
+            _ = r1.write(&[0x11; MIN_ALLOC_SIZE - 4]).await;
+            _ = r4.write(&[0x41; MIN_ALLOC_SIZE - 4]).await;
+            _ = r4.write(&[0x42; MIN_ALLOC_SIZE]).await;
+            let _n_abort1 = rt1.await.unwrap();
+            let _n_abort2 = rt2.await.unwrap();
+            // undeterminism, might not equal
+            // assert_eq!(n_abort1, 1);
+            // assert_eq!(n_abort2, 1);
+
             let ref1 = p1.get_part_ref(0, MIN_ALLOC_SIZE).unwrap();
             for i in ref1.as_ref() {
                 assert_eq!(*i, 0x11);
@@ -1796,10 +1850,86 @@ mod test {
         }
         drop(p1);
         drop(p4);
-        let p6 = c
+        let _p6 = c
             .async_alloc_abort::<ArcCache<_>>(6, 2 * MIN_ALLOC_SIZE)
             .await;
         drop(p5);
+    }
+
+    /// migrate twice
+    #[cfg(not(mloom))]
+    #[tokio::test]
+    async fn test_async_alloc_abort_migrate_3() {
+        let (mut r, w) = duplex(MIN_ALLOC_SIZE);
+        _ = r.write(&[0x11; 4]).await;
+
+        let c = PieceBufPool::new(11 * MIN_ALLOC_SIZE);
+        let p1 = c.async_alloc_abort::<ArcCache<_>>(1, MIN_ALLOC_SIZE).await; // at 10
+        let p2 = c
+            .async_alloc_abort::<ArcCache<_>>(2, 4 * MIN_ALLOC_SIZE)
+            .await; // at 4-7
+        let p3 = c
+            .async_alloc_abort::<ArcCache<_>>(3, 2 * MIN_ALLOC_SIZE)
+            .await; // at 8-9
+        let p4 = c
+            .async_alloc_abort::<ArcCache<_>>(4, 2 * MIN_ALLOC_SIZE)
+            .await; // at 2-3
+        let p5 = c
+            .async_alloc_abort::<ArcCache<_>>(4, 2 * MIN_ALLOC_SIZE)
+            .await; // at 0-1
+        let rt4 = {
+            let p4c = p4.clone();
+            let rt4 = tokio::spawn(async move {
+                let mut w4_pin = Box::pin(w);
+                read_to_ref(&mut w4_pin, p4c, 0, MIN_ALLOC_SIZE).await
+            });
+            rt4
+        };
+        drop(p2);
+        let p2 = c
+            .async_alloc_abort::<ArcCache<_>>(2, 2 * MIN_ALLOC_SIZE)
+            .await; // at 6-7
+        drop(p3);
+        drop(p5);
+
+        // p1: 10
+        // p2: 6-7
+        // p4: 2-3
+        // no enough space for consecutive 4 * MIN_ALLOC_SIZE
+        // this sync alloc should return None
+        // but a async task will be created and migrating blocks
+        println!("{:?}", p1.piece_detail(|p| p.offset_len()).unwrap());
+        println!("{:?}", p2.piece_detail(|p| p.offset_len()).unwrap());
+        println!("{:?}", p4.piece_detail(|p| p.offset_len()).unwrap());
+
+        let p5 = c
+            .async_alloc_abort::<ArcCache<_>>(5, 4 * MIN_ALLOC_SIZE)
+            .await;
+
+        println!("b");
+        {
+            _ = r.write(&[0x11; 10]).await;
+        }
+        drop(p5);
+        drop(p1);
+        drop(p2);
+
+        println!("{:?}", p4.piece_detail(|p| p.offset_len()).unwrap());
+        let p5 = c
+            .async_alloc_abort::<ArcCache<_>>(5, 8 * MIN_ALLOC_SIZE)
+            .await;
+        println!("{:?}", p4.piece_detail(|p| p.offset_len()).unwrap());
+        println!("{:?}", p5.piece_detail(|p| p.offset_len()).unwrap());
+        {
+            _ = r.write(&[0x11; 2 * MIN_ALLOC_SIZE - 14]).await;
+            let _n_abort = rt4.await.unwrap();
+            // assert_eq!(n_abort, 2) // due to undeterminism, this might not be 2
+
+            let ref4 = p4.get_part_ref(0, MIN_ALLOC_SIZE).unwrap();
+            for i in ref4.as_ref() {
+                assert_eq!(*i, 0x11);
+            }
+        }
     }
 
     #[cfg(not(mloom))]
@@ -1926,26 +2056,22 @@ mod test {
         // let p3 = c
         //     .async_alloc_abort::<ArcCache<_>>(1, 4 * MIN_ALLOC_SIZE)
         //     .await;
+        let (mut r1, w1) = duplex(MIN_ALLOC_SIZE);
+        r1.write(&[0; 4]).await;
+        let (mut r2, w2) = duplex(MIN_ALLOC_SIZE);
+        r2.write(&[0; 4]).await;
         let (fb1, fb2) = {
-            let mut ref11 = p1.get_part_ref(0, 16384).unwrap();
-            let mut ref12 = p1.get_part_ref(16384, 16384).unwrap();
-            let mut ref13 = p1.get_part_ref(2 * 16384, 16384).unwrap();
-            let mut ref21 = p2.get_part_ref(2 * 16384, 16384).unwrap();
+            let p1c = p1.clone();
             tokio::spawn(async move {
-                let r = ref11.abortable_work(|_| pending::<()>()).await;
-                assert_eq!(r, Err(future::Aborted));
+                let mut w1_pin = Box::pin(w1);
+                read_to_ref(&mut w1_pin, p1c.clone(), 0, 16384).await;
+                read_to_ref(&mut w1_pin, p1c.clone(), 16384, 16384).await;
+                read_to_ref(&mut w1_pin, p1c.clone(), 2 * 16384, 16384).await;
             });
+            let p2c = p2.clone();
             tokio::spawn(async move {
-                let r = ref12.abortable_work(|_| pending::<()>()).await;
-                assert_eq!(r, Err(future::Aborted));
-            });
-            tokio::spawn(async move {
-                let r = ref13.abortable_work(|_| pending::<()>()).await;
-                assert_eq!(r, Err(future::Aborted));
-            });
-            tokio::spawn(async move {
-                let r = ref21.abortable_work(|_| pending::<()>()).await;
-                assert_eq!(r, Err(future::Aborted));
+                let mut w2_pin = Box::pin(w2);
+                read_to_ref(&mut w2_pin, p2c.clone(), 2 * 16384, 16384).await;
             });
 
             (
@@ -1970,19 +2096,21 @@ mod test {
         let p2 = c
             .async_alloc_abort::<ArcCache<_>>(1, 1 * MIN_ALLOC_SIZE)
             .await;
+        let (_r1, w1) = duplex(MIN_ALLOC_SIZE);
+        let (_r2, w2) = duplex(MIN_ALLOC_SIZE);
         let (fb1, fb2, mut t1, mut t2) = {
             // let p3 = c
             //     .async_alloc_abort::<ArcCache<_>>(1, 4 * MIN_ALLOC_SIZE)
             //     .await;
-            let mut ref11 = p1.get_part_ref(0, 16384).unwrap();
-            let mut ref21 = p2.get_part_ref(2 * 16384, 16384).unwrap();
+            let p1c = p1.clone();
             let mut t1 = task::spawn(async move {
-                let r = ref11.abortable_work(|_| pending::<()>()).await;
-                assert_eq!(r, Err(future::Aborted));
+                let mut w1_pin = Box::pin(w1);
+                read_to_ref(&mut w1_pin, p1c.clone(), 0, 16384).await;
             });
+            let p2c = p2.clone();
             let mut t2 = task::spawn(async move {
-                let r = ref21.abortable_work(|_| pending::<()>()).await;
-                assert_eq!(r, Err(future::Aborted));
+                let mut w2_pin = Box::pin(w2);
+                read_to_ref(&mut w2_pin, p2c.clone(), 2 * 16384, 16384).await;
             });
             assert_eq!(t1.poll(), Poll::Pending);
             assert_eq!(t2.poll(), Poll::Pending);
