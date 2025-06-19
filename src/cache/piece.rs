@@ -1,6 +1,7 @@
 use core::fmt;
 use futures::task::AtomicWaker;
 use pin_project::{pin_project, pinned_drop};
+use std::fmt::Debug;
 use std::{
     collections::{HashMap, VecDeque},
     future::Future,
@@ -68,10 +69,28 @@ impl State {
     }
 }
 
+const ALLOW_NEW_REF: u32 = 0;
+const PAUSE_NEW_REF: u32 = 0b1;
+const DISALLOW_NEW_REF: u32 = 0b10;
+const INVALIDATED: u32 = 0b100;
+
+fn allow_state_to_err(allow_state: u32) -> Option<GetRefErr> {
+    if allow_state == ALLOW_NEW_REF {
+        None
+    } else if allow_state & DISALLOW_NEW_REF > 0 {
+        Some(GetRefErr::Disallowed)
+    } else if allow_state & PAUSE_NEW_REF > 0 {
+        Some(GetRefErr::Paused)
+    } else if allow_state & INVALIDATED > 0 {
+        Some(GetRefErr::Invalidated)
+    } else {
+        None
+    }
+}
+
 struct BufState<T> {
-    // TODO: maybe out of mutex and combind allow_new_ref, pause_new_ref together
-    allow_new_ref: AtomicBool,
-    pause_new_ref: AtomicBool,
+    // TODO: maybe out of mutex
+    allow_new_ref: AtomicU32,
 
     cache: Option<T>,
     state: State,
@@ -112,21 +131,29 @@ where
     }
 
     fn allow_new_ref(&self, allow_new_ref: bool) {
-        self.buf
-            .lock()
-            .expect("allow new ref should lock OK")
-            .allow_new_ref
-            .store(allow_new_ref, Ordering::Release);
+        let buf_guard = self.buf.lock().expect("allow new ref should lock OK");
+        if allow_new_ref {
+            buf_guard
+                .allow_new_ref
+                .fetch_and(!DISALLOW_NEW_REF, Ordering::Release);
+        } else {
+            buf_guard
+                .allow_new_ref
+                .fetch_or(DISALLOW_NEW_REF, Ordering::Release);
+        }
+    }
+
+    fn set_allow_state(&self, state: u32) -> u32 {
+        let buf_guard = self.buf.lock().expect("set_allow_state should lock OK");
+        buf_guard.allow_new_ref.swap(state, Ordering::AcqRel)
     }
 
     /// returns if allowed to add this work
     /// if return false, means this work is aborted now
     fn add_abortable_work(&self, offset: RefOffset, handle: AbortHandle) -> bool {
         let mut buf_guard = self.buf.lock().expect("add abortable work lock should OK");
-        if !buf_guard.allow_new_ref.load(Ordering::Relaxed) {
-            return false;
-        }
-        if buf_guard.pause_new_ref.load(Ordering::Relaxed) {
+        if buf_guard.allow_new_ref.load(Ordering::Relaxed) != ALLOW_NEW_REF {
+            // TODO: return state
             return false;
         }
         buf_guard.abort_handle.insert(offset, handle);
@@ -144,7 +171,10 @@ where
     async fn abort_all(&self) {
         let wait_abort = {
             let mut buf_guard = self.buf.lock().expect("abort all work");
-            buf_guard.pause_new_ref.store(true, Ordering::Relaxed);
+            // TODO: FIXME: what if abort a already DISALLOW_NEW_REF cache?
+            buf_guard
+                .allow_new_ref
+                .fetch_or(PAUSE_NEW_REF, Ordering::Relaxed);
             for (_, handle) in buf_guard.abort_handle.drain() {
                 handle.abort();
             }
@@ -165,7 +195,8 @@ where
 
     fn drop_piecebuf(&self) {
         let mut buf_guard = self.buf.lock().expect("drop piecebuf lock should OK");
-        assert!(buf_guard.pause_new_ref.load(Ordering::Relaxed));
+        assert!(buf_guard.allow_new_ref.load(Ordering::Relaxed) > 0);
+        assert!(buf_guard.allow_new_ref.load(Ordering::Relaxed) & PAUSE_NEW_REF > 0);
         assert_eq!(buf_guard.state.ref_cnt, 0);
 
         #[cfg(test)]
@@ -178,8 +209,8 @@ where
         self.buf
             .lock()
             .expect("reenable lock should OK")
-            .pause_new_ref
-            .store(false, Ordering::Relaxed);
+            .allow_new_ref
+            .fetch_and(!PAUSE_NEW_REF, Ordering::Relaxed);
 
         let mut waiting_reqs = self
             .waiting_reqs
@@ -237,8 +268,7 @@ impl FromPieceBuf for ArcCache<PieceBuf> {
         assert_eq!(size % BLOCKSIZE, 0);
         let inner = Arc::new(Cache {
             buf: Mutex::new(BufState {
-                allow_new_ref: AtomicBool::new(true),
-                pause_new_ref: AtomicBool::new(false),
+                allow_new_ref: AtomicU32::new(ALLOW_NEW_REF),
 
                 cache: Some(t),
                 state: State {
@@ -275,7 +305,7 @@ impl ArcCache<PieceBuf> {
             .map(|p| f(p))
     }
 
-    pub(crate) fn is_valid<T, F>(&self) -> bool {
+    pub(crate) fn is_valid(&self) -> bool {
         self.inner
             .buf
             .lock()
@@ -301,8 +331,7 @@ where
         Self {
             inner: Arc::new(Cache {
                 buf: Mutex::new(BufState {
-                    allow_new_ref: AtomicBool::new(true),
-                    pause_new_ref: AtomicBool::new(false),
+                    allow_new_ref: AtomicU32::new(ALLOW_NEW_REF),
 
                     cache: Some(t),
                     state: State {
@@ -345,26 +374,22 @@ where
     // TODO: maybe not use (offset,length) but use
     // (offset_mutlple_of(block), len_multiple_of(block))
     // TODO: this needs a lot of tests
-    // TODO: maybe use Result to return fail reason(inuse/invalidated/paused/new ref disallowed)
-    pub fn get_part_ref(&self, offset: usize, len: usize) -> Option<Ref<T>> {
+    pub fn get_part_ref(&self, offset: usize, len: usize) -> Result<Ref<T>, GetRefErr> {
         if len.trailing_zeros() < BLOCKSIZE.trailing_zeros() {
             // TODO: maybe not panic, fix size instead?
             panic!("should be multiple of {BLOCKSIZE}");
         }
 
         let mut buf_guard = self.inner.buf.lock().expect("get part ref lock should OK");
-        if !buf_guard.allow_new_ref.load(Ordering::Acquire) {
-            return None;
-        }
-        if buf_guard.pause_new_ref.load(Ordering::Relaxed) {
-            return None;
+        let allow_state = buf_guard.allow_new_ref.load(Ordering::Acquire);
+        if let Some(err) = allow_state_to_err(allow_state) {
+            return Err(err);
         }
 
         let buf = buf_guard.deref_mut();
         if let Some(ref mut cache) = buf.cache {
             if len + offset > cache.as_mut().len() {
-                // TODO: return error code
-                return None;
+                return Err(GetRefErr::RangeOverflow);
             }
 
             let range_state = &mut buf.state;
@@ -375,18 +400,16 @@ where
                 .iter()
                 .any(|s| *s != BlockState::Vacant);
             if any_block_not_vacant {
-                return None;
+                return Err(GetRefErr::InUse);
             }
 
             for s in range_state.state[offset >> BLOCKBITS..(offset + len) >> BLOCKBITS].iter_mut()
             {
-                if *s != BlockState::Vacant {
-                    return None;
-                }
+                assert_eq!(*s, BlockState::Vacant);
                 *s = BlockState::InUse;
             }
 
-            Some(Ref {
+            Ok(Ref {
                 offset: RefOffset {
                     from: offset,
                     ptr: unsafe { cache.as_mut().as_mut_ptr().add(offset) },
@@ -395,8 +418,7 @@ where
                 main_cache: ManuallyDrop::new(self.inner.clone()),
             })
         } else {
-            // TODO: return err
-            None
+            return Err(GetRefErr::Invalidated);
         }
     }
 
@@ -413,8 +435,17 @@ where
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GetRefErr {
+    InUse,
+    RangeOverflow,
+    Invalidated,
+    Paused,
+    Disallowed,
+}
+
 #[must_use = "futures do nothing unless you poll them"]
-pub struct AsyncPartRefFut<'a, T> {
+pub(crate) struct AsyncPartRefFut<'a, T> {
     offset: usize,
     len: usize,
     valid: Arc<AtomicU32>,
@@ -425,7 +456,7 @@ impl<T> Future for AsyncPartRefFut<'_, T>
 where
     T: AsMut<[u8]>,
 {
-    type Output = Option<Ref<T>>;
+    type Output = Result<Ref<T>, GetRefErr>;
 
     fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
         let fut = self.get_mut();
@@ -440,10 +471,16 @@ where
             .buf
             .lock()
             .expect("get part ref lock should OK");
-        if !buf_guard.allow_new_ref.load(Ordering::Acquire) {
-            return Poll::Ready(None);
+
+        let allow_state = buf_guard.allow_new_ref.load(Ordering::Acquire);
+        if allow_state & DISALLOW_NEW_REF > 0 {
+            return Poll::Ready(Err(GetRefErr::Disallowed));
         }
-        if buf_guard.pause_new_ref.load(Ordering::Relaxed) {
+        if allow_state & INVALIDATED > 0 {
+            return Poll::Ready(Err(GetRefErr::Invalidated));
+        }
+        assert!(allow_state == ALLOW_NEW_REF || allow_state == PAUSE_NEW_REF);
+        if allow_state == PAUSE_NEW_REF {
             fut.cache
                 .inner
                 .waiting_reqs
@@ -460,8 +497,7 @@ where
         let buf = buf_guard.deref_mut();
         if let Some(ref mut cache) = buf.cache {
             if fut.len + fut.offset > cache.as_mut().len() {
-                // TODO: return error code
-                return Poll::Ready(None);
+                return Poll::Ready(Err(GetRefErr::RangeOverflow));
             }
 
             let range_state = &mut buf.state;
@@ -472,18 +508,16 @@ where
                 .iter()
                 .any(|s| *s != BlockState::Vacant);
             if any_block_not_vacant {
-                return Poll::Ready(None);
+                return Poll::Ready(Err(GetRefErr::InUse));
             }
 
             for s in range_state.state[fut.offset >> BLOCKBITS..(fut.offset + fut.len) >> BLOCKBITS]
                 .iter_mut()
             {
-                if *s != BlockState::Vacant {
-                    return Poll::Ready(None);
-                }
+                assert_eq!(*s, BlockState::Vacant);
                 *s = BlockState::InUse;
             }
-            Poll::Ready(Some(Ref {
+            Poll::Ready(Ok(Ref {
                 offset: RefOffset {
                     from: fut.offset,
                     ptr: unsafe { cache.as_mut().as_mut_ptr().add(fut.offset) },
@@ -492,7 +526,7 @@ where
                 main_cache: ManuallyDrop::new(fut.cache.inner.clone()),
             }))
         } else {
-            Poll::Ready(None)
+            return Poll::Ready(Err(GetRefErr::Invalidated));
         }
     }
 }
@@ -541,6 +575,7 @@ where
             a.allow_new_ref(false);
             a.abort_all().await;
             a.drop_piecebuf();
+            a.set_allow_state(INVALIDATED);
         } else {
             panic!("invalidate upgrade failed, will this happen?");
         }
@@ -561,8 +596,8 @@ where
             a.buf
                 .lock()
                 .expect("reenable lock should OK")
-                .pause_new_ref
-                .store(false, Ordering::Relaxed);
+                .allow_new_ref
+                .fetch_and(!PAUSE_NEW_REF, Ordering::Relaxed);
 
             let mut waiting_reqs = a
                 .waiting_reqs
@@ -624,6 +659,14 @@ where
     // manually_drop is used in extend_to_entire()
     // extend_or_entire acts as a "Drop"
     main_cache: ManuallyDrop<Arc<Cache<T>>>,
+}
+impl<T> Debug for Ref<T>
+where
+    T: Debug + AsMut<[u8]>,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Ref").field("offset", &self.offset).finish()
+    }
 }
 
 #[derive(Hash, Eq, PartialEq, Clone, Debug)]
@@ -1045,9 +1088,9 @@ mod test {
             let ref5to7 = cache.get_part_ref(5 * BLOCKSIZE, 2 * BLOCKSIZE);
             let ref6to8 = cache.get_part_ref(6 * BLOCKSIZE, 2 * BLOCKSIZE);
             let ref9to11 = cache.get_part_ref(9 * BLOCKSIZE, 2 * BLOCKSIZE);
-            assert!(ref5to7.is_some());
-            assert!(ref6to8.is_none());
-            assert!(ref9to11.is_some());
+            assert!(ref5to7.is_ok());
+            assert!(matches!(ref6to8, Err(GetRefErr::InUse)));
+            assert!(ref9to11.is_ok());
 
             cache
                 .inner
@@ -1086,7 +1129,7 @@ mod test {
 
         let cache = ArcCache::new(vec![0u8; BLOCKSIZE * 16]);
         let ref5to7 = cache.async_get_part_ref(5 * BLOCKSIZE, 2 * BLOCKSIZE).await;
-        assert!(ref5to7.is_some());
+        assert!(ref5to7.is_ok());
 
         // mock migrating
         cache
@@ -1094,8 +1137,8 @@ mod test {
             .buf
             .lock()
             .unwrap()
-            .pause_new_ref
-            .store(true, Ordering::Relaxed);
+            .allow_new_ref
+            .fetch_or(PAUSE_NEW_REF, Ordering::Relaxed);
 
         let mut ref6to8 = task::spawn(cache.async_get_part_ref(6 * BLOCKSIZE, 2 * BLOCKSIZE));
 
@@ -1111,7 +1154,7 @@ mod test {
 
         cache.inner.reenable();
 
-        assert!(matches!(ref6to8.poll(), Poll::Ready(None)));
+        assert!(matches!(ref6to8.poll(), Poll::Ready(Err(GetRefErr::InUse))));
         let r1213 = ref12to13.await;
         let r911 = ref9to11.await;
 
@@ -1148,11 +1191,9 @@ mod test {
 
     #[tokio::test]
     async fn test_cache_async_get_ref() {
-        use tokio_test::task;
-
         let cache = ArcCache::new(vec![0u8; BLOCKSIZE * 16]);
         let ref5to7 = cache.async_get_part_ref(5 * BLOCKSIZE, 2 * BLOCKSIZE).await;
-        assert!(ref5to7.is_some());
+        assert!(ref5to7.is_ok());
 
         // mock migrating
         cache
@@ -1160,22 +1201,22 @@ mod test {
             .buf
             .lock()
             .unwrap()
-            .pause_new_ref
-            .store(true, Ordering::Relaxed);
+            .allow_new_ref
+            .fetch_or(PAUSE_NEW_REF, Ordering::Relaxed);
 
         let c = cache.clone();
-        let mut ref6to8 =
+        let ref6to8 =
             tokio::spawn(async move { c.async_get_part_ref(6 * BLOCKSIZE, 2 * BLOCKSIZE).await });
         let c = cache.clone();
-        let mut ref9to11 =
+        let ref9to11 =
             tokio::spawn(async move { c.async_get_part_ref(9 * BLOCKSIZE, 2 * BLOCKSIZE).await });
         let c = cache.clone();
-        let mut ref12to13 =
+        let ref12to13 =
             tokio::spawn(async move { c.async_get_part_ref(12 * BLOCKSIZE, 1 * BLOCKSIZE).await });
 
         cache.inner.reenable();
 
-        assert!(ref6to8.await.unwrap().is_none());
+        assert!(matches!(ref6to8.await.unwrap(), Err(GetRefErr::InUse)));
         let r1213 = ref12to13.await.unwrap();
         let r911 = ref9to11.await.unwrap();
 
@@ -1312,17 +1353,17 @@ mod test {
 
             // new ref is banned
             let ref3to5 = cache.get_part_ref(3 * BLOCKSIZE, 2 * BLOCKSIZE);
-            assert!(ref3to5.is_none());
+            assert!(matches!(ref3to5, Err(GetRefErr::Disallowed)));
 
             // one ref still holds, no new ref
             drop(ref8to9);
             let ref3to5 = cache.get_part_ref(3 * BLOCKSIZE, 2 * BLOCKSIZE);
-            assert!(ref3to5.is_none());
+            assert!(matches!(ref3to5, Err(GetRefErr::Disallowed)));
 
             drop(ref5to7);
             // all ref reclaimed, new ref allowed
             let ref3to5 = cache.get_part_ref(3 * BLOCKSIZE, 2 * BLOCKSIZE);
-            assert!(ref3to5.is_some());
+            assert!(ref3to5.is_ok());
         });
     }
 

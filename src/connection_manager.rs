@@ -8,7 +8,7 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{info, warn};
 
 use crate::backfile::WriteJob;
-use crate::cache::{AbortErr, ArcCache, PieceBuf, Ref};
+use crate::cache::{AbortErr, ArcCache, GetRefErr, PieceBuf, Ref};
 use crate::metadata;
 use crate::picker::BlockRequests;
 use crate::protocol::{self, BTStream, Message, Piece, ReadStream, Split, WriteStream};
@@ -523,25 +523,25 @@ where
         };
 
         let (block_ref, piece_buf) = {
-            let pb = if let Some(pb) = maybe_pb {
-                if pb.
-                pb
-            } else {
-                // TODO: many peer may all want to write piece i and all of them
-                // allocating new buffer, which is wasting memory and affects other
-                // buffer(other buffer being pushed out?)
-                // Maybe async_alloc can store info about piece and wake up all waiting
-                // tasks when the requested piece buffer is allocated, which avoids
-                // deplicating allocates buffer
-                let pb = tmh
-                    .buffer_pool
-                    .async_alloc_abort::<ArcCache<_>>(1, tmh.piece_size)
-                    .await;
+            let pb: ArcCache<PieceBuf> = match maybe_pb {
+                Some(pb) if pb.is_valid() => pb,
+                _ => {
+                    // TODO: many peer may all want to write piece i and all of them
+                    // allocating new buffer, which is wasting memory and affects other
+                    // buffer(other buffer being pushed out?)
+                    // Maybe async_alloc can store info about piece and wake up all waiting
+                    // tasks when the requested piece buffer is allocated, which avoids
+                    // deplicating allocates buffer
+                    let pb = tmh
+                        .buffer_pool
+                        .async_alloc_abort::<ArcCache<_>>(1, tmh.piece_size)
+                        .await;
 
-                // if this piece buffer already exists(allocated by other peer handler),
-                // use exist one
-                let mut pb_map = tmh.piece_buffer.lock().unwrap();
-                pb_map.entry(piece.index).or_insert(pb).clone()
+                    // if this piece buffer already exists(allocated by other peer handler),
+                    // use exist one
+                    let mut pb_map = tmh.piece_buffer.lock().unwrap();
+                    pb_map.entry(piece.index).or_insert(pb).clone()
+                }
             };
 
             let block_ref = pb
@@ -552,52 +552,60 @@ where
                 )
                 .await;
 
-            if block_ref.is_none() {
-                warn!(
-                    "error get block buf of piece {} block offset {}",
-                    piece.index, piece.begin
-                );
-            }
             (block_ref, pb)
         };
 
         // TODO: need a biglock. What if some peer else is doing operation now?
         // i.e. operation between two locks?
-        if let Some(mut bbuf) = block_ref {
-            while written < target_len {
-                let read_fut = piece.read_to_ref(bbuf, written);
-                match read_fut.await {
-                    Ok((n, bbuf_alive)) => {
-                        written += n;
-                        bbuf = bbuf_alive;
-                    }
-                    Err(AbortErr::IO(e)) => {
-                        // not aborted, but underlying read error
-                        // TODO: do something
-                        warn!("error while receiving piece {e}");
-                        return Err(()); // TODO: return error code
-                    }
-                    Err(e) => {
-                        // go to next round
-                        continue 'outer;
+        match block_ref {
+            Ok(mut bbuf) => {
+                while written < target_len {
+                    let read_fut = piece.read_to_ref(bbuf, written);
+                    match read_fut.await {
+                        Ok((n, bbuf_alive)) => {
+                            written += n;
+                            bbuf = bbuf_alive;
+                        }
+                        Err(AbortErr::IO(e)) => {
+                            // not aborted, but underlying read error
+                            // TODO: do something
+                            warn!("error while receiving piece {e}");
+                            return Err(()); // TODO: return error code
+                        }
+                        Err(e) => {
+                            // go to next round
+                            continue 'outer;
+                        }
                     }
                 }
+                assert_eq!(written, target_len);
+                return Ok((piece_buf, bbuf));
             }
-            assert_eq!(written, target_len);
-            return Ok((piece_buf, bbuf));
-        } else {
-            let mut drain = vec![0u8; target_len];
-            let _ = piece.read_exact(&mut drain).await; // TODO: FIXME: use result
+            Err(GetRefErr::Invalidated) => {
+                // TODO: FIXME: will this cause dead loop?
+                // get buffer then invalidated by other, then re-get
+                // re-invalidate and loops forever?
+                warn!("piece invalidated");
+                continue 'outer;
+            }
+            Err(GetRefErr::Paused) => {
+                // if using async mode, won't return paused
+                unreachable!()
+            }
+            Err(e) => {
+                let mut drain = vec![0u8; target_len - written];
+                let _ = piece.read_exact(&mut drain).await; // TODO: FIXME: use result
 
-            warn!(
-                "drain PIECE msg {} {} {}",
-                piece.index, piece.begin, piece.len
-            );
-            // TODO: what should we do now?
-            // we don't have that space
-            // maybe reads to supplementary buffer?
-            // just return now
-            return Err(());
-        };
+                warn!(
+                    "get ref error: {e:?} drain PIECE msg {} {} {}",
+                    piece.index, piece.begin, piece.len
+                );
+                // TODO: what should we do now?
+                // we don't have that space
+                // maybe reads to supplementary buffer?
+                // just return now
+                return Err(());
+            }
+        }
     }
 }

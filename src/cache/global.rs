@@ -1042,6 +1042,7 @@ mod test {
     use crate::cache::AbortErr;
     use crate::cache::ArcCache;
     use crate::cache::AsyncAbortRead;
+    use crate::cache::GetRefErr;
 
     use super::*;
     use tokio_test::task;
@@ -1696,25 +1697,29 @@ mod test {
         let mut written = 0;
         let mut counter = 0;
         'outer: while written < expect {
-            if let Some(ref mut refbuf) = piece.async_get_part_ref(offset, len).await {
-                while written < expect {
-                    let read_fut = conn.read_abort(refbuf, written);
-                    match read_fut.await {
-                        Ok(n) => {
-                            written += n;
-                        }
-                        Err(AbortErr::IO(_)) => {
-                            panic!("");
-                        }
-                        Err(AbortErr::Aborted) => {
-                            // go to next round
-                            counter += 1;
-                            continue 'outer;
+            match piece.async_get_part_ref(offset, len).await {
+                Ok(ref mut refbuf) => {
+                    while written < expect {
+                        let read_fut = conn.read_abort(refbuf, written);
+                        match read_fut.await {
+                            Ok(n) => {
+                                written += n;
+                            }
+                            Err(AbortErr::IO(_)) => {
+                                panic!("");
+                            }
+                            Err(AbortErr::Aborted) => {
+                                // go to next round
+                                counter += 1;
+                                continue 'outer;
+                            }
                         }
                     }
                 }
-            } else {
-                break;
+                Err(e) => {
+                    println!("{e:?}");
+                    break;
+                }
             }
         }
         counter
@@ -2086,7 +2091,10 @@ mod test {
         c.invalidate(fb1).await;
 
         // TODO: test p1, p2's inner Cache is None
-        assert!(p1.get_part_ref(16384, 16384).is_none());
+        assert!(matches!(
+            p1.get_part_ref(16384, 16384),
+            Err(GetRefErr::Invalidated)
+        ));
     }
 
     #[tokio::test]
