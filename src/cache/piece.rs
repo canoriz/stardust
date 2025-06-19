@@ -274,6 +274,15 @@ impl ArcCache<PieceBuf> {
             .as_ref()
             .map(|p| f(p))
     }
+
+    pub(crate) fn is_valid<T, F>(&self) -> bool {
+        self.inner
+            .buf
+            .lock()
+            .expect("is_valid should lock OK")
+            .cache
+            .is_some()
+    }
 }
 
 impl<T> ArcCache<T>
