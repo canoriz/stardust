@@ -385,6 +385,7 @@ where
                 main_cache: ManuallyDrop::new(self.inner.clone()),
             })
         } else {
+            // TODO: return err
             None
         }
     }
