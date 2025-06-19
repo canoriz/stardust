@@ -1,3 +1,4 @@
+use core::fmt;
 use futures::task::AtomicWaker;
 use pin_project::{pin_project, pinned_drop};
 use std::{
@@ -834,14 +835,30 @@ impl AbortRegistration {
     }
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum AbortErr<T> {
     Aborted,
     IO(T),
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-struct Aborted {}
-// impl std::error::Error for Aborted {}
+impl<T> fmt::Display for AbortErr<T>
+where
+    T: std::fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Aborted => {
+                write!(f, "`Abortable` future has been aborted")?;
+            }
+            Self::IO(t) => {
+                write!(f, "{:?}", t)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<T> std::error::Error for AbortErr<T> where T: std::fmt::Debug {}
 
 #[pin_project(PinnedDrop)]
 #[must_use = "futures/streams do nothing unless you poll them"]
