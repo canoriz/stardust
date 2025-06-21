@@ -1,14 +1,14 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time;
 use tokio::sync::{mpsc, oneshot};
+use tokio::time;
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{info, warn};
 
 use crate::backfile::WriteJob;
-use crate::cache::{AbortErr, ArcCache, GetRefErr, PieceBuf, PieceKey, Ref};
+use crate::cache::{AbortErr, AllocErr, ArcCache, GetRefErr, PieceBuf, PieceKey, Ref};
 use crate::metadata;
 use crate::picker::BlockRequests;
 use crate::protocol::{self, BTStream, Message, Piece, ReadStream, Split, WriteStream};
@@ -515,11 +515,11 @@ where
     let mut written = 0usize;
     let target_len = piece.len as usize;
     'outer: loop {
-        let maybe_pb = {
+        let maybe_pb: Option<ArcCache<_>> = {
             // must drop pb_map before await point
             // pb_map is not Send
             let pb_map = tmh.piece_buffer.lock().unwrap();
-            pb_map.get(&piece.index).map(|v| v.clone())
+            pb_map.get(&piece.index).cloned()
         };
 
         let (block_ref, piece_buf) = {
@@ -532,7 +532,7 @@ where
                     // Maybe async_alloc can store info about piece and wake up all waiting
                     // tasks when the requested piece buffer is allocated, which avoids
                     // deplicating allocates buffer
-                    let pb = tmh
+                    match tmh
                         .buffer_pool
                         .async_alloc_abort::<ArcCache<_>>(
                             PieceKey {
@@ -542,12 +542,31 @@ where
                             },
                             tmh.piece_size,
                         )
-                        .await;
-
-                    // if this piece buffer already exists(allocated by other peer handler),
-                    // use exist one
-                    let mut pb_map = tmh.piece_buffer.lock().unwrap();
-                    pb_map.entry(piece.index).or_insert(pb).clone()
+                        .await
+                    {
+                        Ok(pb) => {
+                            // if this piece buffer already exists(allocated by other peer handler),
+                            // use exist one
+                            let mut pb_map = tmh.piece_buffer.lock().unwrap();
+                            pb_map.entry(piece.index).or_insert(pb).clone()
+                        }
+                        Err(AllocErr::Allocated) => {
+                            // TODO: another connection allocated this piece
+                            // but we did not find that piece in buffer hashmap before
+                            // so the connection allocated this is inserting to buffer
+                            // concurrently.
+                            // we should drop lock and wait some time?
+                            // FIXME: we should wake as soon as the piece is added to
+                            // hashmap, not some fixed 10ms
+                            time::sleep(time::Duration::from_millis(10)).await;
+                            continue 'outer;
+                        }
+                        Err(_) => {
+                            unreachable!(
+                                "we using async alloc should not have NoSpace or Migrating"
+                            );
+                        }
+                    }
                 }
             };
 

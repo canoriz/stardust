@@ -99,11 +99,11 @@ struct BufTree {
 
     // TODO: maybe use a more efficient DS
     // TODO: maybe use HashMap<FreeBlock, handle>
-    alloced: HashMap<FreeBlock, FreeBlockHandle>,
+    alloced: HashMap<PieceKey, FreeBlockHandle>,
 }
 
 impl BufTree {
-    fn alloc(&mut self, power: u32) -> Option<FreeBlock> {
+    fn alloc(&mut self, power: u32, key: PieceKey) -> Result<FreeBlock, AllocErr> {
         // Can not alloc when concurrently migrating.
         // migrate_task() requires all use of PieceBuf stop, And pause is an async
         // operation, which means it does not always hold lock.
@@ -111,42 +111,53 @@ impl BufTree {
         // may be used, which violates the assumption of migrate_task() that all
         // uses are stopped.
         if self.migrating {
-            return None;
+            return Err(AllocErr::IsMigrating);
         }
-        self.migrating_alloc(power)
+        self.migrating_alloc(power, key)
     }
 
-    fn migrating_alloc(&mut self, power: u32) -> Option<FreeBlock> {
-        self.blk_tree.split_down(power).map(|(offset, power)| {
-            let fb = FreeBlock {
-                offset,
-                power,
-                ptr: unsafe { self.buf.as_mut_ptr().add(offset) },
-            };
-            self.alloced.insert(
-                fb.dup(),
-                FreeBlockHandle {
-                    free_block: fb.dup(),
-                    invalidate_waiter: Vec::new(),
-                    sub_manager_handle: None,
-                },
-            );
-            fb
-        })
+    /// alloc regardless of migrating bit
+    fn migrating_alloc(&mut self, power: u32, key: PieceKey) -> Result<FreeBlock, AllocErr> {
+        if self.alloced.contains_key(&key) {
+            return Err(AllocErr::Allocated);
+        }
+        if self.blk_tree.tree.len() as u32 + MIN_ALLOC_SIZE_POWER < power {
+            return Err(AllocErr::Oversize);
+        }
+
+        match self.blk_tree.split_down(power) {
+            Some((offset, power)) => {
+                let fb = FreeBlock {
+                    offset,
+                    power,
+                    ptr: unsafe { self.buf.as_mut_ptr().add(offset) },
+                };
+                self.alloced.insert(
+                    key,
+                    FreeBlockHandle {
+                        free_block: fb.dup(),
+                        invalidate_waiter: Vec::new(),
+                        sub_manager_handle: None,
+                    },
+                );
+                Ok(fb)
+            }
+            None => Err(AllocErr::NoSpace),
+        }
     }
 
-    fn free(&mut self, b: &FreeBlock) -> FreeBlockHandle {
+    fn free(&mut self, b: &FreeBlock, key: &PieceKey) -> FreeBlockHandle {
         self.blk_tree.merge_up(b.offset, b.power);
 
         self.alloced
-            .remove(b)
+            .remove(key)
             .expect("free should see piecebuf in alloced list")
     }
 
     fn count_blk_of_power(&self) -> Vec<usize> {
         let mut alloc_n = vec![0; self.blk_tree.tree.len()];
-        for (b, _) in self.alloced.iter() {
-            alloc_n[(b.power - MIN_ALLOC_SIZE_POWER) as usize] += 1;
+        for (_, fbh) in self.alloced.iter() {
+            alloc_n[(fbh.free_block.power - MIN_ALLOC_SIZE_POWER) as usize] += 1;
         }
         alloc_n
     }
@@ -183,39 +194,39 @@ impl BufTree {
 
         let mut migrate_map = vec![0usize; self.buf.len() >> MIN_ALLOC_SIZE_POWER];
 
-        let mut block_powers: Vec<Vec<(FreeBlock, FreeBlockHandle)>> = Vec::new();
+        let mut block_powers: Vec<Vec<(PieceKey, FreeBlockHandle)>> = Vec::new();
         for _ in 0..self.blk_tree.tree.len() {
             block_powers.push(vec![]);
         }
 
-        for (fb, fbh) in self.alloced.drain() {
-            let power_index = (fb.power - MIN_ALLOC_SIZE_POWER) as usize;
-            block_powers[power_index].push((fb, fbh));
+        for (pk, fbh) in self.alloced.drain() {
+            let power_index = (fbh.free_block.power - MIN_ALLOC_SIZE_POWER) as usize;
+            block_powers[power_index].push((pk, fbh));
         }
 
         let mut new_alloced = HashMap::new();
         for p in block_powers.into_iter() {
-            for (fb, mut fbh) in p.into_iter() {
+            for (pk, mut fbh) in p.into_iter() {
                 //NOTE: self.alloc will modify self.alloced, but we not use the modified "alloced"
                 // variable anyway, we will replace a new one
                 let new_fb = self
-                    .migrating_alloc(fb.power)
+                    .migrating_alloc(fbh.free_block.power, pk.clone())
                     .expect("migrate alloc should ok");
-                fbh.free_block = new_fb.dup();
 
-                let begin_block_idx = fb.offset >> MIN_ALLOC_SIZE_POWER;
+                let begin_block_idx = fbh.free_block.offset >> MIN_ALLOC_SIZE_POWER;
                 for (i, block) in (begin_block_idx
-                    ..begin_block_idx + (1 << (fb.power - MIN_ALLOC_SIZE_POWER)))
+                    ..begin_block_idx + (1 << (fbh.free_block.power - MIN_ALLOC_SIZE_POWER)))
                     .enumerate()
                 {
                     migrate_map[block] = (new_fb.offset >> MIN_ALLOC_SIZE_POWER) + i;
                 }
 
+                fbh.free_block = new_fb.dup();
                 fbh.sub_manager_handle
                     .as_ref()
                     .expect("should have handle")
                     .migrate(new_fb.offset);
-                new_alloced.insert(new_fb, fbh);
+                new_alloced.insert(pk, fbh);
             }
         }
         self.alloced = new_alloced;
@@ -256,7 +267,7 @@ impl BufTree {
         // be careful not to re-enable new ref if is invalidating in progress
         // If a piece is now invalidating, the allow_new_ref should be true
         // restoring pause_new_ref won't make new refs created
-        for (fb, fbh) in self.alloced.iter() {
+        for (_, fbh) in self.alloced.iter() {
             let handle = fbh.sub_manager_handle.as_ref().expect("should have handle");
             handle.reenable();
         }
@@ -286,6 +297,7 @@ struct PieceBufPoolImpl {
 // This is !Clone
 pub(crate) struct PieceBuf {
     b: FreeBlock,
+    key: PieceKey,
     len: usize,
     main_cache: Arc<PieceBufPoolImpl>,
 }
@@ -311,6 +323,15 @@ pub(crate) struct PieceKey {
     pub piece_idx: usize,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum AllocErr {
+    NoSpace,
+    Allocated,
+    Oversize,
+    StartMigrating,
+    IsMigrating,
+}
+
 pub trait AbortHandle
 where
     Self: Send + Sync,
@@ -334,7 +355,7 @@ impl PieceBufPool {
     }
 
     /// alloc PieceBuf
-    pub fn alloc(&self, size: usize) -> Option<PieceBuf> {
+    pub fn alloc(&self, key: PieceKey, size: usize) -> Result<PieceBuf, AllocErr> {
         let size_fixed = if size < MIN_ALLOC_SIZE {
             MIN_ALLOC_SIZE
         } else {
@@ -344,25 +365,35 @@ impl PieceBufPool {
         let power = size_fixed.ilog2();
 
         let mut buf_tree_guard = self.inner.buf_tree.lock().expect("alloc lock should OK");
-        if let Some(fb) = buf_tree_guard.alloc(power) {
-            Some(PieceBuf {
+        match buf_tree_guard.alloc(power, key.clone()) {
+            Ok(fb) => Ok(PieceBuf {
                 b: fb,
+                key,
                 len: size,
                 main_cache: self.inner.clone(),
-            })
-        } else if !buf_tree_guard.migrating && buf_tree_guard.can_fit_n_if_migrated(power) > 0 {
-            // TODO: do we need a from_async flag, so that only fire migrate_task
-            // when calling inside a async environment?
-            let pool_impl = self.inner.clone();
-            start_migrate_task(buf_tree_guard, pool_impl);
-            None
-        } else {
-            None
+            }),
+            Err(e) => {
+                if !buf_tree_guard.migrating && buf_tree_guard.can_fit_n_if_migrated(power) > 0 {
+                    // TODO: do we need a from_async flag, so that only fire migrate_task
+                    // when calling inside a async environment?
+                    let pool_impl = self.inner.clone();
+                    start_migrate_task(buf_tree_guard, pool_impl);
+                    Err(AllocErr::StartMigrating)
+                } else {
+                    assert!(
+                        e == AllocErr::NoSpace
+                            || e == AllocErr::Allocated
+                            || e == AllocErr::Oversize
+                            || e == AllocErr::IsMigrating
+                    );
+                    Err(e)
+                }
+            }
         }
     }
 
     /// alloc PieceBuf
-    pub fn alloc_abort<T>(&self, size: usize) -> Option<T>
+    pub fn alloc_abort<T>(&self, key: PieceKey, size: usize) -> Result<T, AllocErr>
     where
         T: FromPieceBuf,
     {
@@ -380,26 +411,33 @@ impl PieceBufPool {
             .buf_tree
             .lock()
             .expect("alloc sub lock should OK");
-        if let Some(fb) = buf_tree_guard.alloc(power) {
-            let (ret, abort_handle) = T::new_abort(PieceBuf {
-                b: fb.dup(),
-                len: size,
-                main_cache: self.inner.clone(),
-            });
-            let fbh = buf_tree_guard
-                .alloced
-                .get_mut(&fb)
-                .expect("just alloced should exist");
-            fbh.sub_manager_handle = Some(abort_handle);
-            Some(ret)
-        } else if !buf_tree_guard.migrating && buf_tree_guard.can_fit_n_if_migrated(power) > 0 {
-            // TODO: do we need a from_async flag, so that only fire migrate_task
-            // when calling inside a async environment?
-            let pool_impl = self.inner.clone();
-            start_migrate_task(buf_tree_guard, pool_impl);
-            None
-        } else {
-            None
+
+        match buf_tree_guard.alloc(power, key.clone()) {
+            Ok(fb) => {
+                let (ret, abort_handle) = T::new_abort(PieceBuf {
+                    b: fb.dup(),
+                    key: key.clone(),
+                    len: size,
+                    main_cache: self.inner.clone(),
+                });
+                let fbh = buf_tree_guard
+                    .alloced
+                    .get_mut(&key)
+                    .expect("just alloced should exist");
+                fbh.sub_manager_handle = Some(abort_handle);
+                Ok(ret)
+            }
+            Err(e) => {
+                if !buf_tree_guard.migrating && buf_tree_guard.can_fit_n_if_migrated(power) > 0 {
+                    // TODO: do we need a from_async flag, so that only fire migrate_task
+                    // when calling inside a async environment?
+                    let pool_impl = self.inner.clone();
+                    start_migrate_task(buf_tree_guard, pool_impl);
+                    Err(AllocErr::StartMigrating)
+                } else {
+                    Err(e)
+                }
+            }
         }
     }
 
@@ -442,8 +480,8 @@ impl PieceBufPool {
         }
     }
 
-    async fn invalidate(&self, f: FreeBlock) -> Result<(), InvalidateErr> {
-        self.inner.invalidate(f).await
+    async fn invalidate(&self, key: PieceKey) -> Result<(), InvalidateErr> {
+        self.inner.invalidate(key).await
     }
 }
 
@@ -464,7 +502,7 @@ impl PieceBufPoolImpl {
     }
 
     /// alloc FreeBlock
-    fn alloc(&self, size: usize) -> Option<FreeBlock> {
+    fn alloc(&self, key: PieceKey, size: usize) -> Result<FreeBlock, AllocErr> {
         let size_fixed = if size < MIN_ALLOC_SIZE {
             MIN_ALLOC_SIZE
         } else {
@@ -474,14 +512,14 @@ impl PieceBufPoolImpl {
         let power = size_fixed.ilog2();
 
         let mut buf_tree_guard = self.buf_tree.lock().expect("alloc lock should OK");
-        buf_tree_guard.alloc(power)
+        buf_tree_guard.alloc(power, key)
     }
 
-    /// returns PieceBuf
-    fn free(&self, b: &FreeBlock) {
+    /// return PieceBuf to pool
+    fn free(&self, b: &FreeBlock, key: &PieceKey) {
         {
             let mut buf_tree_guard = self.buf_tree.lock().expect("alloc lock should OK");
-            let mut fh = buf_tree_guard.free(b);
+            let mut fh = buf_tree_guard.free(b, key);
 
             #[cfg(test)]
             println!("free piecebuf");
@@ -507,7 +545,7 @@ impl PieceBufPoolImpl {
     // TODO: after invalidate, the block should not be allocated before
     // further operations like flush to disk / migrate
     // TODO: what if this gets dropped?
-    async fn invalidate(&self, f: FreeBlock) -> Result<(), InvalidateErr> {
+    async fn invalidate(&self, key: PieceKey) -> Result<(), InvalidateErr> {
         self.invalidating.fetch_add(1, Ordering::Acquire);
         let (wait_invalid, wait_abort) = {
             let mut buf_tree_guard = self.buf_tree.lock().expect("invalidate lock should OK");
@@ -515,7 +553,7 @@ impl PieceBufPoolImpl {
                 // TODO: FIXME: is this a must?
                 return Err(InvalidateErr::MigrateInProgress);
             }
-            if let Some(fbh) = buf_tree_guard.alloced.get_mut(&f) {
+            if let Some(fbh) = buf_tree_guard.alloced.get_mut(&key) {
                 let aborter = fbh.sub_manager_handle.clone();
                 #[cfg(test)]
                 println!("invalidate add wait_invalid");
@@ -617,7 +655,7 @@ impl Drop for PieceBuf {
         #[cfg(test)]
         println!("free PieceBuf {:?}", self);
 
-        self.main_cache.free(&self.b);
+        self.main_cache.free(&self.b, &self.key);
     }
 }
 
@@ -723,13 +761,13 @@ impl AllocFutInner<'_> {
         self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
         alloc_fn: F,
-    ) -> Poll<T>
+    ) -> Poll<Result<T, AllocErr>>
     where
         // since we only alloc at most once, use most relaxed FnOnce here
         // if we need to call alloc_fn more than once, use FnMut
         // technically we are all using member functions, not even closures
         // so Fn would be enough
-        F: FnOnce(&PieceBufPool, usize) -> Option<T>,
+        F: FnOnce(&PieceBufPool, PieceKey, usize) -> Result<T, AllocErr>,
     {
         let fut = self.get_mut();
 
@@ -754,45 +792,55 @@ impl AllocFutInner<'_> {
             }
 
             // alloc() holds both lock of block_tree and waiting_alloc
-            if let Some(bf) = alloc_fn(fut.pool, fut.size) {
-                let old = fut.valid.swap(DONE, Ordering::Release);
-                debug_assert_eq!(old, WAITING);
-                #[cfg(test)]
-                println!("poll key {:?} ready 2", fut.key);
-                Poll::Ready(bf)
-            } else {
-                waiting_alloc.push_back(AllocReq {
-                    key: fut.key.clone(),
-                    waker: cx.waker().clone(),
-                    valid: fut.valid.clone(),
-                });
-                fut.waiting = true;
-                #[cfg(test)]
-                println!("poll key {:?} pending 3", fut.key);
+            match alloc_fn(fut.pool, fut.key.clone(), fut.size) {
+                ok @ Ok(_) => {
+                    let old = fut.valid.swap(DONE, Ordering::Release);
+                    debug_assert_eq!(old, WAITING);
+                    #[cfg(test)]
+                    println!("poll key {:?} ready 2", fut.key);
+                    Poll::Ready(ok)
+                }
+                e @ Err(AllocErr::Allocated | AllocErr::Oversize) => Poll::Ready(e),
+                Err(e) => {
+                    waiting_alloc.push_back(AllocReq {
+                        key: fut.key.clone(),
+                        waker: cx.waker().clone(),
+                        valid: fut.valid.clone(),
+                    });
+                    fut.waiting = true;
+                    #[cfg(test)]
+                    println!("poll key {:?} pending 3, reason: {e:?}", fut.key);
 
-                fut.valid.swap(WAITING, Ordering::Release);
-                Poll::Pending
+                    fut.valid.swap(WAITING, Ordering::Release);
+                    Poll::Pending
+                }
             }
-        } else if let Some(bf) = alloc_fn(fut.pool, fut.size) {
-            let old = fut.valid.swap(DONE, Ordering::Release);
-            debug_assert!(old == WAITING || old == WAKING);
-
-            wake_next_waiting_alloc(&mut waiting_alloc);
-
-            #[cfg(test)]
-            println!("poll key {:?} ready 4", fut.key);
-            Poll::Ready(bf)
         } else {
-            waiting_alloc.push_front(AllocReq {
-                key: fut.key.clone(),
-                waker: cx.waker().clone(),
-                valid: fut.valid.clone(),
-            }); // try to be the first
-            #[cfg(test)]
-            println!("poll key {:?} pending 5", fut.key);
+            match alloc_fn(fut.pool, fut.key.clone(), fut.size) {
+                ok @ Ok(_) => {
+                    let old = fut.valid.swap(DONE, Ordering::Release);
+                    debug_assert!(old == WAITING || old == WAKING);
 
-            fut.valid.swap(WAITING, Ordering::Release);
-            Poll::Pending
+                    wake_next_waiting_alloc(&mut waiting_alloc);
+
+                    #[cfg(test)]
+                    println!("poll key {:?} ready 4", fut.key);
+                    Poll::Ready(ok)
+                }
+                e @ Err(AllocErr::Allocated | AllocErr::Oversize) => Poll::Ready(e),
+                Err(e) => {
+                    waiting_alloc.push_front(AllocReq {
+                        key: fut.key.clone(),
+                        waker: cx.waker().clone(),
+                        valid: fut.valid.clone(),
+                    }); // try to be the first
+                    #[cfg(test)]
+                    println!("poll key {:?} pending 5 reason {e:?}", fut.key);
+
+                    fut.valid.swap(WAITING, Ordering::Release);
+                    Poll::Pending
+                }
+            }
         }
     }
 }
@@ -827,7 +875,6 @@ pub(crate) struct AllocPieceBufFut<'a> {
 }
 
 async fn migrate_task(pool_impl: Arc<PieceBufPoolImpl>) {
-    // TODO: SAFETY: make sure all PieceBuf is migratable.
     if let Err(e) = pool_impl.pause_all_before_migrate().await {
         warn!("pause failed: {e:?}");
         #[cfg(test)]
@@ -890,7 +937,7 @@ fn start_migrate_task(mut buf_tree: MutexGuard<'_, BufTree>, pool_impl: Arc<Piec
 }
 
 impl Future for AllocPieceBufFut<'_> {
-    type Output = PieceBuf;
+    type Output = Result<PieceBuf, AllocErr>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let inner_fut = Pin::new(&mut self.get_mut().inner);
@@ -908,7 +955,7 @@ impl<T> Future for AllocPieceBufAbortFut<'_, T>
 where
     T: FromPieceBuf + Unpin,
 {
-    type Output = T;
+    type Output = Result<T, AllocErr>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let inner_fut = Pin::new(&mut self.get_mut().inner);
@@ -958,12 +1005,12 @@ impl BlockTree {
 
         while now_idx < self.tree.len() {
             let buddy_blk = buddy_blk_of(now_offset, now_size);
-            if self.tree[now_idx as usize].blk.remove(&buddy_blk) {
+            if self.tree[now_idx].blk.remove(&buddy_blk) {
                 now_size <<= 1;
                 now_idx += 1;
                 now_offset = now_offset.min(buddy_blk);
             } else {
-                self.tree[now_idx as usize].blk.insert(now_offset);
+                self.tree[now_idx].blk.insert(now_offset);
                 return;
             };
         }
@@ -1309,9 +1356,9 @@ mod test {
         }
     }
 
-    fn fb_and_fbh(f: FreeBlock) -> (FreeBlock, FreeBlockHandle) {
+    fn key_and_fbh(key: PieceKey, f: FreeBlock) -> (PieceKey, FreeBlockHandle) {
         (
-            f.dup(),
+            key,
             FreeBlockHandle {
                 free_block: f,
                 invalidate_waiter: Vec::new(),
@@ -1354,40 +1401,85 @@ mod test {
             buf,
             blk_tree: v,
             alloced: HashMap::from([
-                fb_and_fbh(FreeBlock {
-                    offset: 0,
-                    power: MIN_ALLOC_SIZE_POWER,
-                    ptr: base_ptr,
-                }),
-                fb_and_fbh(FreeBlock {
-                    offset: 2 * MIN_ALLOC_SIZE,
-                    power: MIN_ALLOC_SIZE_POWER,
-                    ptr: unsafe { base_ptr.add(2 * MIN_ALLOC_SIZE) },
-                }),
-                fb_and_fbh(FreeBlock {
-                    offset: 6 * MIN_ALLOC_SIZE,
-                    power: MIN_ALLOC_SIZE_POWER,
-                    ptr: unsafe { base_ptr.add(6 * MIN_ALLOC_SIZE) },
-                }),
-                fb_and_fbh(FreeBlock {
-                    offset: 7 * MIN_ALLOC_SIZE,
-                    power: MIN_ALLOC_SIZE_POWER,
-                    ptr: unsafe { base_ptr.add(7 * MIN_ALLOC_SIZE) },
-                }),
-                fb_and_fbh(FreeBlock {
-                    offset: 9 * MIN_ALLOC_SIZE,
-                    power: MIN_ALLOC_SIZE_POWER,
-                    ptr: unsafe { base_ptr.add(9 * MIN_ALLOC_SIZE) },
-                }),
-                fb_and_fbh(FreeBlock {
-                    offset: 10 * MIN_ALLOC_SIZE,
-                    power: MIN_ALLOC_SIZE_POWER,
-                    ptr: unsafe { base_ptr.add(10 * MIN_ALLOC_SIZE) },
-                }),
+                key_and_fbh(
+                    PieceKey {
+                        hash: Arc::new([0; 20]),
+                        piece_idx: 0,
+                    },
+                    FreeBlock {
+                        offset: 0,
+                        power: MIN_ALLOC_SIZE_POWER,
+                        ptr: base_ptr,
+                    },
+                ),
+                key_and_fbh(
+                    PieceKey {
+                        hash: Arc::new([0; 20]),
+                        piece_idx: 1,
+                    },
+                    FreeBlock {
+                        offset: 2 * MIN_ALLOC_SIZE,
+                        power: MIN_ALLOC_SIZE_POWER,
+                        ptr: unsafe { base_ptr.add(2 * MIN_ALLOC_SIZE) },
+                    },
+                ),
+                key_and_fbh(
+                    PieceKey {
+                        hash: Arc::new([0; 20]),
+                        piece_idx: 2,
+                    },
+                    FreeBlock {
+                        offset: 6 * MIN_ALLOC_SIZE,
+                        power: MIN_ALLOC_SIZE_POWER,
+                        ptr: unsafe { base_ptr.add(6 * MIN_ALLOC_SIZE) },
+                    },
+                ),
+                key_and_fbh(
+                    PieceKey {
+                        hash: Arc::new([0; 20]),
+                        piece_idx: 3,
+                    },
+                    FreeBlock {
+                        offset: 7 * MIN_ALLOC_SIZE,
+                        power: MIN_ALLOC_SIZE_POWER,
+                        ptr: unsafe { base_ptr.add(7 * MIN_ALLOC_SIZE) },
+                    },
+                ),
+                key_and_fbh(
+                    PieceKey {
+                        hash: Arc::new([0; 20]),
+                        piece_idx: 4,
+                    },
+                    FreeBlock {
+                        offset: 9 * MIN_ALLOC_SIZE,
+                        power: MIN_ALLOC_SIZE_POWER,
+                        ptr: unsafe { base_ptr.add(9 * MIN_ALLOC_SIZE) },
+                    },
+                ),
+                key_and_fbh(
+                    PieceKey {
+                        hash: Arc::new([0; 20]),
+                        piece_idx: 5,
+                    },
+                    FreeBlock {
+                        offset: 10 * MIN_ALLOC_SIZE,
+                        power: MIN_ALLOC_SIZE_POWER,
+                        ptr: unsafe { base_ptr.add(10 * MIN_ALLOC_SIZE) },
+                    },
+                ),
             ]),
         };
 
-        assert_eq!(b.alloc(MIN_ALLOC_SIZE_POWER + 2), None);
+        assert_eq!(
+            b.alloc(
+                MIN_ALLOC_SIZE_POWER + 2,
+                PieceKey {
+                    hash: Arc::new([0; 20]),
+                    piece_idx: 6
+                }
+            ),
+            Err(AllocErr::NoSpace) // this is BufTree.alloc(), will return NoSpace
+        );
         let can_fit = b.can_fit_n_if_migrated(MIN_ALLOC_SIZE_POWER + 2);
         assert_eq!(can_fit, 1);
     }
@@ -1426,30 +1518,62 @@ mod test {
             buf,
             blk_tree: v,
             alloced: HashMap::from([
-                fb_and_fbh(FreeBlock {
-                    offset: 0,
-                    power: MIN_ALLOC_SIZE_POWER + 1,
-                    ptr: base_ptr,
-                }),
-                fb_and_fbh(FreeBlock {
-                    offset: 4 * MIN_ALLOC_SIZE,
-                    power: MIN_ALLOC_SIZE_POWER + 1,
-                    ptr: unsafe { base_ptr.add(4 * MIN_ALLOC_SIZE) },
-                }),
-                fb_and_fbh(FreeBlock {
-                    offset: 8 * MIN_ALLOC_SIZE,
-                    power: MIN_ALLOC_SIZE_POWER + 1,
-                    ptr: unsafe { base_ptr.add(8 * MIN_ALLOC_SIZE) },
-                }),
-                fb_and_fbh(FreeBlock {
-                    offset: 10 * MIN_ALLOC_SIZE,
-                    power: MIN_ALLOC_SIZE_POWER,
-                    ptr: unsafe { base_ptr.add(10 * MIN_ALLOC_SIZE) },
-                }),
+                key_and_fbh(
+                    PieceKey {
+                        hash: Arc::new([0; 20]),
+                        piece_idx: 0,
+                    },
+                    FreeBlock {
+                        offset: 0,
+                        power: MIN_ALLOC_SIZE_POWER + 1,
+                        ptr: base_ptr,
+                    },
+                ),
+                key_and_fbh(
+                    PieceKey {
+                        hash: Arc::new([0; 20]),
+                        piece_idx: 1,
+                    },
+                    FreeBlock {
+                        offset: 4 * MIN_ALLOC_SIZE,
+                        power: MIN_ALLOC_SIZE_POWER + 1,
+                        ptr: unsafe { base_ptr.add(4 * MIN_ALLOC_SIZE) },
+                    },
+                ),
+                key_and_fbh(
+                    PieceKey {
+                        hash: Arc::new([0; 20]),
+                        piece_idx: 2,
+                    },
+                    FreeBlock {
+                        offset: 8 * MIN_ALLOC_SIZE,
+                        power: MIN_ALLOC_SIZE_POWER + 1,
+                        ptr: unsafe { base_ptr.add(8 * MIN_ALLOC_SIZE) },
+                    },
+                ),
+                key_and_fbh(
+                    PieceKey {
+                        hash: Arc::new([0; 20]),
+                        piece_idx: 3,
+                    },
+                    FreeBlock {
+                        offset: 10 * MIN_ALLOC_SIZE,
+                        power: MIN_ALLOC_SIZE_POWER,
+                        ptr: unsafe { base_ptr.add(10 * MIN_ALLOC_SIZE) },
+                    },
+                ),
             ]),
         };
 
-        assert_eq!(b.alloc(MIN_ALLOC_SIZE_POWER + 2), None);
+        assert!(b
+            .alloc(
+                MIN_ALLOC_SIZE_POWER + 2,
+                PieceKey {
+                    hash: Arc::new([0; 20]),
+                    piece_idx: 6
+                }
+            )
+            .is_err_and(|e| e == AllocErr::NoSpace));
         let can_fit = b.can_fit_n_if_migrated(MIN_ALLOC_SIZE_POWER + 2);
         assert_eq!(can_fit, 1);
     }
@@ -1488,41 +1612,93 @@ mod test {
             buf,
             blk_tree: v,
             alloced: HashMap::from([
-                fb_and_fbh(FreeBlock {
-                    offset: 1,
-                    power: MIN_ALLOC_SIZE_POWER,
-                    ptr: base_ptr,
-                }),
-                fb_and_fbh(FreeBlock {
-                    offset: 3 * MIN_ALLOC_SIZE,
-                    power: MIN_ALLOC_SIZE_POWER,
-                    ptr: unsafe { base_ptr.add(3 * MIN_ALLOC_SIZE) },
-                }),
-                fb_and_fbh(FreeBlock {
-                    offset: 5 * MIN_ALLOC_SIZE,
-                    power: MIN_ALLOC_SIZE_POWER,
-                    ptr: unsafe { base_ptr.add(5 * MIN_ALLOC_SIZE) },
-                }),
-                fb_and_fbh(FreeBlock {
-                    offset: 7 * MIN_ALLOC_SIZE,
-                    power: MIN_ALLOC_SIZE_POWER,
-                    ptr: unsafe { base_ptr.add(7 * MIN_ALLOC_SIZE) },
-                }),
-                fb_and_fbh(FreeBlock {
-                    offset: 9 * MIN_ALLOC_SIZE,
-                    power: MIN_ALLOC_SIZE_POWER,
-                    ptr: unsafe { base_ptr.add(9 * MIN_ALLOC_SIZE) },
-                }),
-                fb_and_fbh(FreeBlock {
-                    offset: 10 * MIN_ALLOC_SIZE,
-                    power: MIN_ALLOC_SIZE_POWER,
-                    ptr: unsafe { base_ptr.add(10 * MIN_ALLOC_SIZE) },
-                }),
+                key_and_fbh(
+                    PieceKey {
+                        hash: Arc::new([0; 20]),
+                        piece_idx: 0,
+                    },
+                    FreeBlock {
+                        offset: 1,
+                        power: MIN_ALLOC_SIZE_POWER,
+                        ptr: base_ptr,
+                    },
+                ),
+                key_and_fbh(
+                    PieceKey {
+                        hash: Arc::new([0; 20]),
+                        piece_idx: 1,
+                    },
+                    FreeBlock {
+                        offset: 3 * MIN_ALLOC_SIZE,
+                        power: MIN_ALLOC_SIZE_POWER,
+                        ptr: unsafe { base_ptr.add(3 * MIN_ALLOC_SIZE) },
+                    },
+                ),
+                key_and_fbh(
+                    PieceKey {
+                        hash: Arc::new([0; 20]),
+                        piece_idx: 2,
+                    },
+                    FreeBlock {
+                        offset: 5 * MIN_ALLOC_SIZE,
+                        power: MIN_ALLOC_SIZE_POWER,
+                        ptr: unsafe { base_ptr.add(5 * MIN_ALLOC_SIZE) },
+                    },
+                ),
+                key_and_fbh(
+                    PieceKey {
+                        hash: Arc::new([0; 20]),
+                        piece_idx: 3,
+                    },
+                    FreeBlock {
+                        offset: 7 * MIN_ALLOC_SIZE,
+                        power: MIN_ALLOC_SIZE_POWER,
+                        ptr: unsafe { base_ptr.add(7 * MIN_ALLOC_SIZE) },
+                    },
+                ),
+                key_and_fbh(
+                    PieceKey {
+                        hash: Arc::new([0; 20]),
+                        piece_idx: 4,
+                    },
+                    FreeBlock {
+                        offset: 9 * MIN_ALLOC_SIZE,
+                        power: MIN_ALLOC_SIZE_POWER,
+                        ptr: unsafe { base_ptr.add(9 * MIN_ALLOC_SIZE) },
+                    },
+                ),
+                key_and_fbh(
+                    PieceKey {
+                        hash: Arc::new([0; 20]),
+                        piece_idx: 5,
+                    },
+                    FreeBlock {
+                        offset: 10 * MIN_ALLOC_SIZE,
+                        power: MIN_ALLOC_SIZE_POWER,
+                        ptr: unsafe { base_ptr.add(10 * MIN_ALLOC_SIZE) },
+                    },
+                ),
             ]),
         };
 
-        assert_eq!(b.alloc(MIN_ALLOC_SIZE_POWER + 2), None);
-        assert_eq!(b.alloc(MIN_ALLOC_SIZE_POWER + 1), None);
+        assert!(b
+            .alloc(
+                MIN_ALLOC_SIZE_POWER + 2,
+                PieceKey {
+                    hash: Arc::new([0; 20]),
+                    piece_idx: 6
+                }
+            )
+            .is_err_and(|e| e == AllocErr::NoSpace));
+        assert!(b
+            .alloc(
+                MIN_ALLOC_SIZE_POWER + 1,
+                PieceKey {
+                    hash: Arc::new([0; 20]),
+                    piece_idx: 7
+                }
+            )
+            .is_err_and(|e| e == AllocErr::NoSpace));
         let can_fit = b.can_fit_n_if_migrated(MIN_ALLOC_SIZE_POWER + 2);
         assert_eq!(can_fit, 1);
         let can_fit = b.can_fit_n_if_migrated(MIN_ALLOC_SIZE_POWER + 1);
@@ -1543,14 +1719,50 @@ mod test {
             b.migrate();
         }
         {
-            let res = b.alloc(MIN_ALLOC_SIZE_POWER + 2).unwrap();
-            b.free(&res);
+            let pk = PieceKey {
+                hash: Arc::new([0; 20]),
+                piece_idx: 6,
+            };
+            let res = b.alloc(MIN_ALLOC_SIZE_POWER + 2, pk.clone()).unwrap();
+            b.free(&res, &pk);
         }
         {
-            let res1 = b.alloc(MIN_ALLOC_SIZE_POWER + 1).unwrap();
-            let res2 = b.alloc(MIN_ALLOC_SIZE_POWER + 1).unwrap();
-            assert!(b.alloc(MIN_ALLOC_SIZE_POWER + 1).is_none());
-            assert!(b.alloc(MIN_ALLOC_SIZE_POWER).is_some());
+            let res1 = b
+                .alloc(
+                    MIN_ALLOC_SIZE_POWER + 1,
+                    PieceKey {
+                        hash: Arc::new([0; 20]),
+                        piece_idx: 7,
+                    },
+                )
+                .unwrap();
+            let res2 = b
+                .alloc(
+                    MIN_ALLOC_SIZE_POWER + 1,
+                    PieceKey {
+                        hash: Arc::new([0; 20]),
+                        piece_idx: 8,
+                    },
+                )
+                .unwrap();
+            assert!(b
+                .alloc(
+                    MIN_ALLOC_SIZE_POWER + 1,
+                    PieceKey {
+                        hash: Arc::new([0; 20]),
+                        piece_idx: 9
+                    }
+                )
+                .is_err_and(|e| e == AllocErr::NoSpace));
+            assert!(b
+                .alloc(
+                    MIN_ALLOC_SIZE_POWER,
+                    PieceKey {
+                        hash: Arc::new([0; 20]),
+                        piece_idx: 10
+                    }
+                )
+                .is_ok());
         }
     }
 
@@ -1600,8 +1812,24 @@ mod test {
             let c = PieceBufPool::new(15 * MIN_ALLOC_SIZE);
             let sz1 = 4114;
             let sz2 = 5 * MIN_ALLOC_SIZE - 411;
-            let mut b1 = c.alloc(sz1).unwrap();
-            let mut b2 = c.alloc(sz2).unwrap();
+            let mut b1 = c
+                .alloc(
+                    PieceKey {
+                        hash: Arc::new([0; 20]),
+                        piece_idx: 0,
+                    },
+                    sz1,
+                )
+                .unwrap();
+            let mut b2 = c
+                .alloc(
+                    PieceKey {
+                        hash: Arc::new([0; 20]),
+                        piece_idx: 1,
+                    },
+                    sz2,
+                )
+                .unwrap();
             assert_eq!(b1.len, sz1);
             assert_eq!(b2.len, sz2);
             assert_eq!(b1.as_mut().len(), sz1);
@@ -1630,7 +1858,15 @@ mod test {
 
             let c1 = c.clone();
             let h1 = thread::spawn(move || {
-                let mut pb = c1.alloc(sz).unwrap();
+                let mut pb = c1
+                    .alloc(
+                        PieceKey {
+                            hash: Arc::new([0; 20]),
+                            piece_idx: 0,
+                        },
+                        sz,
+                    )
+                    .unwrap();
                 for b in pb.as_mut().iter_mut() {
                     *b = 0xff;
                 }
@@ -1639,7 +1875,15 @@ mod test {
 
             let c2 = c.clone();
             let h2 = thread::spawn(move || {
-                let mut pb = c2.alloc(sz).unwrap();
+                let mut pb = c2
+                    .alloc(
+                        PieceKey {
+                            hash: Arc::new([0; 20]),
+                            piece_idx: 1,
+                        },
+                        sz,
+                    )
+                    .unwrap();
                 for b in pb.as_mut().iter_mut() {
                     *b = 0xcc;
                 }
@@ -1766,7 +2010,8 @@ mod test {
                 },
                 MIN_ALLOC_SIZE,
             )
-            .await;
+            .await
+            .unwrap();
         let p2 = c
             .async_alloc_abort::<ArcCache<_>>(
                 PieceKey {
@@ -1775,7 +2020,8 @@ mod test {
                 },
                 MIN_ALLOC_SIZE,
             )
-            .await;
+            .await
+            .unwrap();
         let p3 = c
             .async_alloc_abort::<ArcCache<_>>(
                 PieceKey {
@@ -1784,7 +2030,8 @@ mod test {
                 },
                 MIN_ALLOC_SIZE,
             )
-            .await;
+            .await
+            .unwrap();
         let p4 = c
             .async_alloc_abort::<ArcCache<_>>(
                 PieceKey {
@@ -1793,7 +2040,8 @@ mod test {
                 },
                 MIN_ALLOC_SIZE,
             )
-            .await;
+            .await
+            .unwrap();
         let (rt1, rt2) = {
             let p2c = p2.clone();
             let rt1 = tokio::spawn(async move {
@@ -1813,7 +2061,15 @@ mod test {
         // no enough space for consecutive 2 * MIN_ALLOC_SIZE
         // this sync alloc should return None
         // but a async task will be created and migrating blocks
-        assert!(c.alloc(2 * MIN_ALLOC_SIZE).is_none());
+        assert!(c
+            .alloc(
+                PieceKey {
+                    hash: Arc::new([0; 20]),
+                    piece_idx: 9
+                },
+                2 * MIN_ALLOC_SIZE
+            )
+            .is_err_and(|e| e == AllocErr::StartMigrating));
         let p5 = c
             .async_alloc_abort::<ArcCache<_>>(
                 PieceKey {
@@ -1822,7 +2078,8 @@ mod test {
                 },
                 2 * MIN_ALLOC_SIZE,
             )
-            .await;
+            .await
+            .unwrap();
         {
             _ = r2.write(&[0x22u8; MIN_ALLOC_SIZE - 2]).await;
             _ = r4.write(&[0x44u8; MIN_ALLOC_SIZE - 2]).await;
@@ -1850,7 +2107,8 @@ mod test {
                 },
                 2 * MIN_ALLOC_SIZE,
             )
-            .await;
+            .await
+            .unwrap();
         drop(p5);
     }
 
@@ -1871,7 +2129,8 @@ mod test {
                 },
                 MIN_ALLOC_SIZE,
             )
-            .await; // at 10
+            .await
+            .unwrap(); // at 10
         let p2 = c
             .async_alloc_abort::<ArcCache<_>>(
                 PieceKey {
@@ -1880,7 +2139,8 @@ mod test {
                 },
                 4 * MIN_ALLOC_SIZE,
             )
-            .await; // at 4-7
+            .await
+            .unwrap(); // at 4-7
         let p3 = c
             .async_alloc_abort::<ArcCache<_>>(
                 PieceKey {
@@ -1889,7 +2149,8 @@ mod test {
                 },
                 2 * MIN_ALLOC_SIZE,
             )
-            .await; // at 8-9
+            .await
+            .unwrap(); // at 8-9
         let p4 = c
             .async_alloc_abort::<ArcCache<_>>(
                 PieceKey {
@@ -1898,7 +2159,8 @@ mod test {
                 },
                 2 * MIN_ALLOC_SIZE,
             )
-            .await; // at 2-3
+            .await
+            .unwrap(); // at 2-3
         let (rt1, rt2) = {
             let p1c = p1.clone();
             let rt1 = tokio::spawn(async move {
@@ -1920,7 +2182,15 @@ mod test {
         // no enough space for consecutive 8 * MIN_ALLOC_SIZE
         // this sync alloc should return None
         // but a async task will be created and migrating blocks
-        assert!(c.alloc(8 * MIN_ALLOC_SIZE).is_none());
+        assert!(c
+            .alloc(
+                PieceKey {
+                    hash: Arc::new([0; 20]),
+                    piece_idx: 9
+                },
+                8 * MIN_ALLOC_SIZE
+            )
+            .is_err_and(|e| e == AllocErr::StartMigrating)); // this is BufPool.alloc(), will return StartMigrating
         let p5 = c
             .async_alloc_abort::<ArcCache<_>>(
                 PieceKey {
@@ -1929,7 +2199,8 @@ mod test {
                 },
                 8 * MIN_ALLOC_SIZE,
             )
-            .await;
+            .await
+            .unwrap();
         {
             _ = r1.write(&[0x11; MIN_ALLOC_SIZE - 4]).await;
             _ = r4.write(&[0x41; MIN_ALLOC_SIZE - 4]).await;
@@ -1945,8 +2216,8 @@ mod test {
                 assert_eq!(*i, 0x11);
             }
             let ref4 = p4.get_part_ref(0, 1 * MIN_ALLOC_SIZE).unwrap();
-            for i in ref4.as_ref() {
-                assert_eq!(*i, 0x41);
+            for (i, b) in ref4.as_ref().iter().enumerate() {
+                assert_eq!((i, *b), (i, 0x41));
             }
             let ref4 = p4
                 .get_part_ref(1 * MIN_ALLOC_SIZE, 1 * MIN_ALLOC_SIZE)
@@ -1965,7 +2236,8 @@ mod test {
                 },
                 2 * MIN_ALLOC_SIZE,
             )
-            .await;
+            .await
+            .unwrap();
         drop(p5);
     }
 
@@ -1985,7 +2257,8 @@ mod test {
                 },
                 MIN_ALLOC_SIZE,
             )
-            .await; // at 10
+            .await
+            .unwrap(); // at 10
         let p2 = c
             .async_alloc_abort::<ArcCache<_>>(
                 PieceKey {
@@ -1994,7 +2267,8 @@ mod test {
                 },
                 4 * MIN_ALLOC_SIZE,
             )
-            .await; // at 4-7
+            .await
+            .unwrap(); // at 4-7
         let p3 = c
             .async_alloc_abort::<ArcCache<_>>(
                 PieceKey {
@@ -2003,7 +2277,8 @@ mod test {
                 },
                 2 * MIN_ALLOC_SIZE,
             )
-            .await; // at 8-9
+            .await
+            .unwrap(); // at 8-9
         let p4 = c
             .async_alloc_abort::<ArcCache<_>>(
                 PieceKey {
@@ -2012,16 +2287,18 @@ mod test {
                 },
                 2 * MIN_ALLOC_SIZE,
             )
-            .await; // at 2-3
+            .await
+            .unwrap(); // at 2-3
         let p5 = c
             .async_alloc_abort::<ArcCache<_>>(
                 PieceKey {
                     hash: Arc::new([0; 20]),
-                    piece_idx: 4,
+                    piece_idx: 5,
                 },
                 2 * MIN_ALLOC_SIZE,
             )
-            .await; // at 0-1
+            .await
+            .unwrap(); // at 0-1
         let rt4 = {
             let p4c = p4.clone();
             let rt4 = tokio::spawn(async move {
@@ -2039,7 +2316,8 @@ mod test {
                 },
                 2 * MIN_ALLOC_SIZE,
             )
-            .await; // at 6-7
+            .await
+            .unwrap(); // at 6-7
         drop(p3);
         drop(p5);
 
@@ -2061,7 +2339,8 @@ mod test {
                 },
                 4 * MIN_ALLOC_SIZE,
             )
-            .await;
+            .await
+            .unwrap();
 
         println!("b");
         {
@@ -2080,7 +2359,8 @@ mod test {
                 },
                 8 * MIN_ALLOC_SIZE,
             )
-            .await;
+            .await
+            .unwrap();
         println!("{:?}", p4.piece_detail(|p| p.offset_len()).unwrap());
         println!("{:?}", p5.piece_detail(|p| p.offset_len()).unwrap());
         {
@@ -2093,6 +2373,60 @@ mod test {
                 assert_eq!(*i, 0x11);
             }
         }
+    }
+
+    #[cfg(not(mloom))]
+    #[tokio::test]
+    async fn test_async_alloc_same_piece() {
+        let c = PieceBufPool::new(11 * MIN_ALLOC_SIZE);
+        let _p1 = c
+            .async_alloc_abort::<ArcCache<_>>(
+                PieceKey {
+                    hash: Arc::new([0; 20]),
+                    piece_idx: 1,
+                },
+                MIN_ALLOC_SIZE,
+            )
+            .await
+            .unwrap(); // at 10
+        let _p2 = c
+            .async_alloc_abort::<ArcCache<_>>(
+                PieceKey {
+                    hash: Arc::new([0; 20]),
+                    piece_idx: 2,
+                },
+                4 * MIN_ALLOC_SIZE,
+            )
+            .await
+            .unwrap(); // at 4-7
+
+        // even if no space, try to re-allocate a piece will return "Allocated"
+        assert!(c
+            .async_alloc_abort::<ArcCache<_>>(
+                PieceKey {
+                    hash: Arc::new([0; 20]),
+                    piece_idx: 2,
+                },
+                40 * MIN_ALLOC_SIZE,
+            )
+            .await
+            .is_err_and(|e| e == AllocErr::Allocated));
+    }
+
+    #[cfg(not(mloom))]
+    #[tokio::test]
+    async fn test_async_alloc_oversize() {
+        let c = PieceBufPool::new(11 * MIN_ALLOC_SIZE);
+        assert!(c
+            .async_alloc_abort::<ArcCache<_>>(
+                PieceKey {
+                    hash: Arc::new([0; 20]),
+                    piece_idx: 2,
+                },
+                40 * MIN_ALLOC_SIZE,
+            )
+            .await
+            .is_err_and(|e| e == AllocErr::Oversize));
     }
 
     #[cfg(not(mloom))]
@@ -2118,7 +2452,7 @@ mod test {
             )
             .await
         });
-        let r0 = h0.await;
+        let r0 = h0.await.unwrap();
 
         let h1 = tokio::spawn(async move {
             c1.async_alloc(
@@ -2207,7 +2541,7 @@ mod test {
             )
             .await
         });
-        let r0 = h0.await;
+        let r0 = h0.await.unwrap();
 
         let h1 = tokio::spawn(async move {
             c1.async_alloc_abort::<ArcCache<_>>(
@@ -2265,11 +2599,11 @@ mod test {
         drop(h3);
         drop(r0);
         {
-            assert!(h1.await.is_ok());
-            assert!(h4.await.is_ok());
+            assert!(h1.await.unwrap().is_ok());
+            assert!(h4.await.unwrap().is_ok());
         }
         {
-            assert!(h5.await.is_ok());
+            assert!(h5.await.unwrap().is_ok());
         }
     }
 
@@ -2278,21 +2612,16 @@ mod test {
     async fn test_invalidate_piece_buf() {
         let c = PieceBufPool::new(10 * MIN_ALLOC_SIZE);
 
-        let mut piece = c
-            .async_alloc(
-                PieceKey {
-                    hash: Arc::new([0; 20]),
-                    piece_idx: 0,
-                },
-                2 * MIN_ALLOC_SIZE,
-            )
-            .await;
-        let fb = piece.b.dup();
+        let pk0 = PieceKey {
+            hash: Arc::new([0; 20]),
+            piece_idx: 0,
+        };
+        let mut piece = c.async_alloc(pk0.clone(), 2 * MIN_ALLOC_SIZE).await;
         let ref_work = task::spawn(async move {
             let _ = piece.as_mut();
         });
-        let mut invalid_fut1 = task::spawn(c.invalidate(fb.dup()));
-        let mut invalid_fut2 = task::spawn(c.invalidate(fb.dup()));
+        let mut invalid_fut1 = task::spawn(c.invalidate(pk0.clone()));
+        let mut invalid_fut2 = task::spawn(c.invalidate(pk0.clone()));
         assert_eq!(invalid_fut1.poll(), Poll::Pending);
         assert_eq!(invalid_fut2.poll(), Poll::Pending);
         assert_eq!(invalid_fut1.poll(), Poll::Pending);
@@ -2301,36 +2630,36 @@ mod test {
         assert_eq!(invalid_fut1.poll(), Poll::Ready(Ok(())));
         assert_eq!(invalid_fut2.poll(), Poll::Ready(Ok(())));
         println!("invalidated");
-        assert!(c.invalidate(fb.dup()).await.is_ok());
+        assert!(c.invalidate(pk0.clone()).await.is_ok());
     }
 
     #[tokio::test]
     async fn test_alloc_abort() {
         let c = PieceBufPool::new(10 * MIN_ALLOC_SIZE);
 
+        let (pk1, pk2) = (
+            PieceKey {
+                hash: Arc::new([0; 20]),
+                piece_idx: 1,
+            },
+            PieceKey {
+                hash: Arc::new([0; 20]),
+                piece_idx: 2,
+            },
+        );
         let p1 = c
-            .async_alloc_abort::<ArcCache<_>>(
-                PieceKey {
-                    hash: Arc::new([0; 20]),
-                    piece_idx: 1,
-                },
-                2 * MIN_ALLOC_SIZE,
-            )
-            .await;
+            .async_alloc_abort::<ArcCache<_>>(pk1.clone(), 2 * MIN_ALLOC_SIZE)
+            .await
+            .unwrap();
         let p2 = c
-            .async_alloc_abort::<ArcCache<_>>(
-                PieceKey {
-                    hash: Arc::new([0; 20]),
-                    piece_idx: 1,
-                },
-                1 * MIN_ALLOC_SIZE,
-            )
-            .await;
+            .async_alloc_abort::<ArcCache<_>>(pk2.clone(), 1 * MIN_ALLOC_SIZE)
+            .await
+            .unwrap();
         let (mut r1, w1) = duplex(MIN_ALLOC_SIZE);
         r1.write(&[0; 4]).await;
         let (mut r2, w2) = duplex(MIN_ALLOC_SIZE);
         r2.write(&[0; 4]).await;
-        let (fb1, fb2) = {
+        {
             let p1c = p1.clone();
             tokio::spawn(async move {
                 let mut w1_pin = Box::pin(w1);
@@ -2343,15 +2672,10 @@ mod test {
                 let mut w2_pin = Box::pin(w2);
                 read_to_ref(&mut w2_pin, p2c.clone(), 2 * 16384, 16384).await;
             });
+        }
 
-            (
-                p1.piece_detail(|p| p.b.dup()).unwrap(),
-                p2.piece_detail(|p| p.b.dup()).unwrap(),
-            )
-        };
-
-        c.invalidate(fb2).await;
-        c.invalidate(fb1).await;
+        c.invalidate(pk1).await;
+        c.invalidate(pk2).await;
 
         // TODO: test p1, p2's inner Cache is None
         assert!(matches!(
@@ -2363,27 +2687,27 @@ mod test {
     #[tokio::test]
     async fn test_alloc_abort2() {
         let c = PieceBufPool::new(10 * MIN_ALLOC_SIZE);
+        let (pk1, pk2) = (
+            PieceKey {
+                hash: Arc::new([0; 20]),
+                piece_idx: 1,
+            },
+            PieceKey {
+                hash: Arc::new([0; 20]),
+                piece_idx: 2,
+            },
+        );
         let p1 = c
-            .async_alloc_abort::<ArcCache<_>>(
-                PieceKey {
-                    hash: Arc::new([0; 20]),
-                    piece_idx: 1,
-                },
-                2 * MIN_ALLOC_SIZE,
-            )
-            .await;
+            .async_alloc_abort::<ArcCache<_>>(pk1.clone(), 2 * MIN_ALLOC_SIZE)
+            .await
+            .unwrap();
         let p2 = c
-            .async_alloc_abort::<ArcCache<_>>(
-                PieceKey {
-                    hash: Arc::new([0; 20]),
-                    piece_idx: 1,
-                },
-                1 * MIN_ALLOC_SIZE,
-            )
-            .await;
+            .async_alloc_abort::<ArcCache<_>>(pk2.clone(), 1 * MIN_ALLOC_SIZE)
+            .await
+            .unwrap();
         let (_r1, w1) = duplex(MIN_ALLOC_SIZE);
         let (_r2, w2) = duplex(MIN_ALLOC_SIZE);
-        let (fb1, fb2, mut t1, mut t2) = {
+        let (mut t1, mut t2) = {
             let p1c = p1.clone();
             let mut t1 = task::spawn(async move {
                 let mut w1_pin = Box::pin(w1);
@@ -2397,17 +2721,12 @@ mod test {
             assert_eq!(t1.poll(), Poll::Pending);
             assert_eq!(t2.poll(), Poll::Pending);
 
-            (
-                p1.piece_detail(|p| p.b.dup()).unwrap(),
-                p2.piece_detail(|p| p.b.dup()).unwrap(),
-                t1,
-                t2,
-            )
+            (t1, t2)
         };
         assert_eq!(t1.poll(), Poll::Pending);
         assert_eq!(t2.poll(), Poll::Pending);
-        let mut inv2 = task::spawn(c.invalidate(fb2));
-        let mut inv1 = task::spawn(c.invalidate(fb1));
+        let mut inv2 = task::spawn(c.invalidate(pk2));
+        let mut inv1 = task::spawn(c.invalidate(pk1));
         assert_eq!(inv2.poll(), Poll::Pending);
         assert_eq!(inv2.poll(), Poll::Pending);
         t2.await;
