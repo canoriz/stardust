@@ -2,6 +2,7 @@ use core::fmt;
 use futures::task::AtomicWaker;
 use pin_project::{pin_project, pinned_drop};
 use std::fmt::Debug;
+use std::task::Waker;
 use std::{
     collections::{HashMap, VecDeque},
     future::Future,
@@ -99,11 +100,12 @@ struct BufState<T> {
     abort_waiter: Vec<Arc<Notify>>,
 }
 
+type OffsetLen = (usize, usize);
 struct Cache<T> {
     // TODO: since all jobs access to cache,
     // maybe split lock to smaller granularity to reduce contention
     buf: Mutex<BufState<T>>,
-    waiting_reqs: Mutex<VecDeque<AllocReq>>,
+    waiting_reqs: Mutex<VecDeque<AllocReq<OffsetLen>>>,
 }
 
 fn change_blockstate(v: &mut [BlockState], offset: usize, len: usize, state: BlockState) {
@@ -219,7 +221,7 @@ where
 
         for w in waiting_reqs.drain(0..) {
             #[cfg(test)]
-            println!("try waking {}", w.id);
+            println!("try waking {:?}", w.key);
             match w
                 .valid
                 .compare_exchange(WAITING, WAKING, Ordering::AcqRel, Ordering::Acquire)
@@ -227,7 +229,7 @@ where
                 Ok(_) => {
                     w.waker.wake();
                     #[cfg(test)]
-                    println!("wake waiting {}", w.id);
+                    println!("wake waiting {:?}", w.key);
                     break;
                 }
                 Err(actual) => {
@@ -237,7 +239,7 @@ where
                     debug_assert!(actual == DROPPED || actual == DONE || actual == WAKING);
 
                     #[cfg(test)]
-                    println!("no wake {} because actual state {actual}", w.id);
+                    println!("no wake {:?} because actual state {actual}", w.key);
                 }
             }
         }
@@ -487,7 +489,7 @@ where
                 .lock()
                 .expect("async_get_part lock waiting_reqs should OK")
                 .push_back(AllocReq {
-                    id: 0,
+                    key: (fut.offset, fut.len),
                     waker: cx.waker().clone(),
                     valid: fut.valid.clone(),
                 });
@@ -606,7 +608,7 @@ where
 
             for w in waiting_reqs.drain(0..) {
                 #[cfg(test)]
-                println!("try waking {}", w.id);
+                println!("try waking {:?}", w.key);
                 match w
                     .valid
                     .compare_exchange(WAITING, WAKING, Ordering::AcqRel, Ordering::Acquire)
@@ -614,7 +616,7 @@ where
                     Ok(_) => {
                         w.waker.wake();
                         #[cfg(test)]
-                        println!("wake waiting {}", w.id);
+                        println!("wake waiting {:?}", w.key);
                         break;
                     }
                     Err(actual) => {
@@ -624,7 +626,7 @@ where
                         debug_assert!(actual == DROPPED || actual == DONE || actual == WAKING);
 
                         #[cfg(test)]
-                        println!("no wake {} because actual state {actual}", w.id);
+                        println!("no wake {:?} because actual state {actual}", w.key);
                     }
                 }
             }

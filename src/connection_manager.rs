@@ -8,7 +8,7 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{info, warn};
 
 use crate::backfile::WriteJob;
-use crate::cache::{AbortErr, ArcCache, GetRefErr, PieceBuf, Ref};
+use crate::cache::{AbortErr, ArcCache, GetRefErr, PieceBuf, PieceKey, Ref};
 use crate::metadata;
 use crate::picker::BlockRequests;
 use crate::protocol::{self, BTStream, Message, Piece, ReadStream, Split, WriteStream};
@@ -534,7 +534,14 @@ where
                     // deplicating allocates buffer
                     let pb = tmh
                         .buffer_pool
-                        .async_alloc_abort::<ArcCache<_>>(1, tmh.piece_size)
+                        .async_alloc_abort::<ArcCache<_>>(
+                            PieceKey {
+                                // TODO: OPTIMIZE: avoid allocation
+                                hash: Arc::new(tmh.metadata.info_hash),
+                                piece_idx: piece.index as usize,
+                            },
+                            tmh.piece_size,
+                        )
                         .await;
 
                     // if this piece buffer already exists(allocated by other peer handler),

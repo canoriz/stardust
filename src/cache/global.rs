@@ -276,7 +276,7 @@ pub enum InvalidateErr {
 
 struct PieceBufPoolImpl {
     buf_tree: Mutex<BufTree>,
-    waiting_alloc: Mutex<VecDeque<AllocReq>>,
+    waiting_alloc: Mutex<VecDeque<AllocReq<PieceKey>>>,
 
     // TODO: maybe move into buf_tree
     // TODO: is this used?
@@ -303,6 +303,12 @@ impl Debug for PieceBuf {
             .field("len", &self.len)
             .finish()
     }
+}
+
+#[derive(Debug, Clone, Hash, Eq, PartialEq)]
+pub(crate) struct PieceKey {
+    pub hash: Arc<[u8; 20]>,
+    pub piece_idx: usize,
 }
 
 pub trait AbortHandle
@@ -408,10 +414,10 @@ impl PieceBufPool {
     /// as long as size <= max size of buffer, waits until
     /// enough space, else return None
     // TODO: make this async fn, and make real impl to PieceBufPoolImpl
-    pub fn async_alloc(&self, id: usize, size: usize) -> AllocPieceBufFut {
+    pub fn async_alloc(&self, key: PieceKey, size: usize) -> AllocPieceBufFut {
         AllocPieceBufFut {
             inner: AllocFutInner {
-                id,
+                key,
                 size,
                 pool: self,
                 waiting: false,
@@ -420,13 +426,13 @@ impl PieceBufPool {
         }
     }
 
-    pub fn async_alloc_abort<T>(&self, id: usize, size: usize) -> AllocPieceBufAbortFut<T>
+    pub fn async_alloc_abort<T>(&self, key: PieceKey, size: usize) -> AllocPieceBufAbortFut<T>
     where
         T: FromPieceBuf + Unpin,
     {
         AllocPieceBufAbortFut {
             inner: AllocFutInner {
-                id,
+                key,
                 size,
                 pool: self,
                 waiting: false,
@@ -666,8 +672,8 @@ impl PieceBuf {
     }
 }
 
-pub(crate) struct AllocReq {
-    pub id: usize,
+pub(crate) struct AllocReq<I> {
+    pub key: I,
     pub waker: Waker,
     pub valid: Arc<AtomicU32>,
 }
@@ -677,10 +683,10 @@ const DONE: u32 = 0b010; // TODO: really need this?
 const WAITING: u32 = 0;
 const WAKING: u32 = 0b100;
 
-pub(crate) fn wake_next_waiting_alloc(waiting_alloc: &mut VecDeque<AllocReq>) {
+pub(crate) fn wake_next_waiting_alloc<I: Debug>(waiting_alloc: &mut VecDeque<AllocReq<I>>) {
     while let Some(v) = waiting_alloc.pop_front() {
         #[cfg(test)]
-        println!("try waking {}", v.id);
+        println!("try waking {:?}", v.key);
         match v
             .valid
             .compare_exchange(WAITING, WAKING, Ordering::AcqRel, Ordering::Acquire)
@@ -688,7 +694,7 @@ pub(crate) fn wake_next_waiting_alloc(waiting_alloc: &mut VecDeque<AllocReq>) {
             Ok(_) => {
                 v.waker.wake();
                 #[cfg(test)]
-                println!("wake waiting {}", v.id);
+                println!("wake waiting {:?}", v.key);
                 break;
             }
             Err(actual) => {
@@ -698,14 +704,14 @@ pub(crate) fn wake_next_waiting_alloc(waiting_alloc: &mut VecDeque<AllocReq>) {
                 debug_assert!(actual == DROPPED || actual == DONE || actual == WAKING);
 
                 #[cfg(test)]
-                println!("no wake {} because actual state {actual}", v.id);
+                println!("no wake {:?} because actual state {actual}", v.key);
             }
         }
     }
 }
 
 struct AllocFutInner<'a> {
-    id: usize,
+    key: PieceKey,
     pool: &'a PieceBufPool,
     waiting: bool,
     valid: Arc<AtomicU32>,
@@ -728,19 +734,19 @@ impl AllocFutInner<'_> {
         let fut = self.get_mut();
 
         #[cfg(test)]
-        println!("poll id {}", fut.id);
+        println!("poll key {:?}", fut.key);
 
         let mut waiting_alloc = fut.pool.inner.waiting_alloc.lock().unwrap();
         if !fut.waiting {
             if !waiting_alloc.is_empty() {
                 waiting_alloc.push_back(AllocReq {
-                    id: fut.id,
+                    key: fut.key.clone(),
                     waker: cx.waker().clone(),
                     valid: fut.valid.clone(),
                 });
 
                 #[cfg(test)]
-                println!("poll id {} pending 1", fut.id);
+                println!("poll key {:?} pending 1", fut.key);
 
                 fut.waiting = true;
                 fut.valid.swap(WAITING, Ordering::Release);
@@ -752,17 +758,17 @@ impl AllocFutInner<'_> {
                 let old = fut.valid.swap(DONE, Ordering::Release);
                 debug_assert_eq!(old, WAITING);
                 #[cfg(test)]
-                println!("poll id {} ready 2", fut.id);
+                println!("poll key {:?} ready 2", fut.key);
                 Poll::Ready(bf)
             } else {
                 waiting_alloc.push_back(AllocReq {
-                    id: fut.id,
+                    key: fut.key.clone(),
                     waker: cx.waker().clone(),
                     valid: fut.valid.clone(),
                 });
                 fut.waiting = true;
                 #[cfg(test)]
-                println!("poll id {} pending 3", fut.id);
+                println!("poll key {:?} pending 3", fut.key);
 
                 fut.valid.swap(WAITING, Ordering::Release);
                 Poll::Pending
@@ -774,16 +780,16 @@ impl AllocFutInner<'_> {
             wake_next_waiting_alloc(&mut waiting_alloc);
 
             #[cfg(test)]
-            println!("poll id {} ready 4", fut.id);
+            println!("poll key {:?} ready 4", fut.key);
             Poll::Ready(bf)
         } else {
             waiting_alloc.push_front(AllocReq {
-                id: fut.id,
+                key: fut.key.clone(),
                 waker: cx.waker().clone(),
                 valid: fut.valid.clone(),
             }); // try to be the first
             #[cfg(test)]
-            println!("poll id {} pending 5", fut.id);
+            println!("poll key {:?} pending 5", fut.key);
 
             fut.valid.swap(WAITING, Ordering::Release);
             Poll::Pending
@@ -797,7 +803,10 @@ impl Drop for AllocFutInner<'_> {
         let state = self.valid.swap(DROPPED, Ordering::Acquire);
 
         #[cfg(test)]
-        println!("drop AllocPieceBufFut id {}, old-state {}", self.id, state);
+        println!(
+            "drop AllocPieceBufFut key {:?}, old-state {}",
+            self.key, state
+        );
 
         match state {
             WAKING => {
@@ -1657,7 +1666,16 @@ mod test {
         let mut ts = tokio::task::JoinSet::new();
         for size in [2, 1, 1, 2, 1, 2usize].into_iter().enumerate() {
             let c1 = c.clone();
-            ts.spawn(async move { c1.async_alloc(size.0, size.1 * MIN_ALLOC_SIZE).await });
+            ts.spawn(async move {
+                c1.async_alloc(
+                    PieceKey {
+                        hash: Arc::new([0; 20]),
+                        piece_idx: size.0,
+                    },
+                    size.1 * MIN_ALLOC_SIZE,
+                )
+                .await
+            });
         }
 
         for _ in 0..ts.len() {
@@ -1674,8 +1692,14 @@ mod test {
         for size in [2, 1, 1, 2, 1, 2usize].into_iter().enumerate() {
             let c1 = c.clone();
             ts.spawn(async move {
-                c1.async_alloc_abort::<ArcCache<_>>(size.0, size.1 * MIN_ALLOC_SIZE)
-                    .await
+                c1.async_alloc_abort::<ArcCache<_>>(
+                    PieceKey {
+                        hash: Arc::new([0; 20]),
+                        piece_idx: size.0,
+                    },
+                    size.1 * MIN_ALLOC_SIZE,
+                )
+                .await
             });
         }
 
@@ -1734,10 +1758,42 @@ mod test {
         _ = r4.write(&[0x44u8, 0x44]).await;
 
         let c = PieceBufPool::new(4 * MIN_ALLOC_SIZE);
-        let p1 = c.async_alloc_abort::<ArcCache<_>>(1, MIN_ALLOC_SIZE).await;
-        let p2 = c.async_alloc_abort::<ArcCache<_>>(2, MIN_ALLOC_SIZE).await;
-        let p3 = c.async_alloc_abort::<ArcCache<_>>(3, MIN_ALLOC_SIZE).await;
-        let p4 = c.async_alloc_abort::<ArcCache<_>>(4, MIN_ALLOC_SIZE).await;
+        let p1 = c
+            .async_alloc_abort::<ArcCache<_>>(
+                PieceKey {
+                    hash: Arc::new([0; 20]),
+                    piece_idx: 1,
+                },
+                MIN_ALLOC_SIZE,
+            )
+            .await;
+        let p2 = c
+            .async_alloc_abort::<ArcCache<_>>(
+                PieceKey {
+                    hash: Arc::new([0; 20]),
+                    piece_idx: 2,
+                },
+                MIN_ALLOC_SIZE,
+            )
+            .await;
+        let p3 = c
+            .async_alloc_abort::<ArcCache<_>>(
+                PieceKey {
+                    hash: Arc::new([0; 20]),
+                    piece_idx: 3,
+                },
+                MIN_ALLOC_SIZE,
+            )
+            .await;
+        let p4 = c
+            .async_alloc_abort::<ArcCache<_>>(
+                PieceKey {
+                    hash: Arc::new([0; 20]),
+                    piece_idx: 4,
+                },
+                MIN_ALLOC_SIZE,
+            )
+            .await;
         let (rt1, rt2) = {
             let p2c = p2.clone();
             let rt1 = tokio::spawn(async move {
@@ -1759,7 +1815,13 @@ mod test {
         // but a async task will be created and migrating blocks
         assert!(c.alloc(2 * MIN_ALLOC_SIZE).is_none());
         let p5 = c
-            .async_alloc_abort::<ArcCache<_>>(5, 2 * MIN_ALLOC_SIZE)
+            .async_alloc_abort::<ArcCache<_>>(
+                PieceKey {
+                    hash: Arc::new([0; 20]),
+                    piece_idx: 5,
+                },
+                2 * MIN_ALLOC_SIZE,
+            )
             .await;
         {
             _ = r2.write(&[0x22u8; MIN_ALLOC_SIZE - 2]).await;
@@ -1781,7 +1843,13 @@ mod test {
         drop(p2);
         drop(p4);
         let _p6 = c
-            .async_alloc_abort::<ArcCache<_>>(6, 2 * MIN_ALLOC_SIZE)
+            .async_alloc_abort::<ArcCache<_>>(
+                PieceKey {
+                    hash: Arc::new([0; 20]),
+                    piece_idx: 6,
+                },
+                2 * MIN_ALLOC_SIZE,
+            )
             .await;
         drop(p5);
     }
@@ -1795,15 +1863,41 @@ mod test {
         _ = r4.write(&[0x41; 4]).await;
 
         let c = PieceBufPool::new(11 * MIN_ALLOC_SIZE);
-        let p1 = c.async_alloc_abort::<ArcCache<_>>(1, MIN_ALLOC_SIZE).await; // at 10
+        let p1 = c
+            .async_alloc_abort::<ArcCache<_>>(
+                PieceKey {
+                    hash: Arc::new([0; 20]),
+                    piece_idx: 1,
+                },
+                MIN_ALLOC_SIZE,
+            )
+            .await; // at 10
         let p2 = c
-            .async_alloc_abort::<ArcCache<_>>(2, 4 * MIN_ALLOC_SIZE)
+            .async_alloc_abort::<ArcCache<_>>(
+                PieceKey {
+                    hash: Arc::new([0; 20]),
+                    piece_idx: 2,
+                },
+                4 * MIN_ALLOC_SIZE,
+            )
             .await; // at 4-7
         let p3 = c
-            .async_alloc_abort::<ArcCache<_>>(3, 2 * MIN_ALLOC_SIZE)
+            .async_alloc_abort::<ArcCache<_>>(
+                PieceKey {
+                    hash: Arc::new([0; 20]),
+                    piece_idx: 3,
+                },
+                2 * MIN_ALLOC_SIZE,
+            )
             .await; // at 8-9
         let p4 = c
-            .async_alloc_abort::<ArcCache<_>>(4, 2 * MIN_ALLOC_SIZE)
+            .async_alloc_abort::<ArcCache<_>>(
+                PieceKey {
+                    hash: Arc::new([0; 20]),
+                    piece_idx: 4,
+                },
+                2 * MIN_ALLOC_SIZE,
+            )
             .await; // at 2-3
         let (rt1, rt2) = {
             let p1c = p1.clone();
@@ -1828,7 +1922,13 @@ mod test {
         // but a async task will be created and migrating blocks
         assert!(c.alloc(8 * MIN_ALLOC_SIZE).is_none());
         let p5 = c
-            .async_alloc_abort::<ArcCache<_>>(5, 8 * MIN_ALLOC_SIZE)
+            .async_alloc_abort::<ArcCache<_>>(
+                PieceKey {
+                    hash: Arc::new([0; 20]),
+                    piece_idx: 5,
+                },
+                8 * MIN_ALLOC_SIZE,
+            )
             .await;
         {
             _ = r1.write(&[0x11; MIN_ALLOC_SIZE - 4]).await;
@@ -1858,7 +1958,13 @@ mod test {
         drop(p1);
         drop(p4);
         let _p6 = c
-            .async_alloc_abort::<ArcCache<_>>(6, 2 * MIN_ALLOC_SIZE)
+            .async_alloc_abort::<ArcCache<_>>(
+                PieceKey {
+                    hash: Arc::new([0; 20]),
+                    piece_idx: 6,
+                },
+                2 * MIN_ALLOC_SIZE,
+            )
             .await;
         drop(p5);
     }
@@ -1871,18 +1977,50 @@ mod test {
         _ = r.write(&[0x11; 4]).await;
 
         let c = PieceBufPool::new(11 * MIN_ALLOC_SIZE);
-        let p1 = c.async_alloc_abort::<ArcCache<_>>(1, MIN_ALLOC_SIZE).await; // at 10
+        let p1 = c
+            .async_alloc_abort::<ArcCache<_>>(
+                PieceKey {
+                    hash: Arc::new([0; 20]),
+                    piece_idx: 1,
+                },
+                MIN_ALLOC_SIZE,
+            )
+            .await; // at 10
         let p2 = c
-            .async_alloc_abort::<ArcCache<_>>(2, 4 * MIN_ALLOC_SIZE)
+            .async_alloc_abort::<ArcCache<_>>(
+                PieceKey {
+                    hash: Arc::new([0; 20]),
+                    piece_idx: 2,
+                },
+                4 * MIN_ALLOC_SIZE,
+            )
             .await; // at 4-7
         let p3 = c
-            .async_alloc_abort::<ArcCache<_>>(3, 2 * MIN_ALLOC_SIZE)
+            .async_alloc_abort::<ArcCache<_>>(
+                PieceKey {
+                    hash: Arc::new([0; 20]),
+                    piece_idx: 3,
+                },
+                2 * MIN_ALLOC_SIZE,
+            )
             .await; // at 8-9
         let p4 = c
-            .async_alloc_abort::<ArcCache<_>>(4, 2 * MIN_ALLOC_SIZE)
+            .async_alloc_abort::<ArcCache<_>>(
+                PieceKey {
+                    hash: Arc::new([0; 20]),
+                    piece_idx: 4,
+                },
+                2 * MIN_ALLOC_SIZE,
+            )
             .await; // at 2-3
         let p5 = c
-            .async_alloc_abort::<ArcCache<_>>(4, 2 * MIN_ALLOC_SIZE)
+            .async_alloc_abort::<ArcCache<_>>(
+                PieceKey {
+                    hash: Arc::new([0; 20]),
+                    piece_idx: 4,
+                },
+                2 * MIN_ALLOC_SIZE,
+            )
             .await; // at 0-1
         let rt4 = {
             let p4c = p4.clone();
@@ -1894,7 +2032,13 @@ mod test {
         };
         drop(p2);
         let p2 = c
-            .async_alloc_abort::<ArcCache<_>>(2, 2 * MIN_ALLOC_SIZE)
+            .async_alloc_abort::<ArcCache<_>>(
+                PieceKey {
+                    hash: Arc::new([0; 20]),
+                    piece_idx: 2,
+                },
+                2 * MIN_ALLOC_SIZE,
+            )
             .await; // at 6-7
         drop(p3);
         drop(p5);
@@ -1910,7 +2054,13 @@ mod test {
         println!("{:?}", p4.piece_detail(|p| p.offset_len()).unwrap());
 
         let p5 = c
-            .async_alloc_abort::<ArcCache<_>>(5, 4 * MIN_ALLOC_SIZE)
+            .async_alloc_abort::<ArcCache<_>>(
+                PieceKey {
+                    hash: Arc::new([0; 20]),
+                    piece_idx: 5,
+                },
+                4 * MIN_ALLOC_SIZE,
+            )
             .await;
 
         println!("b");
@@ -1923,7 +2073,13 @@ mod test {
 
         println!("{:?}", p4.piece_detail(|p| p.offset_len()).unwrap());
         let p5 = c
-            .async_alloc_abort::<ArcCache<_>>(5, 8 * MIN_ALLOC_SIZE)
+            .async_alloc_abort::<ArcCache<_>>(
+                PieceKey {
+                    hash: Arc::new([0; 20]),
+                    piece_idx: 5,
+                },
+                8 * MIN_ALLOC_SIZE,
+            )
             .await;
         println!("{:?}", p4.piece_detail(|p| p.offset_len()).unwrap());
         println!("{:?}", p5.piece_detail(|p| p.offset_len()).unwrap());
@@ -1952,14 +2108,68 @@ mod test {
             c.clone(),
         );
 
-        let h0 = tokio::spawn(async move { c0.async_alloc(0, 2 * MIN_ALLOC_SIZE).await });
+        let h0 = tokio::spawn(async move {
+            c0.async_alloc(
+                PieceKey {
+                    hash: Arc::new([0; 20]),
+                    piece_idx: 0,
+                },
+                2 * MIN_ALLOC_SIZE,
+            )
+            .await
+        });
         let r0 = h0.await;
 
-        let h1 = tokio::spawn(async move { c1.async_alloc(1, 1 * MIN_ALLOC_SIZE).await });
-        let mut h2 = task::spawn(async move { c2.async_alloc(2, 1 * MIN_ALLOC_SIZE).await });
-        let mut h3 = task::spawn(async move { c3.async_alloc(3, 2 * MIN_ALLOC_SIZE).await });
-        let h4 = tokio::spawn(async move { c4.async_alloc(4, 1 * MIN_ALLOC_SIZE).await });
-        let h5 = tokio::spawn(async move { c5.async_alloc(5, 2 * MIN_ALLOC_SIZE).await });
+        let h1 = tokio::spawn(async move {
+            c1.async_alloc(
+                PieceKey {
+                    hash: Arc::new([0; 20]),
+                    piece_idx: 1,
+                },
+                1 * MIN_ALLOC_SIZE,
+            )
+            .await
+        });
+        let mut h2 = task::spawn(async move {
+            c2.async_alloc(
+                PieceKey {
+                    hash: Arc::new([0; 20]),
+                    piece_idx: 2,
+                },
+                1 * MIN_ALLOC_SIZE,
+            )
+            .await
+        });
+        let mut h3 = task::spawn(async move {
+            c3.async_alloc(
+                PieceKey {
+                    hash: Arc::new([0; 20]),
+                    piece_idx: 3,
+                },
+                2 * MIN_ALLOC_SIZE,
+            )
+            .await
+        });
+        let h4 = tokio::spawn(async move {
+            c4.async_alloc(
+                PieceKey {
+                    hash: Arc::new([0; 20]),
+                    piece_idx: 4,
+                },
+                1 * MIN_ALLOC_SIZE,
+            )
+            .await
+        });
+        let h5 = tokio::spawn(async move {
+            c5.async_alloc(
+                PieceKey {
+                    hash: Arc::new([0; 20]),
+                    piece_idx: 5,
+                },
+                2 * MIN_ALLOC_SIZE,
+            )
+            .await
+        });
         assert!(h2.poll().is_pending());
         drop(h2);
         assert!(h3.poll().is_pending());
@@ -1988,30 +2198,66 @@ mod test {
         );
 
         let h0 = tokio::spawn(async move {
-            c0.async_alloc_abort::<ArcCache<_>>(0, 2 * MIN_ALLOC_SIZE)
-                .await
+            c0.async_alloc_abort::<ArcCache<_>>(
+                PieceKey {
+                    hash: Arc::new([0; 20]),
+                    piece_idx: 0,
+                },
+                2 * MIN_ALLOC_SIZE,
+            )
+            .await
         });
         let r0 = h0.await;
 
         let h1 = tokio::spawn(async move {
-            c1.async_alloc_abort::<ArcCache<_>>(1, 1 * MIN_ALLOC_SIZE)
-                .await
+            c1.async_alloc_abort::<ArcCache<_>>(
+                PieceKey {
+                    hash: Arc::new([0; 20]),
+                    piece_idx: 1,
+                },
+                1 * MIN_ALLOC_SIZE,
+            )
+            .await
         });
         let mut h2 = task::spawn(async move {
-            c2.async_alloc_abort::<ArcCache<_>>(2, 1 * MIN_ALLOC_SIZE)
-                .await
+            c2.async_alloc_abort::<ArcCache<_>>(
+                PieceKey {
+                    hash: Arc::new([0; 20]),
+                    piece_idx: 2,
+                },
+                1 * MIN_ALLOC_SIZE,
+            )
+            .await
         });
         let mut h3 = task::spawn(async move {
-            c3.async_alloc_abort::<ArcCache<_>>(3, 2 * MIN_ALLOC_SIZE)
-                .await
+            c3.async_alloc_abort::<ArcCache<_>>(
+                PieceKey {
+                    hash: Arc::new([0; 20]),
+                    piece_idx: 3,
+                },
+                2 * MIN_ALLOC_SIZE,
+            )
+            .await
         });
         let h4 = tokio::spawn(async move {
-            c4.async_alloc_abort::<ArcCache<_>>(4, 1 * MIN_ALLOC_SIZE)
-                .await
+            c4.async_alloc_abort::<ArcCache<_>>(
+                PieceKey {
+                    hash: Arc::new([0; 20]),
+                    piece_idx: 4,
+                },
+                1 * MIN_ALLOC_SIZE,
+            )
+            .await
         });
         let h5 = tokio::spawn(async move {
-            c5.async_alloc_abort::<ArcCache<_>>(5, 2 * MIN_ALLOC_SIZE)
-                .await
+            c5.async_alloc_abort::<ArcCache<_>>(
+                PieceKey {
+                    hash: Arc::new([0; 20]),
+                    piece_idx: 5,
+                },
+                2 * MIN_ALLOC_SIZE,
+            )
+            .await
         });
         assert!(h2.poll().is_pending());
         drop(h2);
@@ -2032,7 +2278,15 @@ mod test {
     async fn test_invalidate_piece_buf() {
         let c = PieceBufPool::new(10 * MIN_ALLOC_SIZE);
 
-        let mut piece = c.async_alloc(0, 2 * MIN_ALLOC_SIZE).await;
+        let mut piece = c
+            .async_alloc(
+                PieceKey {
+                    hash: Arc::new([0; 20]),
+                    piece_idx: 0,
+                },
+                2 * MIN_ALLOC_SIZE,
+            )
+            .await;
         let fb = piece.b.dup();
         let ref_work = task::spawn(async move {
             let _ = piece.as_mut();
@@ -2055,14 +2309,23 @@ mod test {
         let c = PieceBufPool::new(10 * MIN_ALLOC_SIZE);
 
         let p1 = c
-            .async_alloc_abort::<ArcCache<_>>(1, 2 * MIN_ALLOC_SIZE)
+            .async_alloc_abort::<ArcCache<_>>(
+                PieceKey {
+                    hash: Arc::new([0; 20]),
+                    piece_idx: 1,
+                },
+                2 * MIN_ALLOC_SIZE,
+            )
             .await;
         let p2 = c
-            .async_alloc_abort::<ArcCache<_>>(1, 1 * MIN_ALLOC_SIZE)
+            .async_alloc_abort::<ArcCache<_>>(
+                PieceKey {
+                    hash: Arc::new([0; 20]),
+                    piece_idx: 1,
+                },
+                1 * MIN_ALLOC_SIZE,
+            )
             .await;
-        // let p3 = c
-        //     .async_alloc_abort::<ArcCache<_>>(1, 4 * MIN_ALLOC_SIZE)
-        //     .await;
         let (mut r1, w1) = duplex(MIN_ALLOC_SIZE);
         r1.write(&[0; 4]).await;
         let (mut r2, w2) = duplex(MIN_ALLOC_SIZE);
@@ -2101,17 +2364,26 @@ mod test {
     async fn test_alloc_abort2() {
         let c = PieceBufPool::new(10 * MIN_ALLOC_SIZE);
         let p1 = c
-            .async_alloc_abort::<ArcCache<_>>(1, 2 * MIN_ALLOC_SIZE)
+            .async_alloc_abort::<ArcCache<_>>(
+                PieceKey {
+                    hash: Arc::new([0; 20]),
+                    piece_idx: 1,
+                },
+                2 * MIN_ALLOC_SIZE,
+            )
             .await;
         let p2 = c
-            .async_alloc_abort::<ArcCache<_>>(1, 1 * MIN_ALLOC_SIZE)
+            .async_alloc_abort::<ArcCache<_>>(
+                PieceKey {
+                    hash: Arc::new([0; 20]),
+                    piece_idx: 1,
+                },
+                1 * MIN_ALLOC_SIZE,
+            )
             .await;
         let (_r1, w1) = duplex(MIN_ALLOC_SIZE);
         let (_r2, w2) = duplex(MIN_ALLOC_SIZE);
         let (fb1, fb2, mut t1, mut t2) = {
-            // let p3 = c
-            //     .async_alloc_abort::<ArcCache<_>>(1, 4 * MIN_ALLOC_SIZE)
-            //     .await;
             let p1c = p1.clone();
             let mut t1 = task::spawn(async move {
                 let mut w1_pin = Box::pin(w1);

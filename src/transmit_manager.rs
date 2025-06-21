@@ -75,6 +75,7 @@ struct PeerConn {
 
 #[derive(Clone)]
 pub(crate) struct TransmitManagerHandle {
+    pub metadata: Arc<Metadata>,
     pub sender: mpsc::UnboundedSender<Msg>,
 
     // TODO: maybe not use Arc<Mutex<..>> but use a splitted lock structure to
@@ -128,6 +129,7 @@ impl TransmitManager {
             metadata: m.clone(),
             receiver: cmd_receiver,
             self_handle: TransmitManagerHandle {
+                metadata: m.clone(),
                 sender: cmd_sender,
                 picker: piece_picker.clone(),
                 piece_buffer: piece_buffer.clone(),
