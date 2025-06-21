@@ -356,48 +356,37 @@ impl PieceBufPool {
 
     /// alloc PieceBuf
     pub fn alloc(&self, key: PieceKey, size: usize) -> Result<PieceBuf, AllocErr> {
-        let size_fixed = if size < MIN_ALLOC_SIZE {
-            MIN_ALLOC_SIZE
-        } else {
-            size.next_power_of_two()
-        };
-        debug_assert_eq!(size_fixed % MIN_ALLOC_SIZE, 0);
-        let power = size_fixed.ilog2();
-
-        let mut buf_tree_guard = self.inner.buf_tree.lock().expect("alloc lock should OK");
-        match buf_tree_guard.alloc(power, key.clone()) {
-            Ok(fb) => Ok(PieceBuf {
-                b: fb,
-                key,
-                len: size,
-                main_cache: self.inner.clone(),
-            }),
-            Err(e) => {
-                if !buf_tree_guard.migrating && buf_tree_guard.can_fit_n_if_migrated(power) > 0 {
-                    // TODO: do we need a from_async flag, so that only fire migrate_task
-                    // when calling inside a async environment?
-                    let pool_impl = self.inner.clone();
-                    start_migrate_task(buf_tree_guard, pool_impl);
-                    Err(AllocErr::StartMigrating)
-                } else {
-                    assert!(
-                        e == AllocErr::NoSpace
-                            || e == AllocErr::Allocated
-                            || e == AllocErr::Oversize
-                            || e == AllocErr::IsMigrating
-                    );
-                    Err(e)
-                }
-            }
-        }
+        let post_work = |pb: PieceBuf, _: &mut BufTree| pb;
+        self.alloc_general(key, size, post_work)
     }
 
-    /// alloc PieceBuf
+    /// alloc abortable PieceBuf
     pub fn alloc_abort<T>(&self, key: PieceKey, size: usize) -> Result<T, AllocErr>
     where
         T: FromPieceBuf,
     {
-        // TODO: simplify repeat patterns
+        let post_work = |pb: PieceBuf, tree: &mut BufTree| {
+            let key = pb.key.clone();
+            let (ret, abort_handle) = T::new_abort(pb);
+            let fbh = tree
+                .alloced
+                .get_mut(&key)
+                .expect("just alloced should exist");
+            fbh.sub_manager_handle = Some(abort_handle);
+            ret
+        };
+        self.alloc_general(key, size, post_work)
+    }
+
+    fn alloc_general<T, F>(
+        &self,
+        key: PieceKey,
+        size: usize,
+        post_piecebuf: F,
+    ) -> Result<T, AllocErr>
+    where
+        F: FnOnce(PieceBuf, &mut BufTree) -> T,
+    {
         let size_fixed = if size < MIN_ALLOC_SIZE {
             MIN_ALLOC_SIZE
         } else {
@@ -414,18 +403,13 @@ impl PieceBufPool {
 
         match buf_tree_guard.alloc(power, key.clone()) {
             Ok(fb) => {
-                let (ret, abort_handle) = T::new_abort(PieceBuf {
-                    b: fb.dup(),
-                    key: key.clone(),
+                let pb = PieceBuf {
+                    b: fb,
+                    key,
                     len: size,
                     main_cache: self.inner.clone(),
-                });
-                let fbh = buf_tree_guard
-                    .alloced
-                    .get_mut(&key)
-                    .expect("just alloced should exist");
-                fbh.sub_manager_handle = Some(abort_handle);
-                Ok(ret)
+                };
+                Ok(post_piecebuf(pb, &mut buf_tree_guard))
             }
             Err(e) => {
                 if !buf_tree_guard.migrating && buf_tree_guard.can_fit_n_if_migrated(power) > 0 {
