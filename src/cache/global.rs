@@ -686,6 +686,10 @@ impl PieceBuf {
         self.b.offset = new_offset;
     }
 
+    pub(crate) fn len(&self) -> usize {
+        self.as_ref().len()
+    }
+
     pub(crate) fn offset_len(&self) -> (usize, usize) {
         (
             self.b.offset / MIN_ALLOC_SIZE,

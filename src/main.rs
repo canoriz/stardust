@@ -234,7 +234,7 @@ where
                             }
                             accum += 1;
                             bt_stream
-                                .send_piece(r.index, r.begin, &A)
+                                .send_piece(r.index, r.begin, &A[..(r.len as usize)])
                                 .await;
                         }
                         _ => {

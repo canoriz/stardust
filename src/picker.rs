@@ -372,7 +372,7 @@ impl HeapPiecePicker {
         let n_full_piece = total_length / (piece_size as usize);
         let full_piece_total_size = n_full_piece * (piece_size as usize);
         let (piece_total, last_piece_size) = if full_piece_total_size == total_length {
-            (n_full_piece, 0)
+            (n_full_piece, piece_size)
         } else {
             (
                 n_full_piece + 1,
@@ -385,7 +385,7 @@ impl HeapPiecePicker {
         }
 
         Self {
-            heap: Heap::new(piece_total as usize),
+            heap: Heap::new(piece_total),
             piece_size,
             piece_total: piece_total as u32,
             peer_status: HashMap::new(),
@@ -1265,12 +1265,56 @@ mod test {
     }
 
     #[test]
+    fn test_receive_last_block_multiple_of_piece_size() {
+        const PIECE_TOTAL: u32 = 30;
+        const TOTAL_LENGTH: usize = (PIECE_TOTAL * BLOCK_SIZE * 14) as usize;
+
+        let mut picker = HeapPiecePicker::new(TOTAL_LENGTH, BLOCK_SIZE * 14);
+        assert_eq!(picker.last_piece_size, BLOCK_SIZE * 14);
+        assert_eq!(picker.piece_total, PIECE_TOTAL);
+
+        let addr1 = generate_peer(1);
+        picker.peer_add(
+            addr1,
+            BitField::from(
+                vec![vec![false; PIECE_TOTAL as usize - 1], vec![true; 1]]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>(),
+            ),
+        );
+
+        const LAST_PIECE_SIZE: u32 = TOTAL_LENGTH as u32 % (14 * BLOCK_SIZE);
+
+        let now = time::Instant::now();
+        let (blks, n) = picker.pick_blocks(&addr1, 15, now);
+
+        // last block has exactly 14 blocks
+        assert_eq!(n, 14);
+        {
+            // if picker not set complete, should also return piece index
+            let mut complete = None;
+            for br in &blks.range {
+                for b in br.iter(LAST_PIECE_SIZE) {
+                    complete = complete.or(picker.block_received(&addr1, b));
+                }
+            }
+            assert_eq!(complete, Some(PIECE_TOTAL - 1));
+        }
+    }
+
+    #[test]
     fn test_receive_last_block() {
         const PIECE_TOTAL: u32 = 30;
         const TOTAL_LENGTH: usize = (PIECE_TOTAL * BLOCK_SIZE * 14 - 3 * (BLOCK_SIZE + 1)) as usize;
 
         // make a length not multiple of block size
         let mut picker = HeapPiecePicker::new(TOTAL_LENGTH, BLOCK_SIZE * 14);
+        assert_eq!(
+            picker.last_piece_size,
+            BLOCK_SIZE * 14 - 3 * (BLOCK_SIZE + 1)
+        );
+        assert_eq!(picker.piece_total, PIECE_TOTAL);
 
         let addr1 = generate_peer(1);
         picker.peer_add(

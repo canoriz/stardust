@@ -540,7 +540,7 @@ where
                                 hash: Arc::new(tmh.metadata.info_hash),
                                 piece_idx: piece.index as usize,
                             },
-                            tmh.piece_size,
+                            tmh.piece_len(piece.index as usize),
                         )
                         .await
                     {
@@ -571,11 +571,7 @@ where
             };
 
             let block_ref = pb
-                .async_get_part_ref(
-                    piece.begin as usize,
-                    // TODO: change 16384 to const
-                    (piece.len.next_multiple_of(16384)) as usize,
-                )
+                .async_get_part_ref(piece.begin as usize, piece.len as usize)
                 .await;
 
             (block_ref, pb)

@@ -84,10 +84,23 @@ pub(crate) struct TransmitManagerHandle {
     pub picker: Arc<Mutex<HeapPiecePicker>>,
     pub piece_buffer: Arc<Mutex<HashMap<u32, ArcCache<PieceBuf>>>>,
     pub piece_size: usize,
+    pub last_piece_size: usize,
+    pub piece_total: usize,
+
     pub back_file: Arc<Mutex<BackFile>>,
     pub write_worker: std::sync::mpsc::Sender<WriteJob<PieceBuf>>,
 
     pub buffer_pool: PieceBufPool,
+}
+
+impl TransmitManagerHandle {
+    pub fn piece_len(&self, piece_idx: usize) -> usize {
+        if piece_idx + 1 == self.piece_total {
+            self.last_piece_size // last piece
+        } else {
+            self.piece_size
+        }
+    }
 }
 
 pub struct TransmitManager {
@@ -122,6 +135,16 @@ impl TransmitManager {
         let piece_picker = Arc::new(Mutex::new(HeapPiecePicker::new(total_length, piece_size)));
         let piece_buffer = Arc::new(Mutex::new(HashMap::new()));
 
+        let (piece_total, last_piece_size) = {
+            let n_full_piece = total_length / (piece_size as usize);
+            let full_piece_total_size = n_full_piece * (piece_size as usize);
+            if full_piece_total_size == total_length {
+                (n_full_piece, piece_size as usize)
+            } else {
+                (n_full_piece + 1, (total_length - full_piece_total_size))
+            }
+        };
+
         let (job_tx, job_rx) = std::sync::mpsc::channel();
         // TODO: let cancellation token cancel this
         tokio::task::spawn_blocking(move || backfile::write_worker(job_rx));
@@ -134,6 +157,8 @@ impl TransmitManager {
                 picker: piece_picker.clone(),
                 piece_buffer: piece_buffer.clone(),
                 piece_size: piece_size as usize,
+                last_piece_size,
+                piece_total,
                 back_file: Arc::new(Mutex::new(BackFile::new(m))),
                 write_worker: job_tx,
                 buffer_pool: PieceBufPool::new(80 * 16 * 16384),

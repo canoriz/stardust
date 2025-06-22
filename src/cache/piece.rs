@@ -261,20 +261,17 @@ impl<T> Clone for ArcCache<T> {
 impl FromPieceBuf for ArcCache<PieceBuf> {
     // TODO: is this safe? require T: AsMut and taking ownership of T
     // size must be multiple of 16384
-    fn new_abort(mut t: PieceBuf) -> (Self, SubAbortHandle<PieceBuf>) {
-        let size = t.as_mut().len();
-        if size.trailing_zeros() < BLOCKSIZE.trailing_zeros() {
-            // TODO: maybe not panic, fix size instead?
-            panic!("cache size must be multiple of {BLOCKSIZE}")
-        }
-        assert_eq!(size % BLOCKSIZE, 0);
+    fn new_abort(t: PieceBuf) -> (Self, SubAbortHandle<PieceBuf>) {
+        let len = t.len();
+        let fixed_len = len.next_multiple_of(BLOCKSIZE);
+        assert_eq!(fixed_len % BLOCKSIZE, 0);
         let inner = Arc::new(Cache {
             buf: Mutex::new(BufState {
                 allow_new_ref: AtomicU32::new(ALLOW_NEW_REF),
 
                 cache: Some(t),
                 state: State {
-                    state: vec![BlockState::Vacant; size >> BLOCKBITS],
+                    state: vec![BlockState::Vacant; fixed_len >> BLOCKBITS],
                     ref_cnt: 0,
                 },
                 abort_handle: HashMap::new(),
@@ -324,12 +321,9 @@ where
     // TODO: is this safe? require T: AsMut and taking ownership of T
     // size must be multiple of 16384
     pub fn new(mut t: T) -> Self {
-        let size = t.as_mut().len();
-        if size.trailing_zeros() < BLOCKSIZE.trailing_zeros() {
-            // TODO: maybe not panic, fix size instead?
-            panic!("cache size must be multiple of {BLOCKSIZE}")
-        }
-        assert_eq!(size % BLOCKSIZE, 0);
+        let len = t.as_mut().len();
+        let fixed_len = len.next_multiple_of(BLOCKSIZE);
+        assert_eq!(fixed_len % BLOCKSIZE, 0);
         Self {
             inner: Arc::new(Cache {
                 buf: Mutex::new(BufState {
@@ -337,7 +331,7 @@ where
 
                     cache: Some(t),
                     state: State {
-                        state: vec![BlockState::Vacant; size >> BLOCKBITS],
+                        state: vec![BlockState::Vacant; fixed_len >> BLOCKBITS],
                         ref_cnt: 0,
                     },
                     abort_handle: HashMap::new(),
@@ -377,10 +371,8 @@ where
     // (offset_mutlple_of(block), len_multiple_of(block))
     // TODO: this needs a lot of tests
     pub fn get_part_ref(&self, offset: usize, len: usize) -> Result<Ref<T>, GetRefErr> {
-        if len.trailing_zeros() < BLOCKSIZE.trailing_zeros() {
-            // TODO: maybe not panic, fix size instead?
-            panic!("should be multiple of {BLOCKSIZE}");
-        }
+        let fixed_len = len.next_multiple_of(BLOCKSIZE);
+        assert_eq!(fixed_len % BLOCKSIZE, 0);
 
         let mut buf_guard = self.inner.buf.lock().expect("get part ref lock should OK");
         let allow_state = buf_guard.allow_new_ref.load(Ordering::Acquire);
@@ -398,14 +390,15 @@ where
             range_state.ref_cnt += 1;
 
             let any_block_not_vacant = range_state.state
-                [offset >> BLOCKBITS..(offset + len) >> BLOCKBITS]
+                [offset >> BLOCKBITS..(offset + fixed_len) >> BLOCKBITS]
                 .iter()
                 .any(|s| *s != BlockState::Vacant);
             if any_block_not_vacant {
                 return Err(GetRefErr::InUse);
             }
 
-            for s in range_state.state[offset >> BLOCKBITS..(offset + len) >> BLOCKBITS].iter_mut()
+            for s in
+                range_state.state[offset >> BLOCKBITS..(offset + fixed_len) >> BLOCKBITS].iter_mut()
             {
                 assert_eq!(*s, BlockState::Vacant);
                 *s = BlockState::InUse;
@@ -420,7 +413,7 @@ where
                 main_cache: ManuallyDrop::new(self.inner.clone()),
             })
         } else {
-            return Err(GetRefErr::Invalidated);
+            Err(GetRefErr::Invalidated)
         }
     }
 
@@ -462,10 +455,7 @@ where
 
     fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
         let fut = self.get_mut();
-        if fut.len.trailing_zeros() < BLOCKSIZE.trailing_zeros() {
-            // TODO: maybe not panic, fix size instead?
-            panic!("should be multiple of {BLOCKSIZE}");
-        }
+        let fixed_len = fut.len.next_multiple_of(BLOCKSIZE);
 
         let mut buf_guard = fut
             .cache
@@ -506,14 +496,15 @@ where
             range_state.ref_cnt += 1;
 
             let any_block_not_vacant = range_state.state
-                [fut.offset >> BLOCKBITS..(fut.offset + fut.len) >> BLOCKBITS]
+                [fut.offset >> BLOCKBITS..(fut.offset + fixed_len) >> BLOCKBITS]
                 .iter()
                 .any(|s| *s != BlockState::Vacant);
             if any_block_not_vacant {
                 return Poll::Ready(Err(GetRefErr::InUse));
             }
 
-            for s in range_state.state[fut.offset >> BLOCKBITS..(fut.offset + fut.len) >> BLOCKBITS]
+            for s in range_state.state
+                [fut.offset >> BLOCKBITS..(fut.offset + fixed_len) >> BLOCKBITS]
                 .iter_mut()
             {
                 assert_eq!(*s, BlockState::Vacant);
@@ -1122,6 +1113,17 @@ mod test {
                 .iter()
                 .enumerate()
                 .for_each(|(i, s)| assert_eq!((i, *s), (i, BlockState::Vacant)));
+        })
+    }
+
+    #[test]
+    fn test_cache_get_last_ref() {
+        loom_test(|| {
+            let cache = ArcCache::new(vec![0u8; BLOCKSIZE * 15 + 201]);
+            assert!(cache
+                .get_part_ref(15 * BLOCKSIZE, 202)
+                .is_err_and(|e| e == GetRefErr::RangeOverflow));
+            let _ref_last = cache.get_part_ref(15 * BLOCKSIZE, 201).unwrap();
         })
     }
 
