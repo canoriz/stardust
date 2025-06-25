@@ -5,6 +5,7 @@ pub use crate::protocol::BitField;
 use heap::Heap;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 use std::time;
 use tracing::{debug, info, warn};
 
@@ -165,7 +166,8 @@ impl Iterator for BlockRangeIter {
 enum BlockStatus {
     NotRequested,
     Requested(SocketAddr, time::Instant), // TODO: maybe use a Rc here to save space?
-    Received,                             // TODO: maybe record which peer sends us this block?
+    Receiving,
+    Received, // TODO: maybe record which peer sends us this block?
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -201,6 +203,14 @@ impl PartialRequestedPiece {
             .iter()
             .skip(self.all_requested_before)
             .all(|b| matches!(b, BlockStatus::Requested(_, _)))
+    }
+
+    // TODO: FIXME: test this and depending funcs
+    fn is_all_requested_or_receiving(&self) -> bool {
+        self.block_map
+            .iter()
+            .skip(self.all_requested_before)
+            .all(|b| matches!(b, BlockStatus::Requested(_, _) | BlockStatus::Receiving))
     }
 
     fn update_flags(&mut self) {
@@ -248,6 +258,11 @@ impl PartialRequestedPiece {
                 }
                 if *all_received_before >= block_index {
                     *all_received_before = block_index;
+                }
+            }
+            BlockStatus::Receiving => {
+                if *all_requested_before == block_index {
+                    *all_requested_before = block_index + 1;
                 }
             }
         }
@@ -838,7 +853,7 @@ impl HeapPiecePicker {
                 .partly_requested_pieces
                 .0
                 .iter()
-                .filter(|(_, v)| v.is_all_requested())
+                .filter(|(_, v)| v.is_all_requested_or_receiving())
                 .map(|(k, _)| *k)
                 .collect::<Vec<u32>>()
                 .iter()
@@ -937,29 +952,63 @@ impl HeapPiecePicker {
         }
     }
 
-    // TODO: maybe let this function maintain n_blk_in_flight?
-    // receive one block, returns if any piece is all received
-    #[must_use = "returns fully received pieces"]
-    pub fn block_received(&mut self, peer: &SocketAddr, blk: protocol::Request) -> Option<u32> {
+    #[must_use = "returns if this piece want or not"]
+    fn want_block(&self, blk: &protocol::Request) -> bool {
         let block_index = blk.begin >> 14;
+        if self.fully_received_pieces.contains(&blk.index) {
+            warn!(
+                "received unwant block piece {} block {block_index}",
+                blk.index,
+            );
+            false
+        } else if let Some(p) = self.fully_requested_pieces.get(&blk.index) {
+            if matches!(
+                p.block_map[block_index as usize],
+                BlockStatus::Received | BlockStatus::Receiving
+            ) {
+                warn!(
+                    "received unwant block piece {} block {block_index}",
+                    blk.index,
+                );
+                false
+            } else {
+                true
+            }
+        } else if let Some(p) = self.partly_requested_pieces.0.get(&blk.index) {
+            if matches!(
+                p.block_map[block_index as usize],
+                BlockStatus::Received | BlockStatus::Receiving
+            ) {
+                warn!(
+                    "received unwant block piece {} block {block_index}",
+                    blk.index,
+                );
+                false
+            } else {
+                true
+            }
+        } else {
+            self.heap.get_val(blk.index as usize).is_some()
+        }
+    }
+
+    /// returns if successfully starts
+    pub fn block_start_receiving(&mut self, peer: &SocketAddr, blk: &protocol::Request) -> bool {
+        // TODO: what if blk is invalid?
+        if !self.want_block(&blk) {
+            // TODO: does p always exist in peer_status?
+            if let Some(status) = self.peer_status.get_mut(peer) {
+                // TODO: should still update response time though...
+                status.bandwidth.add(blk.len as usize);
+                if status.n_in_flight > 0 {
+                    status.n_in_flight -= 1;
+                }
+            };
+            return false;
+        }
+
         let mut update_response_time = |status: BlockStatus| {
             match status {
-                BlockStatus::Received => {
-                    warn!(
-                        "received duplicated block piece {} block {}",
-                        blk.index,
-                        blk.begin >> 14
-                    );
-
-                    // TODO: does p always exist in peer_status?
-                    if let Some(status) = self.peer_status.get_mut(peer) {
-                        // TODO: should still update response time though...
-                        status.bandwidth.add(blk.len as usize);
-                        if status.n_in_flight > 0 {
-                            status.n_in_flight -= 1;
-                        }
-                    };
-                }
                 BlockStatus::Requested(p, t) if p == *peer => {
                     let response_time = time::Instant::now().duration_since(t);
 
@@ -973,14 +1022,101 @@ impl HeapPiecePicker {
                         }
                     };
                 }
-                _ => {}
+                BlockStatus::Received => {
+                    warn!(
+                        "received duplicated block piece {} block {}",
+                        blk.index,
+                        blk.begin >> 14
+                    );
+                    // TODO: does p always exist in peer_status?
+                    if let Some(status) = self.peer_status.get_mut(peer) {
+                        // TODO: should still update response time though...
+                        status.bandwidth.add(blk.len as usize);
+                        if status.n_in_flight > 0 {
+                            status.n_in_flight -= 1;
+                        }
+                    };
+                }
+                other => {
+                    warn!("peer receiving block {blk:?} of state {other:?}");
+                    // TODO: does p always exist in peer_status?
+                    if let Some(status) = self.peer_status.get_mut(peer) {
+                        status.bandwidth.add(blk.len as usize);
+                        if status.n_in_flight > 0 {
+                            status.n_in_flight -= 1;
+                        }
+                    };
+                }
             }
         };
+
+        let block_index = blk.begin >> 14;
+        if let Some(p) = self.partly_requested_pieces.0.get_mut(&blk.index) {
+            info!("start receiving blocks of partial requested piece {blk:?}");
+            debug_assert_eq!(blk.begin / BLOCK_SIZE, block_index);
+
+            update_response_time(p.block_map[block_index as usize]);
+            p.set_one_block_status(blk, BlockStatus::Receiving);
+            true
+        } else if let Some(p) = self.fully_requested_pieces.get_mut(&blk.index) {
+            info!("start receiving blocks of fully requested piece {blk:?}");
+            debug_assert!(!self.partly_requested_pieces.0.contains_key(&blk.index));
+            debug_assert_eq!(blk.begin / BLOCK_SIZE, block_index);
+
+            update_response_time(p.block_map[block_index as usize]);
+            p.set_one_block_status(blk, BlockStatus::Receiving);
+            true
+        } else if self.fully_received_pieces.contains(&blk.index) {
+            warn!(
+                "start receiving block piece {} block {} of fully received pieces",
+                blk.index,
+                blk.begin >> 14
+            );
+            false
+        } else if self.heap.get_val(blk.index as usize).is_none() {
+            // block of an already checked piece
+            warn!(
+                "attempt start receiving piece {} block {} of checked pieces",
+                blk.index,
+                blk.begin >> 14
+            );
+            false
+        } else {
+            // some un-requested blocks come
+            info!("received blocks of not requested piece {blk:?}");
+            let n_blocks_in_piece = (self.piece_size >> 14) as usize;
+            debug_assert_eq!(blk.begin / BLOCK_SIZE, block_index);
+
+            let mut p = PartialRequestedPiece {
+                block_map: vec![BlockStatus::NotRequested; n_blocks_in_piece],
+                all_requested_before: 0,
+                all_received_before: 0,
+            };
+            update_response_time(p.block_map[block_index as usize]);
+            p.set_one_block_status(&blk, BlockStatus::Receiving);
+
+            // TODO: change to is_all_received_or_requested
+            // otherwose half received half requested will ends in partials
+            // which is wrong
+            let is_all_received = p.is_all_received();
+            if is_all_received || p.is_all_requested_or_receiving() {
+                self.fully_requested_pieces.insert(blk.index, p);
+            } else {
+                self.partly_requested_pieces.0.insert(blk.index, p);
+            }
+            true
+        }
+    }
+
+    // TODO: maybe let this function maintain n_blk_in_flight?
+    // receive one block, returns if any piece is all received
+    #[must_use = "returns fully received pieces"]
+    pub fn block_received(&mut self, peer: &SocketAddr, blk: protocol::Request) -> Option<u32> {
+        let block_index = blk.begin >> 14;
         if let Some(p) = self.partly_requested_pieces.0.get_mut(&blk.index) {
             info!("received blocks of partial requested piece {blk:?}");
             debug_assert_eq!(blk.begin / BLOCK_SIZE, block_index);
 
-            update_response_time(p.block_map[block_index as usize]);
             p.set_one_block_status(&blk, BlockStatus::Received);
 
             let piece_received = p.is_all_received();
@@ -996,7 +1132,6 @@ impl HeapPiecePicker {
             debug_assert!(!self.partly_requested_pieces.0.contains_key(&blk.index));
             debug_assert_eq!(blk.begin / BLOCK_SIZE, block_index);
 
-            update_response_time(p.block_map[block_index as usize]);
             p.set_one_block_status(&blk, BlockStatus::Received);
 
             let piece_received = p.is_all_received();
@@ -1034,7 +1169,7 @@ impl HeapPiecePicker {
             // otherwose half received half requested will ends in partials
             // which is wrong
             let is_all_received = p.is_all_received();
-            if is_all_received || p.is_all_requested() {
+            if is_all_received || p.is_all_requested_or_receiving() {
                 self.fully_requested_pieces.insert(blk.index, p);
             } else {
                 self.partly_requested_pieces.0.insert(blk.index, p);
@@ -1122,6 +1257,59 @@ impl HeapPiecePicker {
 
     pub fn get_status(&self, peer: &SocketAddr) -> Option<&PeerStatus> {
         self.peer_status.get(peer)
+    }
+}
+
+pub fn start_receive_piece_block<'a>(
+    picker: Arc<Mutex<HeapPiecePicker>>,
+    peer: &'a SocketAddr,
+    blk: &'a protocol::Request,
+) -> Option<ReceiveBlockGuard<'a>> {
+    let mut p = picker.lock().expect("start receiving should lock OK");
+    if p.block_start_receiving(peer, blk) {
+        Some(ReceiveBlockGuard {
+            received: false,
+            blk,
+            peer,
+            picker: picker.clone(),
+        })
+    } else {
+        None
+    }
+}
+
+// TODO: tests
+pub struct ReceiveBlockGuard<'a> {
+    received: bool,
+    blk: &'a protocol::Request,
+    peer: &'a SocketAddr,
+    picker: Arc<Mutex<HeapPiecePicker>>,
+}
+
+impl ReceiveBlockGuard<'_> {
+    // returns if one piece is completed
+    pub fn block_received(&mut self) -> Option<u32> {
+        let mut picker = self.picker.lock().expect("block received lock should OK");
+        self.received = true;
+        picker.block_received(self.peer, *self.blk)
+    }
+}
+
+impl Drop for ReceiveBlockGuard<'_> {
+    fn drop(&mut self) {
+        if !self.received {
+            let mut picker = self
+                .picker
+                .lock()
+                .expect("drop receive block guard lock should OK");
+            warn!(
+                "block {:?} not received when guard dropped, revoke block",
+                self.blk
+            );
+            let br = BlockRange::one_block(self.blk.index, self.blk.begin, self.blk.len);
+            picker.blocks_revoke(&br);
+        }
+        info!("block {:?} received when guard dropped", self.blk);
     }
 }
 
@@ -1349,6 +1537,21 @@ mod test {
     #[test]
     fn test_block_received() {
         todo!("test block receive fully/partial/duplicate(already received) cases")
+    }
+
+    #[test]
+    fn test_have_block() {
+        todo!("test have block fully/partial/duplicate(already received) cases")
+    }
+
+    #[test]
+    fn test_want_block() {
+        todo!("test want block fully/partial/duplicate(already received) cases")
+    }
+
+    #[test]
+    fn test_receiving_guard() {
+        todo!("test receiving guard")
     }
 
     fn concat_vec<T>(a: Vec<T>, b: Vec<T>) -> Vec<T> {

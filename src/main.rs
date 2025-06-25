@@ -23,7 +23,7 @@ mod transmit_manager;
 use protocol::{BTStream, Message};
 use torrent_manager::TorrentManagerHandle;
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Hello, world!");
     tracing_subscriber::fmt()

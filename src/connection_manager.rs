@@ -10,7 +10,7 @@ use tracing::{info, warn};
 use crate::backfile::WriteJob;
 use crate::cache::{AbortErr, AllocErr, ArcCache, GetRefErr, PieceBuf, PieceKey, Ref};
 use crate::metadata;
-use crate::picker::BlockRequests;
+use crate::picker::{start_receive_piece_block, BlockRequests};
 use crate::protocol::{self, BTStream, Message, Piece, ReadStream, Split, WriteStream};
 use crate::transmit_manager::Msg as TransmitMsg;
 use crate::transmit_manager::TransmitManagerHandle;
@@ -413,27 +413,30 @@ where
     // then discard this block, don't alloc (if needed) piece buffer.
     // And there should be no piece buffer of this piece in pb_map
 
-    let already_have = tmh.picker.lock().unwrap().have_block(&protocol::Request {
+    let blk = protocol::Request {
         index: piece.index,
         begin: piece.begin,
         len: piece.len,
-    });
+    };
+    let mut receiving_guard =
+        if let Some(g) = start_receive_piece_block(tmh.picker.clone(), peer, &blk) {
+            g
+        } else {
+            // TODO: make this persistent
+            let mut drain = vec![0u8; piece.len as usize];
+            piece.read_exact(&mut drain).await;
+            // TODO: why this happen (at testing)?
+            // seems we are requesting twice for each piece
+            warn!(
+                "drain PIECE msg {} {} {} block index {}",
+                piece.index,
+                piece.begin,
+                piece.len,
+                piece.begin >> 14,
+            );
+            return Ok(());
+        };
 
-    if already_have {
-        // TODO: make this persistent
-        let mut drain = vec![0u8; piece.len as usize];
-        piece.read_exact(&mut drain).await;
-        // TODO: why this happen (at testing)?
-        // seems we are requesting twice for each piece
-        warn!(
-            "drain PIECE msg {} {} {} block index {}",
-            piece.index,
-            piece.begin,
-            piece.len,
-            piece.begin >> 14,
-        );
-        return Ok(());
-    }
     info!(
         "receive PIECE msg {} {} {} block index {}",
         piece.index,
@@ -444,14 +447,7 @@ where
 
     let (piece_buf, block_buf) = read_block_from_peer(tmh, &mut piece).await?;
 
-    let received_piece = tmh.picker.lock().unwrap().block_received(
-        peer,
-        protocol::Request {
-            index: piece.index,
-            begin: piece.begin,
-            len: piece.len,
-        },
-    );
+    let received_piece = receiving_guard.block_received();
     if let Some(i) = received_piece {
         info!("piece {i} received");
         // TODO: maybe returns and let upper fn sends this message

@@ -555,7 +555,7 @@ impl Iterator for BitFieldIter<'_> {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub struct Request {
     pub index: u32,
     pub begin: u32,
