@@ -411,6 +411,11 @@ impl PieceBufPool {
                 };
                 Ok(post_piecebuf(pb, &mut buf_tree_guard))
             }
+            Err(r @ AllocErr::Allocated | r @ AllocErr::Oversize) => {
+                #[cfg(test)]
+                println!("poll key {:?} error reason: {r:?}", key);
+                Err(r)
+            }
             Err(e) => {
                 if !buf_tree_guard.migrating && buf_tree_guard.can_fit_n_if_migrated(power) > 0 {
                     // TODO: do we need a from_async flag, so that only fire migrate_task
@@ -788,7 +793,11 @@ impl AllocFutInner<'_> {
                     println!("poll key {:?} ready 2", fut.key);
                     Poll::Ready(ok)
                 }
-                e @ Err(AllocErr::Allocated | AllocErr::Oversize) => Poll::Ready(e),
+                Err(r @ AllocErr::Allocated | r @ AllocErr::Oversize) => {
+                    #[cfg(test)]
+                    println!("poll key {:?} error reason: {r:?}", fut.key);
+                    Poll::Ready(Err(r))
+                }
                 Err(e) => {
                     waiting_alloc.push_back(AllocReq {
                         key: fut.key.clone(),
@@ -815,7 +824,21 @@ impl AllocFutInner<'_> {
                     println!("poll key {:?} ready 4", fut.key);
                     Poll::Ready(ok)
                 }
-                e @ Err(AllocErr::Allocated | AllocErr::Oversize) => Poll::Ready(e),
+                Err(r @ AllocErr::Allocated | r @ AllocErr::Oversize) => {
+                    // No change to the VALID flag, flag is still WAKING.
+                    // When this future dropped, a new waiting task is waked.
+                    // But if future not dropped immediately, following
+                    // allocations are blocked.
+                    // So we wake one here.
+                    // TODO: maybe we change VALID flag to DONE to reduce
+                    // spurious wakes.
+                    wake_next_waiting_alloc(&mut waiting_alloc);
+
+                    #[cfg(test)]
+                    println!("poll key {:?} error reason: {r:?}", fut.key);
+
+                    Poll::Ready(Err(r))
+                }
                 Err(e) => {
                     waiting_alloc.push_front(AllocReq {
                         key: fut.key.clone(),
@@ -2419,6 +2442,69 @@ mod test {
 
     #[cfg(not(mloom))]
     #[tokio::test]
+    async fn test_async_alloc_allocated_wake_next() {
+        let c = PieceBufPool::new(11 * MIN_ALLOC_SIZE);
+        let p1 = c
+            .async_alloc_abort::<ArcCache<_>>(
+                PieceKey {
+                    hash: Arc::new([0; 20]),
+                    piece_idx: 0,
+                },
+                4 * MIN_ALLOC_SIZE,
+            )
+            .await;
+        let _p2 = c
+            .async_alloc_abort::<ArcCache<_>>(
+                PieceKey {
+                    hash: Arc::new([0; 20]),
+                    piece_idx: 1,
+                },
+                4 * MIN_ALLOC_SIZE,
+            )
+            .await;
+        let c3 = c.clone();
+        let make_waiting = tokio::spawn(async move {
+            c3.async_alloc_abort::<ArcCache<_>>(
+                PieceKey {
+                    hash: Arc::new([0; 20]),
+                    piece_idx: 8,
+                },
+                4 * MIN_ALLOC_SIZE,
+            )
+            .await
+        });
+        let c3 = c.clone();
+        let p3 = tokio::spawn(async move {
+            c3.async_alloc_abort::<ArcCache<_>>(
+                PieceKey {
+                    hash: Arc::new([0; 20]),
+                    piece_idx: 8,
+                },
+                4 * MIN_ALLOC_SIZE,
+            )
+            .await
+        }); // returns err(allocated)
+        let c4 = c.clone();
+        let p4 = tokio::spawn(async move {
+            c4.async_alloc_abort::<ArcCache<_>>(
+                PieceKey {
+                    hash: Arc::new([0; 20]),
+                    piece_idx: 4,
+                },
+                2 * MIN_ALLOC_SIZE,
+            )
+            .await
+        });
+        tokio::spawn(async move {
+            drop(p1);
+        });
+        let _p3_1 = make_waiting.await.unwrap().unwrap();
+        assert!(p3.await.unwrap().is_err_and(|e| e == AllocErr::Allocated));
+        assert!(p4.await.unwrap().is_ok());
+    }
+
+    #[cfg(not(mloom))]
+    #[tokio::test]
     async fn test_async_alloc_drop_future() {
         let c = PieceBufPool::new(2 * MIN_ALLOC_SIZE);
         let (c0, c1, c2, c3, c4, c5) = (
@@ -2721,6 +2807,6 @@ mod test {
         assert_eq!(inv2.poll(), Poll::Ready(Ok(())));
         assert_eq!(inv1.poll(), Poll::Pending);
         t1.await;
-        inv1.await;
+        _ = inv1.await;
     }
 }
