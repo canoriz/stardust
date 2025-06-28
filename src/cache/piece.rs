@@ -80,10 +80,10 @@ fn allow_state_to_err(allow_state: u32) -> Option<GetRefErr> {
         None
     } else if allow_state & DISALLOW_NEW_REF > 0 {
         Some(GetRefErr::Disallowed)
-    } else if allow_state & PAUSE_NEW_REF > 0 {
-        Some(GetRefErr::Paused)
     } else if allow_state & INVALIDATED > 0 {
         Some(GetRefErr::Invalidated)
+    } else if allow_state & PAUSE_NEW_REF > 0 {
+        Some(GetRefErr::Paused)
     } else {
         None
     }
@@ -207,17 +207,17 @@ where
         buf_guard.cache.take();
     }
 
-    fn reenable(&self) {
+    fn unpause(&self) {
         self.buf
             .lock()
-            .expect("reenable lock should OK")
+            .expect("unpause lock should OK")
             .allow_new_ref
             .fetch_and(!PAUSE_NEW_REF, Ordering::Relaxed);
 
         let mut waiting_reqs = self
             .waiting_reqs
             .lock()
-            .expect("reenable lock waiting_reqs should OK");
+            .expect("unpause lock waiting_reqs should OK");
 
         for w in waiting_reqs.drain(0..) {
             #[cfg(test)]
@@ -565,10 +565,9 @@ where
     // drop inner Buf
     pub async fn invalidate_all(&self) {
         if let Some(a) = self.cache.upgrade() {
-            a.allow_new_ref(false);
+            a.set_allow_state(INVALIDATED);
             a.abort_all().await;
             a.drop_piecebuf();
-            a.set_allow_state(INVALIDATED);
         } else {
             panic!("invalidate upgrade failed, will this happen?");
         }
@@ -586,41 +585,7 @@ where
     // migrating done reenable get_ref request
     pub fn reenable(&self) {
         if let Some(a) = self.cache.upgrade() {
-            a.buf
-                .lock()
-                .expect("reenable lock should OK")
-                .allow_new_ref
-                .fetch_and(!PAUSE_NEW_REF, Ordering::Relaxed);
-
-            let mut waiting_reqs = a
-                .waiting_reqs
-                .lock()
-                .expect("reenable lock waiting_reqs should OK");
-
-            for w in waiting_reqs.drain(0..) {
-                #[cfg(test)]
-                println!("try waking {:?}", w.key);
-                match w
-                    .valid
-                    .compare_exchange(WAITING, WAKING, Ordering::AcqRel, Ordering::Acquire)
-                {
-                    Ok(_) => {
-                        w.waker.wake();
-                        #[cfg(test)]
-                        println!("wake waiting {:?}", w.key);
-                        break;
-                    }
-                    Err(actual) => {
-                        // if DONE, this future is Ready
-                        // if DROPPED, no one waiting future
-                        // pick next one
-                        debug_assert!(actual == DROPPED || actual == DONE || actual == WAKING);
-
-                        #[cfg(test)]
-                        println!("no wake {:?} because actual state {actual}", w.key);
-                    }
-                }
-            }
+            a.unpause();
         } else {
             panic!("reenable upgrade failed, will this happen?");
         }
@@ -1156,7 +1121,7 @@ mod test {
         assert!(matches!(ref12to13.poll(), Poll::Pending));
         assert!(matches!(ref6to8.poll(), Poll::Pending));
 
-        cache.inner.reenable();
+        cache.inner.unpause();
 
         assert!(matches!(ref6to8.poll(), Poll::Ready(Err(GetRefErr::InUse))));
         let r1213 = ref12to13.await;
@@ -1218,7 +1183,7 @@ mod test {
         let ref12to13 =
             tokio::spawn(async move { c.async_get_part_ref(12 * BLOCKSIZE, 1 * BLOCKSIZE).await });
 
-        cache.inner.reenable();
+        cache.inner.unpause();
 
         assert!(matches!(ref6to8.await.unwrap(), Err(GetRefErr::InUse)));
         let r1213 = ref12to13.await.unwrap();

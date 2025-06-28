@@ -7,7 +7,6 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{info, warn};
 
-use crate::backfile::WriteJob;
 use crate::cache::{AbortErr, AllocErr, ArcCache, GetRefErr, PieceBuf, PieceKey, Ref};
 use crate::metadata;
 use crate::picker::{start_receive_piece_block, BlockRequests};
@@ -456,47 +455,49 @@ where
         // block new ref to piece buffer
         // so ref count only decreases
         piece_buf.disable_new_ref();
+        let mut pb_map = tmh.piece_buffer.lock().unwrap();
+        pb_map.remove(&i);
 
-        let (write_tx, write_rx) = tokio::sync::oneshot::channel::<std::io::Result<()>>();
-        let write_job = {
-            // TODO: mark piece_buf as ready to write,
-            // get_part_ref should stop return new refs
-            // TODO: extend_to_entire may fail, if every Ref extend fail,
-            // will leaving completed block not written to disk.
-            // i.e. some Ref may not call extend_to_entire because the piece
-            // did not complete from their views.
-            if let Some(entire_block) = block_buf.extend_to_entire() {
-                let bf_copy = tmh.back_file.clone();
-                let piece_size = tmh.piece_size;
-                tmh.piece_buffer.lock().expect("lock should ok").remove(&i);
+        // let (write_tx, write_rx) = tokio::sync::oneshot::channel::<std::io::Result<()>>();
+        // let write_job = {
+        //     // TODO: mark piece_buf as ready to write,
+        //     // get_part_ref should stop return new refs
+        //     // TODO: extend_to_entire may fail, if every Ref extend fail,
+        //     // will leaving completed block not written to disk.
+        //     // i.e. some Ref may not call extend_to_entire because the piece
+        //     // did not complete from their views.
+        //     if let Some(entire_block) = block_buf.extend_to_entire() {
+        //         let bf_copy = tmh.back_file.clone();
+        //         let piece_size = tmh.piece_size;
+        //         tmh.piece_buffer.lock().expect("lock should ok").remove(&i);
 
-                Some(WriteJob {
-                    f: bf_copy,
-                    offset: (i as usize) * piece_size,
-                    buf: entire_block,
-                    write_tx,
-                })
-            } else {
-                warn!("some one holding block ref in piece {i}, give up writing",);
-                None
-            }
-        };
+        //         Some(WriteJob {
+        //             f: bf_copy,
+        //             offset: (i as usize) * piece_size,
+        //             buf: entire_block,
+        //             write_tx,
+        //         })
+        //     } else {
+        //         warn!("some one holding block ref in piece {i}, give up writing",);
+        //         None
+        //     }
+        // };
 
-        if let Some(wj) = write_job {
-            if let Err(e) = tmh.write_worker.send(wj) {
-                warn!("error sending write job to worker error {e:?}");
-            }
-            let write_res = write_rx.await;
-            // let r = hdl.await;
-            info!("write piece {i} result {write_res:?}");
-            // TODO: should really check sha1 of piece
-            tmh.picker.lock().unwrap().piece_checked(i);
-            // TODO: check write succes or fail
-            let mut pb_map = tmh.piece_buffer.lock().unwrap();
-            pb_map.remove(&i);
-            warn!("write piece {i} done ,delete in cache");
-            // TODO: still have arc ref to buf
-        }
+        // if let Some(wj) = write_job {
+        //     if let Err(e) = tmh.write_worker.send(wj) {
+        //         warn!("error sending write job to worker error {e:?}");
+        //     }
+        //     let write_res = write_rx.await;
+        //     // let r = hdl.await;
+        //     info!("write piece {i} result {write_res:?}");
+        //     // TODO: should really check sha1 of piece
+        //     tmh.picker.lock().unwrap().piece_checked(i);
+        //     // TODO: check write succes or fail
+        //     let mut pb_map = tmh.piece_buffer.lock().unwrap();
+        //     pb_map.remove(&i);
+        //     warn!("write piece {i} done ,delete in cache");
+        //     // TODO: still have arc ref to buf
+        // }
     }
     Ok(())
 }
@@ -534,8 +535,9 @@ where
                             PieceKey {
                                 // TODO: OPTIMIZE: avoid allocation
                                 hash: Arc::new(tmh.metadata.info_hash),
-                                piece_idx: piece.index as usize,
+                                offset: piece.index as usize * tmh.piece_size,
                             },
+                            Some(tmh.back_file.clone()),
                             tmh.piece_len(piece.index as usize),
                         )
                         .await
@@ -557,10 +559,8 @@ where
                             time::sleep(time::Duration::from_millis(10)).await;
                             continue 'outer;
                         }
-                        Err(_) => {
-                            unreachable!(
-                                "we using async alloc should not have NoSpace or Migrating"
-                            );
+                        Err(e) => {
+                            unreachable!("we using async alloc get error {e:?}");
                         }
                     }
                 }

@@ -2,6 +2,7 @@ mod global;
 mod piece;
 pub(crate) use global::{wake_next_waiting_alloc, AllocReq};
 pub(crate) use global::{AllocErr, PieceBuf, PieceBufPool, PieceKey};
+pub(crate) use global::{DynFileImpl, FileImpl};
 pub(crate) use piece::AsyncAbortRead;
 pub(crate) use piece::*;
 

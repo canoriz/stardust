@@ -765,7 +765,9 @@ impl HeapPiecePicker {
                             // TODO: will this peer always exist in peer_status?
                             self.peer_status.entry(*p).and_modify(|s| {
                                 s.n_timeout += 1;
-                                s.n_in_flight -= 1;
+                                if s.n_in_flight > 0 {
+                                    s.n_in_flight -= 1;
+                                }
                             });
 
                             revoke_pieces.push(BlockRange {
@@ -791,7 +793,9 @@ impl HeapPiecePicker {
                             // TODO: will this peer always exist in peer_status?
                             self.peer_status.entry(*p).and_modify(|s| {
                                 s.n_timeout += 1;
-                                s.n_in_flight -= 1;
+                                if s.n_in_flight > 0 {
+                                    s.n_in_flight -= 1;
+                                }
                             });
 
                             revoke_pieces.push(BlockRange {

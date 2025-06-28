@@ -1,7 +1,6 @@
-use crate::backfile;
 use crate::backfile::BackFile;
-use crate::backfile::WriteJob;
 use crate::cache::ArcCache;
+use crate::cache::DynFileImpl;
 use crate::cache::{PieceBuf, PieceBufPool};
 use crate::connection_manager::ConnectionManagerHandle;
 use crate::connection_manager::Msg as ConnMsg;
@@ -87,10 +86,8 @@ pub(crate) struct TransmitManagerHandle {
     pub last_piece_size: usize,
     pub piece_total: usize,
 
-    pub back_file: Arc<Mutex<BackFile>>,
-    pub write_worker: std::sync::mpsc::Sender<WriteJob<PieceBuf>>,
-
     pub buffer_pool: PieceBufPool,
+    pub back_file: DynFileImpl,
 }
 
 impl TransmitManagerHandle {
@@ -145,9 +142,7 @@ impl TransmitManager {
             }
         };
 
-        let (job_tx, job_rx) = std::sync::mpsc::channel();
         // TODO: let cancellation token cancel this
-        tokio::task::spawn_blocking(move || backfile::write_worker(job_rx));
         Self {
             metadata: m.clone(),
             receiver: cmd_receiver,
@@ -160,7 +155,6 @@ impl TransmitManager {
                 last_piece_size,
                 piece_total,
                 back_file: Arc::new(Mutex::new(BackFile::new(m))),
-                write_worker: job_tx,
                 buffer_pool: PieceBufPool::new(80 * 16 * 16384),
             },
             // announce_handle: None,

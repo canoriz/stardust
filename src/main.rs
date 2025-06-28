@@ -20,7 +20,7 @@ mod protocol;
 mod torrent_manager;
 mod transmit_manager;
 
-use protocol::{BTStream, Message};
+use protocol::{BTStream, Handshake, Message};
 use torrent_manager::TorrentManagerHandle;
 
 #[tokio::main(flavor = "current_thread")]
@@ -45,7 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // };
 
     let torrent_f = include_bytes!("../ubuntu-24.10-desktop-amd64.iso.torrent");
-    // let torrent_f = include_bytes!("../c8.torrent");
+    // let torrent_f = include_bytes!("../31.torrent");
     let torrent = metadata::FileMetadata::load(torrent_f).unwrap();
 
     let (metadata, announce_list) = torrent.to_metadata();
@@ -146,7 +146,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // if let Ok(mut conn) =
-    //     protocol::BTStream::connect_tcp("192.168.71.36:62227".parse().unwrap()).await
+    //     protocol::BTStream::connect_tcp("192.168.71.36:56089".parse().unwrap()).await
     // // protocol::BTStream::connect_tcp("127.0.0.1:35515".parse().unwrap()).await
     // {
     //     info!("{info_hash:?}");

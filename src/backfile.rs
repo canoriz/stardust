@@ -4,21 +4,13 @@ use std::io::Result;
 use std::sync::{mpsc, Mutex};
 use std::{path::Path, sync::Arc};
 
-use crate::cache::Ref;
+use crate::cache::{FileImpl, Ref};
 use crate::metadata::Metadata;
 
 #[cfg(unix)]
 use std::os::unix::prelude::*;
 use tracing::{info, warn};
 use FileExt;
-
-// trait FileImpl
-// where
-//     Self: Sized,
-// {
-//     fn open(path: Path) -> Result<Self>;
-//     fn write(&mut self, offset: usize, buf: &[u8]) -> Result<()>;
-// }
 
 struct NormalFile {
     file: File,
@@ -111,9 +103,10 @@ impl BackFile {
             .collect();
         write_ops
     }
+}
 
-    // TODO: does buf need static?
-    pub fn write(&mut self, offset: usize, buf: &[u8]) -> Result<()> {
+impl FileImpl for BackFile {
+    fn write_all(&mut self, offset: usize, buf: &[u8]) -> Result<()> {
         let mut wops = self.find_file(offset, buf);
         for w in wops.iter_mut() {
             info!(
@@ -142,6 +135,10 @@ impl BackFile {
         }
         Ok(())
     }
+
+    fn read_all(&mut self, offset: usize, buf: &mut [u8]) -> Result<()> {
+        todo!()
+    }
 }
 
 struct FileWriteOp<'a> {
@@ -161,42 +158,6 @@ struct FileWriteOp<'a> {
 //         }
 //     }
 // }
-
-pub struct WriteJob<T>
-where
-    T: AsMut<[u8]>,
-{
-    pub f: Arc<Mutex<BackFile>>,
-    pub offset: usize,
-    pub buf: Ref<T>,
-    pub write_tx: tokio::sync::oneshot::Sender<std::io::Result<()>>,
-}
-
-pub fn write_worker<T>(r: mpsc::Receiver<WriteJob<T>>)
-where
-    T: AsMut<[u8]>,
-{
-    loop {
-        match r.recv() {
-            Ok(job) => {
-                // TODO: dead lock?
-                let mut bf = job.f.lock().unwrap();
-                // let r = bf.write(job.offset, &job.buf);
-                warn!(
-                    "write offset {} len {} result {r:?}",
-                    job.offset,
-                    job.buf.len()
-                );
-                let r = Ok(());
-                job.write_tx.send(r);
-            }
-            Err(e) => {
-                info!("write worker error {e:?}");
-                return;
-            }
-        }
-    }
-}
 
 #[cfg(test)]
 mod test {
