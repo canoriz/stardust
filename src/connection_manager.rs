@@ -449,55 +449,16 @@ where
     let received_piece = receiving_guard.block_received();
     if let Some(i) = received_piece {
         info!("piece {i} received");
+        assert_eq!(piece.index, i);
         // TODO: maybe returns and let upper fn sends this message
         tmh.sender.send(TransmitMsg::PieceReceived(i));
 
         // block new ref to piece buffer
         // so ref count only decreases
+        // TODO: change this to disable_new_write_ref
+        // and start allow read_refs(for future seeding feature)
         piece_buf.disable_new_ref();
-        let mut pb_map = tmh.piece_buffer.lock().unwrap();
-        pb_map.remove(&i);
-
-        // let (write_tx, write_rx) = tokio::sync::oneshot::channel::<std::io::Result<()>>();
-        // let write_job = {
-        //     // TODO: mark piece_buf as ready to write,
-        //     // get_part_ref should stop return new refs
-        //     // TODO: extend_to_entire may fail, if every Ref extend fail,
-        //     // will leaving completed block not written to disk.
-        //     // i.e. some Ref may not call extend_to_entire because the piece
-        //     // did not complete from their views.
-        //     if let Some(entire_block) = block_buf.extend_to_entire() {
-        //         let bf_copy = tmh.back_file.clone();
-        //         let piece_size = tmh.piece_size;
-        //         tmh.piece_buffer.lock().expect("lock should ok").remove(&i);
-
-        //         Some(WriteJob {
-        //             f: bf_copy,
-        //             offset: (i as usize) * piece_size,
-        //             buf: entire_block,
-        //             write_tx,
-        //         })
-        //     } else {
-        //         warn!("some one holding block ref in piece {i}, give up writing",);
-        //         None
-        //     }
-        // };
-
-        // if let Some(wj) = write_job {
-        //     if let Err(e) = tmh.write_worker.send(wj) {
-        //         warn!("error sending write job to worker error {e:?}");
-        //     }
-        //     let write_res = write_rx.await;
-        //     // let r = hdl.await;
-        //     info!("write piece {i} result {write_res:?}");
-        //     // TODO: should really check sha1 of piece
-        //     tmh.picker.lock().unwrap().piece_checked(i);
-        //     // TODO: check write succes or fail
-        //     let mut pb_map = tmh.piece_buffer.lock().unwrap();
-        //     pb_map.remove(&i);
-        //     warn!("write piece {i} done ,delete in cache");
-        //     // TODO: still have arc ref to buf
-        // }
+        tmh.storage.set_can_flush(i);
     }
     Ok(())
 }
@@ -511,72 +472,22 @@ where
 {
     let mut written = 0usize;
     let target_len = piece.len as usize;
+
+    let key = PieceKey {
+        // TODO: OPTIMIZE: avoid allocation
+        hash: Arc::new(tmh.metadata.info_hash),
+        offset: piece.index as usize * tmh.piece_size,
+    };
+
     'outer: loop {
-        let maybe_pb: Option<ArcCache<_>> = {
-            // must drop pb_map before await point
-            // pb_map is not Send
-            let pb_map = tmh.piece_buffer.lock().unwrap();
-            pb_map.get(&piece.index).cloned()
-        };
-
-        let (block_ref, piece_buf) = {
-            let pb: ArcCache<PieceBuf> = match maybe_pb {
-                Some(pb) if pb.is_valid() => pb,
-                _ => {
-                    // TODO: many peer may all want to write piece i and all of them
-                    // allocating new buffer, which is wasting memory and affects other
-                    // buffer(other buffer being pushed out?)
-                    // Maybe async_alloc can store info about piece and wake up all waiting
-                    // tasks when the requested piece buffer is allocated, which avoids
-                    // deplicating allocates buffer
-                    match tmh
-                        .buffer_pool
-                        .async_alloc_abort::<ArcCache<_>>(
-                            PieceKey {
-                                // TODO: OPTIMIZE: avoid allocation
-                                hash: Arc::new(tmh.metadata.info_hash),
-                                offset: piece.index as usize * tmh.piece_size,
-                            },
-                            Some(tmh.back_file.clone()),
-                            tmh.piece_len(piece.index as usize),
-                        )
-                        .await
-                    {
-                        Ok(pb) => {
-                            // if this piece buffer already exists(allocated by other peer handler),
-                            // use exist one
-                            let mut pb_map = tmh.piece_buffer.lock().unwrap();
-                            pb_map.entry(piece.index).or_insert(pb).clone()
-                        }
-                        Err(AllocErr::Allocated) => {
-                            // TODO: another connection allocated this piece
-                            // but we did not find that piece in buffer hashmap before
-                            // so the connection allocated this is inserting to buffer
-                            // concurrently.
-                            // we should drop lock and wait some time?
-                            // FIXME: we should wake as soon as the piece is added to
-                            // hashmap, not some fixed 10ms
-                            time::sleep(time::Duration::from_millis(10)).await;
-                            continue 'outer;
-                        }
-                        Err(e) => {
-                            unreachable!("we using async alloc get error {e:?}");
-                        }
-                    }
-                }
-            };
-
-            let block_ref = pb
-                .async_get_part_ref(piece.begin as usize, piece.len as usize)
-                .await;
-
-            (block_ref, pb)
-        };
-
+        let piece_and_block_buf = tmh
+            .storage
+            .get_part_ref(piece.index, piece.begin, piece.len, key.clone())
+            .await;
         // TODO: need a biglock. What if some peer else is doing operation now?
         // i.e. operation between two locks?
-        match block_ref {
-            Ok(mut bbuf) => {
+        match piece_and_block_buf {
+            Ok((piece_buf, mut bbuf)) => {
                 while written < target_len {
                     let read_fut = piece.read_to_ref(bbuf, written);
                     match read_fut.await {

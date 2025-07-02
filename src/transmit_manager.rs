@@ -1,5 +1,6 @@
 use crate::backfile::BackFile;
 use crate::cache::ArcCache;
+use crate::cache::BufStorage;
 use crate::cache::DynFileImpl;
 use crate::cache::{PieceBuf, PieceBufPool};
 use crate::connection_manager::ConnectionManagerHandle;
@@ -81,13 +82,11 @@ pub(crate) struct TransmitManagerHandle {
     // reduce contention?
     // TODO: using dyn <trait Picker>?
     pub picker: Arc<Mutex<HeapPiecePicker>>,
-    pub piece_buffer: Arc<Mutex<HashMap<u32, ArcCache<PieceBuf>>>>,
     pub piece_size: usize,
     pub last_piece_size: usize,
     pub piece_total: usize,
 
-    pub buffer_pool: PieceBufPool,
-    pub back_file: DynFileImpl,
+    pub storage: BufStorage,
 }
 
 impl TransmitManagerHandle {
@@ -118,7 +117,7 @@ pub struct TransmitManager {
     connected_peers: HashMap<SocketAddr, PeerConn>,
 
     piece_picker: Arc<Mutex<HeapPiecePicker>>,
-    piece_buffer: Arc<Mutex<HashMap<u32, ArcCache<PieceBuf>>>>,
+    storage: BufStorage,
 }
 
 impl TransmitManager {
@@ -130,7 +129,6 @@ impl TransmitManager {
         let piece_size = m.info.piece_length;
         let total_length = m.len();
         let piece_picker = Arc::new(Mutex::new(HeapPiecePicker::new(total_length, piece_size)));
-        let piece_buffer = Arc::new(Mutex::new(HashMap::new()));
 
         let (piece_total, last_piece_size) = {
             let n_full_piece = total_length / (piece_size as usize);
@@ -142,26 +140,26 @@ impl TransmitManager {
             }
         };
 
+        let back_file = Arc::new(Mutex::new(BackFile::new(m.clone())));
+        let buf_storage = BufStorage::new(piece_size as usize, piece_total, back_file);
         // TODO: let cancellation token cancel this
         Self {
             metadata: m.clone(),
             receiver: cmd_receiver,
             self_handle: TransmitManagerHandle {
-                metadata: m.clone(),
+                metadata: m,
                 sender: cmd_sender,
                 picker: piece_picker.clone(),
-                piece_buffer: piece_buffer.clone(),
                 piece_size: piece_size as usize,
                 last_piece_size,
                 piece_total,
-                back_file: Arc::new(Mutex::new(BackFile::new(m))),
-                buffer_pool: PieceBufPool::new(80 * 16 * 16384),
+                storage: buf_storage.clone(),
             },
             // announce_handle: None,
             // announce_tx: None,
             connected_peers: HashMap::new(),
             piece_picker,
-            piece_buffer,
+            storage: buf_storage,
         }
     }
 
@@ -377,9 +375,6 @@ impl TransmitManager {
                 }
 
                 // TODO: if peer is choking us?
-
-                let pbl = self.self_handle.piece_buffer.lock().unwrap().len();
-                info!("piece buffer pending remains {pbl}");
             }
             other => {
                 info!("unhandled other {:?}", other);

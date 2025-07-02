@@ -19,6 +19,7 @@ use std::{
 };
 use tokio::io::{AsyncRead, ReadBuf};
 use tokio::sync::Notify;
+use tracing::warn;
 
 #[cfg(mloom)]
 use loom::sync::{
@@ -109,7 +110,8 @@ struct Cache<T> {
 }
 
 fn change_blockstate(v: &mut [BlockState], offset: usize, len: usize, state: BlockState) {
-    for s in v[offset >> BLOCKBITS..(offset >> BLOCKBITS) + (len >> BLOCKBITS)].iter_mut() {
+    let fixed_len = len.next_multiple_of(BLOCKSIZE);
+    for s in v[offset >> BLOCKBITS..((offset + fixed_len) >> BLOCKBITS)].iter_mut() {
         *s = state;
     }
 }
@@ -569,7 +571,7 @@ where
             a.abort_all().await;
             a.drop_piecebuf();
         } else {
-            panic!("invalidate upgrade failed, will this happen?");
+            warn!("invalidate_all upgrade failed, dropped in between?");
         }
     }
 
@@ -578,7 +580,7 @@ where
         if let Some(a) = self.cache.upgrade() {
             a.abort_all().await;
         } else {
-            panic!("abort upgrade failed, will this happen?");
+            warn!("abort upgrade failed, dropped in between?");
         }
     }
 
@@ -587,7 +589,7 @@ where
         if let Some(a) = self.cache.upgrade() {
             a.unpause();
         } else {
-            panic!("reenable upgrade failed, will this happen?");
+            warn!("reenable upgrade failed, dropped in between?");
         }
     }
 }
@@ -603,6 +605,8 @@ impl SubAbortHandle<PieceBuf> {
                     .expect("at migrate, the piece should be valid")
                     .reset_offset(new_offset)
             };
+        } else {
+            warn!("some PieceBuf dropped while migrating, will this happen? this might indicating a bug!")
         }
     }
 }

@@ -28,4 +28,8 @@ loom = { version = "0.7", features = ["checkpoint"] }
 
 [lints.rust]
 # TODO: What does this really do? Should it warn or not?
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(mloom)'] }
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(mloom)',
+    'cfg(test_flush_migrate_concurrent)',
+] }
+#[cfg(drop_flush_)]

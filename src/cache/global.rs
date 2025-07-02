@@ -5,7 +5,7 @@ use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::io;
 use std::marker::PhantomData;
-use std::ops::{Deref, DerefMut, Div};
+use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 
@@ -13,13 +13,19 @@ use std::task::{Context, Poll, Waker};
 use loom::sync::{mpsc, Arc, Mutex, MutexGuard};
 #[cfg(not(mloom))]
 use std::sync::{mpsc, Arc, Mutex, MutexGuard};
+use tokio::task::JoinHandle;
 
 use tokio::sync::Notify;
+
+#[cfg(test_flush_migrate_concurrent)]
+use tokio::sync::Semaphore;
+#[cfg(test_flush_migrate_concurrent)]
+static DROP_CONCURRENT: Semaphore = Semaphore::const_new(0);
 
 #[cfg(mloom)]
 use loom::atomic::{AtomicBool, AtomicU32, Ordering};
 #[cfg(not(mloom))]
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use tracing::{info, warn};
 
 use super::SubAbortHandle;
@@ -44,7 +50,7 @@ pub(crate) struct PieceBufPool {
 
 // FreeBlock is NOT Clone. It's fundamentally a owned reference to
 // free buffer
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq)]
 struct FreeBlock {
     // TODO: offset and ptr is same thing? only store one?
     offset: usize,
@@ -74,13 +80,19 @@ struct FreeBlockHandle {
     sub_manager_handle: Option<SubAbortHandle<PieceBuf>>,
 }
 
-impl Eq for FreeBlock {}
-impl PartialEq for FreeBlock {
-    fn eq(&self, other: &Self) -> bool {
-        // only compare value, not valid
-        self.offset == other.offset && self.power == other.power && self.ptr == other.ptr
+impl Debug for FreeBlockHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FreeBlockHandle")
+            .field("free_block", &self.free_block)
+            .field("len(invalidate_waiter)", &self.invalidate_waiter.len())
+            .field(
+                "is_some(sub_manager_handle)",
+                &self.sub_manager_handle.is_some(),
+            )
+            .finish()
     }
 }
+
 impl Hash for FreeBlock {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.offset.hash(state);
@@ -93,13 +105,15 @@ unsafe impl Send for FreeBlock {}
 unsafe impl Sync for FreeBlock {}
 
 struct BufTree {
-    migrating: bool, // TODO: Maybe use atomic and move out of BufTree
+    migrating: bool, // TODO: After carefully checking, use atomic and move out of BufTree(Mutex)
+    flushing: u32,   // TODO: After carefully checking, use atomic and move out of BufTree(Mutex)
     buf: Vec<u8>,
     blk_tree: BlockTree,
 
     // TODO: maybe use a more efficient DS
-    // TODO: maybe use HashMap<FreeBlock, handle>
     alloced: HashMap<PieceKey, FreeBlockHandle>,
+
+    flush_after_migrate: Vec<WriteJob>,
 }
 
 impl BufTree {
@@ -119,6 +133,11 @@ impl BufTree {
     /// alloc regardless of migrating bit
     fn migrating_alloc(&mut self, power: u32, key: PieceKey) -> Result<FreeBlock, AllocErr> {
         if self.alloced.contains_key(&key) {
+            for k in self.flush_after_migrate.iter() {
+                if k.piece.0 == key {
+                    return Err(AllocErr::Flushing);
+                }
+            }
             return Err(AllocErr::Allocated);
         }
         if self.blk_tree.tree.len() as u32 + MIN_ALLOC_SIZE_POWER - 1 < power {
@@ -146,12 +165,14 @@ impl BufTree {
         }
     }
 
-    fn free(&mut self, b: &FreeBlock, key: &PieceKey) -> FreeBlockHandle {
-        self.blk_tree.merge_up(b.offset, b.power);
-
-        self.alloced
+    fn free(&mut self, key: &PieceKey) -> FreeBlockHandle {
+        let fbh = self
+            .alloced
             .remove(key)
-            .expect("free should see piecebuf in alloced list")
+            .expect("free should see piecebuf in alloced list");
+        let b = &fbh.free_block;
+        self.blk_tree.merge_up(b.offset, b.power);
+        fbh
     }
 
     fn count_blk_of_power(&self) -> Vec<usize> {
@@ -194,6 +215,11 @@ impl BufTree {
 
         let mut migrate_map = vec![0usize; self.buf.len() >> MIN_ALLOC_SIZE_POWER];
 
+        #[cfg(test)]
+        {
+            println!("old allocated");
+            println!("{:?}", self.alloced);
+        }
         let mut block_powers: Vec<Vec<(PieceKey, FreeBlockHandle)>> = Vec::new();
         for _ in 0..self.blk_tree.tree.len() {
             block_powers.push(vec![]);
@@ -230,9 +256,17 @@ impl BufTree {
             }
         }
         self.alloced = new_alloced;
+        #[cfg(test)]
+        {
+            println!("new allocated");
+            println!("{:?}", self.alloced);
+        }
 
         #[cfg(test)]
-        self.blk_tree.print();
+        {
+            println!("new block tree");
+            self.blk_tree.print();
+        }
 
         let mut blk_offset = 0;
         while blk_offset < self.buf.len() >> MIN_ALLOC_SIZE_POWER {
@@ -288,7 +322,7 @@ pub enum InvalidateErr {
 struct WriteJob {
     f: DynFileImpl,
     offset: usize,
-    piece: (FreeBlock, PieceKey, usize),
+    piece: (PieceKey, usize),
     main_cache: Arc<PieceBufPoolImpl>,
 }
 
@@ -297,14 +331,34 @@ impl WriteJob {
         // TODO: dead lock?
         let mut bf = self.f.lock().unwrap();
 
-        let (b, key, len) = &self.piece;
-        let buf = unsafe { slice::from_raw_parts(b.ptr, *len) };
+        let (key, len) = &self.piece;
+
+        // we have flushing > 0, so even if out of mutex, no migrate task will
+        // run and the pointer always valid
+        let buf = {
+            let buf_tree = self
+                .main_cache
+                .buf_tree
+                .lock()
+                .expect("do_io lock flushing-- should OK");
+            assert!(buf_tree.flushing > 0);
+            assert!(!buf_tree.migrating);
+            let blk = buf_tree
+                .alloced
+                .get(key)
+                .expect("key should exist in allocated list");
+            let buf = unsafe { slice::from_raw_parts(blk.free_block.ptr, *len) };
+            buf
+        };
 
         let r = bf.write_all(self.offset, buf);
 
-        self.main_cache.free(b, key);
+        // TODO: optimize this unlock-relock pattern
+        self.main_cache.free(key, true);
         // let r = Ok(());
         warn!("write offset {} len {} result {r:?}", self.offset, len,);
+        #[cfg(test)]
+        println!("write offset {} len {} result {r:?}", self.offset, len,);
         r
         // job.write_tx.send(r);
     }
@@ -388,6 +442,7 @@ impl Debug for PieceKey {
 pub(crate) enum AllocErr {
     NoSpace,
     Allocated,
+    Flushing,
     Oversize,
     StartMigrating,
     IsMigrating,
@@ -496,7 +551,10 @@ impl PieceBufPool {
                 Err(r)
             }
             Err(e) => {
-                if !buf_tree_guard.migrating && buf_tree_guard.can_fit_n_if_migrated(power) > 0 {
+                if buf_tree_guard.flushing == 0
+                    && !buf_tree_guard.migrating
+                    && buf_tree_guard.can_fit_n_if_migrated(power) > 0
+                {
                     // TODO: do we need a from_async flag, so that only fire migrate_task
                     // when calling inside a async environment?
                     let pool_impl = self.inner.clone();
@@ -577,9 +635,11 @@ impl PieceBufPoolImpl {
         Self {
             buf_tree: Mutex::new(BufTree {
                 migrating: false,
+                flushing: 0,
                 buf: vec![0u8; size_fixed],
                 blk_tree: init_block_tree(size_fixed),
                 alloced: HashMap::new(),
+                flush_after_migrate: Vec::new(),
             }),
             waiting_alloc: Mutex::new(VecDeque::new()),
             invalidating: AtomicU32::new(0),
@@ -602,10 +662,10 @@ impl PieceBufPoolImpl {
     }
 
     /// return PieceBuf to pool
-    fn free(&self, b: &FreeBlock, key: &PieceKey) {
+    fn free(&self, key: &PieceKey, after_flush: bool) {
         {
-            let mut buf_tree_guard = self.buf_tree.lock().expect("alloc lock should OK");
-            let mut fh = buf_tree_guard.free(b, key);
+            let mut buf_tree_guard = self.buf_tree.lock().expect("free lock should OK");
+            let mut fh = buf_tree_guard.free(key);
 
             #[cfg(test)]
             println!("free piecebuf");
@@ -614,6 +674,10 @@ impl PieceBufPoolImpl {
                 #[cfg(test)]
                 println!("invalidate_waker some {:?}", w);
                 w.notify_one();
+            }
+
+            if after_flush {
+                buf_tree_guard.flushing -= 1;
             }
             // buf_tree's lock dropped here, prevents deadlock
         }
@@ -669,6 +733,14 @@ impl PieceBufPoolImpl {
     }
 
     async fn pause_all_before_migrate(&self) -> Result<(), MigrateErr> {
+        #[cfg(test_flush_migrate_concurrent)]
+        {
+            use tokio::time;
+            println!("{}", DROP_CONCURRENT.available_permits());
+            _ = DROP_CONCURRENT.acquire_many(2).await;
+            time::sleep(time::Duration::from_millis(10)).await;
+        }
+
         let wait_abort = {
             let mut buf_tree_guard = self.buf_tree.lock().expect("pause lock should OK");
             assert_eq!(buf_tree_guard.migrating, true);
@@ -737,32 +809,72 @@ impl PieceBufPoolImpl {
 }
 
 impl Drop for PieceBuf {
+    /// Must be very careful since PieceBuf maybe wrapped in struct
+    /// which supports "abort". And we might be dropping some piece while
+    /// concurrently migrating.
+    // SAFETY: TODO: is this sound?
     fn drop(&mut self) {
         #[cfg(test)]
         println!("free PieceBuf {:?}", self);
 
+        #[cfg(test_flush_migrate_concurrent)]
+        {
+            DROP_CONCURRENT.add_permits(1);
+            println!("add permit");
+        }
+
+        // self.b may points to a DANGLING pointer, even if dirty == false or
+        // migrating == false. But key is always valid since no other way except
+        // drop() can purge a key, so the block associated with key always exist.
         if let Self {
             dirty: true,
             under_file: Some(f_impl),
             ..
         } = self
         {
+            let main_cache = &self.main_cache;
+            let mut buf_tree = main_cache
+                .buf_tree
+                .lock()
+                .expect("PieceBuf drop lock flushing++ should OK");
+
             let job = WriteJob {
                 f: f_impl.clone(),
                 offset: self.key.offset,
-                piece: (self.b.dup(), self.key.clone(), self.len),
+                piece: (self.key.clone(), self.len),
                 main_cache: self.main_cache.clone(),
             };
 
-            // TODO: FIXME: check return value of do_io
-            tokio::task::spawn_blocking(move || job.do_io());
+            buf_tree.flushing += 1;
+            if buf_tree.migrating {
+                // we should be in progress of pausing all reads
+                // or after migrating done
+                // we CAN'T be concurrently with real migrating process
+                // because real migrating process holds BufTree lock!
+                //
+                // when pausing, pointers will not move, valid pointers are
+                // always valid. But there may be more than one migrate() called
+                // since drop() begin, our self.b might also be DANGLING
 
-            #[cfg(debug_assertions)]
-            println!("wake worker to flush dirty piece {:?}", self);
-            return;
+                buf_tree.flush_after_migrate.push(job);
+            } else {
+                // There are 2 possibilities:
+                // 1. no migration at entire lifetime of drop()
+                // 2. after entering drop(), migration is called and done
+                //
+                // In situation 2, the self.b maybe DANGLING, but key won't
+
+                // TODO: FIXME: check return value of do_io
+                tokio::task::spawn_blocking(move || job.do_io());
+
+                #[cfg(debug_assertions)]
+                println!("wake worker to flush dirty piece {:?}", self);
+            }
+        } else {
+            // No matter self.b dangling or not, we don't touch these fields
+            // at all. The key is always valid.
+            self.main_cache.free(&self.key, false);
         }
-
-        self.main_cache.free(&self.b, &self.key);
     }
 }
 
@@ -815,7 +927,7 @@ impl PieceBuf {
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.as_ref().len()
+        self.len
     }
 
     pub(crate) fn offset_len(&self) -> (usize, usize) {
@@ -1047,6 +1159,13 @@ async fn migrate_task(pool_impl: Arc<PieceBufPoolImpl>) {
             }
 
             buf_tree_guard.migrating = false;
+
+            for job in buf_tree_guard.flush_after_migrate.drain(0..) {
+                #[cfg(test)]
+                println!("migrate_task: migrating done, wake up one pending flush request");
+                // TODO: FIXME: check return value of do_io
+                tokio::task::spawn_blocking(move || job.do_io());
+            }
         }
         {
             // migrate done, now wake up one pending alloc request
@@ -1063,12 +1182,21 @@ async fn migrate_task(pool_impl: Arc<PieceBufPoolImpl>) {
     }
 }
 
-fn start_migrate_task(mut buf_tree: MutexGuard<'_, BufTree>, pool_impl: Arc<PieceBufPoolImpl>) {
+fn start_migrate_task(buf_tree: MutexGuard<'_, BufTree>, pool_impl: Arc<PieceBufPoolImpl>) {
+    assert!(!buf_tree.migrating);
+    assert!(buf_tree.flushing == 0);
+    start_migrate_task_inner(buf_tree, pool_impl);
+}
+
+fn start_migrate_task_inner(
+    mut buf_tree: MutexGuard<'_, BufTree>,
+    pool_impl: Arc<PieceBufPoolImpl>,
+) -> JoinHandle<()> {
     // must set migrating in sync code
     // so at most one migrate_task can run
     buf_tree.migrating = true;
     drop(buf_tree);
-    tokio::spawn(migrate_task(pool_impl));
+    tokio::spawn(migrate_task(pool_impl))
 }
 
 impl Future for AllocPieceBufFut<'_> {
@@ -1154,8 +1282,9 @@ impl BlockTree {
 
     #[cfg(test)]
     fn print(&self) {
+        println!("empty blocks:");
         for (i, blk) in self.tree.iter().enumerate() {
-            println!("power {}, {:?}", i as u32 + MIN_ALLOC_SIZE_POWER, blk);
+            println!("  power {}, {:?}", i as u32 + MIN_ALLOC_SIZE_POWER, blk);
         }
     }
 }
@@ -1533,8 +1662,10 @@ mod test {
         let base_ptr = buf.as_mut_ptr();
         let mut b = BufTree {
             migrating: false,
+            flushing: 0,
             buf,
             blk_tree: v,
+            flush_after_migrate: Vec::new(),
             alloced: HashMap::from([
                 key_and_fbh(
                     PieceKey {
@@ -1650,8 +1781,10 @@ mod test {
         let base_ptr = buf.as_mut_ptr();
         let mut b = BufTree {
             migrating: false,
+            flushing: 0,
             buf,
             blk_tree: v,
+            flush_after_migrate: Vec::new(),
             alloced: HashMap::from([
                 key_and_fbh(
                     PieceKey {
@@ -1744,8 +1877,10 @@ mod test {
         let base_ptr = buf.as_mut_ptr();
         let mut b = BufTree {
             migrating: false,
+            flushing: 0,
             buf,
             blk_tree: v,
+            flush_after_migrate: Vec::new(),
             alloced: HashMap::from([
                 key_and_fbh(
                     PieceKey {
@@ -1858,8 +1993,8 @@ mod test {
                 hash: Arc::new([0; 20]),
                 offset: 6,
             };
-            let res = b.alloc(MIN_ALLOC_SIZE_POWER + 2, pk.clone()).unwrap();
-            b.free(&res, &pk);
+            let _res = b.alloc(MIN_ALLOC_SIZE_POWER + 2, pk.clone()).unwrap();
+            b.free(&pk);
         }
         {
             let res1 = b
@@ -2099,6 +2234,67 @@ mod test {
         }
     }
 
+    #[cfg(not(mloom))]
+    #[cfg(test_flush_migrate_concurrent)]
+    #[tokio::test]
+    async fn test_flush_migrate_concurrent() {
+        use tokio::time;
+
+        let c = PieceBufPool::new(15 * MIN_ALLOC_SIZE);
+
+        let pk0 = PieceKey {
+            hash: Arc::new([0; 20]),
+            offset: 30,
+        };
+        let pk1 = PieceKey {
+            hash: Arc::new([0; 20]),
+            offset: 0,
+        };
+        let buf = Arc::new(Mutex::new(TestFileImpl::new(1155)));
+        let p0 = c
+            .async_alloc_abort::<ArcCache<_>>(pk0, Some(buf.clone()), 1155)
+            .await
+            .unwrap();
+        let p1 = c
+            .async_alloc_abort::<ArcCache<_>>(pk1, Some(buf.clone()), 1155)
+            .await
+            .unwrap();
+        drop(p0);
+
+        let (mut r1, w1) = duplex(MIN_ALLOC_SIZE);
+
+        // before invalidate, buf should be all 0x00
+        for b in buf.lock().unwrap().buf().iter().take(4) {
+            assert_eq!(*b, 0x00);
+        }
+
+        r1.write(&[0xcc; 4]).await.unwrap();
+        {
+            let p1c = p1.clone();
+            let mut w1_pin = Box::pin(w1);
+            read_to_ref(&mut w1_pin, p1c.clone(), 0, 4).await;
+        }
+        {
+            let r = p1.get_part_ref(0, 4).unwrap();
+            println!("{:?}", r.as_ref());
+        }
+
+        time::sleep(time::Duration::from_millis(10)).await;
+        let buf_guard = c.inner.buf_tree.lock().unwrap();
+        let migrate_task = start_migrate_task_inner(buf_guard, c.inner.clone());
+        drop(p1);
+        // wait read task run
+        _ = migrate_task.await;
+
+        // wait flush task finish
+        time::sleep(time::Duration::from_millis(10)).await;
+
+        // after invalidate, dirty data should be flushed
+        for b in buf.lock().unwrap().buf().iter().take(4) {
+            assert_eq!(*b, 0xcc);
+        }
+    }
+
     #[tokio::test]
     #[cfg(not(mloom))]
     async fn test_invalidate_flush() {
@@ -2207,11 +2403,10 @@ mod test {
     where
         T: AsyncRead,
     {
-        let len = expect.next_multiple_of(16384);
         let mut written = 0;
         let mut counter = 0;
         'outer: while written < expect {
-            match piece.async_get_part_ref(offset, len).await {
+            match piece.async_get_part_ref(offset, expect).await {
                 Ok(ref mut refbuf) => {
                     while written < expect {
                         let read_fut = conn.read_abort(refbuf, written);
@@ -2224,6 +2419,7 @@ mod test {
                             }
                             Err(AbortErr::Aborted) => {
                                 // go to next round
+                                println!("read aborted");
                                 counter += 1;
                                 continue 'outer;
                             }
