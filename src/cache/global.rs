@@ -448,6 +448,7 @@ pub(crate) enum AllocErr {
     NoSpace,
     Allocated,
     Flushing, // TODO: maybe add Loading state?
+    LoadErr(io::ErrorKind),
     Oversize,
     StartMigrating,
     IsMigrating,
@@ -1062,23 +1063,21 @@ impl AllocFutInner<'_> {
                                 // we are out of lock
                                 // but we are holding pb, and pb don't have abort handle
                                 // no one can moves us
-                                let done =
-                                    Arc::new((UnsafeCell::new(None), AtomicBool::new(false)));
+                                let done = Arc::new(LoadJob(
+                                    UnsafeCell::new(None),
+                                    AtomicBool::new(false),
+                                ));
                                 let reader_done = done.clone();
                                 let waker = cx.waker().clone();
                                 tokio::task::spawn_blocking(move || {
                                     let mut f = file.lock().expect("alloc lock file should OK");
                                     let res = f.read_all(pb.key.offset, pb.as_mut());
-                                    *reader_done.0.get_mut() = Some(res);
-                                    reader_done.1.store(true, Ordering::Release); // make sure read done before atomic set
+                                    unsafe { reader_done.store(res) };
                                     atomic::fence(Ordering::Acquire); // make sure we set done first, then wake
                                     waker.wake()
                                 });
 
-                                *fut = AllocFutInner::Loading(Loading {
-                                    pool: a.pool,
-                                    done,
-                                });
+                                *fut = AllocFutInner::Loading(Loading { pool: a.pool, done });
                                 Poll::Pending
                             }
                             _ => {
@@ -1280,10 +1279,34 @@ impl Drop for Allocating<'_> {
     }
 }
 
+struct LoadJob(UnsafeCell<Option<io::ErrorKind>>, AtomicBool);
+unsafe impl Sync for LoadJob {}
+impl LoadJob {
+    // make sure only call this once
+    unsafe fn store(&self, r: io::Result<()>) {
+        debug_assert!(!self.1.load(Ordering::Relaxed));
+        if let Err(e) = r {
+            *self.0.get() = Some(e.kind());
+        }
+        self.1.store(true, Ordering::Release); // make sure read done before atomic set
+        atomic::fence(Ordering::Acquire);
+    }
+
+    // first option for done or not, second for err or not
+    fn load(&self) -> Option<Option<io::ErrorKind>> {
+        if self.1.load(Ordering::Acquire) {
+            unsafe { Some(*self.0.get()) }
+        } else {
+            None
+        }
+    }
+}
+
 struct Loading<'a> {
     pool: &'a PieceBufPool,
-    done: Arc<(UnsafeCell<Option<io::Result<()>>>, AtomicBool)>,
+    done: Arc<LoadJob>,
 }
+
 impl Loading<'_> {
     fn poll_load<F, T>(
         self: Pin<&mut Self>,
@@ -1294,56 +1317,20 @@ impl Loading<'_> {
         F: FnOnce(PieceBuf, &mut BufTree) -> T,
     {
         let fut = self.get_mut();
-        fut.
-        let mut buf_tree_guard = fut
-            .pool
-            .inner
-            .buf_tree
-            .lock()
-            .expect("poll_alloc loading lock should OK");
-        match fut.under_file.clone() {
-            Some(file) if fut.load_from_file => {
-                buf_tree_guard.loading += 1;
-                let offset_before_load = buf_tree_guard
-                    .alloced
-                    .get(&fut.key)
-                    .expect("should exist")
-                    .free_block
-                    .offset;
-                drop(buf_tree_guard);
-
-                // we are out of lock
-                // but we are holding pb, and pb don't have abort handle
-                // no one can moves us
-                let mut f = file.lock().expect("alloc lock file should OK");
-                // tokio::task::spawn_blocking(move {
-                //     f.read_all(pb.key.offset, pb.as_mut());
-                // });
-
-                let mut buf_tree_guard = self
-                    .pool
-                    .inner
-                    .buf_tree
-                    .lock()
-                    .expect("alloc() re-lock after load should OK");
-                let offset_after_load = buf_tree_guard
-                    .alloced
-                    .get(&fut.key)
-                    .expect("should exist")
-                    .free_block
-                    .offset;
-                assert_eq!(offset_before_load, offset_after_load);
-                let wrapped =
-                    post_piecebuf(fut.buf.take().expect("must be some"), &mut buf_tree_guard);
-                buf_tree_guard.loading -= 1;
-
-                // TODO: FIXME: maybe wake alloc
-                Poll::Ready(Ok(wrapped))
+        if let Some(r) = fut.done.load() {
+            let mut buf_tree_guard = fut
+                .pool
+                .inner
+                .buf_tree
+                .lock()
+                .expect("poll_alloc loading lock should OK");
+            buf_tree_guard.loading -= 1;
+            match r {
+                None => {}
+                Some(e) => Poll::Ready(Err(AllocErr::LoadErr(e))),
             }
-            _ => Poll::Ready(Ok(post_piecebuf(
-                fut.buf.take().expect("must be some"),
-                &mut buf_tree_guard,
-            ))),
+        } else {
+            Poll::Pending
         }
     }
 }
