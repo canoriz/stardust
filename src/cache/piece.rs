@@ -372,6 +372,7 @@ where
     // TODO: maybe not use (offset,length) but use
     // (offset_mutlple_of(block), len_multiple_of(block))
     // TODO: this needs a lot of tests
+    // TODO: read|write mode
     pub fn get_part_ref(&self, offset: usize, len: usize) -> Result<Ref<T>, GetRefErr> {
         let fixed_len = len.next_multiple_of(BLOCKSIZE);
         assert_eq!(fixed_len % BLOCKSIZE, 0);

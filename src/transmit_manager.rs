@@ -86,7 +86,7 @@ pub(crate) struct TransmitManagerHandle {
     pub last_piece_size: usize,
     pub piece_total: usize,
 
-    pub storage: BufStorage,
+    pub storage: Arc<BufStorage>,
 }
 
 impl TransmitManagerHandle {
@@ -117,7 +117,17 @@ pub struct TransmitManager {
     connected_peers: HashMap<SocketAddr, PeerConn>,
 
     piece_picker: Arc<Mutex<HeapPiecePicker>>,
-    storage: BufStorage,
+    storage: Arc<BufStorage>,
+}
+
+pub fn piece_total_and_last_size(total_length: usize, piece_size: usize) -> (usize, usize) {
+    let n_full_piece = total_length / piece_size;
+    let full_piece_total_size = n_full_piece * piece_size;
+    if full_piece_total_size == total_length {
+        (n_full_piece, piece_size)
+    } else {
+        (n_full_piece + 1, (total_length - full_piece_total_size))
+    }
 }
 
 impl TransmitManager {
@@ -130,18 +140,15 @@ impl TransmitManager {
         let total_length = m.len();
         let piece_picker = Arc::new(Mutex::new(HeapPiecePicker::new(total_length, piece_size)));
 
-        let (piece_total, last_piece_size) = {
-            let n_full_piece = total_length / (piece_size as usize);
-            let full_piece_total_size = n_full_piece * (piece_size as usize);
-            if full_piece_total_size == total_length {
-                (n_full_piece, piece_size as usize)
-            } else {
-                (n_full_piece + 1, (total_length - full_piece_total_size))
-            }
-        };
+        let (piece_total, last_piece_size) =
+            piece_total_and_last_size(total_length, piece_size as usize);
 
         let back_file = Arc::new(Mutex::new(BackFile::new(m.clone())));
-        let buf_storage = BufStorage::new(piece_size as usize, piece_total, back_file);
+        let buf_storage = Arc::new(BufStorage::new(
+            total_length,
+            piece_size as usize,
+            back_file,
+        ));
         // TODO: let cancellation token cancel this
         Self {
             metadata: m.clone(),

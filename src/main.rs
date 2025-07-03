@@ -19,12 +19,12 @@ mod picker;
 mod protocol;
 mod torrent_manager;
 mod transmit_manager;
-mod buffer_storage;
 
 use protocol::{BTStream, Handshake, Message};
 use torrent_manager::TorrentManagerHandle;
 
-#[tokio::main(flavor = "current_thread")]
+// #[tokio::main(flavor = "current_thread")]
+#[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Hello, world!");
     tracing_subscriber::fmt()

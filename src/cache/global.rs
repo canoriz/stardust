@@ -1,4 +1,5 @@
 use core::slice;
+use std::cell::UnsafeCell;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fmt::Debug;
 use std::future::Future;
@@ -7,8 +8,10 @@ use std::io;
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
+use std::sync::atomic::{self, AtomicBool};
 use std::task::{Context, Poll, Waker};
 
+use futures::ready;
 #[cfg(mloom)]
 use loom::sync::{mpsc, Arc, Mutex, MutexGuard};
 #[cfg(not(mloom))]
@@ -107,6 +110,8 @@ unsafe impl Sync for FreeBlock {}
 struct BufTree {
     migrating: bool, // TODO: After carefully checking, use atomic and move out of BufTree(Mutex)
     flushing: u32,   // TODO: After carefully checking, use atomic and move out of BufTree(Mutex)
+    loading: u32,
+
     buf: Vec<u8>,
     blk_tree: BlockTree,
 
@@ -442,7 +447,7 @@ impl Debug for PieceKey {
 pub(crate) enum AllocErr {
     NoSpace,
     Allocated,
-    Flushing,
+    Flushing, // TODO: maybe add Loading state?
     Oversize,
     StartMigrating,
     IsMigrating,
@@ -475,10 +480,11 @@ impl PieceBufPool {
         &self,
         key: PieceKey,
         under_file: Option<DynFileImpl>,
+        load_from_file: bool,
         size: usize,
     ) -> Result<PieceBuf, AllocErr> {
         let post_work = |pb: PieceBuf, _: &mut BufTree| pb;
-        self.alloc_general(key, under_file, size, post_work)
+        self.alloc_general(key, under_file, load_from_file, size, post_work)
     }
 
     /// alloc abortable PieceBuf
@@ -486,6 +492,7 @@ impl PieceBufPool {
         &self,
         key: PieceKey,
         under_file: Option<DynFileImpl>,
+        load_from_file: bool,
         size: usize,
     ) -> Result<T, AllocErr>
     where
@@ -501,13 +508,14 @@ impl PieceBufPool {
             fbh.sub_manager_handle = Some(abort_handle);
             ret
         };
-        self.alloc_general(key, under_file, size, post_work)
+        self.alloc_general(key, under_file, load_from_file, size, post_work)
     }
 
     fn alloc_general<T, F>(
         &self,
         key: PieceKey,
         under_file: Option<DynFileImpl>,
+        load_from_file: bool,
         size: usize,
         post_piecebuf: F,
     ) -> Result<T, AllocErr>
@@ -527,43 +535,71 @@ impl PieceBufPool {
             panic!("mloom mode can only use (under_file: None) because under_file: Some(_) requires tokio");
         }
 
-        let mut buf_tree_guard = self
-            .inner
-            .buf_tree
-            .lock()
-            .expect("alloc sub lock should OK");
+        let (mut pb, mut buf_tree_guard) = {
+            let mut buf_tree_guard = self
+                .inner
+                .buf_tree
+                .lock()
+                .expect("alloc sub lock should OK");
 
-        match buf_tree_guard.alloc(power, key.clone()) {
-            Ok(fb) => {
-                let pb = PieceBuf {
-                    b: fb,
-                    key,
-                    len: size,
-                    dirty: false,
-                    under_file,
-                    main_cache: self.inner.clone(),
-                };
-                Ok(post_piecebuf(pb, &mut buf_tree_guard))
-            }
-            Err(r @ AllocErr::Allocated | r @ AllocErr::Oversize) => {
-                #[cfg(test)]
-                println!("poll key {:?} error reason: {r:?}", key);
-                Err(r)
-            }
-            Err(e) => {
-                if buf_tree_guard.flushing == 0
-                    && !buf_tree_guard.migrating
-                    && buf_tree_guard.can_fit_n_if_migrated(power) > 0
-                {
-                    // TODO: do we need a from_async flag, so that only fire migrate_task
-                    // when calling inside a async environment?
-                    let pool_impl = self.inner.clone();
-                    start_migrate_task(buf_tree_guard, pool_impl);
-                    Err(AllocErr::StartMigrating)
-                } else {
-                    Err(e)
+            match buf_tree_guard.alloc(power, key.clone()) {
+                Ok(fb) => (
+                    PieceBuf {
+                        b: fb,
+                        key,
+                        len: size,
+                        dirty: false,
+                        under_file,
+                        main_cache: self.inner.clone(),
+                    },
+                    buf_tree_guard,
+                ),
+                Err(r @ AllocErr::Allocated | r @ AllocErr::Oversize) => {
+                    #[cfg(test)]
+                    println!("poll key {:?} error reason: {r:?}", key.clone());
+                    return Err(r);
+                }
+                Err(e) => {
+                    if buf_tree_guard.flushing == 0
+                        && buf_tree_guard.loading == 0
+                        && !buf_tree_guard.migrating
+                        && buf_tree_guard.can_fit_n_if_migrated(power) > 0
+                    {
+                        // TODO: do we need a from_async flag, so that only fire migrate_task
+                        // when calling inside a async environment?
+                        let pool_impl = self.inner.clone();
+                        start_migrate_task(buf_tree_guard, pool_impl);
+                        return Err(AllocErr::StartMigrating);
+                    } else {
+                        return Err(e);
+                    }
                 }
             }
+        };
+
+        match pb.under_file.clone() {
+            Some(file) if load_from_file => {
+                buf_tree_guard.loading += 1;
+                drop(buf_tree_guard);
+
+                // we are out of lock
+                // but we are holding pb, and pb don't have abort handle
+                // no one can moves us
+                let mut f = file.lock().expect("alloc lock file should OK");
+                f.read_all(pb.key.offset, pb.as_mut());
+
+                let mut buf_tree_guard = self
+                    .inner
+                    .buf_tree
+                    .lock()
+                    .expect("alloc() re-lock after load should OK");
+                let wrapped = post_piecebuf(pb, &mut buf_tree_guard);
+                buf_tree_guard.loading -= 1;
+
+                // TODO: FIXME: maybe wake alloc
+                Ok(wrapped)
+            }
+            _ => Ok(post_piecebuf(pb, &mut buf_tree_guard)),
         }
     }
 
@@ -582,17 +618,19 @@ impl PieceBufPool {
         &self,
         key: PieceKey,
         under_file: Option<DynFileImpl>,
+        load_from_file: bool,
         size: usize,
     ) -> AllocPieceBufFut {
         AllocPieceBufFut {
-            inner: AllocFutInner {
+            inner: AllocFutInner::Allocating(Allocating {
                 key,
                 under_file,
+                load_from_file,
                 size,
                 pool: self,
                 waiting: false,
                 valid: Arc::new(AtomicU32::new(WAITING)),
-            },
+            }),
         }
     }
 
@@ -600,20 +638,22 @@ impl PieceBufPool {
         &self,
         key: PieceKey,
         under_file: Option<DynFileImpl>,
+        load_from_file: bool,
         size: usize,
     ) -> AllocPieceBufAbortFut<T>
     where
         T: FromPieceBuf + Unpin,
     {
         AllocPieceBufAbortFut {
-            inner: AllocFutInner {
+            inner: AllocFutInner::Allocating(Allocating {
                 key,
                 size,
                 under_file,
+                load_from_file,
                 pool: self,
                 waiting: false,
                 valid: Arc::new(AtomicU32::new(WAITING)),
-            },
+            }),
             _t: PhantomData,
         }
     }
@@ -636,6 +676,8 @@ impl PieceBufPoolImpl {
             buf_tree: Mutex::new(BufTree {
                 migrating: false,
                 flushing: 0,
+                loading: 0,
+
                 buf: vec![0u8; size_fixed],
                 blk_tree: init_block_tree(size_fixed),
                 alloced: HashMap::new(),
@@ -926,6 +968,10 @@ impl PieceBuf {
         self.dirty = true;
     }
 
+    pub(crate) fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.len
     }
@@ -976,30 +1022,148 @@ pub(crate) fn wake_next_waiting_alloc<I: Debug>(waiting_alloc: &mut VecDeque<All
     }
 }
 
-struct AllocFutInner<'a> {
-    key: PieceKey,
-    under_file: Option<DynFileImpl>,
-    pool: &'a PieceBufPool,
-    waiting: bool,
-    valid: Arc<AtomicU32>,
-    size: usize,
+enum AllocFutInner<'a> {
+    Allocating(Allocating<'a>),
+    Loading(Loading<'a>),
 }
 
 impl AllocFutInner<'_> {
     fn poll_alloc<F, T>(
         self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
-        alloc_fn: F,
+        post_piecebuf: F,
     ) -> Poll<Result<T, AllocErr>>
     where
-        // since we only alloc at most once, use most relaxed FnOnce here
-        // if we need to call alloc_fn more than once, use FnMut
-        // technically we are all using member functions, not even closures
-        // so Fn would be enough
-        F: FnOnce(&PieceBufPool, PieceKey, Option<DynFileImpl>, usize) -> Result<T, AllocErr>,
+        F: FnOnce(PieceBuf, &mut BufTree) -> T,
     {
         let fut = self.get_mut();
+        match fut {
+            AllocFutInner::Allocating(a) => {
+                let alloc_res = ready!(Pin::new(&mut *a).poll_alloc(cx));
+                let mut buf_tree_guard = a
+                    .pool
+                    .inner
+                    .buf_tree
+                    .lock()
+                    .expect("poll_alloc loading lock should OK");
+                match alloc_res {
+                    Ok(mut pb) => {
+                        match a.under_file.clone() {
+                            Some(file) if a.load_from_file => {
+                                buf_tree_guard.loading += 1;
+                                let offset_before_load = buf_tree_guard
+                                    .alloced
+                                    .get(&a.key)
+                                    .expect("should exist")
+                                    .free_block
+                                    .offset;
+                                drop(buf_tree_guard);
 
+                                // we are out of lock
+                                // but we are holding pb, and pb don't have abort handle
+                                // no one can moves us
+                                let done =
+                                    Arc::new((UnsafeCell::new(None), AtomicBool::new(false)));
+                                let reader_done = done.clone();
+                                let waker = cx.waker().clone();
+                                tokio::task::spawn_blocking(move || {
+                                    let mut f = file.lock().expect("alloc lock file should OK");
+                                    let res = f.read_all(pb.key.offset, pb.as_mut());
+                                    *reader_done.0.get_mut() = Some(res);
+                                    reader_done.1.store(true, Ordering::Release); // make sure read done before atomic set
+                                    atomic::fence(Ordering::Acquire); // make sure we set done first, then wake
+                                    waker.wake()
+                                });
+
+                                *fut = AllocFutInner::Loading(Loading {
+                                    pool: a.pool,
+                                    done,
+                                });
+                                Poll::Pending
+                            }
+                            _ => {
+                                let wrapped = post_piecebuf(pb, &mut buf_tree_guard);
+                                Poll::Ready(Ok(wrapped))
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("alloc error {e:?}");
+                        return Poll::Ready(Err(e));
+                    }
+                }
+            }
+            AllocFutInner::Loading(load) => Pin::new(load).poll_load(cx, post_piecebuf),
+        }
+        // if let Some(mut pb) = fut.res_piece_buf {
+        //     let mut buf_tree_guard = self
+        //         .pool
+        //         .inner
+        //         .buf_tree
+        //         .lock()
+        //         .expect("poll_alloc loading lock should OK");
+        //     match fut.under_file.clone() {
+        //         Some(file) if fut.load_from_file => {
+        //             buf_tree_guard.loading += 1;
+        //             let offset_before_load = buf_tree_guard
+        //                 .alloced
+        //                 .get(&fut.key)
+        //                 .expect("should exist")
+        //                 .free_block
+        //                 .offset;
+        //             drop(buf_tree_guard);
+
+        //             // we are out of lock
+        //             // but we are holding pb, and pb don't have abort handle
+        //             // no one can moves us
+        //             let mut f = file.lock().expect("alloc lock file should OK");
+        //             // tokio::task::spawn_blocking(move {
+        //             //     f.read_all(pb.key.offset, pb.as_mut());
+        //             // });
+
+        //             let mut buf_tree_guard = self
+        //                 .pool
+        //                 .inner
+        //                 .buf_tree
+        //                 .lock()
+        //                 .expect("alloc() re-lock after load should OK");
+        //             let offset_after_load = buf_tree_guard
+        //                 .alloced
+        //                 .get(&fut.key)
+        //                 .expect("should exist")
+        //                 .free_block
+        //                 .offset;
+        //             assert_eq!(offset_before_load, offset_after_load);
+        //             let wrapped = post_piecebuf(pb, &mut buf_tree_guard);
+        //             buf_tree_guard.loading -= 1;
+
+        //             // TODO: FIXME: maybe wake alloc
+        //             Poll::Ready(Ok(wrapped))
+        //         }
+        //         _ => Poll::Ready(Ok(post_piecebuf(pb, &mut buf_tree_guard))),
+        //     }
+        // } else {
+        //     self.poll_alloc_inner(cx)
+        // }
+    }
+}
+
+struct Allocating<'a> {
+    key: PieceKey,
+    under_file: Option<DynFileImpl>,
+    load_from_file: bool,
+    pool: &'a PieceBufPool,
+    waiting: bool,
+    valid: Arc<AtomicU32>,
+    size: usize,
+}
+
+impl Allocating<'_> {
+    fn poll_alloc(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<PieceBuf, AllocErr>> {
+        let fut = self.get_mut();
         #[cfg(test)]
         println!("poll key {:?}", fut.key);
 
@@ -1092,7 +1256,7 @@ impl AllocFutInner<'_> {
     }
 }
 
-impl Drop for AllocFutInner<'_> {
+impl Drop for Allocating<'_> {
     fn drop(&mut self) {
         // TODO: optimize this
         let state = self.valid.swap(DROPPED, Ordering::Acquire);
@@ -1112,6 +1276,74 @@ impl Drop for AllocFutInner<'_> {
                 wake_next_waiting_alloc(&mut waiting_alloc);
             }
             w => debug_assert!(w == WAITING || w == DONE),
+        }
+    }
+}
+
+struct Loading<'a> {
+    pool: &'a PieceBufPool,
+    done: Arc<(UnsafeCell<Option<io::Result<()>>>, AtomicBool)>,
+}
+impl Loading<'_> {
+    fn poll_load<F, T>(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        post_piecebuf: F,
+    ) -> Poll<Result<T, AllocErr>>
+    where
+        F: FnOnce(PieceBuf, &mut BufTree) -> T,
+    {
+        let fut = self.get_mut();
+        fut.
+        let mut buf_tree_guard = fut
+            .pool
+            .inner
+            .buf_tree
+            .lock()
+            .expect("poll_alloc loading lock should OK");
+        match fut.under_file.clone() {
+            Some(file) if fut.load_from_file => {
+                buf_tree_guard.loading += 1;
+                let offset_before_load = buf_tree_guard
+                    .alloced
+                    .get(&fut.key)
+                    .expect("should exist")
+                    .free_block
+                    .offset;
+                drop(buf_tree_guard);
+
+                // we are out of lock
+                // but we are holding pb, and pb don't have abort handle
+                // no one can moves us
+                let mut f = file.lock().expect("alloc lock file should OK");
+                // tokio::task::spawn_blocking(move {
+                //     f.read_all(pb.key.offset, pb.as_mut());
+                // });
+
+                let mut buf_tree_guard = self
+                    .pool
+                    .inner
+                    .buf_tree
+                    .lock()
+                    .expect("alloc() re-lock after load should OK");
+                let offset_after_load = buf_tree_guard
+                    .alloced
+                    .get(&fut.key)
+                    .expect("should exist")
+                    .free_block
+                    .offset;
+                assert_eq!(offset_before_load, offset_after_load);
+                let wrapped =
+                    post_piecebuf(fut.buf.take().expect("must be some"), &mut buf_tree_guard);
+                buf_tree_guard.loading -= 1;
+
+                // TODO: FIXME: maybe wake alloc
+                Poll::Ready(Ok(wrapped))
+            }
+            _ => Poll::Ready(Ok(post_piecebuf(
+                fut.buf.take().expect("must be some"),
+                &mut buf_tree_guard,
+            ))),
         }
     }
 }
@@ -1185,6 +1417,7 @@ async fn migrate_task(pool_impl: Arc<PieceBufPoolImpl>) {
 fn start_migrate_task(buf_tree: MutexGuard<'_, BufTree>, pool_impl: Arc<PieceBufPoolImpl>) {
     assert!(!buf_tree.migrating);
     assert!(buf_tree.flushing == 0);
+    assert!(buf_tree.loading == 0);
     start_migrate_task_inner(buf_tree, pool_impl);
 }
 
@@ -1204,7 +1437,8 @@ impl Future for AllocPieceBufFut<'_> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let inner_fut = Pin::new(&mut self.get_mut().inner);
-        inner_fut.poll_alloc(cx, PieceBufPool::alloc)
+        let post_work = |pb: PieceBuf, _: &mut BufTree| pb;
+        inner_fut.poll_alloc(cx, post_work)
     }
 }
 
@@ -1222,7 +1456,17 @@ where
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let inner_fut = Pin::new(&mut self.get_mut().inner);
-        inner_fut.poll_alloc(cx, PieceBufPool::alloc_abort)
+        let post_work = |pb: PieceBuf, tree: &mut BufTree| {
+            let key = pb.key.clone();
+            let (ret, abort_handle) = T::new_abort(pb);
+            let fbh = tree
+                .alloced
+                .get_mut(&key)
+                .expect("just alloced should exist");
+            fbh.sub_manager_handle = Some(abort_handle);
+            ret
+        };
+        let buf = ready!(inner_fut.poll_alloc(cx, post_work));
     }
 }
 
