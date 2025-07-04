@@ -485,7 +485,28 @@ impl PieceBufPool {
         size: usize,
     ) -> Result<PieceBuf, AllocErr> {
         let post_work = |pb: PieceBuf, _: &mut BufTree| pb;
-        self.alloc_general(key, under_file, load_from_file, size, post_work)
+        let mut pb =
+            self.alloc_general(key, under_file.clone(), load_from_file, size, post_work)?;
+        match under_file {
+            Some(file) => {
+                let mut f = file.lock().expect("alloc lock file should OK");
+                // TODO: FIXME: do not mark pb dirty
+                let res = f.read_all(pb.key.offset, pb.as_mut());
+                let mut buf_guard = self
+                    .inner
+                    .buf_tree
+                    .lock()
+                    .expect("alloc_abort re-lock() should OK");
+                assert!(!buf_guard.migrating);
+                buf_guard.loading -= 1;
+                if let Err(e) = res {
+                    Err(AllocErr::LoadErr(e.kind()))
+                } else {
+                    Ok(pb)
+                }
+            }
+            _ => Ok(pb),
+        }
     }
 
     /// alloc abortable PieceBuf
@@ -499,7 +520,7 @@ impl PieceBufPool {
     where
         T: FromPieceBuf,
     {
-        let post_work = |pb: PieceBuf, tree: &mut BufTree| {
+        let to_abortable = |pb: PieceBuf, tree: &mut BufTree| {
             let key = pb.key.clone();
             let (ret, abort_handle) = T::new_abort(pb);
             let fbh = tree
@@ -509,7 +530,41 @@ impl PieceBufPool {
             fbh.sub_manager_handle = Some(abort_handle);
             ret
         };
-        self.alloc_general(key, under_file, load_from_file, size, post_work)
+        let post_work_do_nothing = |pb: PieceBuf, _: &mut BufTree| pb;
+        let mut pb = self.alloc_general(
+            key,
+            under_file.clone(),
+            load_from_file,
+            size,
+            post_work_do_nothing,
+        )?;
+
+        match under_file {
+            Some(file) => {
+                let mut f = file.lock().expect("alloc lock file should OK");
+                // TODO: FIXME: do not mark pb dirty
+                let res = f.read_all(pb.key.offset, pb.as_mut());
+                if let Err(e) = res {
+                    Err(AllocErr::LoadErr(e.kind()))
+                } else {
+                    let mut buf_guard = self
+                        .inner
+                        .buf_tree
+                        .lock()
+                        .expect("alloc_abort re-lock() should OK");
+                    buf_guard.loading -= 1;
+                    Ok(to_abortable(pb, &mut buf_guard))
+                }
+            }
+            _ => {
+                let mut buf_guard = self
+                    .inner
+                    .buf_tree
+                    .lock()
+                    .expect("alloc_abort re-lock() should OK");
+                Ok(to_abortable(pb, &mut buf_guard))
+            }
+        }
     }
 
     fn alloc_general<T, F>(
@@ -536,7 +591,7 @@ impl PieceBufPool {
             panic!("mloom mode can only use (under_file: None) because under_file: Some(_) requires tokio");
         }
 
-        let (mut pb, mut buf_tree_guard) = {
+        let (pb, mut buf_tree_guard) = {
             let mut buf_tree_guard = self
                 .inner
                 .buf_tree
@@ -580,23 +635,11 @@ impl PieceBufPool {
 
         match pb.under_file.clone() {
             Some(file) if load_from_file => {
+                assert!(!buf_tree_guard.migrating);
                 buf_tree_guard.loading += 1;
-                drop(buf_tree_guard);
 
-                // we are out of lock
-                // but we are holding pb, and pb don't have abort handle
-                // no one can moves us
-                let mut f = file.lock().expect("alloc lock file should OK");
-                f.read_all(pb.key.offset, pb.as_mut());
-
-                let mut buf_tree_guard = self
-                    .inner
-                    .buf_tree
-                    .lock()
-                    .expect("alloc() re-lock after load should OK");
                 let wrapped = post_piecebuf(pb, &mut buf_tree_guard);
-                buf_tree_guard.loading -= 1;
-
+                drop(buf_tree_guard);
                 // TODO: FIXME: maybe wake alloc
                 Ok(wrapped)
             }
@@ -1051,7 +1094,6 @@ impl AllocFutInner<'_> {
                     Ok(mut pb) => {
                         match a.under_file.clone() {
                             Some(file) if a.load_from_file => {
-                                buf_tree_guard.loading += 1;
                                 let offset_before_load = buf_tree_guard
                                     .alloced
                                     .get(&a.key)
@@ -1066,14 +1108,17 @@ impl AllocFutInner<'_> {
                                 let done = Arc::new(LoadJob(
                                     UnsafeCell::new(None),
                                     AtomicBool::new(false),
+                                    #[cfg(debug_assertions)]
+                                    AtomicBool::new(false),
+                                    #[cfg(debug_assertions)]
+                                    AtomicBool::new(false),
                                 ));
                                 let reader_done = done.clone();
                                 let waker = cx.waker().clone();
                                 tokio::task::spawn_blocking(move || {
                                     let mut f = file.lock().expect("alloc lock file should OK");
                                     let res = f.read_all(pb.key.offset, pb.as_mut());
-                                    unsafe { reader_done.store(res) };
-                                    atomic::fence(Ordering::Acquire); // make sure we set done first, then wake
+                                    unsafe { reader_done.store(pb, res) };
                                     waker.wake()
                                 });
 
@@ -1094,56 +1139,6 @@ impl AllocFutInner<'_> {
             }
             AllocFutInner::Loading(load) => Pin::new(load).poll_load(cx, post_piecebuf),
         }
-        // if let Some(mut pb) = fut.res_piece_buf {
-        //     let mut buf_tree_guard = self
-        //         .pool
-        //         .inner
-        //         .buf_tree
-        //         .lock()
-        //         .expect("poll_alloc loading lock should OK");
-        //     match fut.under_file.clone() {
-        //         Some(file) if fut.load_from_file => {
-        //             buf_tree_guard.loading += 1;
-        //             let offset_before_load = buf_tree_guard
-        //                 .alloced
-        //                 .get(&fut.key)
-        //                 .expect("should exist")
-        //                 .free_block
-        //                 .offset;
-        //             drop(buf_tree_guard);
-
-        //             // we are out of lock
-        //             // but we are holding pb, and pb don't have abort handle
-        //             // no one can moves us
-        //             let mut f = file.lock().expect("alloc lock file should OK");
-        //             // tokio::task::spawn_blocking(move {
-        //             //     f.read_all(pb.key.offset, pb.as_mut());
-        //             // });
-
-        //             let mut buf_tree_guard = self
-        //                 .pool
-        //                 .inner
-        //                 .buf_tree
-        //                 .lock()
-        //                 .expect("alloc() re-lock after load should OK");
-        //             let offset_after_load = buf_tree_guard
-        //                 .alloced
-        //                 .get(&fut.key)
-        //                 .expect("should exist")
-        //                 .free_block
-        //                 .offset;
-        //             assert_eq!(offset_before_load, offset_after_load);
-        //             let wrapped = post_piecebuf(pb, &mut buf_tree_guard);
-        //             buf_tree_guard.loading -= 1;
-
-        //             // TODO: FIXME: maybe wake alloc
-        //             Poll::Ready(Ok(wrapped))
-        //         }
-        //         _ => Poll::Ready(Ok(post_piecebuf(pb, &mut buf_tree_guard))),
-        //     }
-        // } else {
-        //     self.poll_alloc_inner(cx)
-        // }
     }
 }
 
@@ -1166,6 +1161,10 @@ impl Allocating<'_> {
         #[cfg(test)]
         println!("poll key {:?}", fut.key);
 
+        fn post_work_do_nothing(pb: PieceBuf, _: &mut BufTree) -> PieceBuf {
+            pb
+        }
+
         let mut waiting_alloc = fut.pool.inner.waiting_alloc.lock().unwrap();
         if !fut.waiting {
             if !waiting_alloc.is_empty() {
@@ -1184,7 +1183,13 @@ impl Allocating<'_> {
             }
 
             // alloc() holds both lock of block_tree and waiting_alloc
-            match alloc_fn(fut.pool, fut.key.clone(), fut.under_file.clone(), fut.size) {
+            match fut.pool.alloc_general(
+                fut.key.clone(),
+                fut.under_file.clone(),
+                fut.load_from_file,
+                fut.size,
+                post_work_do_nothing,
+            ) {
                 ok @ Ok(_) => {
                     let old = fut.valid.swap(DONE, Ordering::Release);
                     debug_assert_eq!(old, WAITING);
@@ -1212,7 +1217,13 @@ impl Allocating<'_> {
                 }
             }
         } else {
-            match alloc_fn(fut.pool, fut.key.clone(), fut.under_file.clone(), fut.size) {
+            match fut.pool.alloc_general(
+                fut.key.clone(),
+                fut.under_file.clone(),
+                fut.load_from_file,
+                fut.size,
+                post_work_do_nothing,
+            ) {
                 ok @ Ok(_) => {
                     let old = fut.valid.swap(DONE, Ordering::Release);
                     debug_assert!(old == WAITING || old == WAKING);
@@ -1279,23 +1290,38 @@ impl Drop for Allocating<'_> {
     }
 }
 
-struct LoadJob(UnsafeCell<Option<io::ErrorKind>>, AtomicBool);
+struct LoadJob(
+    UnsafeCell<Option<Result<PieceBuf, io::ErrorKind>>>,
+    AtomicBool,
+    #[cfg(debug_assertions)] AtomicBool, // for store
+    #[cfg(debug_assertions)] AtomicBool, // for success load
+);
 unsafe impl Sync for LoadJob {}
 impl LoadJob {
     // make sure only call this once
-    unsafe fn store(&self, r: io::Result<()>) {
-        debug_assert!(!self.1.load(Ordering::Relaxed));
+    unsafe fn store(&self, pb: PieceBuf, r: io::Result<()>) {
+        #[cfg(debug_assertions)]
+        assert!(self.2.swap(true, Ordering::Acquire) == false);
+
         if let Err(e) = r {
-            *self.0.get() = Some(e.kind());
+            *self.0.get() = Some(Err(e.kind()));
+        } else {
+            *self.0.get() = Some(Ok(pb));
         }
-        self.1.store(true, Ordering::Release); // make sure read done before atomic set
+
+        // make sure write happens-before atomic set
+        self.1.store(true, Ordering::Release);
+
+        // make sure atomic set happens-before further operation
         atomic::fence(Ordering::Acquire);
     }
 
-    // first option for done or not, second for err or not
-    fn load(&self) -> Option<Option<io::ErrorKind>> {
+    fn load(&self) -> Option<Result<PieceBuf, io::ErrorKind>> {
         if self.1.load(Ordering::Acquire) {
-            unsafe { Some(*self.0.get()) }
+            #[cfg(debug_assertions)]
+            assert!(self.3.swap(true, Ordering::Relaxed) == false);
+
+            unsafe { (*self.0.get()).take() }
         } else {
             None
         }
@@ -1317,17 +1343,18 @@ impl Loading<'_> {
         F: FnOnce(PieceBuf, &mut BufTree) -> T,
     {
         let fut = self.get_mut();
-        if let Some(r) = fut.done.load() {
+        if let Some(r) = fut.done.clone().load() {
             let mut buf_tree_guard = fut
                 .pool
                 .inner
                 .buf_tree
                 .lock()
                 .expect("poll_alloc loading lock should OK");
+            assert!(!buf_tree_guard.migrating);
             buf_tree_guard.loading -= 1;
             match r {
-                None => {}
-                Some(e) => Poll::Ready(Err(AllocErr::LoadErr(e))),
+                Ok(p) => Poll::Ready(Ok(post_piecebuf(p, &mut buf_tree_guard))),
+                Err(e) => Poll::Ready(Err(AllocErr::LoadErr(e))),
             }
         } else {
             Poll::Pending
@@ -1453,7 +1480,7 @@ where
             fbh.sub_manager_handle = Some(abort_handle);
             ret
         };
-        let buf = ready!(inner_fut.poll_alloc(cx, post_work));
+        inner_fut.poll_alloc(cx, post_work)
     }
 }
 
@@ -1585,6 +1612,23 @@ fn prev_power_of_two(s: usize) -> usize {
         s.next_power_of_two() >> 1
     }
 }
+
+// #[cfg(test)]
+// use std::sync::LazyLock;
+// #[cfg(test)]
+// static WAITPOINT: LazyLock<Mutex<HashMap<String, u32>>> =
+//     LazyLock::new(|| Mutex::new(HashMap::new()));
+// #[cfg(test)]
+// struct FlowControl {
+//     WAITPOINT: String,
+// }
+// #[cfg(test)]
+// impl FlowControl {
+//     fn new(marker: String) -> Self {
+
+//     }
+//     fn wait(marker: String)
+// }
 
 #[cfg(test)]
 mod test {
@@ -1894,6 +1938,7 @@ mod test {
         let mut b = BufTree {
             migrating: false,
             flushing: 0,
+            loading: 0,
             buf,
             blk_tree: v,
             flush_after_migrate: Vec::new(),
@@ -2013,6 +2058,7 @@ mod test {
         let mut b = BufTree {
             migrating: false,
             flushing: 0,
+            loading: 0,
             buf,
             blk_tree: v,
             flush_after_migrate: Vec::new(),
@@ -2109,6 +2155,7 @@ mod test {
         let mut b = BufTree {
             migrating: false,
             flushing: 0,
+            loading: 0,
             buf,
             blk_tree: v,
             flush_after_migrate: Vec::new(),
@@ -2320,6 +2367,7 @@ mod test {
                         offset: 0,
                     },
                     None,
+                    false,
                     sz1,
                 )
                 .unwrap();
@@ -2330,6 +2378,7 @@ mod test {
                         offset: 1,
                     },
                     None,
+                    false,
                     sz2,
                 )
                 .unwrap();
@@ -2368,6 +2417,7 @@ mod test {
                             offset: 0,
                         },
                         None,
+                        false,
                         sz,
                     )
                     .unwrap();
@@ -2386,6 +2436,7 @@ mod test {
                             offset: 1,
                         },
                         None,
+                        false,
                         sz,
                     )
                     .unwrap();
@@ -2413,20 +2464,28 @@ mod test {
 
     impl FileImpl for TestFileImpl {
         fn write_all(&mut self, offset: usize, buf: &[u8]) -> io::Result<()> {
-            self.buf[offset..].copy_from_slice(buf);
+            let limit = buf.len();
+            self.buf[offset..offset + limit].copy_from_slice(buf);
             Ok(())
         }
 
-        fn read_all(&mut self, _offset: usize, _buf: &mut [u8]) -> io::Result<()> {
-            unimplemented!();
+        fn read_all(&mut self, offset: usize, buf: &mut [u8]) -> io::Result<()> {
+            #[cfg(test)]
+            println!("read offset {offset} buf[{}]", buf.len());
+            let limit = buf.len();
+            buf.copy_from_slice(&self.buf[offset..offset + limit]);
+            Ok(())
         }
     }
 
     impl TestFileImpl {
-        fn new(size: usize) -> Self {
+        fn empty(size: usize) -> Self {
             Self {
                 buf: vec![0u8; size],
             }
+        }
+        fn new(vec: Vec<u8>) -> Self {
+            Self { buf: vec }
         }
 
         fn buf(&self) -> &[u8] {
@@ -2436,12 +2495,12 @@ mod test {
 
     #[cfg(not(mloom))]
     #[tokio::test]
-    async fn test_flush_dirty() {
+    async fn test_load_flush_dirty() {
         use tokio::time;
 
         let c = PieceBufPool::new(15 * MIN_ALLOC_SIZE);
         let sz1 = 4114;
-        let buf = Arc::new(Mutex::new(TestFileImpl::new(sz1)));
+        let buf = Arc::new(Mutex::new(TestFileImpl::new(vec![0xcc; sz1])));
 
         let mut b1 = c
             .alloc(
@@ -2450,10 +2509,14 @@ mod test {
                     offset: 0,
                 },
                 Some(buf.clone()),
+                true,
                 sz1,
             )
             .unwrap();
         assert_eq!(b1.len, sz1);
+        for b in b1.iter() {
+            assert_eq!(*b, 0xcc);
+        }
         for b in b1.as_mut().iter_mut() {
             *b = 0xff;
         }
@@ -2462,6 +2525,9 @@ mod test {
         time::sleep(time::Duration::from_millis(10)).await;
         for b in buf.lock().unwrap().buf().iter().take(sz1) {
             assert_eq!(*b, 0xff);
+        }
+        for b in buf.lock().unwrap().buf().iter().skip(sz1) {
+            assert_eq!(*b, 0xcc);
         }
     }
 
@@ -2481,13 +2547,13 @@ mod test {
             hash: Arc::new([0; 20]),
             offset: 0,
         };
-        let buf = Arc::new(Mutex::new(TestFileImpl::new(1155)));
+        let buf = Arc::new(Mutex::new(TestFileImpl::empty(1155)));
         let p0 = c
-            .async_alloc_abort::<ArcCache<_>>(pk0, Some(buf.clone()), 1155)
+            .async_alloc_abort::<ArcCache<_>>(pk0, Some(buf.clone()), false, 1155)
             .await
             .unwrap();
         let p1 = c
-            .async_alloc_abort::<ArcCache<_>>(pk1, Some(buf.clone()), 1155)
+            .async_alloc_abort::<ArcCache<_>>(pk1, Some(buf.clone()), false, 1155)
             .await
             .unwrap();
         drop(p0);
@@ -2537,9 +2603,14 @@ mod test {
             hash: Arc::new([0; 20]),
             offset: 0,
         };
-        let buf = Arc::new(Mutex::new(TestFileImpl::new(2 * MIN_ALLOC_SIZE)));
+        let buf = Arc::new(Mutex::new(TestFileImpl::empty(2 * MIN_ALLOC_SIZE)));
         let p1 = c
-            .async_alloc_abort::<ArcCache<_>>(pk1.clone(), Some(buf.clone()), 2 * MIN_ALLOC_SIZE)
+            .async_alloc_abort::<ArcCache<_>>(
+                pk1.clone(),
+                Some(buf.clone()),
+                false,
+                2 * MIN_ALLOC_SIZE,
+            )
             .await
             .unwrap();
         let (mut r1, w1) = duplex(MIN_ALLOC_SIZE);
@@ -2588,6 +2659,7 @@ mod test {
                         offset: size.0,
                     },
                     None,
+                    false,
                     size.1 * MIN_ALLOC_SIZE,
                 )
                 .await
@@ -2614,6 +2686,7 @@ mod test {
                         offset: size.0,
                     },
                     None,
+                    false,
                     size.1 * MIN_ALLOC_SIZE,
                 )
                 .await
@@ -2668,6 +2741,100 @@ mod test {
 
     #[cfg(not(mloom))]
     #[tokio::test]
+    async fn test_async_alloc_load_flush() {
+        use tokio::time;
+
+        let ftest = Arc::new(Mutex::new(TestFileImpl::new(vec![
+            0xaa;
+            4 * MIN_ALLOC_SIZE
+        ])));
+        let c = PieceBufPool::new(4 * MIN_ALLOC_SIZE);
+
+        {
+            println!("asdf");
+            let p1 = c
+                .async_alloc_abort::<ArcCache<_>>(
+                    PieceKey {
+                        hash: Arc::new([0; 20]),
+                        offset: 0 * MIN_ALLOC_SIZE,
+                    },
+                    Some(ftest.clone()),
+                    true,
+                    MIN_ALLOC_SIZE,
+                )
+                .await
+                .unwrap();
+            println!("asdf");
+            let p2 = c
+                .async_alloc_abort::<ArcCache<_>>(
+                    PieceKey {
+                        hash: Arc::new([0; 20]),
+                        offset: 1 * MIN_ALLOC_SIZE,
+                    },
+                    Some(ftest.clone()),
+                    true,
+                    MIN_ALLOC_SIZE,
+                )
+                .await
+                .unwrap();
+            println!("asdf");
+            let p3 = c
+                .async_alloc_abort::<ArcCache<_>>(
+                    PieceKey {
+                        hash: Arc::new([0; 20]),
+                        offset: 2 * MIN_ALLOC_SIZE,
+                    },
+                    Some(ftest.clone()),
+                    true,
+                    MIN_ALLOC_SIZE,
+                )
+                .await
+                .unwrap();
+            let p4 = c
+                .async_alloc_abort::<ArcCache<_>>(
+                    PieceKey {
+                        hash: Arc::new([0; 20]),
+                        offset: 3 * MIN_ALLOC_SIZE,
+                    },
+                    Some(ftest.clone()),
+                    true,
+                    MIN_ALLOC_SIZE,
+                )
+                .await
+                .unwrap();
+            p1.get_part_ref(0, 4)
+                .unwrap()
+                .as_mut()
+                .copy_from_slice(&[0x00, 0x01, 0x02, 0x03]);
+            p2.get_part_ref(0, 4)
+                .unwrap()
+                .as_mut()
+                .copy_from_slice(&[0x10, 0x11, 0x12, 0x13]);
+            p3.get_part_ref(0, 4)
+                .unwrap()
+                .as_mut()
+                .copy_from_slice(&[0x20, 0x21, 0x22, 0x23]);
+            p4.get_part_ref(0, 4)
+                .unwrap()
+                .as_mut()
+                .copy_from_slice(&[0x30, 0x31, 0x32, 0x33]);
+        }
+        time::sleep(time::Duration::from_millis(10)).await;
+        let f = ftest.lock().unwrap();
+        for (i, b) in f.buf.iter().enumerate() {
+            match (i / MIN_ALLOC_SIZE, i % MIN_ALLOC_SIZE) {
+                (a, v @ 0..=3) => {
+                    assert_eq!((0x10 * a + v) as u8, *b)
+                }
+                _ => {
+                    assert_eq!(*b, 0xaa);
+                }
+            }
+        }
+    }
+
+    #[cfg(not(mloom))]
+    #[tokio::test]
     async fn test_async_alloc_abort_migrate() {
         let (mut r2, w2) = duplex(MIN_ALLOC_SIZE);
         _ = r2.write(&[0x22u8, 0x22]).await;
@@ -2682,6 +2849,7 @@ mod test {
                     offset: 1,
                 },
                 None,
+                false,
                 MIN_ALLOC_SIZE,
             )
             .await
@@ -2693,6 +2861,7 @@ mod test {
                     offset: 2,
                 },
                 None,
+                false,
                 MIN_ALLOC_SIZE,
             )
             .await
@@ -2704,6 +2873,7 @@ mod test {
                     offset: 3,
                 },
                 None,
+                false,
                 MIN_ALLOC_SIZE,
             )
             .await
@@ -2715,6 +2885,7 @@ mod test {
                     offset: 4,
                 },
                 None,
+                false,
                 MIN_ALLOC_SIZE,
             )
             .await
@@ -2745,6 +2916,7 @@ mod test {
                     offset: 9
                 },
                 None,
+                false,
                 2 * MIN_ALLOC_SIZE
             )
             .is_err_and(|e| e == AllocErr::StartMigrating));
@@ -2755,6 +2927,7 @@ mod test {
                     offset: 5,
                 },
                 None,
+                false,
                 2 * MIN_ALLOC_SIZE,
             )
             .await
@@ -2785,6 +2958,7 @@ mod test {
                     offset: 6,
                 },
                 None,
+                false,
                 2 * MIN_ALLOC_SIZE,
             )
             .await
@@ -2808,6 +2982,7 @@ mod test {
                     offset: 1,
                 },
                 None,
+                false,
                 MIN_ALLOC_SIZE,
             )
             .await
@@ -2819,6 +2994,7 @@ mod test {
                     offset: 2,
                 },
                 None,
+                false,
                 4 * MIN_ALLOC_SIZE,
             )
             .await
@@ -2830,6 +3006,7 @@ mod test {
                     offset: 3,
                 },
                 None,
+                false,
                 2 * MIN_ALLOC_SIZE,
             )
             .await
@@ -2841,6 +3018,7 @@ mod test {
                     offset: 4,
                 },
                 None,
+                false,
                 2 * MIN_ALLOC_SIZE,
             )
             .await
@@ -2873,6 +3051,7 @@ mod test {
                     offset: 9
                 },
                 None,
+                false,
                 8 * MIN_ALLOC_SIZE
             )
             .is_err_and(|e| e == AllocErr::StartMigrating)); // this is BufPool.alloc(), will return StartMigrating
@@ -2883,6 +3062,7 @@ mod test {
                     offset: 5,
                 },
                 None,
+                false,
                 8 * MIN_ALLOC_SIZE,
             )
             .await
@@ -2921,6 +3101,7 @@ mod test {
                     offset: 6,
                 },
                 None,
+                false,
                 2 * MIN_ALLOC_SIZE,
             )
             .await
@@ -2943,6 +3124,7 @@ mod test {
                     offset: 1,
                 },
                 None,
+                false,
                 MIN_ALLOC_SIZE,
             )
             .await
@@ -2954,6 +3136,7 @@ mod test {
                     offset: 2,
                 },
                 None,
+                false,
                 4 * MIN_ALLOC_SIZE,
             )
             .await
@@ -2965,6 +3148,7 @@ mod test {
                     offset: 3,
                 },
                 None,
+                false,
                 2 * MIN_ALLOC_SIZE,
             )
             .await
@@ -2976,6 +3160,7 @@ mod test {
                     offset: 4,
                 },
                 None,
+                false,
                 2 * MIN_ALLOC_SIZE,
             )
             .await
@@ -2987,6 +3172,7 @@ mod test {
                     offset: 5,
                 },
                 None,
+                false,
                 2 * MIN_ALLOC_SIZE,
             )
             .await
@@ -3007,6 +3193,7 @@ mod test {
                     offset: 2,
                 },
                 None,
+                false,
                 2 * MIN_ALLOC_SIZE,
             )
             .await
@@ -3031,6 +3218,7 @@ mod test {
                     offset: 5,
                 },
                 None,
+                false,
                 4 * MIN_ALLOC_SIZE,
             )
             .await
@@ -3052,6 +3240,7 @@ mod test {
                     offset: 5,
                 },
                 None,
+                false,
                 8 * MIN_ALLOC_SIZE,
             )
             .await
@@ -3081,6 +3270,7 @@ mod test {
                     offset: 1,
                 },
                 None,
+                false,
                 MIN_ALLOC_SIZE,
             )
             .await
@@ -3092,6 +3282,7 @@ mod test {
                     offset: 2,
                 },
                 None,
+                false,
                 4 * MIN_ALLOC_SIZE,
             )
             .await
@@ -3105,6 +3296,7 @@ mod test {
                     offset: 2,
                 },
                 None,
+                false,
                 40 * MIN_ALLOC_SIZE,
             )
             .await
@@ -3122,6 +3314,7 @@ mod test {
                     offset: 2,
                 },
                 None,
+                false,
                 40 * MIN_ALLOC_SIZE,
             )
             .await
@@ -3139,6 +3332,7 @@ mod test {
                     offset: 0,
                 },
                 None,
+                false,
                 4 * MIN_ALLOC_SIZE,
             )
             .await;
@@ -3149,6 +3343,7 @@ mod test {
                     offset: 1,
                 },
                 None,
+                false,
                 4 * MIN_ALLOC_SIZE,
             )
             .await;
@@ -3160,6 +3355,7 @@ mod test {
                     offset: 8,
                 },
                 None,
+                false,
                 4 * MIN_ALLOC_SIZE,
             )
             .await
@@ -3172,6 +3368,7 @@ mod test {
                     offset: 8,
                 },
                 None,
+                false,
                 4 * MIN_ALLOC_SIZE,
             )
             .await
@@ -3184,6 +3381,7 @@ mod test {
                     offset: 4,
                 },
                 None,
+                false,
                 2 * MIN_ALLOC_SIZE,
             )
             .await
@@ -3216,6 +3414,7 @@ mod test {
                     offset: 0,
                 },
                 None,
+                false,
                 2 * MIN_ALLOC_SIZE,
             )
             .await
@@ -3229,6 +3428,7 @@ mod test {
                     offset: 1,
                 },
                 None,
+                false,
                 1 * MIN_ALLOC_SIZE,
             )
             .await
@@ -3240,6 +3440,7 @@ mod test {
                     offset: 2,
                 },
                 None,
+                false,
                 1 * MIN_ALLOC_SIZE,
             )
             .await
@@ -3251,6 +3452,7 @@ mod test {
                     offset: 3,
                 },
                 None,
+                false,
                 2 * MIN_ALLOC_SIZE,
             )
             .await
@@ -3262,6 +3464,7 @@ mod test {
                     offset: 4,
                 },
                 None,
+                false,
                 1 * MIN_ALLOC_SIZE,
             )
             .await
@@ -3273,6 +3476,7 @@ mod test {
                     offset: 5,
                 },
                 None,
+                false,
                 2 * MIN_ALLOC_SIZE,
             )
             .await
@@ -3311,6 +3515,7 @@ mod test {
                     offset: 0,
                 },
                 None,
+                false,
                 2 * MIN_ALLOC_SIZE,
             )
             .await
@@ -3324,6 +3529,7 @@ mod test {
                     offset: 1,
                 },
                 None,
+                false,
                 1 * MIN_ALLOC_SIZE,
             )
             .await
@@ -3335,6 +3541,7 @@ mod test {
                     offset: 2,
                 },
                 None,
+                false,
                 1 * MIN_ALLOC_SIZE,
             )
             .await
@@ -3346,6 +3553,7 @@ mod test {
                     offset: 3,
                 },
                 None,
+                false,
                 2 * MIN_ALLOC_SIZE,
             )
             .await
@@ -3357,6 +3565,7 @@ mod test {
                     offset: 4,
                 },
                 None,
+                false,
                 1 * MIN_ALLOC_SIZE,
             )
             .await
@@ -3368,6 +3577,7 @@ mod test {
                     offset: 5,
                 },
                 None,
+                false,
                 2 * MIN_ALLOC_SIZE,
             )
             .await
@@ -3395,7 +3605,9 @@ mod test {
             hash: Arc::new([0; 20]),
             offset: 0,
         };
-        let mut piece = c.async_alloc(pk0.clone(), None, 2 * MIN_ALLOC_SIZE).await;
+        let mut piece = c
+            .async_alloc(pk0.clone(), None, false, 2 * MIN_ALLOC_SIZE)
+            .await;
         let ref_work = task::spawn(async move {
             let _ = piece.as_mut();
         });
@@ -3428,11 +3640,11 @@ mod test {
             },
         );
         let p1 = c
-            .async_alloc_abort::<ArcCache<_>>(pk1.clone(), None, 2 * MIN_ALLOC_SIZE)
+            .async_alloc_abort::<ArcCache<_>>(pk1.clone(), None, false, 2 * MIN_ALLOC_SIZE)
             .await
             .unwrap();
         let p2 = c
-            .async_alloc_abort::<ArcCache<_>>(pk2.clone(), None, 1 * MIN_ALLOC_SIZE)
+            .async_alloc_abort::<ArcCache<_>>(pk2.clone(), None, false, 1 * MIN_ALLOC_SIZE)
             .await
             .unwrap();
         let (mut r1, w1) = duplex(MIN_ALLOC_SIZE);
@@ -3478,11 +3690,11 @@ mod test {
             },
         );
         let p1 = c
-            .async_alloc_abort::<ArcCache<_>>(pk1.clone(), None, 2 * MIN_ALLOC_SIZE)
+            .async_alloc_abort::<ArcCache<_>>(pk1.clone(), None, false, 2 * MIN_ALLOC_SIZE)
             .await
             .unwrap();
         let p2 = c
-            .async_alloc_abort::<ArcCache<_>>(pk2.clone(), None, 1 * MIN_ALLOC_SIZE)
+            .async_alloc_abort::<ArcCache<_>>(pk2.clone(), None, false, 1 * MIN_ALLOC_SIZE)
             .await
             .unwrap();
         let (_r1, w1) = duplex(MIN_ALLOC_SIZE);
