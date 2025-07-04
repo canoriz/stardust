@@ -112,7 +112,7 @@ struct BufTree {
     flushing: u32,   // TODO: After carefully checking, use atomic and move out of BufTree(Mutex)
     loading: u32,
 
-    buf: Vec<u8>,
+    buf: UnsafeCell<Vec<u8>>,
     blk_tree: BlockTree,
 
     // TODO: maybe use a more efficient DS
@@ -154,7 +154,7 @@ impl BufTree {
                 let fb = FreeBlock {
                     offset,
                     power,
-                    ptr: unsafe { self.buf.as_mut_ptr().add(offset) },
+                    ptr: unsafe { self.buf.get_mut().as_mut_ptr().add(offset) },
                 };
                 self.alloced.insert(
                     key,
@@ -191,7 +191,7 @@ impl BufTree {
     fn can_fit_n_if_migrated(&self, target_power: u32) -> usize {
         let alloc_n = self.count_blk_of_power();
 
-        let total = self.buf.len();
+        let total = unsafe { (&*self.buf.get()).len() };
         let mut can_fit = 0;
         let mut occupied_since = total;
         for (i, b) in alloc_n.iter().enumerate() {
@@ -216,9 +216,10 @@ impl BufTree {
     // TODO: longterm: optimize this
     unsafe fn migrate(&mut self) {
         // clear all blk_tree
-        self.blk_tree = init_block_tree(self.buf.len());
+        let len = unsafe { (&*self.buf.get()).len() };
+        self.blk_tree = init_block_tree(len);
 
-        let mut migrate_map = vec![0usize; self.buf.len() >> MIN_ALLOC_SIZE_POWER];
+        let mut migrate_map = vec![0usize; len >> MIN_ALLOC_SIZE_POWER];
 
         #[cfg(test)]
         {
@@ -274,7 +275,8 @@ impl BufTree {
         }
 
         let mut blk_offset = 0;
-        while blk_offset < self.buf.len() >> MIN_ALLOC_SIZE_POWER {
+        let len = unsafe { (&*self.buf.get()).len() };
+        while blk_offset < len >> MIN_ALLOC_SIZE_POWER {
             let dest = migrate_map[blk_offset];
             if dest == blk_offset || dest == 0 {
                 blk_offset += 1;
@@ -283,8 +285,12 @@ impl BufTree {
                     // dest is not used
                     unsafe {
                         std::ptr::copy_nonoverlapping(
-                            self.buf.as_mut_ptr().add(blk_offset * MIN_ALLOC_SIZE),
-                            self.buf.as_mut_ptr().add(dest * MIN_ALLOC_SIZE),
+                            (&mut *self.buf.get())
+                                .as_mut_ptr()
+                                .add(blk_offset * MIN_ALLOC_SIZE),
+                            (&mut *self.buf.get())
+                                .as_mut_ptr()
+                                .add(dest * MIN_ALLOC_SIZE),
                             MIN_ALLOC_SIZE,
                         );
                     }
@@ -292,8 +298,12 @@ impl BufTree {
                     // dest used
                     unsafe {
                         std::ptr::swap_nonoverlapping(
-                            self.buf.as_mut_ptr().add(blk_offset * MIN_ALLOC_SIZE),
-                            self.buf.as_mut_ptr().add(dest * MIN_ALLOC_SIZE),
+                            (&mut *self.buf.get())
+                                .as_mut_ptr()
+                                .add(blk_offset * MIN_ALLOC_SIZE),
+                            (&mut *self.buf.get())
+                                .as_mut_ptr()
+                                .add(dest * MIN_ALLOC_SIZE),
                             MIN_ALLOC_SIZE,
                         );
                     }
@@ -722,7 +732,7 @@ impl PieceBufPoolImpl {
                 flushing: 0,
                 loading: 0,
 
-                buf: vec![0u8; size_fixed],
+                buf: UnsafeCell::new(vec![0u8; size_fixed]),
                 blk_tree: init_block_tree(size_fixed),
                 alloced: HashMap::new(),
                 flush_after_migrate: Vec::new(),
@@ -1642,7 +1652,7 @@ mod test {
     use super::*;
     use tokio_test::task;
 
-    use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+    use tokio::io::{AsyncRead, AsyncWriteExt};
 
     #[test]
     fn test_mul_of_2() {
@@ -1933,8 +1943,8 @@ mod test {
             ],
         };
 
-        let mut buf = vec![0u8; 10 * MIN_ALLOC_SIZE];
-        let base_ptr = buf.as_mut_ptr();
+        let buf = UnsafeCell::new(vec![0u8; 10 * MIN_ALLOC_SIZE]);
+        let base_ptr = unsafe { (&mut *buf.get()).as_mut_ptr() };
         let mut b = BufTree {
             migrating: false,
             flushing: 0,
@@ -2053,8 +2063,8 @@ mod test {
             ],
         };
 
-        let mut buf = vec![0u8; 11 * MIN_ALLOC_SIZE];
-        let base_ptr = buf.as_mut_ptr();
+        let buf = UnsafeCell::new(vec![0u8; 11 * MIN_ALLOC_SIZE]);
+        let base_ptr = unsafe { (*buf.get()).as_mut_ptr() };
         let mut b = BufTree {
             migrating: false,
             flushing: 0,
@@ -2150,8 +2160,8 @@ mod test {
             ],
         };
 
-        let mut buf = vec![0u8; 11 * MIN_ALLOC_SIZE];
-        let base_ptr = buf.as_mut_ptr();
+        let buf = UnsafeCell::new(vec![0u8; 11 * MIN_ALLOC_SIZE]);
+        let base_ptr = unsafe { (&mut *buf.get()).as_mut_ptr() };
         let mut b = BufTree {
             migrating: false,
             flushing: 0,
@@ -2392,11 +2402,11 @@ mod test {
                 *b = 0xcc;
             }
 
-            let guard = c.inner.buf_tree.lock().unwrap();
-            for b in guard.buf.iter().skip(b1.b.offset).take(sz1) {
+            let mut guard = c.inner.buf_tree.lock().unwrap();
+            for b in guard.buf.get_mut().iter().skip(b1.b.offset).take(sz1) {
                 assert_eq!(*b, 0xff);
             }
-            for b in guard.buf.iter().skip(b2.b.offset).take(sz2) {
+            for b in guard.buf.get_mut().iter().skip(b2.b.offset).take(sz2) {
                 assert_eq!(*b, 0xcc);
             }
         });
@@ -2448,11 +2458,11 @@ mod test {
             let pb1 = h1.join().unwrap();
             let pb2 = h2.join().unwrap();
 
-            let guard = c.inner.buf_tree.lock().unwrap();
-            for b in guard.buf.iter().skip(pb1.b.offset).take(sz) {
+            let mut guard = c.inner.buf_tree.lock().unwrap();
+            for b in guard.buf.get_mut().iter().skip(pb1.b.offset).take(sz) {
                 assert_eq!(*b, 0xff);
             }
-            for b in guard.buf.iter().skip(pb2.b.offset).take(sz) {
+            for b in guard.buf.get_mut().iter().skip(pb2.b.offset).take(sz) {
                 assert_eq!(*b, 0xcc);
             }
         });
