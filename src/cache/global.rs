@@ -12,6 +12,7 @@ use std::sync::atomic::{self, AtomicBool};
 use std::task::{Context, Poll, Waker};
 
 use futures::ready;
+use futures::task::AtomicWaker;
 #[cfg(mloom)]
 use loom::sync::{mpsc, Arc, Mutex, MutexGuard};
 #[cfg(not(mloom))]
@@ -1138,15 +1139,21 @@ impl AllocFutInner<'_> {
                                     AtomicBool::new(false),
                                 ));
                                 let reader_done = done.clone();
-                                let waker = cx.waker().clone();
+                                let waker = Arc::new(AtomicWaker::new());
+                                waker.register(cx.waker());
+                                let waker_clone = waker.clone();
                                 tokio::task::spawn_blocking(move || {
                                     let mut f = file.lock().expect("alloc lock file should OK");
                                     let res = f.read_all(pb.key.offset, pb.as_mut());
                                     unsafe { reader_done.store(pb, res) };
-                                    waker.wake()
+                                    waker_clone.wake()
                                 });
 
-                                *fut = AllocFutInner::Loading(Loading { pool: a.pool, done });
+                                *fut = AllocFutInner::Loading(Loading {
+                                    pool: a.pool,
+                                    done,
+                                    waker,
+                                });
                                 Poll::Pending
                             }
                             _ => {
@@ -1355,6 +1362,7 @@ impl LoadJob {
 struct Loading<'a> {
     pool: &'a PieceBufPool,
     done: Arc<LoadJob>,
+    waker: Arc<AtomicWaker>,
 }
 
 impl Loading<'_> {
@@ -1394,6 +1402,7 @@ impl Loading<'_> {
             }
             ret
         } else {
+            fut.waker.register(cx.waker());
             Poll::Pending
         }
     }
