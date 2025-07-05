@@ -500,8 +500,12 @@ impl PieceBufPool {
         match under_file {
             Some(file) => {
                 let mut f = file.lock().expect("alloc lock file should OK");
-                // TODO: FIXME: do not mark pb dirty
-                let res = f.read_all(pb.key.offset, pb.as_mut());
+
+                // get &mut of pb but reading to it, don't set dirty
+                // if success and no change, no flush needed
+                // if failed, MUST not flush
+                let res = f.read_all(pb.key.offset, pb.as_slice_mut(false));
+
                 let mut buf_guard = self
                     .inner
                     .buf_tree
@@ -552,8 +556,12 @@ impl PieceBufPool {
         match under_file {
             Some(file) => {
                 let mut f = file.lock().expect("alloc lock file should OK");
-                // TODO: FIXME: do not mark pb dirty
-                let res = f.read_all(pb.key.offset, pb.as_mut());
+
+                // get &mut of pb but reading to it, don't set dirty
+                // if success and no change, no flush needed
+                // if failed, MUST not flush
+                let res = f.read_all(pb.key.offset, pb.as_slice_mut(false));
+
                 if let Err(e) = res {
                     Err(AllocErr::LoadErr(e.kind()))
                 } else {
@@ -976,8 +984,7 @@ impl Drop for PieceBuf {
 
 impl AsMut<[u8]> for PieceBuf {
     fn as_mut(&mut self) -> &mut [u8] {
-        self.set_dirty();
-        unsafe { slice::from_raw_parts_mut(self.b.ptr, self.len) }
+        self.as_slice_mut(true)
     }
 }
 
@@ -1028,6 +1035,13 @@ impl PieceBuf {
 
     pub(crate) fn len(&self) -> usize {
         self.len
+    }
+
+    fn as_slice_mut(&mut self, set_dirty: bool) -> &mut [u8] {
+        if set_dirty {
+            self.set_dirty();
+        }
+        unsafe { slice::from_raw_parts_mut(self.b.ptr, self.len) }
     }
 
     pub(crate) fn offset_len(&self) -> (usize, usize) {
@@ -1354,18 +1368,31 @@ impl Loading<'_> {
     {
         let fut = self.get_mut();
         if let Some(r) = fut.done.clone().load() {
-            let mut buf_tree_guard = fut
-                .pool
-                .inner
-                .buf_tree
-                .lock()
-                .expect("poll_alloc loading lock should OK");
-            assert!(!buf_tree_guard.migrating);
-            buf_tree_guard.loading -= 1;
-            match r {
-                Ok(p) => Poll::Ready(Ok(post_piecebuf(p, &mut buf_tree_guard))),
-                Err(e) => Poll::Ready(Err(AllocErr::LoadErr(e))),
+            let (wake_one, ret) = {
+                let mut buf_tree_guard = fut
+                    .pool
+                    .inner
+                    .buf_tree
+                    .lock()
+                    .expect("poll_alloc loading lock should OK");
+                assert!(!buf_tree_guard.migrating);
+                buf_tree_guard.loading -= 1;
+                let ret = match r {
+                    Ok(p) => Poll::Ready(Ok(post_piecebuf(p, &mut buf_tree_guard))),
+                    Err(e) => Poll::Ready(Err(AllocErr::LoadErr(e))),
+                };
+                (buf_tree_guard.loading == 0, ret)
+            };
+            if wake_one {
+                let mut waiting_alloc = fut
+                    .pool
+                    .inner
+                    .waiting_alloc
+                    .lock()
+                    .expect("migrate task lock waiting alloc should OK");
+                wake_next_waiting_alloc(&mut waiting_alloc);
             }
+            ret
         } else {
             Poll::Pending
         }
