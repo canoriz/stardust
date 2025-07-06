@@ -9,7 +9,7 @@ use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
 use std::sync::atomic::{self, AtomicBool};
-use std::task::{Context, Poll, Waker};
+use std::task::{Context, Poll};
 
 use futures::ready;
 use futures::task::AtomicWaker;
@@ -673,6 +673,8 @@ impl PieceBufPool {
                 size,
                 pool: self,
                 waiting: false,
+
+                waker: Arc::new(AtomicWaker::new()),
                 valid: Arc::new(AtomicU32::new(WAITING)),
             }),
         }
@@ -694,6 +696,7 @@ impl PieceBufPool {
                 under_file,
                 pool: self,
                 waiting: false,
+                waker: Arc::new(AtomicWaker::new()),
                 valid: Arc::new(AtomicU32::new(WAITING)),
             }),
             _t: PhantomData,
@@ -1038,7 +1041,7 @@ impl PieceBuf {
 
 pub(crate) struct AllocReq<I> {
     pub key: I,
-    pub waker: Waker,
+    pub waker: Arc<AtomicWaker>,
     pub valid: Arc<AtomicU32>,
 }
 
@@ -1147,7 +1150,7 @@ impl AllocFutInner<'_> {
                     }
                     Err(e) => {
                         warn!("alloc error {e:?}");
-                        return Poll::Ready(Err(e));
+                        Poll::Ready(Err(e))
                     }
                 }
             }
@@ -1161,6 +1164,8 @@ struct Allocating<'a> {
     under_file: Option<MutexBackFile>,
     pool: &'a PieceBufPool,
     waiting: bool,
+
+    waker: Arc<AtomicWaker>,
     valid: Arc<AtomicU32>,
     size: usize,
 }
@@ -1181,9 +1186,10 @@ impl Allocating<'_> {
         let mut waiting_alloc = fut.pool.inner.waiting_alloc.lock().unwrap();
         if !fut.waiting {
             if !waiting_alloc.is_empty() {
+                fut.waker.register(cx.waker());
                 waiting_alloc.push_back(AllocReq {
                     key: fut.key.clone(),
-                    waker: cx.waker().clone(),
+                    waker: fut.waker.clone(),
                     valid: fut.valid.clone(),
                 });
 
@@ -1215,9 +1221,10 @@ impl Allocating<'_> {
                     Poll::Ready(Err(r))
                 }
                 Err(e) => {
+                    fut.waker.register(cx.waker());
                     waiting_alloc.push_back(AllocReq {
                         key: fut.key.clone(),
-                        waker: cx.waker().clone(),
+                        waker: fut.waker.clone(),
                         valid: fut.valid.clone(),
                     });
                     fut.waiting = true;
@@ -1261,9 +1268,10 @@ impl Allocating<'_> {
                     Poll::Ready(Err(r))
                 }
                 Err(e) => {
+                    fut.waker.register(cx.waker());
                     waiting_alloc.push_front(AllocReq {
                         key: fut.key.clone(),
-                        waker: cx.waker().clone(),
+                        waker: fut.waker.clone(),
                         valid: fut.valid.clone(),
                     }); // try to be the first
                     #[cfg(test)]

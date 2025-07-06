@@ -427,6 +427,7 @@ where
         AsyncPartRefFut {
             offset,
             len,
+            waker: Arc::new(AtomicWaker::new()),
             valid: Arc::new(AtomicU32::new(WAITING)),
             cache: self,
         }
@@ -446,6 +447,7 @@ pub(crate) enum GetRefErr {
 pub(crate) struct AsyncPartRefFut<'a, T> {
     offset: usize,
     len: usize,
+    waker: Arc<AtomicWaker>,
     valid: Arc<AtomicU32>,
     cache: &'a ArcCache<T>,
 }
@@ -476,6 +478,7 @@ where
         }
         assert!(allow_state == ALLOW_NEW_REF || allow_state == PAUSE_NEW_REF);
         if allow_state == PAUSE_NEW_REF {
+            fut.waker.register(cx.waker());
             fut.cache
                 .inner
                 .waiting_reqs
@@ -483,7 +486,7 @@ where
                 .expect("async_get_part lock waiting_reqs should OK")
                 .push_back(AllocReq {
                     key: (fut.offset, fut.len),
-                    waker: cx.waker().clone(),
+                    waker: fut.waker.clone(),
                     valid: fut.valid.clone(),
                 });
             return Poll::Pending;
