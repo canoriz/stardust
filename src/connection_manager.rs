@@ -476,7 +476,7 @@ where
     let key = PieceKey {
         // TODO: OPTIMIZE: avoid allocation
         hash: Arc::new(tmh.metadata.info_hash),
-        offset: piece.index as usize * tmh.piece_size,
+        offset: piece.index as usize * tmh.metadata.regular_piece_size(),
     };
 
     'outer: loop {

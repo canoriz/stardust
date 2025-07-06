@@ -143,7 +143,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         use sha1::{Digest, Sha1};
         let mut hasher = Sha1::new();
         // process input message
-        hasher.update(&[0u8; 100000]);
+        hasher.update([0u8; 100000]);
     }
 
     // if let Ok(mut conn) =

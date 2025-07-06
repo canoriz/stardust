@@ -1,7 +1,7 @@
 use crate::backfile::BackFile;
+use crate::backfile::NormalFile;
 use crate::cache::ArcCache;
 use crate::cache::BufStorage;
-use crate::cache::DynFileImpl;
 use crate::cache::{PieceBuf, PieceBufPool};
 use crate::connection_manager::ConnectionManagerHandle;
 use crate::connection_manager::Msg as ConnMsg;
@@ -82,21 +82,8 @@ pub(crate) struct TransmitManagerHandle {
     // reduce contention?
     // TODO: using dyn <trait Picker>?
     pub picker: Arc<Mutex<HeapPiecePicker>>,
-    pub piece_size: usize,
-    pub last_piece_size: usize,
-    pub piece_total: usize,
 
     pub storage: Arc<BufStorage>,
-}
-
-impl TransmitManagerHandle {
-    pub fn piece_len(&self, piece_idx: usize) -> usize {
-        if piece_idx + 1 == self.piece_total {
-            self.last_piece_size // last piece
-        } else {
-            self.piece_size
-        }
-    }
 }
 
 pub struct TransmitManager {
@@ -120,33 +107,25 @@ pub struct TransmitManager {
     storage: Arc<BufStorage>,
 }
 
-pub fn piece_total_and_last_size(total_length: usize, piece_size: usize) -> (usize, usize) {
-    let n_full_piece = total_length / piece_size;
-    let full_piece_total_size = n_full_piece * piece_size;
-    if full_piece_total_size == total_length {
-        (n_full_piece, piece_size)
-    } else {
-        (n_full_piece + 1, (total_length - full_piece_total_size))
-    }
-}
-
 impl TransmitManager {
     pub fn new(
         m: Arc<Metadata>,
         cmd_sender: mpsc::UnboundedSender<Msg>,
         cmd_receiver: mpsc::UnboundedReceiver<Msg>,
     ) -> Self {
-        let piece_size = m.info.piece_length;
+        let piece_size = m.regular_piece_size() as u32;
         let total_length = m.len();
         let piece_picker = Arc::new(Mutex::new(HeapPiecePicker::new(total_length, piece_size)));
 
-        let (piece_total, last_piece_size) =
-            piece_total_and_last_size(total_length, piece_size as usize);
+        let (piece_total, last_piece_size) = (
+            m.total_pieces(),
+            m.piece_size_of(m.total_pieces() as u32 - 1),
+        );
 
-        let back_file = Arc::new(Mutex::new(BackFile::new(m.clone())));
+        let back_file = BackFile::new::<NormalFile>().metadata(m.clone()).build();
         let buf_storage = Arc::new(BufStorage::new(
             total_length,
-            piece_size as usize,
+            m.regular_piece_size(),
             back_file,
         ));
         // TODO: let cancellation token cancel this
@@ -157,9 +136,6 @@ impl TransmitManager {
                 metadata: m,
                 sender: cmd_sender,
                 picker: piece_picker.clone(),
-                piece_size: piece_size as usize,
-                last_piece_size,
-                piece_total,
                 storage: buf_storage.clone(),
             },
             // announce_handle: None,

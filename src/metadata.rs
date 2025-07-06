@@ -30,6 +30,33 @@ impl Metadata {
     pub fn files(&self) -> &Vec<File> {
         &self.files
     }
+
+    pub fn regular_piece_size(&self) -> usize {
+        self.info.piece_length as usize
+    }
+
+    pub fn total_pieces(&self) -> usize {
+        let n_full_piece = self.len() / self.regular_piece_size();
+        let full_piece_total_size = n_full_piece * self.regular_piece_size();
+        if full_piece_total_size == self.len() {
+            n_full_piece
+        } else {
+            n_full_piece + 1
+        }
+    }
+
+    pub fn piece_size_of(&self, index: u32) -> usize {
+        assert!((index as usize) < self.total_pieces());
+        let n_full_piece = self.len() / self.regular_piece_size();
+        let full_piece_total_size = n_full_piece * self.regular_piece_size();
+        if (index as usize) < n_full_piece {
+            self.regular_piece_size()
+        } else {
+            assert_eq!((index as usize), self.total_pieces() - 1);
+            assert_eq!(n_full_piece + 1, self.total_pieces());
+            self.len() - full_piece_total_size
+        }
+    }
 }
 
 // FileMetadata is raw data from .torrent file
