@@ -57,6 +57,13 @@ impl Metadata {
             self.len() - full_piece_total_size
         }
     }
+
+    pub fn verify_info_hash(&self) -> anyhow::Result<bool> {
+        let mut hasher = Sha1::new();
+        bt_bencode::to_writer(&mut hasher, &self.info)?;
+        let info_hash: [u8; 20] = hasher.finalize().into();
+        Ok(info_hash == self.info_hash)
+    }
 }
 
 // FileMetadata is raw data from .torrent file

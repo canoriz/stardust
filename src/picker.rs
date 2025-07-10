@@ -810,6 +810,7 @@ impl HeapPiecePicker {
             warn!("timeout revoke {revoke_pieces:?}");
             for br in revoke_pieces {
                 self.blocks_revoke(&br);
+                // TODO: send CANCEL message to corresponding peers
             }
             self.last_check_timeout = now;
         }
@@ -1054,6 +1055,8 @@ impl HeapPiecePicker {
             }
         };
 
+        // TODO: if some block come from unrequested peer, send CENCEL message to requested
+        // peer, save bandwidth
         let block_index = blk.begin >> 14;
         if let Some(p) = self.partly_requested_pieces.0.get_mut(&blk.index) {
             info!("start receiving blocks of partial requested piece {blk:?}");
