@@ -1,3 +1,4 @@
+use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
@@ -10,7 +11,9 @@ use tracing::{info, warn};
 use crate::cache::{AbortErr, AllocErr, ArcCache, GetRefErr, PieceBuf, PieceKey, Ref};
 use crate::metadata;
 use crate::picker::{start_receive_piece_block, BlockRequests};
-use crate::protocol::{self, BTStream, Message, Piece, ReadStream, Split, WriteStream};
+use crate::protocol::{
+    self, BTStream, Message, Piece, ReadStream, SetExtendedID, Split, WriteStream,
+};
 use crate::transmit_manager::Msg as TransmitMsg;
 use crate::transmit_manager::TransmitManagerHandle;
 
@@ -295,6 +298,10 @@ where
             todo!();
             0
         }
+        Message::Extended(extend) => {
+            handle_extended_msg(&addr, tmh, extend).await;
+            1
+        }
     }
 }
 
@@ -537,4 +544,19 @@ where
             }
         }
     }
+}
+
+async fn handle_extended_msg<T>(
+    peer: &SocketAddr,
+    tmh: &mut TransmitManagerHandle,
+    mut extended: protocol::ExtendedHandle<'_, T>,
+) -> io::Result<()>
+where
+    T: AsyncRead + Unpin + SetExtendedID,
+{
+    info!("handle_extended_msg {extended:?}");
+
+    let extend_msg = extended.recv().await?;
+    match extend_msg
+    Ok(())
 }

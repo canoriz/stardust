@@ -1,7 +1,9 @@
 use crate::cache::{AbortErr, AsyncAbortRead, Ref};
 
-use bytes::BufMut;
+use bytes::{BufMut, BytesMut};
 use core::fmt;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fmt::Formatter;
 use std::mem::MaybeUninit;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -41,10 +43,34 @@ pub trait TryWrite {
     fn try_write(&self, buf: &[u8]) -> io::Result<usize>;
 }
 
+const EXTENSION_NAME_METADATA: &str = "ut_metadata";
+const EXTENSION_NAME_PEX: &str = "ut_pex";
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum ExtensionType {
+    Metadata,
+    Pex,
+}
+
+impl ExtensionType {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Metadata => EXTENSION_NAME_METADATA,
+            Self::Pex => EXTENSION_NAME_PEX,
+        }
+    }
+}
+
+pub trait SetExtendedID {
+    fn set_extend_id(&mut self, extensions: &HashMap<String, u32>);
+    fn get_extend_id(&self, id: u8) -> ExtensionType;
+}
+
 pub struct BTStream<T> {
     // inner: BufStream<T>,
     inner: T,
     partial_header: PartialHeader,
+    extension_id: HashMap<ExtensionType, u8>,
 }
 
 #[derive(Debug)]
@@ -54,6 +80,8 @@ pub struct ReadStream<T> {
 
     // required to implement Cancel Safe for read_msg_header
     partial_header: PartialHeader,
+
+    extension_id: HashMap<ExtensionType, u8>,
 }
 
 // store partial received header,
@@ -92,6 +120,7 @@ impl BTStream<net::TcpStream> {
                 filled: 0,
                 discard_remain: 0,
             },
+            extension_id: HashMap::new(),
         })
     }
 
@@ -125,6 +154,7 @@ where
                 filled: 0,
                 discard_remain: 0,
             },
+            extension_id: HashMap::new(),
         }
     }
 }
@@ -141,6 +171,7 @@ where
                 inner: BufReader::with_capacity(32768, read_end),
                 peer_addr,
                 partial_header: self.partial_header,
+                extension_id: self.extension_id,
             },
             WriteStream {
                 inner: BufWriter::with_capacity(32768, write_end),
@@ -361,6 +392,7 @@ impl MsgTy {
     const REQUEST: u8 = 6;
     const PIECE: u8 = 7;
     const CANCEL: u8 = 8;
+    const EXTENDED: u8 = 20;
 
     const KEEPALIVE_LEN: u32 = 0;
     const CHOKE_LEN: u32 = 1;
@@ -386,6 +418,7 @@ pub enum Message<'a, T> {
     Request(Request),
     Piece(Piece<'a, T>),
     Cancel(Request),
+    Extended(ExtendedHandle<'a, T>),
 }
 
 impl<T> Message<'_, T> {
@@ -401,6 +434,7 @@ impl<T> Message<'_, T> {
             Message::Request(_) => 13,
             Message::Piece(_) => unimplemented!(),
             Message::Cancel(_) => 13,
+            Message::Extended(_) => unimplemented!(),
         }
     }
     fn ty(&self) -> u8 {
@@ -414,7 +448,8 @@ impl<T> Message<'_, T> {
             Message::BitField(_) => MsgTy::BITFIELD,
             Message::Request(_) => MsgTy::REQUEST,
             Message::Piece(_) => MsgTy::PIECE,
-            Message::Cancel(_) => MsgTy::PIECE,
+            Message::Cancel(_) => MsgTy::CANCEL,
+            Message::Extended(_) => MsgTy::EXTENDED,
         }
     }
 }
@@ -457,6 +492,9 @@ impl<T> std::fmt::Debug for Message<'_, T> {
             }
             Message::Cancel(request) => {
                 request.fmt(f)?;
+            }
+            Message::Extended(extend) => {
+                extend.fmt(f)?;
             }
         };
         Ok(())
@@ -629,6 +667,79 @@ impl<T> std::fmt::Debug for Piece<'_, T> {
         ))
     }
 }
+
+#[derive(Eq, PartialEq)]
+pub struct ExtendedHandle<'a, T> {
+    id: u8,
+    len: usize,
+    handle: &'a mut T,
+}
+
+impl<T> ExtendedHandle<'_, T>
+where
+    T: AsyncRead + Unpin + SetExtendedID,
+{
+    pub async fn recv(&mut self) -> Result<ExtendedMsg, io::Error> {
+        let mut reader = self.handle.take(self.len as u64);
+        let mut data = BytesMut::new();
+        let mut read = 0;
+
+        while read < self.len {
+            read += reader.read_buf(&mut data).await?;
+        }
+
+        match self.id {
+            0 => {
+                // 0 is handshake
+                let handshake: ExtendedHandshake = bt_bencode::from_reader(data.as_ref())?;
+                self.handle.set_extend_id(&handshake.m);
+                Ok(ExtendedMsg::Handshake(handshake))
+            }
+            id => match self.handle.get_extend_id(id) {
+                ExtensionType::Metadata => {
+                    todo!()
+                }
+                ExtensionType::Pex => {
+                    todo!()
+                }
+            },
+        }
+    }
+}
+
+impl<T> std::fmt::Debug for ExtendedHandle<'_, T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!("Extended id {}, len {}", self.id, self.len))
+    }
+}
+
+#[derive(Eq, PartialEq)]
+pub enum ExtendedMsg {
+    Handshake(ExtendedHandshake),
+    Pex(ExtendedPex),
+    Metadata(ExtendedMetadata),
+}
+#[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ExtendedHandshake {
+    pub m: HashMap<String, u32>, // supported extensions and id number
+    pub p: u16,                  // TCP listen port
+    pub v: String,               // client name and version
+
+    // A string containing the compact representation of the ip address this peer
+    // sees you as. i.e. this is the receiver's external ip address (no port is
+    // included). This may be either an IPv4 (4 bytes) or an IPv6 (16 bytes) address.
+    pub yourip: Option<String>,
+
+    pub ipv6: Option<String>,
+    pub ipv4: Option<String>,
+    pub reqq: Option<u32>, // request queue limit before drop any message
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct ExtendedPex {}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct ExtendedMetadata {}
 
 #[derive(Eq, PartialEq)]
 pub struct BitFieldRecv<'a, T> {
@@ -814,8 +925,6 @@ async fn recv_msg_header<'a, T: AsyncRead + Unpin>(
         state.filled += 1;
     }
 
-    let n_remain = len as usize - 1;
-
     match state.field_ty {
         MsgTy::CHOKE => {
             state.filled = 0;
@@ -998,6 +1107,22 @@ async fn recv_msg_header<'a, T: AsyncRead + Unpin>(
             state.filled = 0;
             Ok(Message::Cancel(Request { index, begin, len }))
         }
+        MsgTy::EXTENDED => {
+            let capacity = (len - 2) as usize;
+
+            assert!(state.filled >= 5);
+
+            // this is cancel safe, and it's last field, so not update
+            // state.filled more
+            let ext_id = handle.read_u8().await?;
+            state.filled = 0;
+
+            Ok(Message::Extended(ExtendedHandle {
+                id: ext_id,
+                len: capacity,
+                handle,
+            }))
+        }
         other => {
             warn!("received unknown Msg type {other}, length {len}");
             discard_remain(handle, state).await?;
@@ -1079,11 +1204,13 @@ mod tests {
                 // inner: tokio::io::BufStream::new(end1),
                 inner: end1,
                 partial_header: EMPTY_PARTIAL_HEADER,
+                extension_id: HashMap::new(),
             },
             BTStream::<DuplexStream> {
                 // inner: tokio::io::BufStream::new(end2),
                 inner: end2,
                 partial_header: EMPTY_PARTIAL_HEADER,
+                extension_id: HashMap::new(),
             },
         )
     }
@@ -1103,6 +1230,7 @@ mod tests {
                     inner: BufReader::new(read_end),
                     peer_addr: DEFAULT_ADDR,
                     partial_header: EMPTY_PARTIAL_HEADER,
+                    extension_id: HashMap::new(),
                 },
                 WriteStream {
                     inner: BufWriter::new(write_end),
@@ -1127,12 +1255,14 @@ mod tests {
                 // inner: tokio::io::BufStream::new(end1),
                 inner: end1,
                 partial_header: EMPTY_PARTIAL_HEADER,
+                extension_id: HashMap::new(),
             }
             .into_split(),
             BTStream::<DuplexStream> {
                 // inner: tokio::io::BufStream::new(end2),
                 inner: end2,
                 partial_header: EMPTY_PARTIAL_HEADER,
+                extension_id: HashMap::new(),
             }
             .into_split(),
         )
