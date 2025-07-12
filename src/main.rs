@@ -2,11 +2,11 @@ use std::net::SocketAddr;
 // use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use anyhow::Result;
 use std::sync::Arc;
-use tokio::io::BufStream;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::TcpStream;
 use tokio::time::Duration;
 use tokio::{net, time};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 // mod abort_readwriter;
 mod announce_manager;
@@ -20,7 +20,7 @@ mod protocol;
 mod torrent_manager;
 mod transmit_manager;
 
-use protocol::{BTStream, Handshake, Message};
+use protocol::{BTStream, Message};
 use torrent_manager::TorrentManagerHandle;
 
 // #[tokio::main(flavor = "current_thread")]
@@ -62,35 +62,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut set = tokio::task::JoinSet::new();
             ready.notify_one();
             loop {
-                let (bt_stream, addr) = match listener.accept().await {
+                let total = metadata_clone.info.pieces.len() / 20;
+                match listener.accept().await {
                     Ok((stream, addr)) => {
                         info!("input from addr {}", addr);
-                        (
-                            protocol::BTStream::from(BufStream::with_capacity(
-                                32768, 32768, stream,
-                            )),
+                        set.spawn(handle_income_connection(
+                            stream,
                             addr,
-                        )
+                            metadata_clone.clone(),
+                            // vec![vec![true; 1], vec![false; total - 1]]
+                            //     .into_iter()
+                            //     .flatten()
+                            //     .collect(),
+                            vec![vec![false; total / 2], vec![true; total - total / 2]]
+                                .into_iter()
+                                .flatten()
+                                .collect(),
+                        ));
                     }
                     Err(e) => {
                         info!("accept error {}", e);
-                        continue;
                     }
                 };
-                let total = metadata_clone.info.pieces.len() / 20;
-                let handle = set.spawn(handle_income_connection(
-                    bt_stream,
-                    addr,
-                    metadata_clone.clone(),
-                    // vec![vec![true; 1], vec![false; total - 1]]
-                    //     .into_iter()
-                    //     .flatten()
-                    //     .collect(),
-                    vec![vec![false; total / 2], vec![true; total - total / 2]]
-                        .into_iter()
-                        .flatten()
-                        .collect(),
-                ));
             }
             set.join_all().await;
         });
@@ -104,26 +97,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut set = tokio::task::JoinSet::new();
             ready2.notify_one();
             loop {
-                let (bt_stream, addr) = match listener.accept().await {
+                let total = metadata_clone.info.pieces.len() / 20;
+                match listener.accept().await {
                     Ok((stream, addr)) => {
                         info!("input from addr {}", addr);
-                        (protocol::BTStream::from(stream), addr)
+                        set.spawn(handle_income_connection(
+                            stream,
+                            addr,
+                            metadata_clone.clone(),
+                            // vec![vec![true; 1], vec![false; total - 1]]
+                            //     .into_iter()
+                            //     .flatten()
+                            //     .collect(),
+                            vec![vec![false; total / 2], vec![true; total - total / 2]]
+                                .into_iter()
+                                .flatten()
+                                .collect(),
+                        ));
                     }
                     Err(e) => {
                         info!("accept error {}", e);
-                        continue;
                     }
-                };
-                let total = metadata_clone.info.pieces.len() / 20;
-                let handle = set.spawn(handle_income_connection(
-                    bt_stream,
-                    addr,
-                    metadata_clone.clone(),
-                    vec![vec![true; total / 2], vec![false; total - total / 2]]
-                        .into_iter()
-                        .flatten()
-                        .collect(),
-                ));
+                }
             }
             set.join_all().await;
         });
@@ -189,7 +184,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn handle_income_connection<T>(
-    mut bt_stream: BTStream<T>,
+    mut raw_conn: T,
     addr: SocketAddr,
     metadata: metadata::Metadata,
     field: Vec<bool>,
@@ -197,12 +192,15 @@ async fn handle_income_connection<T>(
 where
     T: AsyncRead + AsyncWrite + Unpin + std::fmt::Debug, // TODO: maybe remove this Debug
 {
-    let mut handshake = bt_stream.recv_handshake().await?;
-    info!("get handshake {:?}", handshake);
-    handshake.reserved = [0; 8];
-    handshake.client_id = *CLIENT_ID;
-    bt_stream.send_handshake(&handshake).await?;
-    info!("handshake sent");
+    let client_id = [
+        0x54, 0x42, 0x54, 0x69, 0x21, 0x58, 0x21, 0x58, 0x68, 0x69, 0x93, 0x51, 0x54, 0x42, 0x54,
+        0x69, 0x21, 0x58, 0x21, 0x58,
+    ];
+
+    let mut bt_stream =
+        protocol::BTStream::accept(raw_conn, &protocol::FuncBits::default(), &client_id).await?;
+    info!("handshake done");
+
     let bitfield_total = (metadata.info.pieces.len() / 20).div_ceil(8);
     info!("{bitfield_total}");
     assert_eq!(field.len(), metadata.info.pieces.len() / 20);
@@ -217,7 +215,7 @@ where
     let ticker5 = tokio::time::interval(time::Duration::from_secs(3));
     let mut ticker1 = tokio::time::interval(time::Duration::from_millis(1000));
     bt_stream.send_unchoke().await;
-    let limit = 200;
+    let limit = 2000;
     let mut accum = 0;
     let choked = false;
     const A: [u8; 16384] = [0u8; 16384];
@@ -269,7 +267,7 @@ where
 const CLIENT_ID: &[u8; 20] = b"-ZS0405-qwerasdfzxcv";
 
 const HANDSHAKE: protocol::Handshake = protocol::Handshake {
-    reserved: [0; 8],
+    reserved: protocol::FuncBits::none().set_extension(),
     torrent_hash: [
         0x05, 0xb7, 0x49, 0x26, 0xfc, 0xb6, 0x0e, 0x28, 0x87, 0x02, 0xb4, 0x89, 0xc9, 0x99, 0x88,
         0x6d, 0x0d, 0x08, 0xcc, 0x90,

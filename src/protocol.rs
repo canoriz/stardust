@@ -1,12 +1,15 @@
 use crate::cache::{AbortErr, AsyncAbortRead, Ref};
+use bt_bencode::ByteIpAddr;
+use bt_bencode::ByteString;
 
-use bytes::{BufMut, BytesMut};
+use bytes::BytesMut;
 use core::fmt;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
 use std::fmt::Formatter;
 use std::mem::MaybeUninit;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::LazyLock;
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net;
 use tokio::net::tcp;
@@ -33,20 +36,61 @@ impl Split for net::TcpStream {
     }
 }
 
-// non-blocking io
-pub trait TryRead {
-    fn try_read(&self, buf: &mut [u8]) -> io::Result<usize>;
-    fn try_read_buf<B: BufMut>(&self, buf: &mut B) -> io::Result<usize>;
-}
+const EMPTY_PARTIAL_HEADER: PartialHeader = PartialHeader {
+    field_len: [0; 4],
+    field_ty: 0,
+    field1: [0; 4],
+    field2: [0; 4],
+    field3: [0; 4],
+    filled: 0,
+    discard_remain: 0,
+};
 
-pub trait TryWrite {
-    fn try_write(&self, buf: &[u8]) -> io::Result<usize>;
-}
-
-const EXTENSION_NAME_METADATA: &str = "ut_metadata";
 const EXTENSION_NAME_PEX: &str = "ut_pex";
+const EXTENSION_NAME_METADATA: &str = "ut_metadata";
+const EXTENSION_ID_PEX: u8 = 1;
+const EXTENSION_ID_METADATA: u8 = 3;
 
-#[derive(Debug, Eq, PartialEq)]
+static EXTENSION_IDS: LazyLock<HashMap<ExtensionType, u8>> =
+    LazyLock::new(|| HashMap::from([(ExtensionType::Metadata, 3), (ExtensionType::Pex, 1)]));
+pub static EXTENSION_IDS_MAP: LazyLock<HashMap<String, u8>> = LazyLock::new(|| {
+    HashMap::from([
+        (EXTENSION_NAME_METADATA.into(), 3),
+        (EXTENSION_NAME_PEX.into(), 1),
+    ])
+});
+
+fn extension_type(ext_name: &str) -> Option<ExtensionType> {
+    match ext_name {
+        EXTENSION_NAME_METADATA => Some(ExtensionType::Metadata),
+        EXTENSION_NAME_PEX => Some(ExtensionType::Pex),
+        _ => {
+            // TODO: use leveled logger? span?
+            warn!("received unknown extension {ext_name}");
+            None
+        }
+    }
+}
+
+struct GeneralConnHandle<'a, T> {
+    reader: &'a mut T,
+    partial_header: &'a mut PartialHeader,
+}
+
+pub trait GeneralConn: sealed::GeneralConnSealed {}
+impl<T: GeneralConnSealed> GeneralConn for T {}
+
+use sealed::GeneralConnSealed;
+mod sealed {
+    use tokio::io::AsyncRead;
+    pub trait GeneralConnSealed {
+        type Inner: AsyncRead + Unpin;
+
+        fn general_reader(&mut self) -> super::GeneralConnHandle<Self::Inner>;
+    }
+}
+
+#[derive(Hash, Debug, Eq, PartialEq)]
 pub enum ExtensionType {
     Metadata,
     Pex,
@@ -61,16 +105,15 @@ impl ExtensionType {
     }
 }
 
-pub trait SetExtendedID {
-    fn set_extend_id(&mut self, extensions: &HashMap<String, u32>);
-    fn get_extend_id(&self, id: u8) -> ExtensionType;
-}
-
 pub struct BTStream<T> {
-    // inner: BufStream<T>,
     inner: T,
     partial_header: PartialHeader,
     extension_id: HashMap<ExtensionType, u8>,
+
+    reserved: FuncBits,
+    peer_id: [u8; 20],
+    // TODO: maybe add a torrent hash Arc<>
+    // torrent_hash: [u8; 20],
 }
 
 #[derive(Debug)]
@@ -80,8 +123,6 @@ pub struct ReadStream<T> {
 
     // required to implement Cancel Safe for read_msg_header
     partial_header: PartialHeader,
-
-    extension_id: HashMap<ExtensionType, u8>,
 }
 
 // store partial received header,
@@ -101,28 +142,30 @@ struct PartialHeader {
 pub struct WriteStream<T> {
     inner: BufWriter<T>,
     peer_addr: SocketAddr,
+
+    extension_id: HashMap<ExtensionType, u8>,
 }
 
 impl BTStream<net::TcpStream> {
-    pub async fn connect_tcp(peer_addr: SocketAddr) -> io::Result<BTStream<net::TcpStream>> {
-        // TODO: fix type of peer_addr
-        // TODO: add timeout
-        let tcp_stream = net::TcpStream::connect(peer_addr).await?;
-        Ok(BTStream::<net::TcpStream> {
-            // inner: BufStream::new(tcp_stream),
-            inner: tcp_stream,
-            partial_header: PartialHeader {
-                field_len: [0; 4],
-                field_ty: 0,
-                field1: [0; 4],
-                field2: [0; 4],
-                field3: [0; 4],
-                filled: 0,
-                discard_remain: 0,
-            },
-            extension_id: HashMap::new(),
-        })
-    }
+    // pub async fn connect_tcp(peer_addr: SocketAddr) -> io::Result<BTStream<net::TcpStream>> {
+    //     // TODO: fix type of peer_addr
+    //     // TODO: add timeout
+    //     let tcp_stream = net::TcpStream::connect(peer_addr).await?;
+    //     Ok(BTStream::<net::TcpStream> {
+    //         // inner: BufStream::new(tcp_stream),
+    //         inner: tcp_stream,
+    //         partial_header: PartialHeader {
+    //             field_len: [0; 4],
+    //             field_ty: 0,
+    //             field1: [0; 4],
+    //             field2: [0; 4],
+    //             field3: [0; 4],
+    //             filled: 0,
+    //             discard_remain: 0,
+    //         },
+    //         extension_id: HashMap::new(),
+    //     })
+    // }
 
     pub fn peer_addr(&self) -> SocketAddr {
         // TODO: is this possible to be error?
@@ -137,27 +180,41 @@ impl BTStream<net::TcpStream> {
     }
 }
 
-impl<T> From<T> for BTStream<T>
-where
-    T: AsyncRead + AsyncWrite,
-{
-    fn from(t: T) -> Self {
-        Self {
-            // inner: BufStream::new(t),
-            inner: t,
-            partial_header: PartialHeader {
-                field_len: [0; 4],
-                field_ty: 0,
-                field1: [0; 4],
-                field2: [0; 4],
-                field3: [0; 4],
-                filled: 0,
-                discard_remain: 0,
-            },
-            extension_id: HashMap::new(),
+pub struct ConnInfo<'a> {
+    func_bits: &'a FuncBits,
+    peer_id: &'a [u8; 20],
+}
+
+impl<T> BTStream<T> {
+    pub fn info(&self) -> ConnInfo {
+        ConnInfo {
+            func_bits: &self.reserved,
+            peer_id: &self.peer_id,
         }
     }
 }
+
+// impl<T> From<T> for BTStream<T>
+// where
+//     T: AsyncRead + AsyncWrite,
+// {
+//     fn from(t: T) -> Self {
+//         Self {
+//             // inner: BufStream::new(t),
+//             inner: t,
+//             partial_header: PartialHeader {
+//                 field_len: [0; 4],
+//                 field_ty: 0,
+//                 field1: [0; 4],
+//                 field2: [0; 4],
+//                 field3: [0; 4],
+//                 filled: 0,
+//                 discard_remain: 0,
+//             },
+//             extension_id: HashMap::new(),
+//         }
+//     }
+// }
 
 impl<T> BTStream<T>
 where
@@ -171,11 +228,11 @@ where
                 inner: BufReader::with_capacity(32768, read_end),
                 peer_addr,
                 partial_header: self.partial_header,
-                extension_id: self.extension_id,
             },
             WriteStream {
                 inner: BufWriter::with_capacity(32768, write_end),
                 peer_addr,
+                extension_id: self.extension_id,
             },
         )
     }
@@ -201,7 +258,7 @@ where
     flushed: bool,
 }
 
-impl<'a, T> Drop for WriteHandle<'a, T>
+impl<T> Drop for WriteHandle<'_, T>
 where
     T: AsyncWrite + Unpin,
 {
@@ -212,7 +269,7 @@ where
     }
 }
 
-impl<'a, T> WriteHandle<'a, T>
+impl<T> WriteHandle<'_, T>
 where
     T: AsyncWrite + Unpin,
 {
@@ -237,8 +294,108 @@ impl<T> BTStream<T>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
-    pub async fn send_handshake(&mut self, h: &Handshake) -> io::Result<()> {
-        send_handshake(&mut self.inner, h).await
+    pub async fn connect(mut t: T, h: &Handshake, extend: &ExtendedHandshake) -> io::Result<Self>
+    where
+        T: AsyncRead + AsyncWrite + Unpin,
+    {
+        send_handshake(&mut t, h).await?;
+        let peer_handshake = recv_handshake(&mut t).await?;
+
+        let mut s = BTStream {
+            inner: t,
+            partial_header: EMPTY_PARTIAL_HEADER,
+            extension_id: HashMap::new(),
+
+            peer_id: peer_handshake.client_id,
+            reserved: peer_handshake.reserved,
+        };
+
+        let support_extension =
+            peer_handshake.reserved.have_extension() & h.reserved.have_extension();
+        if support_extension {
+            // TODO: will this block? both ends sending data while OS buffer full
+            // and waiting data sent not checking incoming handshake?
+            send_extension_handshake(&mut s.inner, extend).await?;
+            let exth = s.recv_extend_handshake().await?;
+            s.extension_id = exth
+                .m
+                .iter()
+                .filter_map(|(s, id)| extension_type(s).map(|ss| (ss, *id)))
+                .filter(|(_, id)| *id != 0)
+                .collect();
+        }
+        Ok(s)
+    }
+
+    pub async fn accept(mut t: T, funcbits: &FuncBits, client_id: &[u8; 20]) -> io::Result<Self>
+    where
+        T: AsyncRead + AsyncWrite + Unpin,
+    {
+        let peer_handshake = recv_handshake(&mut t).await?;
+        // TODO: check the id, if no same id, close connection
+        send_handshake(
+            &mut t,
+            &Handshake {
+                reserved: *funcbits,
+                torrent_hash: peer_handshake.torrent_hash,
+                client_id: *client_id,
+            },
+        )
+        .await?;
+
+        let mut s = BTStream {
+            inner: t,
+            partial_header: EMPTY_PARTIAL_HEADER,
+            extension_id: HashMap::new(),
+            peer_id: peer_handshake.client_id,
+            reserved: peer_handshake.reserved.common(funcbits),
+        };
+
+        let support_extension = peer_handshake.reserved.have_extension();
+        if support_extension {
+            let exth = ExtendedHandshake {
+                // TODO: optimize: on sending, clone() can be optimized
+                m: EXTENSION_IDS_MAP.clone(),
+                p: 12345,
+                v: "stardust 0.1.0".into(),
+                yourip: None,
+
+                ipv6: None,
+                ipv4: None,
+                reqq: None, // request queue limit before drop any message
+            };
+            // TODO: will this block? both ends sending data while OS buffer full
+            // and waiting data sent not checking incoming handshake?
+            send_extension_handshake(&mut s.inner, &exth).await?;
+            let exth = s.recv_extend_handshake().await?;
+            s.extension_id = exth
+                .m
+                .iter()
+                .filter_map(|(s, id)| extension_type(s).map(|ss| (ss, *id)))
+                .filter(|(_, id)| *id != 0)
+                .collect();
+        }
+        Ok(s)
+    }
+
+    async fn recv_extend_handshake(&mut self) -> io::Result<ExtendedHandshake> {
+        let msg = recv_msg_header(self).await?;
+        match msg {
+            Message::Extended(mut e) => {
+                let ext_msg = e.recv().await?;
+                match ext_msg {
+                    ExtendedMsg::Handshake(exth) => Ok(exth),
+                    other => Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("expecting extension handshake, receive extension msg {other:?}"),
+                    )),
+                }
+            }
+            other => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("expecting extension handshake, receive {other:?}"),
+            )),
+        }
     }
 
     pub async fn send_keepalive(&mut self) -> io::Result<()> {
@@ -287,10 +444,6 @@ impl<T> WriteStream<T>
 where
     T: AsyncWrite + Unpin,
 {
-    pub async fn send_handshake(&mut self, h: &Handshake) -> io::Result<()> {
-        send_handshake(&mut self.inner, h).await
-    }
-
     pub async fn send_keepalive(&mut self) -> io::Result<()> {
         send_keepalive(&mut self.inner).await
     }
@@ -338,14 +491,23 @@ where
 {
     /// # Cancel Safety
     /// this is safe
-    pub async fn recv_msg_header(&mut self) -> io::Result<Message<'_, T>> {
-        recv_msg_header(&mut self.inner, &mut self.partial_header).await
+    pub async fn recv_msg_header(&mut self) -> io::Result<Message<'_, Self>> {
+        recv_msg_header(self).await
     }
+}
 
-    /// # Cancel Safety
-    /// this is not cancel safe
-    pub async fn recv_handshake(&mut self) -> io::Result<Handshake> {
-        recv_handshake(&mut self.inner).await
+impl<T> GeneralConnSealed for BTStream<T>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    type Inner = T;
+
+    fn general_reader(&mut self) -> GeneralConnHandle<Self::Inner> {
+        GeneralConnHandle {
+            reader: &mut self.inner,
+            partial_header: &mut self.partial_header,
+            // extension_id: &mut self.extension_id,
+        }
     }
 }
 
@@ -358,25 +520,78 @@ where
     /// further handling of body is required
     /// # Cancel safety
     /// this is cancel safe
-    pub async fn recv_msg_header(&mut self) -> io::Result<Message<'_, BufReader<T>>> {
-        recv_msg_header(&mut self.inner, &mut self.partial_header).await
+    pub async fn recv_msg_header(&mut self) -> io::Result<Message<'_, Self>> {
+        recv_msg_header(self).await
     }
 
-    pub async fn recv_handshake(&mut self) -> io::Result<Handshake> {
-        recv_handshake(&mut self.inner).await
-    }
-
-    /// # Cancel safety
-    /// this is not cancel safe
     pub fn peer_addr(&self) -> SocketAddr {
         // TODO: change a different name
         self.peer_addr
     }
 }
 
+impl<T> GeneralConnSealed for ReadStream<T>
+where
+    T: AsyncRead + Unpin,
+{
+    type Inner = BufReader<T>;
+
+    fn general_reader(&mut self) -> GeneralConnHandle<Self::Inner> {
+        GeneralConnHandle {
+            reader: &mut self.inner,
+            partial_header: &mut self.partial_header,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct FuncBits([u8; 8]);
+impl FuncBits {
+    pub const fn have_extension(&self) -> bool {
+        self.0[5] & 0x10 > 0
+    }
+
+    pub const fn new(b: [u8; 8]) -> Self {
+        Self(b)
+    }
+
+    pub const fn none() -> Self {
+        Self::new([0; 8])
+    }
+
+    pub const fn basic() -> Self {
+        Self::none().set_extension()
+    }
+
+    pub const fn set_extension(mut self) -> Self {
+        self.0[5] |= 0x10;
+        self
+    }
+
+    fn common(mut self, other: &Self) -> Self {
+        for i in 0..8 {
+            self.0[i] &= other.0[i];
+        }
+        self
+    }
+}
+
+impl From<[u8; 8]> for FuncBits {
+    fn from(t: [u8; 8]) -> Self {
+        Self::new(t)
+    }
+}
+
+impl Default for FuncBits {
+    fn default() -> Self {
+        Self::basic()
+    }
+}
+
+// TODO: make this a builder pattern
 #[derive(Debug, Eq, PartialEq)]
 pub struct Handshake {
-    pub reserved: [u8; 8],
+    pub reserved: FuncBits,
     pub torrent_hash: [u8; 20],
     pub client_id: [u8; 20],
 }
@@ -418,7 +633,7 @@ pub enum Message<'a, T> {
     Request(Request),
     Piece(Piece<'a, T>),
     Cancel(Request),
-    Extended(ExtendedHandle<'a, T>),
+    Extended(ExtendedRecv<'a, T>),
 }
 
 impl<T> Message<'_, T> {
@@ -613,20 +828,22 @@ pub struct Piece<'a, T> {
 
 impl<T> Piece<'_, T>
 where
-    T: AsyncRead + Unpin,
+    T: GeneralConn,
 {
     // read all remaining piece(block) data into buf
     // read should be called once, buf.len should
     // be large enough to store the entire block
     pub async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         // TODO: test the limit part
+        let GeneralConnHandle { reader, .. } = self.handle.general_reader();
+
         let remain = (self.len - self.read) as usize;
         let limit = remain.min(buf.len());
 
         // TODO: Transmission sends data in seperate packets
         // and 500ms after first packet
         // maybe make this read() instead of read_exact
-        let res = self.handle.read(&mut buf[..limit]).await?;
+        let res = reader.read(&mut buf[..limit]).await?;
         self.read += res as u32;
         Ok(res)
     }
@@ -637,10 +854,10 @@ where
         offset: usize,
     ) -> Result<(usize, Ref<U>), AbortErr<io::Error>>
     where
-        T: AsyncRead,
         U: AsMut<[u8]>,
     {
-        match self.handle.read_abort(&mut buf, offset).await {
+        let GeneralConnHandle { reader, .. } = self.handle.general_reader();
+        match reader.read_abort(&mut buf, offset).await {
             Ok(n) => Ok((n, buf)),
             Err(e) => Err(e),
         }
@@ -655,7 +872,8 @@ where
         // TODO: Transmission sends data in seperate packets
         // and 500ms after first packet
         // maybe make this read() instead of read_exact
-        self.handle.read_exact(&mut buf[..limit]).await
+        let GeneralConnHandle { reader, .. } = self.handle.general_reader();
+        reader.read_exact(&mut buf[..limit]).await
     }
 }
 
@@ -669,70 +887,105 @@ impl<T> std::fmt::Debug for Piece<'_, T> {
 }
 
 #[derive(Eq, PartialEq)]
-pub struct ExtendedHandle<'a, T> {
+pub struct ExtendedRecv<'a, T> {
     id: u8,
     len: usize,
     handle: &'a mut T,
 }
 
-impl<T> ExtendedHandle<'_, T>
+impl<T> ExtendedRecv<'_, T>
 where
-    T: AsyncRead + Unpin + SetExtendedID,
+    T: GeneralConn,
 {
     pub async fn recv(&mut self) -> Result<ExtendedMsg, io::Error> {
-        let mut reader = self.handle.take(self.len as u64);
+        let GeneralConnHandle { reader, .. } = self.handle.general_reader();
+        let mut limit_reader = reader.take(self.len as u64);
         let mut data = BytesMut::new();
         let mut read = 0;
 
         while read < self.len {
-            read += reader.read_buf(&mut data).await?;
+            read += limit_reader.read_buf(&mut data).await?;
         }
 
         match self.id {
             0 => {
                 // 0 is handshake
                 let handshake: ExtendedHandshake = bt_bencode::from_reader(data.as_ref())?;
-                self.handle.set_extend_id(&handshake.m);
                 Ok(ExtendedMsg::Handshake(handshake))
             }
-            id => match self.handle.get_extend_id(id) {
-                ExtensionType::Metadata => {
-                    todo!()
-                }
-                ExtensionType::Pex => {
-                    todo!()
-                }
-            },
+            EXTENSION_ID_METADATA => Ok(ExtendedMsg::Metadata(ExtendedMetadata {})),
+            EXTENSION_ID_PEX => Ok(ExtendedMsg::Pex(ExtendedPex {})),
+            other => {
+                warn!("received unknown extension id {other}");
+                // TODO: maybe store the unknown extension's name?
+                Ok(ExtendedMsg::Unknown(other))
+            }
         }
     }
 }
 
-impl<T> std::fmt::Debug for ExtendedHandle<'_, T> {
+impl<T> std::fmt::Debug for ExtendedRecv<'_, T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.write_fmt(format_args!("Extended id {}, len {}", self.id, self.len))
     }
 }
 
-#[derive(Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub enum ExtendedMsg {
     Handshake(ExtendedHandshake),
     Pex(ExtendedPex),
     Metadata(ExtendedMetadata),
+    Unknown(u8),
 }
+
 #[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ExtendedHandshake {
-    pub m: HashMap<String, u32>, // supported extensions and id number
-    pub p: u16,                  // TCP listen port
-    pub v: String,               // client name and version
+    // TODO: when sending can use 'static ref
+    pub m: HashMap<String, u8>, // supported extensions and id number
+    //
+    pub p: u16, // TCP listen port
+    //
+    // TODO: when sending can use 'static ref
+    pub v: String, // client name and version
 
     // A string containing the compact representation of the ip address this peer
     // sees you as. i.e. this is the receiver's external ip address (no port is
     // included). This may be either an IPv4 (4 bytes) or an IPv6 (16 bytes) address.
-    pub yourip: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub yourip: Option<ByteIpAddr>,
 
-    pub ipv6: Option<String>,
-    pub ipv4: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ipv6: Option<ByteIpAddr>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ipv4: Option<ByteIpAddr>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub reqq: Option<u32>, // request queue limit before drop any message
+}
+
+pub struct ExtendedHandshakeBuilder {
+    h: ExtendedHandshake,
+}
+
+impl ExtendedHandshakeBuilder {
+    pub fn build(self) -> ExtendedHandshake {
+        self.h
+    }
+}
+
+impl ExtendedHandshake {
+    pub fn builder(port: u16, version: &str) -> ExtendedHandshakeBuilder {
+        ExtendedHandshakeBuilder {
+            h: ExtendedHandshake {
+                m: EXTENSION_IDS_MAP.clone(),
+                p: port,
+                v: version.into(),
+                yourip: None,
+                ipv6: None,
+                ipv4: None,
+                reqq: None,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -747,21 +1000,25 @@ pub struct BitFieldRecv<'a, T> {
     handle: &'a mut T,
 }
 
-impl<T> BitFieldRecv<'_, T>
+impl<T, U> BitFieldRecv<'_, T>
 where
-    T: AsyncRead + Unpin,
+    T: GeneralConn<Inner = U>,
+    U: AsyncRead + Unpin,
 {
     // read all remaining piece(block) data into buf
     // read should be called once, buf.len should
     // be large enough to store the entire block
+
     pub async fn read(&mut self) -> io::Result<BitField> {
         info!("BitFieldRecv read capacity {}", self.capacity);
+        let GeneralConnHandle { reader, .. } = self.handle.general_reader();
+
         let mut bitfield: Vec<u8> = unsafe {
             let mut piece: Vec<MaybeUninit<u8>> = Vec::with_capacity(self.capacity);
             piece.set_len(self.capacity);
             std::mem::transmute(piece)
         };
-        let n_read = self.handle.read_exact(bitfield.as_mut_slice()).await?;
+        let n_read = reader.read_exact(bitfield.as_mut_slice()).await?;
         assert_eq!(n_read, self.capacity);
         Ok(BitField::new(bitfield))
     }
@@ -770,9 +1027,25 @@ where
 async fn send_handshake<T: AsyncWrite + Unpin>(handle: &mut T, h: &Handshake) -> io::Result<()> {
     handle.write_u8(19).await?;
     handle.write_all(b"BitTorrent protocol").await?;
-    handle.write_all(&h.reserved).await?;
+    handle.write_all(&h.reserved.0).await?;
     handle.write_all(&h.torrent_hash).await?;
     handle.write_all(&h.client_id).await?;
+    handle.flush().await
+}
+
+async fn send_extension_handshake<T: AsyncWrite + Unpin>(
+    handle: &mut T,
+    h: &ExtendedHandshake,
+) -> io::Result<()> {
+    let mut buf = Vec::new();
+    bt_bencode::to_writer(&mut buf, h)?;
+    let len = buf.len() + 2;
+    handle.write_u32(len as u32).await?;
+    handle.write_u8(MsgTy::EXTENDED).await?;
+    handle.write_u8(0).await?;
+
+    handle.write_all(&mut buf).await?;
+
     handle.flush().await
 }
 
@@ -892,18 +1165,24 @@ async fn discard_remain<T: AsyncRead + Unpin>(
     Ok(())
 }
 
-async fn recv_msg_header<'a, T: AsyncRead + Unpin>(
-    handle: &'a mut T,
-    state: &'_ mut PartialHeader,
-) -> io::Result<Message<'a, T>> {
+async fn recv_msg_header<'a, T>(handle: &'a mut T) -> io::Result<Message<'a, T>>
+where
+    T: GeneralConn,
+{
     // TODO: what to do if some malicious peer sends a long len data
     // and a lot of garbage data? use timeout
     // TODO: what if some bug happens in peer and peer shutdown connection
     // leaving data unsend?
     // TODO: what if peer claims to send data, but does not really send?
 
+    let GeneralConnHandle {
+        reader,
+        partial_header: state,
+        ..
+    } = handle.general_reader();
+
     while state.filled < 4 {
-        let n = handle.read(&mut state.field_len[state.filled..4]).await?;
+        let n = reader.read(&mut state.field_len[state.filled..4]).await?;
         state.filled += n;
         if n == 0 {
             // Go has ZeroReadIsEof, in TCP, this should be true
@@ -921,7 +1200,7 @@ async fn recv_msg_header<'a, T: AsyncRead + Unpin>(
 
     if state.filled <= 4 {
         // read_u8 is cancel safe
-        state.field_ty = handle.read_u8().await?;
+        state.field_ty = reader.read_u8().await?;
         state.filled += 1;
     }
 
@@ -948,7 +1227,7 @@ async fn recv_msg_header<'a, T: AsyncRead + Unpin>(
             assert!(state.filled >= 5);
             let mut filled_len = state.filled - 5;
             while filled_len < 4 {
-                let n = handle.read(&mut state.field1[filled_len..4]).await?;
+                let n = reader.read(&mut state.field1[filled_len..4]).await?;
                 state.filled += n;
                 if n == 0 {
                     // Go has ZeroReadIsEof, in TCP, this should be true
@@ -970,7 +1249,7 @@ async fn recv_msg_header<'a, T: AsyncRead + Unpin>(
             assert!(state.filled >= 5);
             let mut filled_len = state.filled - 5;
             while filled_len < 4 {
-                let n = handle.read(&mut state.field1[filled_len..4]).await?;
+                let n = reader.read(&mut state.field1[filled_len..4]).await?;
                 state.filled += n;
                 if n == 0 {
                     // Go has ZeroReadIsEof, in TCP, this should be true
@@ -985,7 +1264,7 @@ async fn recv_msg_header<'a, T: AsyncRead + Unpin>(
             assert!(state.filled >= 9);
             let mut filled_len = state.filled - 9;
             while filled_len < 4 {
-                let n = handle.read(&mut state.field2[filled_len..4]).await?;
+                let n = reader.read(&mut state.field2[filled_len..4]).await?;
                 state.filled += n;
                 if n == 0 {
                     // Go has ZeroReadIsEof, in TCP, this should be true
@@ -1000,7 +1279,7 @@ async fn recv_msg_header<'a, T: AsyncRead + Unpin>(
             assert!(state.filled >= 13);
             let mut filled_len = state.filled - 13;
             while filled_len < 4 {
-                let n = handle.read(&mut state.field3[filled_len..4]).await?;
+                let n = reader.read(&mut state.field3[filled_len..4]).await?;
                 state.filled += n;
                 if n == 0 {
                     // Go has ZeroReadIsEof, in TCP, this should be true
@@ -1021,7 +1300,7 @@ async fn recv_msg_header<'a, T: AsyncRead + Unpin>(
             assert!(state.filled >= 5);
             let mut filled_len = state.filled - 5;
             while filled_len < 4 {
-                let n = handle.read(&mut state.field1[filled_len..4]).await?;
+                let n = reader.read(&mut state.field1[filled_len..4]).await?;
                 state.filled += n;
                 if n == 0 {
                     // Go has ZeroReadIsEof, in TCP, this should be true
@@ -1036,7 +1315,7 @@ async fn recv_msg_header<'a, T: AsyncRead + Unpin>(
             assert!(state.filled >= 9);
             let mut filled_len = state.filled - 9;
             while filled_len < 4 {
-                let n = handle.read(&mut state.field2[filled_len..4]).await?;
+                let n = reader.read(&mut state.field2[filled_len..4]).await?;
                 state.filled += n;
                 if n == 0 {
                     // Go has ZeroReadIsEof, in TCP, this should be true
@@ -1062,7 +1341,7 @@ async fn recv_msg_header<'a, T: AsyncRead + Unpin>(
             assert!(state.filled >= 5);
             let mut filled_len = state.filled - 5;
             while filled_len < 4 {
-                let n = handle.read(&mut state.field1[filled_len..4]).await?;
+                let n = reader.read(&mut state.field1[filled_len..4]).await?;
                 state.filled += n;
                 if n == 0 {
                     // Go has ZeroReadIsEof, in TCP, this should be true
@@ -1077,7 +1356,7 @@ async fn recv_msg_header<'a, T: AsyncRead + Unpin>(
             assert!(state.filled >= 9);
             let mut filled_len = state.filled - 9;
             while filled_len < 4 {
-                let n = handle.read(&mut state.field2[filled_len..4]).await?;
+                let n = reader.read(&mut state.field2[filled_len..4]).await?;
                 state.filled += n;
                 if n == 0 {
                     // Go has ZeroReadIsEof, in TCP, this should be true
@@ -1092,7 +1371,7 @@ async fn recv_msg_header<'a, T: AsyncRead + Unpin>(
             assert!(state.filled >= 13);
             let mut filled_len = state.filled - 13;
             while filled_len < 4 {
-                let n = handle.read(&mut state.field3[filled_len..4]).await?;
+                let n = reader.read(&mut state.field3[filled_len..4]).await?;
                 state.filled += n;
                 if n == 0 {
                     // Go has ZeroReadIsEof, in TCP, this should be true
@@ -1114,10 +1393,10 @@ async fn recv_msg_header<'a, T: AsyncRead + Unpin>(
 
             // this is cancel safe, and it's last field, so not update
             // state.filled more
-            let ext_id = handle.read_u8().await?;
+            let ext_id = reader.read_u8().await?;
             state.filled = 0;
 
-            Ok(Message::Extended(ExtendedHandle {
+            Ok(Message::Extended(ExtendedRecv {
                 id: ext_id,
                 len: capacity,
                 handle,
@@ -1125,28 +1404,29 @@ async fn recv_msg_header<'a, T: AsyncRead + Unpin>(
         }
         other => {
             warn!("received unknown Msg type {other}, length {len}");
-            discard_remain(handle, state).await?;
-            panic!();
+            discard_remain(reader, state).await?;
+            todo!("loop and receive next packet");
         }
     }
 }
 
 async fn recv_handshake<T: AsyncRead + Unpin>(handle: &mut T) -> io::Result<Handshake> {
-    let mut header = [0u8; 19];
     let first = handle.read_u8().await?;
     if first != 19 {
         todo!();
     }
+    let mut header = [0u8; 19];
     handle.read_exact(&mut header).await?;
     if header != *b"BitTorrent protocol" {
         todo!();
     }
-    let mut reserved = [0u8; 8];
+    let mut reserved = FuncBits::default();
     let mut torrent_hash = [0u8; 20];
     let mut client_id = [0u8; 20];
-    handle.read_exact(&mut reserved).await?;
+    handle.read_exact(&mut reserved.0).await?;
     handle.read_exact(&mut torrent_hash).await?;
     handle.read_exact(&mut client_id).await?;
+
     Ok(Handshake {
         reserved,
         torrent_hash,
@@ -1187,32 +1467,50 @@ mod tests {
         }
     }
 
-    const EMPTY_PARTIAL_HEADER: PartialHeader = PartialHeader {
-        field_len: [0; 4],
-        field_ty: 0,
-        field1: [0; 4],
-        field2: [0; 4],
-        field3: [0; 4],
-        filled: 0,
-        discard_remain: 0,
-    };
+    async fn make_ends_tune(
+        connect_shake: Handshake,
+        connect_ext_shake: ExtendedHandshake,
+        accept_func: FuncBits,
+        accept_client_id: [u8; 20],
+    ) -> (BTStream<DuplexStream>, BTStream<DuplexStream>) {
+        let (peer1, peer2) = duplex(1024 * 1024);
+        let p1 = tokio::spawn(async move {
+            BTStream::connect(peer1, &connect_shake, &connect_ext_shake)
+                .await
+                .unwrap()
+        });
 
-    fn make_ends() -> (BTStream<DuplexStream>, BTStream<DuplexStream>) {
-        let (end1, end2) = duplex(1024 * 1024);
-        (
-            BTStream::<DuplexStream> {
-                // inner: tokio::io::BufStream::new(end1),
-                inner: end1,
-                partial_header: EMPTY_PARTIAL_HEADER,
-                extension_id: HashMap::new(),
-            },
-            BTStream::<DuplexStream> {
-                // inner: tokio::io::BufStream::new(end2),
-                inner: end2,
-                partial_header: EMPTY_PARTIAL_HEADER,
-                extension_id: HashMap::new(),
-            },
-        )
+        let p2 = tokio::spawn(async move {
+            BTStream::accept(peer2, &accept_func, &accept_client_id)
+                .await
+                .unwrap()
+        });
+
+        (p1.await.unwrap(), p2.await.unwrap())
+    }
+
+    async fn make_ends() -> (BTStream<DuplexStream>, BTStream<DuplexStream>) {
+        const HANDSHAKE: Handshake = Handshake {
+            reserved: FuncBits::new([0x0, 0x0, 0x0, 0x0, 0x0, 0x10, 0x0, 0x0]), // extension bit
+            torrent_hash: [
+                0x05, 0xb7, 0x49, 0x26, 0xfc, 0xb6, 0x0e, 0x28, 0x87, 0x02, 0xb4, 0x89, 0xc9, 0x99,
+                0x88, 0x6d, 0x0d, 0x08, 0xcc, 0x90,
+            ],
+            client_id: *b"-ST0010-qwertyuiopas",
+        };
+        let exth = ExtendedHandshake {
+            // TODO: optimize: on sending, clone() can be optimized
+            m: EXTENSION_IDS_MAP.clone(),
+            p: 12345,
+            v: "stardust 0.1.0".into(),
+            yourip: None,
+
+            ipv6: None,
+            ipv4: None,
+            reqq: None, // request queue limit before drop any message
+        };
+
+        make_ends_tune(HANDSHAKE, exth, HANDSHAKE.reserved, HANDSHAKE.client_id).await
     }
 
     impl BTStream<DuplexStream> {
@@ -1230,16 +1528,17 @@ mod tests {
                     inner: BufReader::new(read_end),
                     peer_addr: DEFAULT_ADDR,
                     partial_header: EMPTY_PARTIAL_HEADER,
-                    extension_id: HashMap::new(),
                 },
                 WriteStream {
                     inner: BufWriter::new(write_end),
                     peer_addr: DEFAULT_ADDR,
+                    extension_id: self.extension_id,
                 },
             )
         }
     }
-    fn make_ends_split() -> (
+
+    async fn make_ends_split() -> (
         (
             ReadStream<ReadHalf<DuplexStream>>,
             WriteStream<WriteHalf<DuplexStream>>,
@@ -1249,77 +1548,101 @@ mod tests {
             WriteStream<WriteHalf<DuplexStream>>,
         ),
     ) {
-        let (end1, end2) = duplex(1024 * 1024);
-        (
-            BTStream::<DuplexStream> {
-                // inner: tokio::io::BufStream::new(end1),
-                inner: end1,
-                partial_header: EMPTY_PARTIAL_HEADER,
-                extension_id: HashMap::new(),
-            }
-            .into_split(),
-            BTStream::<DuplexStream> {
-                // inner: tokio::io::BufStream::new(end2),
-                inner: end2,
-                partial_header: EMPTY_PARTIAL_HEADER,
-                extension_id: HashMap::new(),
-            }
-            .into_split(),
-        )
+        let (end1, end2) = make_ends().await;
+        (end1.into_split(), end2.into_split())
     }
 
     #[tokio::test]
     async fn handshake() {
         // TODO: change value of hash, id and reserved
         const HANDSHAKE: Handshake = Handshake {
-            reserved: [0x1, 0x2, 0x3, 0x4, 0x1, 0x2, 0x3, 0x4],
+            reserved: FuncBits::new([0x1, 0x2, 0x3, 0x4, 0x1, 0x0, 0x3, 0x4]),
             torrent_hash: [
                 0x05, 0xb7, 0x49, 0x26, 0xfc, 0xb6, 0x0e, 0x28, 0x87, 0x02, 0xb4, 0x89, 0xc9, 0x99,
                 0x88, 0x6d, 0x0d, 0x08, 0xcc, 0x90,
             ],
             client_id: *b"-ST0010-qwertyuiopas",
         };
-        let (mut peer1, mut peer2) = make_ends();
-        peer1
-            .send_handshake(&HANDSHAKE)
-            .await
-            .expect("should send ok");
-        let received = peer2.recv_handshake().await.expect("should recv ok");
-        assert_eq!(received, HANDSHAKE);
+        let exth = ExtendedHandshake {
+            // TODO: optimize: on sending, clone() can be optimized
+            m: EXTENSION_IDS_MAP.clone(),
+            p: 12345,
+            v: "stardust 0.1.0".into(),
+            yourip: None,
 
-        let ((_, mut p1w), (mut p2r, _)) = make_ends_split();
-        p1w.send_handshake(&HANDSHAKE)
-            .await
-            .expect("should send ok");
-        let received = p2r.recv_handshake().await.expect("should recv ok");
-        assert_eq!(received, HANDSHAKE);
+            ipv6: None,
+            ipv4: None,
+            reqq: None, // request queue limit before drop any message
+        };
+        let (peer1, peer2) = duplex(1024);
+        make_ends_tune(HANDSHAKE, exth, HANDSHAKE.reserved, HANDSHAKE.client_id).await;
+        // TODO: test info
+    }
+
+    #[tokio::test]
+    async fn handshake_extend() {
+        // TODO: change value of hash, id and reserved
+        const HANDSHAKE: Handshake = Handshake {
+            reserved: FuncBits::new([0x0, 0x0, 0x0, 0x0, 0x0, 0x10, 0x0, 0x0]), // extension bit
+            torrent_hash: [
+                0x05, 0xb7, 0x49, 0x26, 0xfc, 0xb6, 0x0e, 0x28, 0x87, 0x02, 0xb4, 0x89, 0xc9, 0x99,
+                0x88, 0x6d, 0x0d, 0x08, 0xcc, 0x90,
+            ],
+            client_id: *b"-ST0010-qwertyuiopas",
+        };
+        let (mut peer1, mut peer2) = duplex(1024);
+        let exth = ExtendedHandshake {
+            // TODO: optimize: on sending, clone() can be optimized
+            m: EXTENSION_IDS_MAP.clone(),
+            p: 12345,
+            v: "stardust 0.1.0".into(),
+            yourip: None,
+
+            ipv6: None,
+            ipv4: None,
+            reqq: None, // request queue limit before drop any message
+        };
+        let (peer1, peer2) = duplex(1024);
+        make_ends_tune(HANDSHAKE, exth, HANDSHAKE.reserved, HANDSHAKE.client_id).await;
+        // TODO: test info
     }
 
     #[tokio::test]
     #[ignore]
     async fn test_connect_real() {
-        let mut bstream = BTStream::<net::TcpStream>::connect_tcp("[::0]:35515".parse().unwrap())
+        let tcp_stream = net::TcpStream::connect("[::0]:35515".parse::<SocketAddr>().unwrap())
             .await
             .unwrap();
-        let _ = bstream
-            .send_handshake(&Handshake {
-                reserved: [0; 8],
+        let bstream = BTStream::connect(
+            tcp_stream,
+            &Handshake {
+                reserved: FuncBits::new([0; 8]),
                 torrent_hash: [0; 20],
                 client_id: [0; 20],
-            })
-            .await;
-        let rcv = bstream.recv_handshake().await.unwrap();
-        dbg!(rcv);
+            },
+            &ExtendedHandshake {
+                m: EXTENSION_IDS_MAP.clone(),
+                p: 12345,
+                v: "stardust 0.1.0".into(),
+                yourip: None,
+
+                ipv6: None,
+                ipv4: None,
+                reqq: None, // request queue limit before drop any message
+            },
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn keepalive() {
-        let (mut peer1, mut peer2) = make_ends();
+        let (mut peer1, mut peer2) = make_ends().await;
         peer1.send_keepalive().await.expect("should send ok");
         let received = peer2.recv_msg_header().await.expect("should recv ok");
         assert!(matches!(received, Message::KeepAlive));
 
-        let ((_, mut p1w), (mut p2r, _)) = make_ends_split();
+        let ((_, mut p1w), (mut p2r, _)) = make_ends_split().await;
         p1w.send_keepalive().await.expect("should send ok");
         let received = p2r.recv_msg_header().await.expect("should recv ok");
         assert!(matches!(received, Message::KeepAlive));
@@ -1327,12 +1650,12 @@ mod tests {
 
     #[tokio::test]
     async fn keepalive_split() {
-        let (mut peer1, mut peer2) = make_ends();
+        let (mut peer1, mut peer2) = make_ends().await;
         peer1.send_keepalive().await.expect("should send ok");
         let received = peer2.recv_msg_header().await.expect("should recv ok");
         assert!(matches!(received, Message::KeepAlive));
 
-        let ((_, mut p1w), (mut p2r, _)) = make_ends_split();
+        let ((_, mut p1w), (mut p2r, _)) = make_ends_split().await;
         p1w.send_keepalive().await.expect("should send ok");
         let received = p2r.recv_msg_header().await.expect("should recv ok");
         assert!(matches!(received, Message::KeepAlive));
@@ -1340,12 +1663,12 @@ mod tests {
 
     #[tokio::test]
     async fn choke() {
-        let (mut peer1, mut peer2) = make_ends();
+        let (mut peer1, mut peer2) = make_ends().await;
         peer1.send_choke().await.expect("should send ok");
         let received = peer2.recv_msg_header().await.expect("should recv ok");
         assert!(matches!(received, Message::Choke));
 
-        let ((_, mut p1w), (mut p2r, _)) = make_ends_split();
+        let ((_, mut p1w), (mut p2r, _)) = make_ends_split().await;
         p1w.send_choke().await.expect("should send ok");
         let received = p2r.recv_msg_header().await.expect("should recv ok");
         assert!(matches!(received, Message::Choke));
@@ -1353,12 +1676,12 @@ mod tests {
 
     #[tokio::test]
     async fn unchoke() {
-        let (mut peer1, mut peer2) = make_ends();
+        let (mut peer1, mut peer2) = make_ends().await;
         peer1.send_unchoke().await.expect("should send ok");
         let received = peer2.recv_msg_header().await.expect("should recv ok");
         assert!(matches!(received, Message::Unchoke));
 
-        let ((_, mut p1w), (mut p2r, _)) = make_ends_split();
+        let ((_, mut p1w), (mut p2r, _)) = make_ends_split().await;
         p1w.send_unchoke().await.expect("should send ok");
         let received = p2r.recv_msg_header().await.expect("should recv ok");
         assert!(matches!(received, Message::Unchoke));
@@ -1366,12 +1689,12 @@ mod tests {
 
     #[tokio::test]
     async fn intrested() {
-        let (mut peer1, mut peer2) = make_ends();
+        let (mut peer1, mut peer2) = make_ends().await;
         peer1.send_interested().await.expect("should send ok");
         let received = peer2.recv_msg_header().await.expect("should recv ok");
         assert!(matches!(received, Message::Interested));
 
-        let ((_, mut p1w), (mut p2r, _)) = make_ends_split();
+        let ((_, mut p1w), (mut p2r, _)) = make_ends_split().await;
         p1w.send_interested().await.expect("should send ok");
         let received = p2r.recv_msg_header().await.expect("should recv ok");
         assert!(matches!(received, Message::Interested));
@@ -1379,12 +1702,12 @@ mod tests {
 
     #[tokio::test]
     async fn notintrested() {
-        let (mut peer1, mut peer2) = make_ends();
+        let (mut peer1, mut peer2) = make_ends().await;
         peer1.send_notinterested().await.expect("should send ok");
         let received = peer2.recv_msg_header().await.expect("should recv ok");
         assert!(matches!(received, Message::NotInterested));
 
-        let ((_, mut p1w), (mut p2r, _)) = make_ends_split();
+        let ((_, mut p1w), (mut p2r, _)) = make_ends_split().await;
         p1w.send_notinterested().await.expect("should send ok");
         let received = p2r.recv_msg_header().await.expect("should recv ok");
         assert!(matches!(received, Message::NotInterested));
@@ -1392,12 +1715,12 @@ mod tests {
 
     #[tokio::test]
     async fn have() {
-        let (mut peer1, mut peer2) = make_ends();
+        let (mut peer1, mut peer2) = make_ends().await;
         peer1.send_have(533).await.expect("should send ok");
         let received = peer2.recv_msg_header().await.expect("should recv ok");
         assert!(matches!(received, Message::Have(533)));
 
-        let ((_, mut p1w), (mut p2r, _)) = make_ends_split();
+        let ((_, mut p1w), (mut p2r, _)) = make_ends_split().await;
         p1w.send_have(533).await.expect("should send ok");
         let received = p2r.recv_msg_header().await.expect("should recv ok");
         assert!(matches!(received, Message::Have(533)));
@@ -1405,10 +1728,10 @@ mod tests {
 
     #[tokio::test]
     async fn bitfield() {
-        let (mut peer1, mut peer2) = make_ends();
+        let (mut peer1, mut peer2) = make_ends().await;
         let fields = rand::random::<[u8; 143]>();
         peer1
-            .send_bitfield(&BitField::new(fields.clone().into()))
+            .send_bitfield(&BitField::new(fields.into()))
             .await
             .expect("should send ok");
         let received = peer2.recv_msg_header().await.expect("should recv ok");
@@ -1416,9 +1739,9 @@ mod tests {
         let bf = b.read().await.unwrap();
         assert_eq!(bf, BitField::new(fields.into()));
 
-        let ((_, mut p1w), (mut p2r, _)) = make_ends_split();
+        let ((_, mut p1w), (mut p2r, _)) = make_ends_split().await;
         let fields = rand::random::<[u8; 143]>();
-        p1w.send_bitfield(&BitField::new(fields.clone().into()))
+        p1w.send_bitfield(&BitField::new(fields.into()))
             .await
             .expect("should send ok");
         let received = p2r.recv_msg_header().await.expect("should recv ok");
@@ -1429,7 +1752,7 @@ mod tests {
 
     #[tokio::test]
     async fn request() {
-        let (mut peer1, mut peer2) = make_ends();
+        let (mut peer1, mut peer2) = make_ends().await;
         let index = rand::random::<u32>();
         let begin = rand::random::<u32>();
         peer1
@@ -1441,14 +1764,14 @@ mod tests {
         assert_eq!(
             r,
             Request {
-                index: index,
-                begin: begin,
+                index,
+                begin,
                 len: 4,
             }
         );
         // TODO: test long request
 
-        let ((_, mut p1w), (mut p2r, _)) = make_ends_split();
+        let ((_, mut p1w), (mut p2r, _)) = make_ends_split().await;
         p1w.send_request(index, begin, 4)
             .await
             .expect("should send ok");
@@ -1457,8 +1780,8 @@ mod tests {
         assert_eq!(
             r,
             Request {
-                index: index,
-                begin: begin,
+                index,
+                begin,
                 len: 4,
             }
         );
@@ -1467,7 +1790,7 @@ mod tests {
 
     #[tokio::test]
     async fn piece() {
-        let (mut peer1, mut peer2) = make_ends();
+        let (mut peer1, mut peer2) = make_ends().await;
         let random_bytes = rand::random::<[u8; 143]>();
         let index = rand::random::<u32>();
         let begin = rand::random::<u32>();
@@ -1488,7 +1811,7 @@ mod tests {
 
         // TODO: test long piece are dropped
 
-        let ((_, mut p1w), (mut p2r, _)) = make_ends_split();
+        let ((_, mut p1w), (mut p2r, _)) = make_ends_split().await;
         let random_bytes = rand::random::<[u8; 143]>();
         p1w.send_piece(index, begin, &random_bytes)
             .await
@@ -1509,7 +1832,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancel() {
-        let (mut peer1, mut peer2) = make_ends();
+        let (mut peer1, mut peer2) = make_ends().await;
         let index = rand::random::<u32>();
         let begin = rand::random::<u32>();
         peer1
@@ -1524,7 +1847,7 @@ mod tests {
         assert_eq!(msg.len, 4);
         // TODO: test long request
 
-        let ((_, mut p1w), (mut p2r, _)) = make_ends_split();
+        let ((_, mut p1w), (mut p2r, _)) = make_ends_split().await;
         p1w.send_cancel(index, begin, 4)
             .await
             .expect("should send ok");
@@ -1538,7 +1861,7 @@ mod tests {
 
     #[tokio::test]
     async fn bi_direction() {
-        let ((mut p1r, mut p1w), (mut p2r, mut p2w)) = make_ends_split();
+        let ((mut p1r, mut p1w), (mut p2r, mut p2w)) = make_ends_split().await;
         p1w.send_interested().await.expect("p1 should send ok");
         let p2_recv = p2r.recv_msg_header().await.expect("p2 should recv ok");
         p2w.send_choke().await.expect("p2 should send ok");
@@ -1549,7 +1872,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_msg_header_cancel_safe() {
-        let ((p1r, mut p1w), (mut p2r, p2w)) = make_ends_split();
+        let ((p1r, mut p1w), (mut p2r, p2w)) = make_ends_split().await;
         let request_msg = [
             0u8, 0, 0, 13, 6, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xa, 0xb, 0xc,
         ];

@@ -95,12 +95,15 @@ impl Access for NormalFile {
     }
 
     fn write_all_at(&mut self, buf: &[u8], offset: usize) -> Result<()> {
-        warn!("write_all at {offset} {}", buf.len());
-        self.file.write_all_at(buf, offset as u64)
+        info!("write_all at offset {offset} len {}", buf.len());
+        // self.file.write_all_at(buf, offset as u64)
+        Ok(())
     }
 
     fn read_exact_at(&mut self, buf: &mut [u8], offset: usize) -> Result<()> {
-        self.file.read_exact_at(buf, offset as u64)
+        info!("read_exact at offset {offset} len {}", buf.len());
+        // self.file.read_exact_at(buf, offset as u64)
+        Ok(())
     }
 
     fn metadata(&self) -> Result<FileMetadata> {
@@ -278,10 +281,10 @@ impl BackFile {
     #[cfg(test)]
     pub fn get_inner(&mut self, offset: usize, len: usize) -> Option<Result<Vec<u8>>> {
         assert_eq!(self.file_range.len(), 1);
-        match &mut self.file_range[0].handle {
-            Some(h) => Some(h.get_inner(offset, len)),
-            None => None,
-        }
+        self.file_range[0]
+            .handle
+            .as_mut()
+            .map(|h| h.get_inner(offset, len))
     }
 }
 

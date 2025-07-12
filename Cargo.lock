@@ -105,8 +105,7 @@ dependencies = [
 [[package]]
 name = "bt_bencode"
 version = "0.8.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6398febbe0d54acd58256692c7d0608c0f49741ec830af6918129d6348f5c4bd"
+source = "git+https://github.com/canoriz/bt_bencode?rev=e98a891#e98a891d9cbedac508f99050232a5b1166e03eda"
 dependencies = [
  "itoa",
  "serde",

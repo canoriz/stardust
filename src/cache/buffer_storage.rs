@@ -5,7 +5,6 @@ use tokio::time;
 use tracing::warn;
 
 use crate::backfile::BackFile;
-use crate::picker::BitField;
 
 use super::{AllocErr, ArcCache, GetRefErr, MutexBackFile, PieceBuf, PieceBufPool, PieceKey, Ref};
 
@@ -128,7 +127,7 @@ impl BufStorage {
             // i.e. operation between two locks?
             match block_ref {
                 Ok(bbuf) => {
-                    let mut pb_map = self.piece_buffer.lock().unwrap();
+                    let pb_map = self.piece_buffer.lock().unwrap();
                     return Ok((piece_buf, bbuf));
                 }
                 Err(GetRefErr::Invalidated) => {

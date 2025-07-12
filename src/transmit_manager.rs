@@ -1,12 +1,11 @@
 use crate::backfile::BackFile;
 use crate::backfile::NormalFile;
-use crate::cache::ArcCache;
 use crate::cache::BufStorage;
-use crate::cache::{PieceBuf, PieceBufPool};
 use crate::connection_manager::ConnectionManagerHandle;
 use crate::connection_manager::Msg as ConnMsg;
 use crate::metadata::{self, Metadata};
 use crate::picker::HeapPiecePicker;
+use crate::protocol::FuncBits;
 use crate::protocol::{self, BitField};
 
 use std::collections::HashMap;
@@ -205,7 +204,7 @@ impl TransmitManager {
                     // maybe calculate this with response time
                     let batch_seconds = 10.0;
                     let mut optimal_n_in_flight = (estm_bw_bps * batch_seconds / 16384.0) as u32;
-                    optimal_n_in_flight = optimal_n_in_flight.min(500).max(16);
+                    optimal_n_in_flight = optimal_n_in_flight.min(1500).max(16);
 
                     dbg!(n_received, estm_bw_bps, optimal_n_in_flight);
 
@@ -446,19 +445,34 @@ async fn connect_peer(
     addr: SocketAddr,
     m: Arc<Metadata>,
 ) -> Result<(), std::io::Error> {
-    let conn = protocol::BTStream::connect_tcp(addr).await;
+    let tcp_stream = TcpStream::connect(addr).await?;
+    let mut func = FuncBits::default();
+    func.set_extension();
+    let conn = protocol::BTStream::connect(
+        tcp_stream,
+        &protocol::Handshake {
+            reserved: func,
+            client_id: [
+                0x54, 0x42, 0x54, 0x69, 0x21, 0x58, 0x21, 0x58, 0x68, 0x69, 0x93, 0x51, 0x54, 0x42,
+                0x54, 0x69, 0x21, 0x58, 0x21, 0x58,
+            ],
+            torrent_hash: m.info_hash,
+        },
+        &protocol::ExtendedHandshake {
+            m: protocol::EXTENSION_IDS_MAP.clone(), // supported extensions and id number
+            p: 14351,                               // TCP listen port
+            v: "stardust 0.1.0".into(),             // client name and version
+
+            yourip: None,
+
+            ipv6: None,
+            ipv4: None,
+            reqq: None, // request queue limit before drop any message
+        },
+    )
+    .await;
     match conn {
         Ok(mut c) => {
-            c.send_handshake(&protocol::Handshake {
-                reserved: [0u8; 8],
-                client_id: [
-                    0x54, 0x42, 0x54, 0x69, 0x21, 0x58, 0x21, 0x58, 0x68, 0x69, 0x93, 0x51, 0x54,
-                    0x42, 0x54, 0x69, 0x21, 0x58, 0x21, 0x58,
-                ],
-                torrent_hash: m.info_hash,
-            })
-            .await?;
-            c.recv_handshake().await?;
             if let Err(e) = main_tx.sender.send(Msg::NewPeer(c)) {
                 info!("send new peer to main {e}");
             }

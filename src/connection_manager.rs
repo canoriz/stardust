@@ -8,11 +8,11 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{info, warn};
 
-use crate::cache::{AbortErr, AllocErr, ArcCache, GetRefErr, PieceBuf, PieceKey, Ref};
+use crate::cache::{AbortErr, ArcCache, GetRefErr, PieceBuf, PieceKey, Ref};
 use crate::metadata;
 use crate::picker::{start_receive_piece_block, BlockRequests};
 use crate::protocol::{
-    self, BTStream, Message, Piece, ReadStream, SetExtendedID, Split, WriteStream,
+    self, BTStream, GeneralConn, Message, Piece, ReadStream, Split, WriteStream,
 };
 use crate::transmit_manager::Msg as TransmitMsg;
 use crate::transmit_manager::TransmitManagerHandle;
@@ -49,7 +49,7 @@ impl ConnectionManagerHandle {
         let recv_cancel = CancellationToken::new();
         let recv_stream: RecvStream<T> = RecvStream {
             receiver: recv_rx,
-            read_stream: read_stream,
+            read_stream,
             transmit_handle: trh,
             blk_recv_count: 0,
         };
@@ -59,7 +59,7 @@ impl ConnectionManagerHandle {
         let (send_done_tx, send_done_rx) = oneshot::channel();
         let send_stream: SendStream<T> = SendStream {
             receiver: send_rx,
-            write_stream: write_stream,
+            write_stream,
         };
 
         tokio::spawn(run_recv_stream(
@@ -230,7 +230,7 @@ async fn handle_peer_msg<'a, R>(
     m: Message<'a, R>,
 ) -> u32
 where
-    R: AsyncRead + Unpin,
+    R: GeneralConn,
 {
     info!("handle_peer_msg from {addr} {m:?}");
     // TODO: send statistics to transmit handle
@@ -407,7 +407,7 @@ async fn handle_piece_msg<T>(
     mut piece: protocol::Piece<'_, T>,
 ) -> Result<(), ()>
 where
-    T: AsyncRead + Unpin,
+    T: GeneralConn,
 {
     // TODO:
     // if coming piece have cache, store it in cache
@@ -475,7 +475,7 @@ async fn read_block_from_peer<'a, T>(
     piece: &mut Piece<'a, T>,
 ) -> Result<(ArcCache<PieceBuf>, Ref<PieceBuf>), ()>
 where
-    T: AsyncRead + Unpin,
+    T: GeneralConn,
 {
     let mut written = 0usize;
     let target_len = piece.len as usize;
@@ -549,14 +549,14 @@ where
 async fn handle_extended_msg<T>(
     peer: &SocketAddr,
     tmh: &mut TransmitManagerHandle,
-    mut extended: protocol::ExtendedHandle<'_, T>,
+    mut extended: protocol::ExtendedRecv<'_, T>,
 ) -> io::Result<()>
 where
-    T: AsyncRead + Unpin + SetExtendedID,
+    T: GeneralConn,
 {
     info!("handle_extended_msg {extended:?}");
 
     let extend_msg = extended.recv().await?;
-    match extend_msg
+    // match extend_msg
     Ok(())
 }

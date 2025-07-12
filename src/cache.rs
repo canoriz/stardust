@@ -19,9 +19,4 @@ const WAITING: u32 = 0;
 const WAKING: u32 = 0b100;
 
 #[cfg(test)]
-mod test {
-    use std::future::pending;
-
-    use super::*;
-    use tokio_test::task;
-}
+mod test {}

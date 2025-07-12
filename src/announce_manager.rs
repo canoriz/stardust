@@ -178,7 +178,7 @@ async fn run_announce_manager<A>(
             Some(r) = manager.announce_timer.join_next() => {
                 if let Ok(t) = r {
                     info!("announce url {}", t.url);
-                    if let Some(_) = manager.url_list.get(&(AnnounceType::V4, (&t.url).clone())) {
+                    if manager.url_list.get(&(AnnounceType::V4, t.url.clone())).is_some() {
                         announce_task_tx.send(t);
                     }
                 } else {

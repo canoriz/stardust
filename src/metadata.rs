@@ -7,6 +7,7 @@ use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::LazyLock;
 use thiserror::Error;
+use tracing::warn;
 
 // Metadata is a universal structure
 #[derive(Debug, Clone)]
@@ -181,7 +182,7 @@ pub struct TrackerGet<'a> {
     // event: Option<Enum<...>>
 }
 
-impl<'a> TrackerGet<'a> {
+impl TrackerGet<'_> {
     pub fn url(&self, meta: &Metadata, url: String) -> String {
         fn percent_encoding_str<T: AsRef<[u8]>, P: AsRef<[u8]>>(k: &T, v: &P) -> String {
             percent_encoding::percent_encode(k.as_ref(), percent_encoding::NON_ALPHANUMERIC)
@@ -238,19 +239,13 @@ pub struct Failure {
 
 fn ipv6_client() -> Result<Client, reqwest::Error> {
     const V6_ADDR: Ipv6Addr = Ipv6Addr::from_bits(0);
-    Client::builder()
-        .local_address(IpAddr::V6(V6_ADDR))
-        .build()
-        .map_err(|e| e.into())
+    Client::builder().local_address(IpAddr::V6(V6_ADDR)).build()
 }
 
 fn ipv4_client() -> Result<Client, reqwest::Error> {
     const V4_ADDR: Ipv4Addr = Ipv4Addr::from_bits(0);
     let builder = Client::builder();
-    builder
-        .local_address(IpAddr::V4(V4_ADDR))
-        .build()
-        .map_err(|e| e.into())
+    builder.local_address(IpAddr::V4(V4_ADDR)).build()
 }
 
 static IPV4_CLIENT: LazyLock<Option<Client>> = LazyLock::new(|| ipv4_client().ok());
@@ -324,23 +319,30 @@ async fn announce_one<'a>(
     torrent: &Metadata,
     url: String,
 ) -> AnnounceResult {
+    let url2 = url.clone();
     let request = match net_type {
         AnnounceType::V4 => match *IPV4_CLIENT {
-            Some(ref client) => client.get(&req.url(torrent, url)),
+            Some(ref client) => client.get(req.url(torrent, url)),
             None => return Err(ClientErr::Ipv4Err.into()),
         },
         AnnounceType::V6 => match *IPV6_CLIENT {
-            Some(ref client) => client.get(&req.url(torrent, url)),
+            Some(ref client) => client.get(req.url(torrent, url)),
             None => return Err(ClientErr::Ipv6Err.into()),
         },
     }; // TODO: request more tiers url
 
-    let r = request.send().await?;
-    let decoded = bt_bencode::from_slice::<TrackerResp>(&r.bytes().await?);
+    let resp_bytes = request.send().await?.bytes().await?;
+    let decoded = bt_bencode::from_slice::<TrackerResp>(&resp_bytes);
     match decoded {
         Ok(TrackerResp::Success(s)) => Ok(s),
         Ok(TrackerResp::Failure(f)) => Err(AnnounceError::TrackerFailure(f)),
-        Err(e) => Err(AnnounceError::from(e)),
+        Err(e) => {
+            warn!(
+                "announce bencode decode error, url: {}, raw: {:?}",
+                url2, &resp_bytes,
+            );
+            Err(AnnounceError::from(e))
+        }
     }
 }
 
@@ -356,7 +358,7 @@ mod tests {
         let (metadata, announce_list) = torrent.to_metadata();
 
         let announce_req = TrackerGet {
-            peer_id: "-ZS0405-qwerasdfzxcv".into(),
+            peer_id: "-ZS0405-qwerasdfzxcv",
             uploaded: 0,
             port: 35515,
             downloaded: 0,

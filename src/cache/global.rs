@@ -30,9 +30,7 @@ static DROP_CONCURRENT: Semaphore = Semaphore::const_new(0);
 use loom::atomic::{AtomicBool, AtomicU32, Ordering};
 #[cfg(not(mloom))]
 use std::sync::atomic::{AtomicU32, Ordering};
-use tracing::{info, warn};
-
-use crate::backfile::BackFile;
+use tracing::warn;
 
 use super::{MutexBackFile, SubAbortHandle};
 
@@ -194,7 +192,7 @@ impl BufTree {
     fn can_fit_n_if_migrated(&self, target_power: u32) -> usize {
         let alloc_n = self.count_blk_of_power();
 
-        let total = unsafe { (&*self.buf.get()).len() };
+        let total = unsafe { (*self.buf.get()).len() };
         let mut can_fit = 0;
         let mut occupied_since = total;
         for (i, b) in alloc_n.iter().enumerate() {
@@ -219,7 +217,7 @@ impl BufTree {
     // TODO: longterm: optimize this
     unsafe fn migrate(&mut self) {
         // clear all blk_tree
-        let len = unsafe { (&*self.buf.get()).len() };
+        let len = unsafe { (*self.buf.get()).len() };
         self.blk_tree = init_block_tree(len);
 
         let mut migrate_map = vec![0usize; len >> MIN_ALLOC_SIZE_POWER];
@@ -278,7 +276,7 @@ impl BufTree {
         }
 
         let mut blk_offset = 0;
-        let len = unsafe { (&*self.buf.get()).len() };
+        let len = unsafe { (*self.buf.get()).len() };
         while blk_offset < len >> MIN_ALLOC_SIZE_POWER {
             let dest = migrate_map[blk_offset];
             if dest == blk_offset || dest == 0 {
@@ -288,12 +286,10 @@ impl BufTree {
                     // dest is not used
                     unsafe {
                         std::ptr::copy_nonoverlapping(
-                            (&mut *self.buf.get())
+                            (*self.buf.get())
                                 .as_mut_ptr()
                                 .add(blk_offset * MIN_ALLOC_SIZE),
-                            (&mut *self.buf.get())
-                                .as_mut_ptr()
-                                .add(dest * MIN_ALLOC_SIZE),
+                            (*self.buf.get()).as_mut_ptr().add(dest * MIN_ALLOC_SIZE),
                             MIN_ALLOC_SIZE,
                         );
                     }
@@ -301,12 +297,10 @@ impl BufTree {
                     // dest used
                     unsafe {
                         std::ptr::swap_nonoverlapping(
-                            (&mut *self.buf.get())
+                            (*self.buf.get())
                                 .as_mut_ptr()
                                 .add(blk_offset * MIN_ALLOC_SIZE),
-                            (&mut *self.buf.get())
-                                .as_mut_ptr()
-                                .add(dest * MIN_ALLOC_SIZE),
+                            (*self.buf.get()).as_mut_ptr().add(dest * MIN_ALLOC_SIZE),
                             MIN_ALLOC_SIZE,
                         );
                     }
@@ -830,7 +824,7 @@ impl PieceBufPoolImpl {
 
         let wait_abort = {
             let mut buf_tree_guard = self.buf_tree.lock().expect("pause lock should OK");
-            assert_eq!(buf_tree_guard.migrating, true);
+            assert!(buf_tree_guard.migrating);
             let mut aborters = Vec::new();
             for (fb, fbh) in buf_tree_guard.alloced.iter_mut() {
                 #[cfg(test)]
@@ -1320,7 +1314,7 @@ impl LoadJob {
     // make sure only call this once
     unsafe fn store(&self, pb: PieceBuf, r: io::Result<()>) {
         #[cfg(debug_assertions)]
-        assert!(self.2.swap(true, Ordering::Acquire) == false);
+        assert!(!self.2.swap(true, Ordering::Acquire));
 
         if let Err(e) = r {
             *self.0.get() = Some(Err(e.kind()));
@@ -1338,7 +1332,7 @@ impl LoadJob {
     fn load(&self) -> Option<Result<PieceBuf, io::ErrorKind>> {
         if self.1.load(Ordering::Acquire) {
             #[cfg(debug_assertions)]
-            assert!(self.3.swap(true, Ordering::Relaxed) == false);
+            assert!(!self.3.swap(true, Ordering::Relaxed));
 
             unsafe { (*self.0.get()).take() }
         } else {
@@ -1603,7 +1597,6 @@ fn init_block_tree(total_size: usize) -> BlockTree {
     let max_block_size = prev_power_of_two(total_size);
     let max_power = max_block_size.ilog2();
     let mut t: Vec<BlockList> = (MIN_ALLOC_SIZE_POWER..=max_power)
-        .into_iter()
         .map(|power| BlockList {
             size: 1usize << power,
             blk: BTreeSet::new(),
@@ -1668,8 +1661,7 @@ fn prev_power_of_two(s: usize) -> usize {
 mod test {
     use tokio::io::duplex;
 
-    use crate::backfile::Access;
-    use crate::backfile::FileMetadata;
+    use crate::backfile::{Access, BackFile, FileMetadata};
     use crate::cache::AbortErr;
     use crate::cache::ArcCache;
     use crate::cache::AsyncAbortRead;
@@ -1970,7 +1962,7 @@ mod test {
         };
 
         let buf = UnsafeCell::new(vec![0u8; 10 * MIN_ALLOC_SIZE]);
-        let base_ptr = unsafe { (&mut *buf.get()).as_mut_ptr() };
+        let base_ptr = unsafe { (*buf.get()).as_mut_ptr() };
         let mut b = BufTree {
             migrating: false,
             flushing: 0,
@@ -2187,7 +2179,7 @@ mod test {
         };
 
         let buf = UnsafeCell::new(vec![0u8; 11 * MIN_ALLOC_SIZE]);
-        let base_ptr = unsafe { (&mut *buf.get()).as_mut_ptr() };
+        let base_ptr = unsafe { (*buf.get()).as_mut_ptr() };
         let mut b = BufTree {
             migrating: false,
             flushing: 0,
@@ -2362,7 +2354,7 @@ mod test {
             8 * MIN_ALLOC_SIZE
         );
         assert_eq!(
-            buddy_blk_of(9 * MIN_ALLOC_SIZE, 1 * MIN_ALLOC_SIZE),
+            buddy_blk_of(9 * MIN_ALLOC_SIZE, MIN_ALLOC_SIZE),
             8 * MIN_ALLOC_SIZE
         );
         assert_eq!(buddy_blk_of(4 * MIN_ALLOC_SIZE, 4 * MIN_ALLOC_SIZE), 0);
@@ -2375,7 +2367,6 @@ mod test {
     #[cfg(mloom)]
     use loom::thread;
 
-    use std::future::pending;
     use std::path::Path;
     #[cfg(not(mloom))]
     use std::thread;
@@ -2501,7 +2492,7 @@ mod test {
         }
 
         fn write_all_at(&mut self, buf: &[u8], offset: usize) -> io::Result<()> {
-            let offset = offset as usize;
+            let offset = offset;
             self.buf[offset..offset + buf.len()].copy_from_slice(buf);
             Ok(())
         }
@@ -2510,7 +2501,7 @@ mod test {
             #[cfg(test)]
             println!("read offset {offset} buf[{}]", buf.len());
 
-            let offset = offset as usize;
+            let offset = offset;
 
             buf.copy_from_slice(&self.buf[offset..offset + buf.len()]);
             Ok(())
@@ -2820,7 +2811,7 @@ mod test {
                 .async_alloc_abort::<ArcCache<_>>(
                     PieceKey {
                         hash: Arc::new([0; 20]),
-                        offset: 1 * MIN_ALLOC_SIZE,
+                        offset: MIN_ALLOC_SIZE,
                     },
                     Some(back_file.clone()),
                     MIN_ALLOC_SIZE,
@@ -3120,13 +3111,11 @@ mod test {
             for i in ref1.as_ref() {
                 assert_eq!(*i, 0x11);
             }
-            let ref4 = p4.get_part_ref(0, 1 * MIN_ALLOC_SIZE).unwrap();
+            let ref4 = p4.get_part_ref(0, MIN_ALLOC_SIZE).unwrap();
             for (i, b) in ref4.as_ref().iter().enumerate() {
                 assert_eq!((i, *b), (i, 0x41));
             }
-            let ref4 = p4
-                .get_part_ref(1 * MIN_ALLOC_SIZE, 1 * MIN_ALLOC_SIZE)
-                .unwrap();
+            let ref4 = p4.get_part_ref(MIN_ALLOC_SIZE, MIN_ALLOC_SIZE).unwrap();
             for i in ref4.as_ref() {
                 assert_eq!(*i, 0x42);
             }
@@ -3212,11 +3201,11 @@ mod test {
             .unwrap(); // at 0-1
         let rt4 = {
             let p4c = p4.clone();
-            let rt4 = tokio::spawn(async move {
+
+            tokio::spawn(async move {
                 let mut w4_pin = Box::pin(w);
                 read_to_ref(&mut w4_pin, p4c, 0, MIN_ALLOC_SIZE).await
-            });
-            rt4
+            })
         };
         drop(p2);
         let p2 = c
@@ -3448,7 +3437,7 @@ mod test {
                     offset: 1,
                 },
                 None,
-                1 * MIN_ALLOC_SIZE,
+                MIN_ALLOC_SIZE,
             )
             .await
         });
@@ -3459,7 +3448,7 @@ mod test {
                     offset: 2,
                 },
                 None,
-                1 * MIN_ALLOC_SIZE,
+                MIN_ALLOC_SIZE,
             )
             .await
         });
@@ -3481,7 +3470,7 @@ mod test {
                     offset: 4,
                 },
                 None,
-                1 * MIN_ALLOC_SIZE,
+                MIN_ALLOC_SIZE,
             )
             .await
         });
@@ -3543,7 +3532,7 @@ mod test {
                     offset: 1,
                 },
                 None,
-                1 * MIN_ALLOC_SIZE,
+                MIN_ALLOC_SIZE,
             )
             .await
         });
@@ -3554,7 +3543,7 @@ mod test {
                     offset: 2,
                 },
                 None,
-                1 * MIN_ALLOC_SIZE,
+                MIN_ALLOC_SIZE,
             )
             .await
         });
@@ -3576,7 +3565,7 @@ mod test {
                     offset: 4,
                 },
                 None,
-                1 * MIN_ALLOC_SIZE,
+                MIN_ALLOC_SIZE,
             )
             .await
         });
@@ -3651,7 +3640,7 @@ mod test {
             .await
             .unwrap();
         let p2 = c
-            .async_alloc_abort::<ArcCache<_>>(pk2.clone(), None, 1 * MIN_ALLOC_SIZE)
+            .async_alloc_abort::<ArcCache<_>>(pk2.clone(), None, MIN_ALLOC_SIZE)
             .await
             .unwrap();
         let (mut r1, w1) = duplex(MIN_ALLOC_SIZE);
@@ -3701,7 +3690,7 @@ mod test {
             .await
             .unwrap();
         let p2 = c
-            .async_alloc_abort::<ArcCache<_>>(pk2.clone(), None, 1 * MIN_ALLOC_SIZE)
+            .async_alloc_abort::<ArcCache<_>>(pk2.clone(), None, MIN_ALLOC_SIZE)
             .await
             .unwrap();
         let (_r1, w1) = duplex(MIN_ALLOC_SIZE);

@@ -2,7 +2,6 @@ use core::fmt;
 use futures::task::AtomicWaker;
 use pin_project::{pin_project, pinned_drop};
 use std::fmt::Debug;
-use std::task::Waker;
 use std::{
     collections::{HashMap, VecDeque},
     future::Future,
@@ -303,7 +302,7 @@ impl ArcCache<PieceBuf> {
             .expect("piece detail lock should OK")
             .cache
             .as_ref()
-            .map(|p| f(p))
+            .map(f)
     }
 
     pub(crate) fn is_valid(&self) -> bool {
@@ -525,7 +524,7 @@ where
                 main_cache: ManuallyDrop::new(fut.cache.inner.clone()),
             }))
         } else {
-            return Poll::Ready(Err(GetRefErr::Invalidated));
+            Poll::Ready(Err(GetRefErr::Invalidated))
         }
     }
 }
@@ -1068,7 +1067,7 @@ mod test {
                 .iter()
                 .enumerate()
                 .for_each(|(i, s)| {
-                    if i >= 5 && i < 7 || i >= 9 && i < 11 {
+                    if (5..7).contains(&i) || (9..11).contains(&i) {
                         assert_eq!((i, *s), (i, BlockState::InUse))
                     } else {
                         assert_ne!((i, *s), (i, BlockState::InUse))
@@ -1120,7 +1119,7 @@ mod test {
         let mut ref6to8 = task::spawn(cache.async_get_part_ref(6 * BLOCKSIZE, 2 * BLOCKSIZE));
 
         let mut ref9to11 = task::spawn(cache.async_get_part_ref(9 * BLOCKSIZE, 2 * BLOCKSIZE));
-        let mut ref12to13 = task::spawn(cache.async_get_part_ref(12 * BLOCKSIZE, 1 * BLOCKSIZE));
+        let mut ref12to13 = task::spawn(cache.async_get_part_ref(12 * BLOCKSIZE, BLOCKSIZE));
 
         // poll will return pending
         assert!(matches!(ref9to11.poll(), Poll::Pending));
@@ -1145,7 +1144,7 @@ mod test {
             .iter()
             .enumerate()
             .for_each(|(i, s)| {
-                if i >= 5 && i < 7 || i >= 9 && i < 11 || i >= 12 && i < 13 {
+                if (5..7).contains(&i) || (9..11).contains(&i) || (12..13).contains(&i) {
                     assert_eq!((i, *s), (i, BlockState::InUse))
                 } else {
                     assert_ne!((i, *s), (i, BlockState::InUse))
@@ -1189,7 +1188,7 @@ mod test {
             tokio::spawn(async move { c.async_get_part_ref(9 * BLOCKSIZE, 2 * BLOCKSIZE).await });
         let c = cache.clone();
         let ref12to13 =
-            tokio::spawn(async move { c.async_get_part_ref(12 * BLOCKSIZE, 1 * BLOCKSIZE).await });
+            tokio::spawn(async move { c.async_get_part_ref(12 * BLOCKSIZE, BLOCKSIZE).await });
 
         cache.inner.unpause();
 
@@ -1207,7 +1206,7 @@ mod test {
             .iter()
             .enumerate()
             .for_each(|(i, s)| {
-                if i >= 5 && i < 7 || i >= 9 && i < 11 || i >= 12 && i < 13 {
+                if (5..7).contains(&i) || (9..11).contains(&i) || (12..13).contains(&i) {
                     assert_eq!((i, *s), (i, BlockState::InUse))
                 } else {
                     assert_ne!((i, *s), (i, BlockState::InUse))
