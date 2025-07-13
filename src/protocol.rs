@@ -84,9 +84,9 @@ use sealed::GeneralConnSealed;
 mod sealed {
     use tokio::io::AsyncRead;
     pub trait GeneralConnSealed {
-        type Inner: AsyncRead + Unpin;
+        type Read: AsyncRead + Unpin;
 
-        fn general_reader(&mut self) -> super::GeneralConnHandle<Self::Inner>;
+        fn general_reader(&mut self) -> super::GeneralConnHandle<Self::Read>;
     }
 }
 
@@ -500,9 +500,9 @@ impl<T> GeneralConnSealed for BTStream<T>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
-    type Inner = T;
+    type Read = T;
 
-    fn general_reader(&mut self) -> GeneralConnHandle<Self::Inner> {
+    fn general_reader(&mut self) -> GeneralConnHandle<Self::Read> {
         GeneralConnHandle {
             reader: &mut self.inner,
             partial_header: &mut self.partial_header,
@@ -534,9 +534,9 @@ impl<T> GeneralConnSealed for ReadStream<T>
 where
     T: AsyncRead + Unpin,
 {
-    type Inner = BufReader<T>;
+    type Read = BufReader<T>;
 
-    fn general_reader(&mut self) -> GeneralConnHandle<Self::Inner> {
+    fn general_reader(&mut self) -> GeneralConnHandle<Self::Read> {
         GeneralConnHandle {
             reader: &mut self.inner,
             partial_header: &mut self.partial_header,
@@ -914,7 +914,10 @@ where
                 Ok(ExtendedMsg::Handshake(handshake))
             }
             EXTENSION_ID_METADATA => Ok(ExtendedMsg::Metadata(ExtendedMetadata {})),
-            EXTENSION_ID_PEX => Ok(ExtendedMsg::Pex(ExtendedPex {})),
+            EXTENSION_ID_PEX => {
+                let pex: ExtendedPexWire = bt_bencode::from_reader(data.as_ref())?;
+                Ok(ExtendedMsg::Pex(pex.into()))
+            }
             other => {
                 warn!("received unknown extension id {other}");
                 // TODO: maybe store the unknown extension's name?
@@ -988,8 +991,114 @@ impl ExtendedHandshake {
     }
 }
 
+fn empty_bytestring() -> ByteString {
+    ByteString::from("")
+}
+
+#[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
+pub struct ExtendedPexWire {
+    #[serde(rename = "added")]
+    #[serde(default = "empty_bytestring")]
+    added: ByteString,
+    #[serde(rename = "added.f")]
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    addedf: Option<ByteString>,
+    #[serde(rename = "added6")]
+    #[serde(default = "empty_bytestring")]
+    added6: ByteString,
+    #[serde(rename = "added6.f")]
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    added6f: Option<ByteString>,
+
+    // some implementation (Transmission) won't send this field if no dropped
+    // although BEP10 says it's a required field
+    #[serde(rename = "dropped")]
+    #[serde(default = "empty_bytestring")]
+    dropped: ByteString,
+    #[serde(rename = "dropped6")]
+    #[serde(default = "empty_bytestring")]
+    dropped6: ByteString,
+}
+
 #[derive(Debug, Eq, PartialEq)]
-pub struct ExtendedPex {}
+pub struct PexFlag(u8);
+
+impl From<u8> for PexFlag {
+    fn from(value: u8) -> Self {
+        PexFlag(value)
+    }
+}
+
+#[derive(Debug, Eq, PartialEq, Default)]
+pub struct ExtendedPex {
+    pub added: Vec<(IpAddr, Option<PexFlag>)>,
+    pub added6: Vec<(IpAddr, Option<PexFlag>)>,
+    pub dropped: Vec<IpAddr>,
+    pub dropped6: Vec<IpAddr>,
+}
+
+impl From<ExtendedPexWire> for ExtendedPex {
+    // Required method
+    fn from(v: ExtendedPexWire) -> Self {
+        let mut r = Self::default();
+        for (i, bip) in v.added.chunks_exact(4).enumerate() {
+            let ip = IpAddr::from(Ipv4Addr::from([bip[0], bip[1], bip[2], bip[3]]));
+            let f = if let Some(ref fs) = v.addedf {
+                if fs.len() > i {
+                    let f = PexFlag::from(fs[i]);
+                    Some(f)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            r.added.push((ip, f))
+        }
+
+        for (i, bip) in v.added6.chunks_exact(16).enumerate() {
+            let ip = IpAddr::from(Ipv6Addr::from([
+                bip[0], bip[1], bip[2], bip[3], bip[4], bip[5], bip[6], bip[7], bip[8], bip[9],
+                bip[10], bip[11], bip[12], bip[13], bip[14], bip[15],
+            ]));
+            let f = if let Some(ref fs) = v.added6f {
+                if fs.len() > i {
+                    let f = PexFlag::from(fs[i]);
+                    Some(f)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            r.added6.push((ip, f))
+        }
+
+        r.dropped = v
+            .dropped
+            .chunks_exact(4)
+            .map(|bip| {
+                let ip = IpAddr::from(Ipv4Addr::from([bip[0], bip[1], bip[2], bip[3]]));
+                ip
+            })
+            .collect();
+
+        r.dropped6 = v
+            .dropped6
+            .chunks_exact(16)
+            .map(|bip| {
+                let ip = IpAddr::from(Ipv6Addr::from([
+                    bip[0], bip[1], bip[2], bip[3], bip[4], bip[5], bip[6], bip[7], bip[8], bip[9],
+                    bip[10], bip[11], bip[12], bip[13], bip[14], bip[15],
+                ]));
+                ip
+            })
+            .collect();
+        r
+    }
+}
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct ExtendedMetadata {}
@@ -1002,7 +1111,7 @@ pub struct BitFieldRecv<'a, T> {
 
 impl<T, U> BitFieldRecv<'_, T>
 where
-    T: GeneralConn<Inner = U>,
+    T: GeneralConn<Read = U>,
     U: AsyncRead + Unpin,
 {
     // read all remaining piece(block) data into buf
