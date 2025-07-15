@@ -784,7 +784,7 @@ where
 
 /// A handle to an `Abortable` task.
 #[derive(Debug, Clone)]
-pub struct AbortHandle {
+struct AbortHandle {
     inner: Arc<AbortInner>,
 }
 
@@ -836,7 +836,7 @@ impl AbortHandle {
 /// Values of this type can be acquired from `AbortHandle::new` and are used
 /// in calls to `Abortable::new`.
 #[derive(Debug)]
-pub struct AbortRegistration {
+struct AbortRegistration {
     pub(crate) inner: Arc<AbortInner>,
 }
 
@@ -911,7 +911,7 @@ where
 // Inner type storing the waker to awaken and a bool indicating that it
 // should be aborted.
 #[derive(Debug)]
-pub(crate) struct AbortInner {
+struct AbortInner {
     pub(crate) waker: AtomicWaker,
     pub(crate) aborted: AtomicBool,
 }

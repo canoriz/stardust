@@ -6,8 +6,7 @@ use std::sync::{Arc, Mutex};
 pub(crate) use buffer_storage::BufStorage;
 pub(crate) use global::{wake_next_waiting_alloc, AllocReq};
 pub(crate) use global::{AllocErr, PieceBuf, PieceBufPool, PieceKey};
-pub(crate) use piece::AsyncAbortRead;
-pub(crate) use piece::*;
+pub(crate) use piece::{AbortErr, ArcCache, AsyncAbortRead, GetRefErr, Ref, SubAbortHandle};
 
 use crate::backfile::BackFile;
 

@@ -1190,7 +1190,7 @@ pub enum ExtendedMetadata {
 
 #[derive(Eq, PartialEq)]
 pub struct BitFieldRecv<'a, T> {
-    pub capacity: usize,
+    capacity: usize,
     handle: &'a mut T,
 }
 
