@@ -437,6 +437,18 @@ where
     pub async fn send_cancel(&mut self, index: u32, begin: u32, len: u32) -> io::Result<()> {
         send_cancel(&mut self.inner, index, begin, len).await
     }
+
+    pub async fn send_extend_pex(
+        &mut self,
+        added: impl Iterator<Item = &(IpAddr, PexFlag)>,
+        dropped: impl Iterator<Item = &IpAddr>,
+    ) -> io::Result<()> {
+        send_extend_pex(&mut self.inner, added, dropped, &self.extension_id).await
+    }
+
+    pub async fn send_extend_metadata(&mut self, meta: SendExtendMeta<'_>) -> io::Result<()> {
+        send_extend_metadata(&mut self.inner, meta, &self.extension_id).await
+    }
 }
 
 // TODO: write returns 0 means EOF, should return error
@@ -482,6 +494,18 @@ where
 
     pub async fn send_cancel(&mut self, index: u32, begin: u32, len: u32) -> io::Result<()> {
         send_cancel(&mut self.inner, index, begin, len).await
+    }
+
+    pub async fn send_extend_pex(
+        &mut self,
+        added: impl Iterator<Item = &(IpAddr, PexFlag)>,
+        dropped: impl Iterator<Item = &IpAddr>,
+    ) -> io::Result<()> {
+        send_extend_pex(&mut self.inner, added, dropped, &self.extension_id).await
+    }
+
+    pub async fn send_extend_metadata(&mut self, meta: SendExtendMeta<'_>) -> io::Result<()> {
+        send_extend_metadata(&mut self.inner, meta, &self.extension_id).await
     }
 }
 
@@ -949,9 +973,6 @@ pub enum SendExtendMeta<'a> {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub struct SendExtendPex {}
-
-#[derive(Debug, Eq, PartialEq)]
 pub enum ExtendedMsg {
     Handshake(ExtendedHandshake),
     Pex(ExtendedPex),
@@ -1322,6 +1343,15 @@ async fn send_extend_metadata<T: AsyncWrite + Unpin>(
     extend_idmap: &HashMap<ExtensionType, u8>,
 ) -> io::Result<()> {
     // TODO: len must be 16KiB unless end of file
+    let extension_id = if let Some(id) = extend_idmap.get(&ExtensionType::Metadata) {
+        *id
+    } else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "metadata extension id not in map",
+        ));
+    };
+
     let mut bencode_part = Vec::new();
     let data_part = match meta {
         SendExtendMeta::Request { piece } => {
@@ -1364,23 +1394,76 @@ async fn send_extend_metadata<T: AsyncWrite + Unpin>(
     };
 
     let len = 2 + bencode_part.len() + if let Some(d) = data_part { d.len() } else { 0 };
-
     handle.write_u32(len as u32).await?; // length
     handle.write_u8(MsgTy::EXTENDED).await?;
-
-    if let Some(id) = extend_idmap.get(&ExtensionType::Metadata) {
-        handle.write_u8(*id).await?;
-    } else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "metadata extension id not in map",
-        ));
-    }
-
+    handle.write_u8(extension_id).await?;
     handle.write_all(&bencode_part).await?;
     if let Some(data) = data_part {
         handle.write_all(data).await?;
     }
+    handle.flush().await
+}
+
+async fn send_extend_pex<T: AsyncWrite + Unpin>(
+    handle: &mut T,
+    added: impl Iterator<Item = &(IpAddr, PexFlag)>,
+    dropped: impl Iterator<Item = &IpAddr>,
+    extend_idmap: &HashMap<ExtensionType, u8>,
+) -> io::Result<()> {
+    let extension_id = if let Some(id) = extend_idmap.get(&ExtensionType::Pex) {
+        *id
+    } else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "pex extension id not in map",
+        ));
+    };
+
+    // TODO: len must be 16KiB unless end of file
+    let mut added_bin = empty_bytestring();
+    let mut addedf_bin = empty_bytestring();
+    let mut added6_bin = empty_bytestring();
+    let mut added6f_bin = empty_bytestring();
+    let mut dropped_bin = empty_bytestring();
+    let mut dropped6_bin = empty_bytestring();
+    for (a, f) in added {
+        match a {
+            IpAddr::V4(v4) => {
+                added_bin.extend_from_slice(&v4.octets());
+                addedf_bin.push(f.0);
+            }
+            IpAddr::V6(v6) => {
+                added6_bin.extend_from_slice(&v6.octets());
+                added6f_bin.push(f.0);
+            }
+        }
+    }
+
+    for a in dropped {
+        match a {
+            IpAddr::V4(v4) => dropped_bin.extend_from_slice(&v4.octets()),
+            IpAddr::V6(v6) => dropped6_bin.extend_from_slice(&v6.octets()),
+        }
+    }
+
+    let mut data = Vec::new();
+    bt_bencode::to_writer(
+        &mut data,
+        &ExtendedPexWire {
+            added: added_bin,
+            added6: added6_bin,
+            addedf: Some(addedf_bin),
+            added6f: Some(added6f_bin),
+            dropped: dropped_bin,
+            dropped6: dropped6_bin,
+        },
+    )?;
+
+    let len = 2 + data.len();
+    handle.write_u32(len as u32).await?; // length
+    handle.write_u8(MsgTy::EXTENDED).await?;
+    handle.write_u8(extension_id).await?;
+    handle.write_all(&data).await?;
     handle.flush().await
 }
 
@@ -2130,6 +2213,101 @@ mod tests {
         let p1_recv = p1r.recv_msg_header().await.expect("p1 should recv ok");
         assert!(matches!(p2_recv, Message::Interested));
         assert!(matches!(p1_recv, Message::Choke));
+    }
+
+    #[tokio::test]
+    async fn extend_pex() {
+        let (mut peer1, mut peer2) = make_ends().await;
+        let added: Vec<(IpAddr, PexFlag)> = vec![
+            ("1.2.3.4".parse().unwrap(), PexFlag(1)),
+            ("::9".parse().unwrap(), PexFlag(2)),
+        ];
+        let dropped: Vec<IpAddr> = vec!["4.3.2.1".parse().unwrap(), "::f".parse().unwrap()];
+
+        peer1
+            .send_extend_pex(added.iter(), dropped.iter())
+            .await
+            .expect("should send ok");
+        let hdr = peer2.recv_msg_header().await.unwrap();
+        let mut extend_recv = extract_enum!(hdr, Message::Extended);
+        let msg = extend_recv.recv().await.unwrap();
+        let pex_msg = extract_enum!(msg, ExtendedMsg::Pex);
+        assert_eq!(
+            pex_msg,
+            ExtendedPex {
+                added: vec![("1.2.3.4".parse().unwrap(), Some(PexFlag(1))),],
+                added6: vec![("::9".parse().unwrap(), Some(PexFlag(2)))],
+                dropped: vec!["4.3.2.1".parse().unwrap()],
+                dropped6: vec!["::f".parse().unwrap()],
+            }
+        );
+
+        let ((_, mut p1w), (mut p2r, _)) = make_ends_split().await;
+        p1w.send_extend_pex(added.iter(), dropped.iter())
+            .await
+            .expect("should send ok");
+        let hdr = p2r.recv_msg_header().await.unwrap();
+        let mut extend_recv = extract_enum!(hdr, Message::Extended);
+        let msg = extend_recv.recv().await.unwrap();
+        let pex_msg = extract_enum!(msg, ExtendedMsg::Pex);
+        assert_eq!(
+            pex_msg,
+            ExtendedPex {
+                added: vec![("1.2.3.4".parse().unwrap(), Some(PexFlag(1))),],
+                added6: vec![("::9".parse().unwrap(), Some(PexFlag(2)))],
+                dropped: vec!["4.3.2.1".parse().unwrap()],
+                dropped6: vec!["::f".parse().unwrap()],
+            }
+        )
+    }
+
+    #[tokio::test]
+    async fn extend_metadata() {
+        let (mut peer1, mut peer2) = make_ends().await;
+
+        peer1
+            .send_extend_metadata(SendExtendMeta::Data {
+                piece: 0,
+                data: &[1, 2, 3, 4, 5],
+                total_size: Some(5),
+            })
+            .await
+            .expect("should send ok");
+
+        let hdr = peer2.recv_msg_header().await.unwrap();
+        let mut extend_recv = extract_enum!(hdr, Message::Extended);
+        let msg = extend_recv.recv().await.unwrap();
+        let pex_msg = extract_enum!(msg, ExtendedMsg::Metadata);
+        assert_eq!(
+            pex_msg,
+            ExtendedMetadata::Data {
+                piece: 0,
+                total_size: Some(5),
+                data: vec![1, 2, 3, 4, 5]
+            }
+        );
+
+        let ((_, mut p1w), (mut p2r, _)) = make_ends_split().await;
+        p1w.send_extend_metadata(SendExtendMeta::Data {
+            piece: 0,
+            data: &[1, 2, 3, 4, 5],
+            total_size: Some(5),
+        })
+        .await
+        .expect("should send ok");
+
+        let hdr = p2r.recv_msg_header().await.unwrap();
+        let mut extend_recv = extract_enum!(hdr, Message::Extended);
+        let msg = extend_recv.recv().await.unwrap();
+        let pex_msg = extract_enum!(msg, ExtendedMsg::Metadata);
+        assert_eq!(
+            pex_msg,
+            ExtendedMetadata::Data {
+                piece: 0,
+                total_size: Some(5),
+                data: vec![1, 2, 3, 4, 5]
+            }
+        );
     }
 
     #[tokio::test]
