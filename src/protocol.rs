@@ -913,7 +913,7 @@ where
                 let handshake: ExtendedHandshake = bt_bencode::from_reader(data.as_ref())?;
                 Ok(ExtendedMsg::Handshake(handshake))
             }
-            EXTENSION_ID_METADATA => Ok(ExtendedMsg::Metadata(ExtendedMetadata {})),
+            EXTENSION_ID_METADATA => Ok(ExtendedMsg::Metadata(bytes_to_metadata(data)?)),
             EXTENSION_ID_PEX => {
                 let pex: ExtendedPexWire = bt_bencode::from_reader(data.as_ref())?;
                 Ok(ExtendedMsg::Pex(pex.into()))
@@ -932,6 +932,24 @@ impl<T> std::fmt::Debug for ExtendedRecv<'_, T> {
         f.write_fmt(format_args!("Extended id {}, len {}", self.id, self.len))
     }
 }
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum SendExtendMeta<'a> {
+    Request {
+        piece: u32,
+    },
+    Data {
+        piece: u32,
+        data: &'a [u8],
+        total_size: Option<usize>,
+    },
+    Reject {
+        piece: u32,
+    },
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct SendExtendPex {}
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum ExtendedMsg {
@@ -991,12 +1009,69 @@ impl ExtendedHandshake {
     }
 }
 
+type MetadataMsgType = u8;
+const METADATA_MSG_TYPE_REQUEST: MetadataMsgType = 0;
+const METADATA_MSG_TYPE_DATA: MetadataMsgType = 1;
+const METADATA_MSG_TYPE_REJECT: MetadataMsgType = 2;
+
+#[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
+pub struct ExtendedMetadataWire {
+    msg_type: MetadataMsgType,
+    piece: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total_size: Option<usize>,
+}
+
+fn bytes_to_metadata(mut data: BytesMut) -> io::Result<ExtendedMetadata> {
+    let mut de = bt_bencode::Deserializer::from_slice(data.as_ref());
+    let bencode_meta = <ExtendedMetadataWire>::deserialize(&mut de)?;
+    match bencode_meta {
+        ExtendedMetadataWire {
+            msg_type: METADATA_MSG_TYPE_REJECT,
+            piece,
+            ..
+        } => {
+            de.end()?;
+            Ok(ExtendedMetadata::Reject { piece })
+        }
+        ExtendedMetadataWire {
+            msg_type: METADATA_MSG_TYPE_REQUEST,
+            piece,
+            ..
+        } => {
+            de.end()?;
+            Ok(ExtendedMetadata::Request { piece })
+        }
+        ExtendedMetadataWire {
+            msg_type: METADATA_MSG_TYPE_DATA,
+            piece,
+            total_size,
+        } => {
+            let rest = data.split_off(de.byte_offset());
+            Ok(ExtendedMetadata::Data {
+                piece,
+                data: rest.to_vec(),
+                total_size,
+            })
+        }
+        ExtendedMetadataWire { msg_type, .. } => {
+            warn!("received unknown metadata type {msg_type}");
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("received unknown metadata type {msg_type}"),
+            ));
+        }
+    }
+}
+
 fn empty_bytestring() -> ByteString {
     ByteString::from("")
 }
 
 #[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
 pub struct ExtendedPexWire {
+    // some implementation (Transmission) won't send fields if no change
+    // although BEP10 says it's a required field
     #[serde(rename = "added")]
     #[serde(default = "empty_bytestring")]
     added: ByteString,
@@ -1012,8 +1087,6 @@ pub struct ExtendedPexWire {
     #[serde(skip_serializing_if = "Option::is_none")]
     added6f: Option<ByteString>,
 
-    // some implementation (Transmission) won't send this field if no dropped
-    // although BEP10 says it's a required field
     #[serde(rename = "dropped")]
     #[serde(default = "empty_bytestring")]
     dropped: ByteString,
@@ -1101,7 +1174,19 @@ impl From<ExtendedPexWire> for ExtendedPex {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub struct ExtendedMetadata {}
+pub enum ExtendedMetadata {
+    Request {
+        piece: u32,
+    },
+    Data {
+        piece: u32,
+        data: Vec<u8>,
+        total_size: Option<usize>,
+    },
+    Reject {
+        piece: u32,
+    },
+}
 
 #[derive(Eq, PartialEq)]
 pub struct BitFieldRecv<'a, T> {
@@ -1228,6 +1313,74 @@ async fn send_piece<T: AsyncWrite + Unpin>(
     handle.write_u32(index).await?;
     handle.write_u32(begin).await?;
     handle.write_all(piece).await?;
+    handle.flush().await
+}
+
+async fn send_extend_metadata<T: AsyncWrite + Unpin>(
+    handle: &mut T,
+    meta: SendExtendMeta<'_>,
+    extend_idmap: &HashMap<ExtensionType, u8>,
+) -> io::Result<()> {
+    // TODO: len must be 16KiB unless end of file
+    let mut bencode_part = Vec::new();
+    let data_part = match meta {
+        SendExtendMeta::Request { piece } => {
+            bt_bencode::to_writer(
+                &mut bencode_part,
+                &ExtendedMetadataWire {
+                    msg_type: METADATA_MSG_TYPE_REQUEST,
+                    piece,
+                    total_size: None,
+                },
+            )?;
+            None
+        }
+        SendExtendMeta::Data {
+            piece,
+            data,
+            total_size,
+        } => {
+            bt_bencode::to_writer(
+                &mut bencode_part,
+                &ExtendedMetadataWire {
+                    msg_type: METADATA_MSG_TYPE_DATA,
+                    piece,
+                    total_size,
+                },
+            )?;
+            Some(data)
+        }
+        SendExtendMeta::Reject { piece } => {
+            bt_bencode::to_writer(
+                &mut bencode_part,
+                &ExtendedMetadataWire {
+                    msg_type: METADATA_MSG_TYPE_REJECT,
+                    piece,
+                    total_size: None,
+                },
+            )?;
+            None
+        }
+    };
+
+    let len = 2 + bencode_part.len() + if let Some(d) = data_part { d.len() } else { 0 };
+
+    handle.write_u32(len as u32).await?; // length
+    handle.write_u8(MsgTy::EXTENDED).await?;
+
+    if let Some(id) = extend_idmap.get(&ExtensionType::Metadata) {
+        handle.write_u8(*id).await?;
+    } else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "metadata extension id not in map",
+        ));
+    }
+
+    handle.write_all(&bencode_part).await?;
+    if let Some(data) = data_part {
+        handle.write_all(data).await?;
+    }
     handle.flush().await
 }
 
