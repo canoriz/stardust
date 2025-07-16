@@ -51,8 +51,6 @@ const EXTENSION_NAME_METADATA: &str = "ut_metadata";
 const EXTENSION_ID_PEX: u8 = 1;
 const EXTENSION_ID_METADATA: u8 = 3;
 
-static EXTENSION_IDS: LazyLock<HashMap<ExtensionType, u8>> =
-    LazyLock::new(|| HashMap::from([(ExtensionType::Metadata, 3), (ExtensionType::Pex, 1)]));
 pub static EXTENSION_IDS_MAP: LazyLock<HashMap<String, u8>> = LazyLock::new(|| {
     HashMap::from([
         (EXTENSION_NAME_METADATA.into(), 3),
@@ -366,7 +364,6 @@ where
             };
             // TODO: will this block? both ends sending data while OS buffer full
             // and waiting data sent not checking incoming handshake?
-            send_extension_handshake(&mut s.inner, &exth).await?;
             let exth = s.recv_extend_handshake().await?;
             s.extension_id = exth
                 .m
@@ -374,6 +371,7 @@ where
                 .filter_map(|(s, id)| extension_type(s).map(|ss| (ss, *id)))
                 .filter(|(_, id)| *id != 0)
                 .collect();
+            send_extension_handshake(&mut s.inner, &exth).await?;
         }
         Ok(s)
     }
