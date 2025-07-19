@@ -361,6 +361,8 @@ where
                 ipv6: None,
                 ipv4: None,
                 reqq: None, // request queue limit before drop any message
+
+                metadata_size: None,
             };
             // TODO: will this block? both ends sending data while OS buffer full
             // and waiting data sent not checking incoming handshake?
@@ -1000,6 +1002,9 @@ pub struct ExtendedHandshake {
     pub ipv4: Option<ByteIpAddr>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reqq: Option<u32>, // request queue limit before drop any message
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata_size: Option<u32>, // size of metadata
 }
 
 pub struct ExtendedHandshakeBuilder {

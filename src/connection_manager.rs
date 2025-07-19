@@ -556,7 +556,22 @@ where
 {
     info!("handle_extended_msg {extended:?}");
 
-    let extend_msg = extended.recv().await?;
-    // match extend_msg
-    Ok(())
+    match extended.recv().await {
+        Ok(extend_msg) => match extend_msg {
+            ExtendedMsg::Handshake(extended_handshake) => todo!(),
+            ExtendedMsg::Pex(extended_pex) => {
+                info!("received pex from {peer}, {extended_pex:?}");
+                Ok(())
+            }
+            ExtendedMsg::Metadata(extended_metadata) => todo!(),
+            ExtendedMsg::Unknown(id) => {
+                warn!("received unknown extend message: id {id}");
+                Ok(())
+            }
+        },
+        Err(e) => {
+            warn!("receive extend msg error {e}");
+            Err(e)
+        }
+    }
 }
