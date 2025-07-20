@@ -12,7 +12,7 @@ use crate::cache::{AbortErr, ArcCache, GetRefErr, PieceBuf, PieceKey, Ref};
 use crate::metadata;
 use crate::picker::{start_receive_piece_block, BlockRequests};
 use crate::protocol::{
-    self, BTStream, GeneralConn, Message, Piece, ReadStream, Split, WriteStream,
+    self, BTStream, ExtendedMsg, GeneralConn, Message, Piece, ReadStream, Split, WriteStream,
 };
 use crate::transmit_manager::Msg as TransmitMsg;
 use crate::transmit_manager::TransmitManagerHandle;

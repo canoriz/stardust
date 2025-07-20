@@ -6,6 +6,7 @@ use bytes::BytesMut;
 use core::fmt;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fmt::Formatter;
 use std::mem::MaybeUninit;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -112,6 +113,9 @@ pub struct BTStream<T> {
     peer_id: [u8; 20],
     // TODO: maybe add a torrent hash Arc<>
     // torrent_hash: [u8; 20],
+
+    // what this peer knows about our connected peers
+    pex_peers: HashMap<IpAddr, Option<PexFlag>>,
 }
 
 #[derive(Debug)]
@@ -142,6 +146,9 @@ pub struct WriteStream<T> {
     peer_addr: SocketAddr,
 
     extension_id: HashMap<ExtensionType, u8>,
+
+    // what this peer knows about our connected peers
+    pex_peers: HashMap<IpAddr, Option<PexFlag>>,
 }
 
 impl BTStream<net::TcpStream> {
@@ -231,6 +238,7 @@ where
                 inner: BufWriter::with_capacity(32768, write_end),
                 peer_addr,
                 extension_id: self.extension_id,
+                pex_peers: self.pex_peers,
             },
         )
     }
@@ -306,6 +314,7 @@ where
 
             peer_id: peer_handshake.client_id,
             reserved: peer_handshake.reserved,
+            pex_peers: HashMap::new(),
         };
 
         let support_extension =
@@ -347,6 +356,7 @@ where
             extension_id: HashMap::new(),
             peer_id: peer_handshake.client_id,
             reserved: peer_handshake.reserved.common(funcbits),
+            pex_peers: HashMap::new(),
         };
 
         let support_extension = peer_handshake.reserved.have_extension();
@@ -440,14 +450,60 @@ where
 
     pub async fn send_extend_pex(
         &mut self,
-        added: impl Iterator<Item = &(IpAddr, PexFlag)>,
-        dropped: impl Iterator<Item = &IpAddr>,
+        now_connected: &HashMap<IpAddr, Option<PexFlag>>,
     ) -> io::Result<()> {
-        send_extend_pex(&mut self.inner, added, dropped, &self.extension_id).await
+        let (added, dropped) = make_added_and_dropped(now_connected, &self.pex_peers);
+        match send_extend_pex(
+            &mut self.inner,
+            added.iter(),
+            dropped.iter(),
+            &self.extension_id,
+        )
+        .await
+        {
+            Ok(_) => {
+                update_pex_map(&mut self.pex_peers, &added, &dropped);
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     pub async fn send_extend_metadata(&mut self, meta: SendExtendMeta<'_>) -> io::Result<()> {
         send_extend_metadata(&mut self.inner, meta, &self.extension_id).await
+    }
+}
+
+fn make_added_and_dropped(
+    now_connected: &HashMap<IpAddr, Option<PexFlag>>,
+    old_connected: &HashMap<IpAddr, Option<PexFlag>>,
+) -> (Vec<(IpAddr, Option<PexFlag>)>, Vec<IpAddr>) {
+    // to send added and dropped
+    // what we now have, but peer don't know comes to added
+    // what we don't have, but peer thinks we have, come to dropped
+    let added: Vec<_> = now_connected
+        .iter()
+        .filter(|(ip, _)| !old_connected.contains_key(ip))
+        .map(|(ip, pex)| (*ip, *pex))
+        .collect();
+    let dropped: Vec<_> = old_connected
+        .iter()
+        .filter(|(ip, _)| !now_connected.contains_key(ip))
+        .map(|(ip, _)| *ip)
+        .collect();
+    (added, dropped)
+}
+
+fn update_pex_map(
+    pex_map: &mut HashMap<IpAddr, Option<PexFlag>>,
+    added: &Vec<(IpAddr, Option<PexFlag>)>,
+    dropped: &Vec<IpAddr>,
+) {
+    for (ip, pex) in added {
+        pex_map.insert(*ip, *pex);
+    }
+    for ip in dropped {
+        pex_map.remove(ip);
     }
 }
 
@@ -498,10 +554,23 @@ where
 
     pub async fn send_extend_pex(
         &mut self,
-        added: impl Iterator<Item = &(IpAddr, PexFlag)>,
-        dropped: impl Iterator<Item = &IpAddr>,
+        now_connected: &HashMap<IpAddr, Option<PexFlag>>,
     ) -> io::Result<()> {
-        send_extend_pex(&mut self.inner, added, dropped, &self.extension_id).await
+        let (added, dropped) = make_added_and_dropped(now_connected, &self.pex_peers);
+        match send_extend_pex(
+            &mut self.inner,
+            added.iter(),
+            dropped.iter(),
+            &self.extension_id,
+        )
+        .await
+        {
+            Ok(_) => {
+                update_pex_map(&mut self.pex_peers, &added, &dropped);
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     pub async fn send_extend_metadata(&mut self, meta: SendExtendMeta<'_>) -> io::Result<()> {
@@ -1015,6 +1084,11 @@ impl ExtendedHandshakeBuilder {
     pub fn build(self) -> ExtendedHandshake {
         self.h
     }
+
+    pub fn metadata_size(mut self, size: u32) -> Self {
+        self.h.metadata_size = Some(size);
+        self
+    }
 }
 
 impl ExtendedHandshake {
@@ -1028,6 +1102,7 @@ impl ExtendedHandshake {
                 ipv6: None,
                 ipv4: None,
                 reqq: None,
+                metadata_size: None,
             },
         }
     }
@@ -1119,7 +1194,7 @@ pub struct ExtendedPexWire {
     dropped6: ByteString,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub struct PexFlag(u8);
 
 impl From<u8> for PexFlag {
@@ -1409,7 +1484,7 @@ async fn send_extend_metadata<T: AsyncWrite + Unpin>(
 
 async fn send_extend_pex<T: AsyncWrite + Unpin>(
     handle: &mut T,
-    added: impl Iterator<Item = &(IpAddr, PexFlag)>,
+    added: impl Iterator<Item = &(IpAddr, Option<PexFlag>)>,
     dropped: impl Iterator<Item = &IpAddr>,
     extend_idmap: &HashMap<ExtensionType, u8>,
 ) -> io::Result<()> {
@@ -1433,11 +1508,11 @@ async fn send_extend_pex<T: AsyncWrite + Unpin>(
         match a {
             IpAddr::V4(v4) => {
                 added_bin.extend_from_slice(&v4.octets());
-                addedf_bin.push(f.0);
+                addedf_bin.push(f.unwrap_or(PexFlag::from(0)).0);
             }
             IpAddr::V6(v6) => {
                 added6_bin.extend_from_slice(&v6.octets());
-                added6f_bin.push(f.0);
+                added6f_bin.push(f.unwrap_or(PexFlag::from(0)).0);
             }
         }
     }
@@ -1856,6 +1931,7 @@ mod tests {
             ipv6: None,
             ipv4: None,
             reqq: None, // request queue limit before drop any message
+            metadata_size: None,
         };
 
         make_ends_tune(HANDSHAKE, exth, HANDSHAKE.reserved, HANDSHAKE.client_id).await
@@ -1881,6 +1957,7 @@ mod tests {
                     inner: BufWriter::new(write_end),
                     peer_addr: DEFAULT_ADDR,
                     extension_id: self.extension_id,
+                    pex_peers: HashMap::new(),
                 },
             )
         }
@@ -1921,6 +1998,7 @@ mod tests {
             ipv6: None,
             ipv4: None,
             reqq: None, // request queue limit before drop any message
+            metadata_size: None,
         };
         let (peer1, peer2) = duplex(1024);
         make_ends_tune(HANDSHAKE, exth, HANDSHAKE.reserved, HANDSHAKE.client_id).await;
@@ -1949,6 +2027,7 @@ mod tests {
             ipv6: None,
             ipv4: None,
             reqq: None, // request queue limit before drop any message
+            metadata_size: None,
         };
         let (peer1, peer2) = duplex(1024);
         make_ends_tune(HANDSHAKE, exth, HANDSHAKE.reserved, HANDSHAKE.client_id).await;
@@ -1977,6 +2056,7 @@ mod tests {
                 ipv6: None,
                 ipv4: None,
                 reqq: None, // request queue limit before drop any message
+                metadata_size: None,
             },
         )
         .await
@@ -2221,14 +2301,13 @@ mod tests {
     #[tokio::test]
     async fn extend_pex() {
         let (mut peer1, mut peer2) = make_ends().await;
-        let added: Vec<(IpAddr, PexFlag)> = vec![
-            ("1.2.3.4".parse().unwrap(), PexFlag(1)),
-            ("::9".parse().unwrap(), PexFlag(2)),
+        let initial: Vec<_> = vec![
+            ("1.2.3.4".parse().unwrap(), Some(PexFlag(1))),
+            ("::9".parse().unwrap(), Some(PexFlag(2))),
         ];
-        let dropped: Vec<IpAddr> = vec!["4.3.2.1".parse().unwrap(), "::f".parse().unwrap()];
 
         peer1
-            .send_extend_pex(added.iter(), dropped.iter())
+            .send_extend_pex(&HashMap::from_iter(initial.clone().into_iter()))
             .await
             .expect("should send ok");
         let hdr = peer2.recv_msg_header().await.unwrap();
@@ -2240,13 +2319,36 @@ mod tests {
             ExtendedPex {
                 added: vec![("1.2.3.4".parse().unwrap(), Some(PexFlag(1))),],
                 added6: vec![("::9".parse().unwrap(), Some(PexFlag(2)))],
-                dropped: vec!["4.3.2.1".parse().unwrap()],
-                dropped6: vec!["::f".parse().unwrap()],
+                dropped: vec![],
+                dropped6: vec![],
+            }
+        );
+
+        let then: Vec<_> = vec![
+            ("4.3.2.1".parse().unwrap(), Some(PexFlag(1))),
+            ("::9".parse().unwrap(), Some(PexFlag(2))),
+        ];
+
+        peer1
+            .send_extend_pex(&HashMap::from_iter(then.clone().into_iter()))
+            .await
+            .expect("should send ok");
+        let hdr = peer2.recv_msg_header().await.unwrap();
+        let mut extend_recv = extract_enum!(hdr, Message::Extended);
+        let msg = extend_recv.recv().await.unwrap();
+        let pex_msg = extract_enum!(msg, ExtendedMsg::Pex);
+        assert_eq!(
+            pex_msg,
+            ExtendedPex {
+                added: vec![("4.3.2.1".parse().unwrap(), Some(PexFlag(1))),],
+                added6: vec![],
+                dropped: vec!["1.2.3.4".parse().unwrap()],
+                dropped6: vec![],
             }
         );
 
         let ((_, mut p1w), (mut p2r, _)) = make_ends_split().await;
-        p1w.send_extend_pex(added.iter(), dropped.iter())
+        p1w.send_extend_pex(&HashMap::from_iter(initial.clone().into_iter()))
             .await
             .expect("should send ok");
         let hdr = p2r.recv_msg_header().await.unwrap();
@@ -2258,8 +2360,8 @@ mod tests {
             ExtendedPex {
                 added: vec![("1.2.3.4".parse().unwrap(), Some(PexFlag(1))),],
                 added6: vec![("::9".parse().unwrap(), Some(PexFlag(2)))],
-                dropped: vec!["4.3.2.1".parse().unwrap()],
-                dropped6: vec!["::f".parse().unwrap()],
+                dropped: vec![],
+                dropped6: vec![],
             }
         )
     }

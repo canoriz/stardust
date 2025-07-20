@@ -467,7 +467,8 @@ async fn connect_peer(
 
             ipv6: None,
             ipv4: None,
-            reqq: None, // request queue limit before drop any message
+            reqq: None,          // request queue limit before drop any message
+            metadata_size: None, // TODO: FIXME: send correct metadata size
         },
     )
     .await;
