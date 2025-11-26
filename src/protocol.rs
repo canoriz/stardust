@@ -481,14 +481,19 @@ fn make_added_and_dropped(
     // to send added and dropped
     // what we now have, but peer don't know comes to added
     // what we don't have, but peer thinks we have, come to dropped
+
+    const MAX_PEERS: usize = 50; // spec says no more than 50 peer in one message
+
     let added: Vec<_> = now_connected
         .iter()
         .filter(|(ip, _)| !old_connected.contains_key(ip))
+        .take(MAX_PEERS)
         .map(|(ip, pex)| (*ip, *pex))
         .collect();
     let dropped: Vec<_> = old_connected
         .iter()
         .filter(|(ip, _)| !now_connected.contains_key(ip))
+        .take(MAX_PEERS)
         .map(|(ip, _)| *ip)
         .collect();
     (added, dropped)

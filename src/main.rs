@@ -14,6 +14,7 @@ mod backfile;
 mod bandwidth;
 mod cache;
 mod connection_manager;
+mod dht;
 mod metadata;
 mod picker;
 mod protocol;

@@ -9,6 +9,7 @@ use crate::protocol::FuncBits;
 use crate::protocol::{self, BitField};
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpStream;
@@ -101,6 +102,7 @@ pub struct TransmitManager {
     // TODO: use a Map instead of Vec?
     // TODO: change V type
     connected_peers: HashMap<SocketAddr, PeerConn>,
+    connecting_peers: HashSet<SocketAddr>,
 
     piece_picker: Arc<Mutex<HeapPiecePicker>>,
     storage: Arc<BufStorage>,
@@ -140,6 +142,7 @@ impl TransmitManager {
             // announce_handle: None,
             // announce_tx: None,
             connected_peers: HashMap::new(),
+            connecting_peers: HashSet::new(),
             piece_picker,
             storage: buf_storage,
         }
@@ -238,22 +241,21 @@ impl TransmitManager {
                 // TODO
                 info!("announce finish");
                 for p in a.peers {
-                    let sock = format!("{}:{}", p.ip, p.port);
-                    let sockv6 = format!("[{}]:{}", p.ip, p.port);
-                    if let Ok(s) = sock.parse() {
+                    use std::str::FromStr;
+                    if let Ok(ip) = std::net::IpAddr::from_str(&p.ip) {
                         let h_clone = self.self_handle.clone();
                         let m_clone = self.metadata.clone();
-                        // TODO: only try connect not-connected peer
                         // TODO: store peers in a map, if cannot connect this time
                         // try re-connect later
-                        tokio::spawn(connect_peer(h_clone, s, m_clone));
-                    } else if let Ok(s) = sockv6.parse() {
-                        let h_clone = self.self_handle.clone();
-                        let m_clone = self.metadata.clone();
-                        // TODO: only try connect not-connected peer
-                        // TODO: store peers in a map, if cannot connect this time
-                        // try re-connect later
-                        tokio::spawn(connect_peer(h_clone, s, m_clone));
+                        // TODO: if we already connected to a lot of active peers,
+                        // maybe store available peers in a pool, connect to them when
+                        // running out of peers
+                        let s = SocketAddr::new(ip, p.port);
+                        if !self.connected_peers.contains_key(&s)
+                            && !self.connecting_peers.contains(&s)
+                        {
+                            tokio::spawn(connect_peer(h_clone, s, m_clone));
+                        }
                     }
                 }
             }
@@ -262,28 +264,27 @@ impl TransmitManager {
             }
             Msg::NewPeer(bt_conn) => {
                 info!("new outward connection {:?}", bt_conn);
-                if !self.connected_peers.contains_key(&bt_conn.peer_addr()) {
-                    let peer_addr = bt_conn.peer_addr();
-                    let cm = ConnectionManagerHandle::new(
-                        bt_conn,
-                        self.self_handle.clone(),
-                        self.metadata.clone(),
-                    );
-                    self.connected_peers.insert(
-                        peer_addr,
-                        PeerConn {
-                            conn: cm,
-                            state: PeerStatus {
-                                our_choke_status: ChokeStatus::Unknown,
-                                our_interest_status: InterestStatus::Unknown,
-                                peer_choke_status: ChokeStatus::Unknown,
-                                peer_interest_status: InterestStatus::Unknown,
-                            },
-                            last_pick_time: time::Instant::now(),
-                            n_block_in_flight: 0,
+                let peer_addr = bt_conn.peer_addr();
+                let cm = ConnectionManagerHandle::new(
+                    bt_conn,
+                    self.self_handle.clone(),
+                    self.metadata.clone(),
+                );
+                self.connected_peers.insert(
+                    peer_addr,
+                    PeerConn {
+                        conn: cm,
+                        state: PeerStatus {
+                            our_choke_status: ChokeStatus::Unknown,
+                            our_interest_status: InterestStatus::Unknown,
+                            peer_choke_status: ChokeStatus::Unknown,
+                            peer_interest_status: InterestStatus::Unknown,
                         },
-                    );
-                }
+                        last_pick_time: time::Instant::now(),
+                        n_block_in_flight: 0,
+                    },
+                );
+                self.connecting_peers.remove(&peer_addr);
             }
             Msg::PeerBitField(addr, bitfield) => {
                 info!("new BitField msg from peer {addr}");

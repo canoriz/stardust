@@ -1088,6 +1088,7 @@ impl AllocFutInner<'_> {
         let fut = self.get_mut();
         match fut {
             AllocFutInner::Allocating(a) => {
+                // TODO: maybe use pin! macro?
                 let alloc_res = ready!(Pin::new(&mut *a).poll_alloc(cx));
                 let mut buf_tree_guard = a
                     .pool
