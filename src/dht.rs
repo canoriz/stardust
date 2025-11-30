@@ -1,22 +1,16 @@
 use bt_bencode::ByteString;
 use bt_bencode::Value as BtValue;
-use futures::task::AtomicWaker;
+use core::time;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::future::Future;
 use std::io;
-use std::net::Ipv4Addr;
 use std::net::SocketAddr;
 use std::net::SocketAddrV4;
 use std::net::SocketAddrV6;
-use std::pin::pin;
-use std::sync::atomic;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::task::ready;
-use std::task::Poll;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::{CancellationToken, DropGuard};
@@ -169,9 +163,9 @@ pub struct Resp {
 }
 
 #[derive(Copy, Clone, Eq, Hash, PartialEq)]
-struct NodeAddr {
-    id: NodeID,
-    addr: SocketAddr,
+pub struct NodeAddr {
+    pub id: NodeID,
+    pub addr: SocketAddr,
 }
 
 struct TransactionGuard {
@@ -246,15 +240,20 @@ impl DHT {
         Ok(())
     }
 
-    pub fn delete_route(&self, addr: NodeID) {
+    fn delete_route(&self, id: NodeID) {
         todo!()
     }
 
-    async fn do_req(&self, addr: SocketAddr, krpc: KRPC) -> io::Result<Resp> {
+    async fn do_req(
+        &self,
+        addr: NodeAddr,
+        krpc: KRPC,
+        timeout: time::Duration,
+    ) -> io::Result<Resp> {
         let (tx, rx) = oneshot::channel();
         let tid = krpc.t.clone();
         let req = OutReq {
-            addr: NodeAddr { id: self.id, addr },
+            addr: addr.addr,
             krpc,
         };
         let _drop_guard = TransactionGuard::new(tid.into_vec(), self.tmap.clone(), tx);
@@ -264,16 +263,21 @@ impl DHT {
                 "send request to worker error",
             ));
         }
-        match rx.await {
-            Ok(r) => r,
-            Err(_) => Err(io::Error::new(
+
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(_)) => Err(io::Error::new(
                 io::ErrorKind::Other,
                 "recv result from worker error",
             )),
+            Err(_) => {
+                self.delete_route(addr.id);
+                Err(io::Error::new(io::ErrorKind::Other, "timeout"))
+            }
         }
     }
 
-    pub async fn ping(&self, addr: SocketAddr) -> io::Result<Resp> {
+    pub async fn ping(&self, addr: NodeAddr, timeout: time::Duration) -> io::Result<Resp> {
         let tid = self.tid.fetch_add(1, Ordering::Relaxed).to_be_bytes();
         let tid: ByteString = tid[..].into();
         let krpc = KRPC {
@@ -281,10 +285,15 @@ impl DHT {
             v: self.version.clone().into(),
             inner: KRPCInner::Request(Arg::Ping(PingArg { id: self.id })),
         };
-        self.do_req(addr, krpc).await
+        self.do_req(addr, krpc, timeout).await
     }
 
-    pub async fn find_node<'a>(&'a self, addr: SocketAddr, target: NodeID) -> io::Result<Resp> {
+    pub async fn find_node(
+        &self,
+        addr: NodeAddr,
+        target: NodeID,
+        timeout: time::Duration,
+    ) -> io::Result<Resp> {
         let tid = self.tid.fetch_add(1, Ordering::Relaxed).to_be_bytes();
         let tid: ByteString = tid[..].into();
         let krpc = KRPC {
@@ -295,10 +304,15 @@ impl DHT {
                 target,
             })),
         };
-        self.do_req(addr, krpc).await
+        self.do_req(addr, krpc, timeout).await
     }
 
-    pub async fn get_peers<'a>(&'a self, addr: SocketAddr, info_hash: NodeID) -> io::Result<Resp> {
+    pub async fn get_peers(
+        &self,
+        addr: NodeAddr,
+        info_hash: NodeID,
+        timeout: time::Duration,
+    ) -> io::Result<Resp> {
         let tid = self.tid.fetch_add(1, Ordering::Relaxed).to_be_bytes();
         let tid: ByteString = tid[..].into();
         let krpc = KRPC {
@@ -309,16 +323,17 @@ impl DHT {
                 info_hash,
             })),
         };
-        self.do_req(addr, krpc).await
+        self.do_req(addr, krpc, timeout).await
     }
 
-    pub async fn announce_peer<'a>(
-        &'a self,
-        addr: SocketAddr,
+    pub async fn announce_peer(
+        &self,
+        addr: NodeAddr,
         info_hash: NodeID,
         port: u16,
         implied: bool,
         token: &[u8],
+        timeout: time::Duration,
     ) -> io::Result<Resp> {
         let tid = self.tid.fetch_add(1, Ordering::Relaxed).to_be_bytes();
         let tid: ByteString = tid[..].into();
@@ -333,12 +348,12 @@ impl DHT {
                 token: token.into(),
             })),
         };
-        self.do_req(addr, krpc).await
+        self.do_req(addr, krpc, timeout).await
     }
 }
 
 struct OutReq {
-    addr: NodeAddr,
+    addr: SocketAddr,
     krpc: KRPC,
 }
 
@@ -443,7 +458,7 @@ impl Server {
         }
     }
 
-    async fn handle_out_req(&mut self, addr: NodeAddr, krpc: KRPC, mut buf: &mut Vec<u8>) {
+    async fn handle_out_req(&mut self, addr: SocketAddr, krpc: KRPC, mut buf: &mut Vec<u8>) {
         buf.clear();
         match bt_bencode::to_writer(&mut buf, &krpc) {
             Ok(b) => b,
@@ -462,7 +477,7 @@ impl Server {
             KRPCInner::Response(resp) => todo!(),
             KRPCInner::Err(items) => todo!(),
         }
-        if let Err(e) = self.s.send_to(buf, addr.addr).await {
+        if let Err(e) = self.s.send_to(buf, addr).await {
             warn!("send udp packet failed error {e}");
         }
     }
