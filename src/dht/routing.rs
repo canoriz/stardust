@@ -14,7 +14,7 @@ pub struct RoutingTable {
 
     /// bucket[i] stores nodes that have i common bits with self.id
     /// [160] is not used, since it's the Node ID of self.
-    bucket: [Bucket; RANGE_MAX],
+    bucket: [Bucket; RANGE_MAX + 1],
 }
 
 type ContactInfo = (SocketAddr, Instant);
@@ -35,21 +35,19 @@ impl RoutingTable {
 
     pub fn add_route(&mut self, addr: NodeAddr) {
         let prefix = common_bits(&self.id, &addr.id) as usize;
-        if prefix < RANGE_MAX {
-            let bucket = &mut self.bucket[prefix];
-            let n = bucket.inuse.len();
-            let contact_info = (addr.addr, Instant::now());
-            if n < K {
-                bucket.inuse.insert(addr.id, contact_info);
-                info!("dht routing: add route to bucket {:?}", addr);
-            } else {
-                while bucket.backup.len() > K {
-                    // nodes at front will always be the early ones
-                    bucket.backup.pop_front();
-                }
-                bucket.backup.push_back((addr.id, contact_info));
-                info!("dht routing: add route to backup {:?}", addr);
+        let bucket = &mut self.bucket[prefix];
+        let n = bucket.inuse.len();
+        let contact_info = (addr.addr, Instant::now());
+        if n < K {
+            bucket.inuse.insert(addr.id, contact_info);
+            info!("dht routing: add route to bucket {:?}", addr);
+        } else {
+            while bucket.backup.len() > K {
+                // nodes at front will always be the early ones
+                bucket.backup.pop_front();
             }
+            bucket.backup.push_back((addr.id, contact_info));
+            info!("dht routing: add route to backup {:?}", addr);
         }
     }
 
@@ -57,14 +55,12 @@ impl RoutingTable {
         // TODO: give node some limit of times to fail?
         info!("dht routing: remove route to {:?}", id);
         let prefix = common_bits(&self.id, id) as usize;
-        if prefix < RANGE_MAX {
-            let bucket = &mut self.bucket[prefix];
-            bucket.inuse.remove(id);
-            if bucket.inuse.len() < K {
-                if let Some((node, t)) = bucket.backup.pop_back() {
-                    bucket.inuse.insert(node, t);
-                    info!("dht routing: add route from backup {:?}", node);
-                }
+        let bucket = &mut self.bucket[prefix];
+        bucket.inuse.remove(id);
+        if bucket.inuse.len() < K {
+            if let Some((node, t)) = bucket.backup.pop_back() {
+                bucket.inuse.insert(node, t);
+                info!("dht routing: add route from backup {:?}", node);
             }
         }
     }
@@ -80,11 +76,7 @@ impl RoutingTable {
             // so all nodes starts with 00.. will be closest to target
             // and nodes starts with 00 falls in bucket[2]
             // nodes start with 01 falls in bucket[1], dist to target will be
-            let mut sorted: Vec<_> = bucket
-                .inuse
-                .iter()
-                .filter_map(|(x, (a, _))| (x != id).then_some((x, a)))
-                .collect();
+            let mut sorted: Vec<_> = bucket.inuse.iter().map(|(x, (a, _))| (x, a)).collect();
             sorted.sort_by_key(|(x, _)| dist(id, x));
             for (nid, addr) in sorted {
                 nodes.push(NodeAddr {
@@ -104,11 +96,7 @@ impl RoutingTable {
             // so all nodes starts with 00.. will be closest to target
             // and nodes starts with 00 falls in bucket[2]
             // nodes start with 01 falls in bucket[1], dist to target will be
-            let mut sorted: Vec<_> = bucket
-                .inuse
-                .iter()
-                .filter_map(|(x, (a, _))| (x != id).then_some((x, a)))
-                .collect();
+            let mut sorted: Vec<_> = bucket.inuse.iter().map(|(x, (a, _))| (x, a)).collect();
             sorted.sort_by_key(|(x, _)| dist(id, x));
             for (nid, addr) in sorted {
                 nodes.push(NodeAddr {

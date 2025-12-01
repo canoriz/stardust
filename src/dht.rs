@@ -555,6 +555,10 @@ impl Server {
                 _ = self.send_response(from_addr, &resp).await;
             }
             KRPCInner::Response(resp) => {
+                self.route.add_route(NodeAddr {
+                    id: resp.id,
+                    addr: from_addr,
+                });
                 if let Some(ns) = &resp.nodes6 {
                     if self.ipv6 {
                         for (id, addr) in &ns.0 {
