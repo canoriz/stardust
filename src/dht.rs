@@ -22,7 +22,7 @@ mod wire_serde;
 use routing::RoutingTable;
 use wire::WireKRPC;
 
-type NodeID = [u8; 20];
+pub type NodeID = [u8; 20];
 
 pub struct DHT {
     id: NodeID,
@@ -31,7 +31,7 @@ pub struct DHT {
 
     tid: AtomicU64,
 
-    tx: mpsc::Sender<OutReq>,
+    tx: mpsc::Sender<Req>,
 
     tmap: Arc<Mutex<TransactionMap>>,
     _cancel_token: DropGuard,
@@ -162,10 +162,26 @@ pub struct Resp {
     values: Option<Vec<ByteSocketAddr>>,
 }
 
-#[derive(Copy, Clone, Eq, Hash, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
 pub struct NodeAddr {
-    pub id: NodeID,
-    pub addr: SocketAddr,
+    id: NodeID,
+    addr: SocketAddr,
+}
+
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+pub enum RpcAddr {
+    ID(NodeAddr),
+    NoID(SocketAddr),
+}
+
+impl RpcAddr {
+    pub fn no_id(addr: SocketAddr) -> Self {
+        Self::NoID(addr)
+    }
+
+    pub fn id(id: NodeID, addr: SocketAddr) -> Self {
+        Self::ID(NodeAddr { id, addr })
+    }
 }
 
 struct TransactionGuard {
@@ -212,7 +228,7 @@ impl DHT {
     fn run_ipv6(
         id: NodeID,
         port: u16,
-        rx: mpsc::Receiver<OutReq>,
+        rx: mpsc::Receiver<Req>,
         tmap: Arc<Mutex<TransactionMap>>,
         cancel: CancellationToken,
     ) -> io::Result<()> {
@@ -231,36 +247,49 @@ impl DHT {
         };
 
         let server = Server {
+            ipv6: true,
             id,
             s: socket,
             route: RoutingTable::new(id),
             tmap,
+            nodes_buf: Vec::with_capacity(8),
+            nodes4_buf: VecNode4(Vec::with_capacity(8)),
+            nodes6_buf: VecNode6(Vec::with_capacity(8)),
         };
         tokio::spawn(server.serve(rx, cancel));
         Ok(())
     }
 
-    fn delete_route(&self, id: NodeID) {
-        todo!()
+    async fn remove_route(&self, id: NodeID) -> io::Result<()> {
+        let req = Req::RemoveRoute { id };
+        self.tx.send(req).await.map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                "send remove-route request to worker error",
+            )
+        })
     }
 
-    async fn do_req(
+    async fn do_rpc_req(
         &self,
-        addr: NodeAddr,
+        addr: RpcAddr,
         krpc: KRPC,
         timeout: time::Duration,
     ) -> io::Result<Resp> {
         let (tx, rx) = oneshot::channel();
         let tid = krpc.t.clone();
-        let req = OutReq {
-            addr: addr.addr,
+        let req = Req::KRPC {
+            addr: match addr {
+                RpcAddr::ID(na) => na.addr,
+                RpcAddr::NoID(a) => a,
+            },
             krpc,
         };
         let _drop_guard = TransactionGuard::new(tid.into_vec(), self.tmap.clone(), tx);
         if self.tx.send(req).await.is_err() {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
-                "send request to worker error",
+                "send KRPC request to worker error",
             ));
         }
 
@@ -271,13 +300,15 @@ impl DHT {
                 "recv result from worker error",
             )),
             Err(_) => {
-                self.delete_route(addr.id);
+                if let RpcAddr::ID(na) = addr {
+                    self.remove_route(na.id).await?;
+                }
                 Err(io::Error::new(io::ErrorKind::Other, "timeout"))
             }
         }
     }
 
-    pub async fn ping(&self, addr: NodeAddr, timeout: time::Duration) -> io::Result<Resp> {
+    pub async fn ping_rpc(&self, addr: RpcAddr, timeout: time::Duration) -> io::Result<Resp> {
         let tid = self.tid.fetch_add(1, Ordering::Relaxed).to_be_bytes();
         let tid: ByteString = tid[..].into();
         let krpc = KRPC {
@@ -285,12 +316,12 @@ impl DHT {
             v: self.version.clone().into(),
             inner: KRPCInner::Request(Arg::Ping(PingArg { id: self.id })),
         };
-        self.do_req(addr, krpc, timeout).await
+        self.do_rpc_req(addr, krpc, timeout).await
     }
 
-    pub async fn find_node(
+    pub async fn find_node_rpc(
         &self,
-        addr: NodeAddr,
+        addr: RpcAddr,
         target: NodeID,
         timeout: time::Duration,
     ) -> io::Result<Resp> {
@@ -304,12 +335,12 @@ impl DHT {
                 target,
             })),
         };
-        self.do_req(addr, krpc, timeout).await
+        self.do_rpc_req(addr, krpc, timeout).await
     }
 
-    pub async fn get_peers(
+    pub async fn get_peers_rpc(
         &self,
-        addr: NodeAddr,
+        addr: RpcAddr,
         info_hash: NodeID,
         timeout: time::Duration,
     ) -> io::Result<Resp> {
@@ -323,12 +354,12 @@ impl DHT {
                 info_hash,
             })),
         };
-        self.do_req(addr, krpc, timeout).await
+        self.do_rpc_req(addr, krpc, timeout).await
     }
 
     pub async fn announce_peer(
         &self,
-        addr: NodeAddr,
+        addr: RpcAddr,
         info_hash: NodeID,
         port: u16,
         implied: bool,
@@ -348,18 +379,19 @@ impl DHT {
                 token: token.into(),
             })),
         };
-        self.do_req(addr, krpc, timeout).await
+        self.do_rpc_req(addr, krpc, timeout).await
     }
 }
 
-struct OutReq {
-    addr: SocketAddr,
-    krpc: KRPC,
+enum Req {
+    RemoveRoute { id: NodeID },
+    KRPC { addr: SocketAddr, krpc: KRPC },
 }
 
 type TransactionMap = HashMap<Vec<u8>, oneshot::Sender<io::Result<Resp>>>;
 
 struct Server {
+    ipv6: bool,
     s: UdpSocket,
     id: NodeID,
 
@@ -367,19 +399,41 @@ struct Server {
 
     /// transaction id map
     tmap: Arc<Mutex<TransactionMap>>,
+
+    nodes_buf: Vec<NodeAddr>,
+    nodes4_buf: VecNode4,
+    nodes6_buf: VecNode6,
+}
+
+fn to_nodes64(ns: &[NodeAddr], v4: &mut VecNode4, v6: &mut VecNode6) {
+    let r4 = &mut v4.0;
+    let r6 = &mut v6.0;
+    r4.clear();
+    r6.clear();
+    for na in ns {
+        match na.addr {
+            SocketAddr::V4(s4) => r4.push((na.id, s4)),
+            SocketAddr::V6(s6) => r6.push((na.id, s6)),
+        }
+    }
 }
 
 const BUF_MAX: usize = 10240;
 
 impl Server {
-    async fn serve(mut self, mut out_req: mpsc::Receiver<OutReq>, cancel_token: CancellationToken) {
-        let mut buf = vec![0u8; BUF_MAX];
+    async fn serve(mut self, mut out_req: mpsc::Receiver<Req>, cancel_token: CancellationToken) {
+        let mut in_buf = vec![0u8; BUF_MAX];
         let mut out_buf = vec![0u8; BUF_MAX];
         loop {
             tokio::select! {
-                _ = self.handle_income(&mut buf) => {},
-                Some(OutReq{addr, krpc}) = out_req.recv() => {
-                    self.handle_out_req(addr, krpc,  &mut out_buf).await
+                _ = self.handle_income(&mut in_buf) => {},
+                Some(req) = out_req.recv() => {
+                    match req {
+                        Req::KRPC{ addr, krpc } => self.handle_out_req(
+                            addr, krpc, &mut out_buf,
+                        ).await,
+                        Req::RemoveRoute { id } => self.route.remove_route(&id),
+                    }
                 },
                 _ = cancel_token.cancelled() => {
                     break;
@@ -411,10 +465,23 @@ impl Server {
         self.handle_krpc_in(msg, peer_addr).await;
     }
 
+    async fn send_response(&self, addr: SocketAddr, resp: &KRPC) -> io::Result<()> {
+        match bt_bencode::to_vec(&resp) {
+            Ok(resp_buf) => {
+                _ = self.s.send_to(&resp_buf, addr).await?;
+            }
+            Err(e) => {
+                warn!("dht at response, bencode error {e}");
+            }
+        }
+        Ok(())
+    }
+
     async fn handle_krpc_in(&mut self, krpc: KRPC, from_addr: SocketAddr) {
         let version: ByteString = "st01".into();
         match krpc.inner {
             KRPCInner::Request(Arg::Ping(p)) => {
+                info!("receive ping from {}", from_addr);
                 let resp = KRPC {
                     t: krpc.t,
                     v: version,
@@ -426,33 +493,93 @@ impl Server {
                         values: None,
                     }),
                 };
-                if let Ok(resp_buf) = bt_bencode::to_vec(&resp) {
-                    _ = self.s.send_to(&resp_buf, from_addr).await;
-                }
-                self.route.add(NodeAddr {
+                self.route.add_route(NodeAddr {
                     id: p.id,
                     addr: from_addr,
-                })
+                });
+                _ = self.send_response(from_addr, &resp).await;
             }
-            KRPCInner::Request(Arg::AnnouncePeer(a)) => self.route.add(NodeAddr {
-                id: a.id,
-                addr: from_addr,
-            }),
-            KRPCInner::Request(Arg::FindNode(f)) => self.route.add(NodeAddr {
-                id: f.id,
-                addr: from_addr,
-            }),
-            KRPCInner::Request(Arg::GetPeers(gp)) => self.route.add(NodeAddr {
-                id: gp.id,
-                addr: from_addr,
-            }),
+            KRPCInner::Request(Arg::AnnouncePeer(a)) => {
+                info!("receive announce_peer from {}", from_addr);
+                self.route.add_route(NodeAddr {
+                    id: a.id,
+                    addr: from_addr,
+                });
+                // todo!("add data to storage")
+            }
+            KRPCInner::Request(Arg::FindNode(f)) => {
+                info!("receive find_node from {}", from_addr);
+                self.route.add_route(NodeAddr {
+                    id: f.id,
+                    addr: from_addr,
+                });
+                self.nodes_buf.clear();
+                self.route
+                    .get_k_closest_nodes(&f.id, 8, &mut self.nodes_buf);
+                to_nodes64(&self.nodes_buf, &mut self.nodes4_buf, &mut self.nodes6_buf);
+                let resp = KRPC {
+                    t: krpc.t,
+                    v: version,
+                    inner: KRPCInner::Response(Resp {
+                        id: self.id,
+                        // TODO: optimize clone, use ref or cow
+                        nodes: (!self.ipv6).then_some(self.nodes4_buf.clone()),
+                        nodes6: (self.ipv6).then_some(self.nodes6_buf.clone()),
+                        token: None,
+                        values: None,
+                    }),
+                };
+                _ = self.send_response(from_addr, &resp).await;
+            }
+            KRPCInner::Request(Arg::GetPeers(gp)) => {
+                info!("receive get_peer from {}", from_addr);
+                self.route.add_route(NodeAddr {
+                    id: gp.id,
+                    addr: from_addr,
+                });
+                self.nodes_buf.clear();
+                self.route
+                    .get_k_closest_nodes(&gp.id, 8, &mut self.nodes_buf);
+                to_nodes64(&self.nodes_buf, &mut self.nodes4_buf, &mut self.nodes6_buf);
+                let resp = KRPC {
+                    t: krpc.t,
+                    v: version,
+                    inner: KRPCInner::Response(Resp {
+                        id: self.id,
+                        nodes: (!self.ipv6).then_some(self.nodes4_buf.clone()),
+                        nodes6: (self.ipv6).then_some(self.nodes6_buf.clone()),
+                        token: Some("abaaabba".into()), // TODO generate token
+                        values: None,                   // TODO: return peers from storage
+                    }),
+                };
+                _ = self.send_response(from_addr, &resp).await;
+            }
             KRPCInner::Response(resp) => {
+                if let Some(ns) = &resp.nodes6 {
+                    if self.ipv6 {
+                        for (id, addr) in &ns.0 {
+                            self.route.add_route(NodeAddr {
+                                id: *id,
+                                addr: SocketAddr::V6(*addr),
+                            });
+                        }
+                    }
+                }
+                if let Some(ns) = &resp.nodes {
+                    if !self.ipv6 {
+                        for (id, addr) in &ns.0 {
+                            self.route.add_route(NodeAddr {
+                                id: *id,
+                                addr: SocketAddr::V4(*addr),
+                            });
+                        }
+                    }
+                }
                 if let Some(ret) = self.tmap.lock().unwrap().remove(krpc.t.as_slice()) {
                     _ = ret.send(Ok(resp));
                 } else {
                     info!("dht unknown transaction id");
                 }
-                // TODO: do we refresh routing table?
             }
             KRPCInner::Err(items) => todo!(),
         }

@@ -76,7 +76,7 @@ impl From<KRPC> for WireKRPC {
                 t: krpc.t,
                 v: krpc.v,
                 y: [b'r'],
-                q: Some("find_node".into()),
+                q: None,
                 a: None,
                 r: Some(resp),
                 e: vec![],
