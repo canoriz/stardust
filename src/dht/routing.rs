@@ -111,7 +111,7 @@ impl RoutingTable {
     }
 }
 
-fn dist(a: &NodeID, b: &NodeID) -> [u8; 20] {
+pub(crate) fn dist(a: &NodeID, b: &NodeID) -> [u8; 20] {
     let mut ret = [0u8; 20];
     for (i, r) in ret.iter_mut().enumerate() {
         *r = a[i] ^ b[i];

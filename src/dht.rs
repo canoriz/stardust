@@ -2,6 +2,7 @@ use bt_bencode::ByteString;
 use bt_bencode::Value as BtValue;
 use core::time;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
@@ -22,6 +23,8 @@ mod wire_serde;
 use routing::RoutingTable;
 use wire::WireKRPC;
 
+use routing::dist;
+
 pub type NodeID = [u8; 20];
 
 pub struct DHT {
@@ -31,7 +34,12 @@ pub struct DHT {
 
     tid: AtomicU64,
 
-    tx: mpsc::Sender<Req>,
+    net_type: NetType,
+
+    // ipv6 request sender
+    tx6: mpsc::Sender<Req>,
+    // ipv4 request sender
+    tx4: mpsc::Sender<Req>,
 
     tmap: Arc<Mutex<TransactionMap>>,
     _cancel_token: DropGuard,
@@ -206,23 +214,105 @@ impl Drop for TransactionGuard {
     }
 }
 
+pub struct NetType(u32);
+
+impl NetType {
+    pub const V4: NetType = NetType(0b1);
+    pub const V6: NetType = NetType(0b10);
+
+    fn enabled(&self, nt: Self) -> bool {
+        self.0 & nt.0 > 0
+    }
+}
+
+impl std::ops::BitOr for NetType {
+    type Output = Self;
+
+    #[inline]
+    fn bitor(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+}
+
+impl std::fmt::Debug for NetType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.0 & (Self::V4.0 | Self::V6.0) > 0 {
+            write!(f, "DUAL STACK")
+        } else if self.0 & (Self::V4.0) > 0 {
+            write!(f, "IPV4 ONLY")
+        } else if self.0 & (Self::V6.0) > 0 {
+            write!(f, "IPV6 ONLY")
+        } else {
+            write!(f, "NONE")
+        }
+    }
+}
+
 impl DHT {
-    pub fn new(id: NodeID, port: u16, version: String) -> Self {
-        let (tx, rx) = mpsc::channel(2048);
+    pub fn new(id: NodeID, port: u16, version: String, nt: NetType) -> Self {
+        let mut nt = nt;
+        let (tx6, rx6) = mpsc::channel(2048);
+        let (tx4, rx4) = mpsc::channel(2048);
         let tmap = Arc::new(Mutex::new(HashMap::new()));
         let cancel_token = CancellationToken::new();
-        if let Err(e) = DHT::run_ipv6(id, port, rx, tmap.clone(), cancel_token.clone()) {
-            warn!("dht start server error {e}");
+
+        if nt.enabled(NetType::V6) {
+            if let Err(e) = DHT::run_ipv6(id, port, rx6, tmap.clone(), cancel_token.clone()) {
+                warn!("dht start v6 server error {e}");
+                nt = NetType(nt.0 & !(NetType::V6.0));
+            }
+        }
+        if nt.enabled(NetType::V4) {
+            if let Err(e) = DHT::run_ipv4(id, port, rx4, tmap.clone(), cancel_token.clone()) {
+                warn!("dht start v4 server error {e}");
+                nt = NetType(nt.0 & !(NetType::V4.0));
+            }
         }
         Self {
             id,
             port,
             version,
-            tx,
+            tx6,
+            tx4,
             tid: 0.into(),
             tmap,
+            net_type: nt,
             _cancel_token: cancel_token.drop_guard(),
         }
+    }
+
+    fn run_ipv4(
+        id: NodeID,
+        port: u16,
+        rx: mpsc::Receiver<Req>,
+        tmap: Arc<Mutex<TransactionMap>>,
+        cancel: CancellationToken,
+    ) -> io::Result<()> {
+        let addr = format!("0.0.0.0:{}", port);
+        let socket = match std::net::UdpSocket::bind(&addr) {
+            Ok(s) => {
+                s.set_nonblocking(true)?;
+                UdpSocket::from_std(s)?
+            }
+            Err(e) => {
+                warn!("error binding dht v4 socket at {addr}, reason {e}");
+                return Err(e);
+            }
+        };
+
+        let server = Server {
+            ipv6: false,
+            id,
+            s: socket,
+            route: RoutingTable::new(id),
+            tmap,
+            nodes_buf: Vec::with_capacity(8),
+            nodes4_buf: VecNode4(Vec::with_capacity(8)),
+            nodes6_buf: VecNode6(Vec::with_capacity(8)),
+            out_buf: Vec::with_capacity(BUF_MAX),
+        };
+        tokio::spawn(server.serve(rx, cancel));
+        Ok(())
     }
 
     fn run_ipv6(
@@ -241,7 +331,7 @@ impl DHT {
                 UdpSocket::from_std(s)?
             }
             Err(e) => {
-                warn!("error binding dht socket at {addr}, reason {e}");
+                warn!("error binding dht v6 socket at {addr}, reason {e}");
                 return Err(e);
             }
         };
@@ -255,6 +345,7 @@ impl DHT {
             nodes_buf: Vec::with_capacity(8),
             nodes4_buf: VecNode4(Vec::with_capacity(8)),
             nodes6_buf: VecNode6(Vec::with_capacity(8)),
+            out_buf: Vec::with_capacity(BUF_MAX),
         };
         tokio::spawn(server.serve(rx, cancel));
         Ok(())
@@ -262,7 +353,7 @@ impl DHT {
 
     async fn remove_route(&self, id: NodeID) -> io::Result<()> {
         let req = Req::RemoveRoute { id };
-        self.tx.send(req).await.map_err(|_| {
+        self.tx6.send(req).await.map_err(|_| {
             io::Error::new(
                 io::ErrorKind::Other,
                 "send remove-route request to worker error",
@@ -278,15 +369,21 @@ impl DHT {
     ) -> io::Result<Resp> {
         let (tx, rx) = oneshot::channel();
         let tid = krpc.t.clone();
+        let ip_addr = match addr {
+            RpcAddr::ID(na) => na.addr,
+            RpcAddr::NoID(a) => a,
+        };
         let req = Req::KRPC {
-            addr: match addr {
-                RpcAddr::ID(na) => na.addr,
-                RpcAddr::NoID(a) => a,
-            },
+            addr: ip_addr,
             krpc,
         };
+
         let _drop_guard = TransactionGuard::new(tid.into_vec(), self.tmap.clone(), tx);
-        if self.tx.send(req).await.is_err() {
+        let send_to_worker = match ip_addr {
+            SocketAddr::V4(_) => self.tx4.send(req).await,
+            SocketAddr::V6(_) => self.tx6.send(req).await,
+        };
+        if send_to_worker.is_err() {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
                 "send KRPC request to worker error",
@@ -308,6 +405,47 @@ impl DHT {
         }
     }
 
+    /// get k closest nodes to id
+    async fn get_k_closest(&self, id: NodeID, k: usize, ipv6: bool) -> Vec<NodeAddr> {
+        let (tx, rx) = oneshot::channel();
+
+        async fn wait_result(
+            rx: oneshot::Receiver<Vec<NodeAddr>>,
+        ) -> Result<Vec<NodeAddr>, &'static str> {
+            let timeout = time::Duration::from_secs(3);
+            match tokio::time::timeout(timeout, rx).await {
+                Ok(Ok(r)) => Ok(r),
+                Ok(Err(_)) => Err("wait result error"),
+                Err(_) => Err("timeout"),
+            }
+        }
+
+        let mut nodes = if !ipv6 && self.net_type.enabled(NetType::V4) {
+            self.tx4.send(Req::GetClosestNodes { id, k, tx: tx }).await;
+            match wait_result(rx).await {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("dht: ipv4 get_k_closest err {}", e);
+                    vec![]
+                }
+            }
+        } else if ipv6 && self.net_type.enabled(NetType::V6) {
+            self.tx6.send(Req::GetClosestNodes { id, k, tx }).await;
+            match wait_result(rx).await {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("dht: ipv6 get_k_closest err {}", e);
+                    vec![]
+                }
+            }
+        } else {
+            vec![]
+        };
+
+        nodes.sort_by_cached_key(|n| dist(&id, &n.id));
+        nodes
+    }
+
     pub async fn ping_rpc(&self, addr: RpcAddr, timeout: time::Duration) -> io::Result<Resp> {
         let tid = self.tid.fetch_add(1, Ordering::Relaxed).to_be_bytes();
         let tid: ByteString = tid[..].into();
@@ -320,11 +458,12 @@ impl DHT {
     }
 
     pub async fn find_node_rpc(
-        &self,
+        self: &Arc<Self>,
         addr: RpcAddr,
         target: NodeID,
         timeout: time::Duration,
     ) -> io::Result<Resp> {
+        info!("request find_node {target:?} to {addr:?}");
         let tid = self.tid.fetch_add(1, Ordering::Relaxed).to_be_bytes();
         let tid: ByteString = tid[..].into();
         let krpc = KRPC {
@@ -357,7 +496,7 @@ impl DHT {
         self.do_rpc_req(addr, krpc, timeout).await
     }
 
-    pub async fn announce_peer(
+    pub async fn announce_peer_rpc(
         &self,
         addr: RpcAddr,
         info_hash: NodeID,
@@ -381,11 +520,161 @@ impl DHT {
         };
         self.do_rpc_req(addr, krpc, timeout).await
     }
+
+    /// find closest nodes to target, returns closest IPV4 or IPV6 nodes
+    pub async fn find_closest_node_to(
+        self: &Arc<Self>,
+        target: NodeID,
+        ipv6: bool,
+    ) -> Vec<NodeAddr> {
+        const K: usize = 8;
+        const ALPHA: usize = 3;
+        let timeout = time::Duration::from_secs(5);
+
+        let send_req = |client: Arc<DHT>,
+                        target: NodeID,
+                        timeout: time::Duration,
+                        addr: RpcAddr,
+                        resp: mpsc::Sender<Result<Vec<NodeAddr>, NodeID>>| {
+            tokio::spawn(async move {
+                let mut ns = Vec::with_capacity(8);
+                match client.find_node_rpc(addr, target, timeout).await {
+                    Ok(r) => {
+                        if !ipv6 {
+                            if let Some(n4) = r.nodes {
+                                ns.extend(n4.0.into_iter().map(|(id, a)| NodeAddr {
+                                    id,
+                                    addr: SocketAddr::V4(a),
+                                }))
+                            }
+                        } else if let Some(n6) = r.nodes6 {
+                            ns.extend(n6.0.into_iter().map(|(id, a)| NodeAddr {
+                                id,
+                                addr: SocketAddr::V6(a),
+                            }))
+                        }
+                        ns.sort_by_cached_key(|n| dist(&target, &n.id));
+                        _ = resp.send(Ok(ns)).await;
+                    }
+                    Err(e) => {
+                        info!("in find_closest_node, node {target:?} does not respond, error {e}");
+                        _ = resp.send(Err(target)).await;
+                    }
+                };
+            })
+        };
+
+        struct Dist {
+            dist: NodeID,
+            addr: NodeAddr,
+        }
+        impl core::cmp::Ord for Dist {
+            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+                self.dist.cmp(&other.dist)
+            }
+        }
+        impl core::cmp::PartialOrd for Dist {
+            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                self.dist.partial_cmp(&other.dist)
+            }
+        }
+        impl core::cmp::PartialEq for Dist {
+            fn eq(&self, other: &Self) -> bool {
+                self.dist == other.dist
+            }
+        }
+        impl core::cmp::Eq for Dist {}
+
+        #[derive(Debug, Eq, PartialEq)]
+        enum State {
+            Seen,    // known but not queried nodes
+            Queried, // queried nodes
+            Deleted, // unreachable nodes
+        }
+
+        let (resp_tx, mut resp_rx) = mpsc::channel::<Result<Vec<NodeAddr>, NodeID>>(K);
+        let mut node_state: HashMap<NodeID, State> = HashMap::new();
+        let mut closest_nodes: BTreeSet<Dist> = BTreeSet::new();
+
+        // send the initial node candidates
+        _ = resp_tx
+            .send(Ok(self.get_k_closest(target, K, ipv6).await))
+            .await;
+
+        let mut nodes = vec![];
+        while let Some(r) = resp_rx.recv().await {
+            match r {
+                Ok(nodes) => {
+                    for n in nodes {
+                        match node_state.get(&n.id) {
+                            Some(State::Deleted) => {
+                                closest_nodes.retain(|x| x.addr.id != n.id);
+                            }
+                            None => {
+                                node_state.insert(n.id, State::Seen);
+                                closest_nodes.insert(Dist {
+                                    dist: dist(&target, &n.id),
+                                    addr: n,
+                                });
+                                if closest_nodes.len() > K {
+                                    closest_nodes.pop_last();
+                                }
+                            }
+                            Some(_) => {}
+                        }
+                    }
+                }
+                Err(id) => {
+                    info!("receive response from {id:?} error");
+                    node_state.insert(id, State::Deleted);
+                    closest_nodes.retain(|x| x.addr.id != id);
+                }
+            }
+
+            let mut q = 0;
+            for Dist { addr, .. } in closest_nodes.iter() {
+                match node_state.get(&addr.id) {
+                    Some(State::Seen) | None => {
+                        node_state.insert(addr.id, State::Queried);
+                        send_req(
+                            self.clone(),
+                            target,
+                            timeout,
+                            RpcAddr::ID(*addr),
+                            resp_tx.clone(),
+                        );
+                        q += 1;
+                        if q >= ALPHA {
+                            break;
+                        }
+                    }
+                    Some(s) => assert_eq!(*s, State::Queried),
+                }
+            }
+
+            if q == 0 {
+                // TODO: is the correct, may there any request in flight?
+                nodes = closest_nodes.into_iter().map(|x| x.addr).collect();
+                break;
+            }
+        }
+        nodes
+    }
 }
 
 enum Req {
-    RemoveRoute { id: NodeID },
-    KRPC { addr: SocketAddr, krpc: KRPC },
+    RemoveRoute {
+        id: NodeID,
+    },
+    GetClosestNodes {
+        id: NodeID,
+        k: usize,
+        tx: oneshot::Sender<Vec<NodeAddr>>,
+    },
+    KRPC {
+        addr: SocketAddr,
+        krpc: KRPC,
+    },
 }
 
 type TransactionMap = HashMap<Vec<u8>, oneshot::Sender<io::Result<Resp>>>;
@@ -403,6 +692,7 @@ struct Server {
     nodes_buf: Vec<NodeAddr>,
     nodes4_buf: VecNode4,
     nodes6_buf: VecNode6,
+    out_buf: Vec<u8>,
 }
 
 fn to_nodes64(ns: &[NodeAddr], v4: &mut VecNode4, v6: &mut VecNode6) {
@@ -423,21 +713,27 @@ const BUF_MAX: usize = 10240;
 impl Server {
     async fn serve(mut self, mut out_req: mpsc::Receiver<Req>, cancel_token: CancellationToken) {
         let mut in_buf = vec![0u8; BUF_MAX];
-        let mut out_buf = vec![0u8; BUF_MAX];
         loop {
             tokio::select! {
                 _ = self.handle_income(&mut in_buf) => {},
                 Some(req) = out_req.recv() => {
-                    match req {
-                        Req::KRPC{ addr, krpc } => self.handle_out_req(
-                            addr, krpc, &mut out_buf,
-                        ).await,
-                        Req::RemoveRoute { id } => self.route.remove_route(&id),
-                    }
-                },
+                    self.handle_user_req(req).await;
+                }
                 _ = cancel_token.cancelled() => {
                     break;
                 }
+            }
+        }
+    }
+
+    async fn handle_user_req(&mut self, req: Req) {
+        match req {
+            Req::KRPC { addr, krpc } => self.handle_out_req(addr, krpc).await,
+            Req::RemoveRoute { id } => self.route.remove_route(&id),
+            Req::GetClosestNodes { id, k, tx } => {
+                let mut nodes = Vec::with_capacity(8);
+                self.route.get_k_closest_nodes(&id, k, &mut nodes);
+                _ = tx.send(nodes);
             }
         }
     }
@@ -589,9 +885,9 @@ impl Server {
         }
     }
 
-    async fn handle_out_req(&mut self, addr: SocketAddr, krpc: KRPC, mut buf: &mut Vec<u8>) {
-        buf.clear();
-        match bt_bencode::to_writer(&mut buf, &krpc) {
+    async fn handle_out_req(&mut self, addr: SocketAddr, krpc: KRPC) {
+        self.out_buf.clear();
+        match bt_bencode::to_writer(&mut self.out_buf, &krpc) {
             Ok(b) => b,
             Err(e) => {
                 if let Some(v) = self.tmap.lock().unwrap().remove(krpc.t.as_slice()) {
@@ -600,15 +896,7 @@ impl Server {
                 return;
             }
         };
-        match krpc.inner {
-            KRPCInner::Request(Arg::Ping(id)) => {}
-            KRPCInner::Request(Arg::AnnouncePeer(a)) => {}
-            KRPCInner::Request(Arg::FindNode(f)) => {}
-            KRPCInner::Request(Arg::GetPeers(gp)) => {}
-            KRPCInner::Response(resp) => todo!(),
-            KRPCInner::Err(items) => todo!(),
-        }
-        if let Err(e) = self.s.send_to(buf, addr).await {
+        if let Err(e) = self.s.send_to(&self.out_buf, addr).await {
             warn!("send udp packet failed error {e}");
         }
     }

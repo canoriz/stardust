@@ -1,7 +1,7 @@
 use core::time;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
-use stardust::dht::{NodeID, Resp, RpcAddr, DHT};
+use stardust::dht::{NetType, NodeID, RpcAddr, DHT};
 use tokio::{
     io::{stdin, stdout, AsyncBufReadExt, AsyncWriteExt, BufReader},
     time::timeout,
@@ -30,7 +30,12 @@ async fn main() -> std::io::Result<()> {
     //     0xbb, 0x73, 0xfa, 0x11, 0x7e,
     // ];
 
-    let client = DHT::new(id, 49999, "ST01".into());
+    let client = Arc::new(DHT::new(
+        id,
+        49999,
+        "ST01".into(),
+        NetType::V4 | NetType::V6,
+    ));
     let r = timeout(
         time::Duration::from_millis(5000),
         client.ping_rpc(
@@ -60,6 +65,9 @@ async fn main() -> std::io::Result<()> {
         .unwrap();
     println!("find node {:?}", r);
 
+    let res = client.find_closest_node_to(id, true).await;
+    println!("find_closest {:?}", res);
+
     // Wrap it in a BufReader for efficient line-by-line reading.
     let mut reader = BufReader::new(stdin()).lines();
     println!("--- Tokio Async Line Processor ---");
@@ -74,7 +82,7 @@ async fn main() -> std::io::Result<()> {
         let line = line_result;
 
         // Process the line asynchronously.
-        let processed_line = process_line_async(line, &client).await;
+        let processed_line = process_line_async(line, client.clone()).await;
 
         println!("\nProcessed: {}", processed_line);
         print!("> ");
@@ -89,7 +97,7 @@ async fn main() -> std::io::Result<()> {
     Ok(())
 }
 
-async fn process_line_async(line: String, client: &DHT) -> String {
+async fn process_line_async(line: String, client: Arc<DHT>) -> String {
     let (cmd, addr, id) = {
         let v: Vec<_> = line.split_ascii_whitespace().collect();
         if v.len() != 3 {
@@ -103,31 +111,35 @@ async fn process_line_async(line: String, client: &DHT) -> String {
     } else {
         return "NodeID should in hex format".into();
     };
-    let addr = if let Ok(a) = addr.parse() {
-        a
-    } else {
-        return "addr format wrong".into();
-    };
 
-    let res = if cmd.starts_with("p") {
-        client
-            .ping_rpc(RpcAddr::no_id(addr), Duration::from_secs(5))
-            .await
-    } else if cmd.starts_with("f") {
-        client
-            .find_node_rpc(RpcAddr::no_id(addr), id, Duration::from_secs(5))
-            .await
-    } else if cmd.starts_with("g") {
-        client
-            .get_peers_rpc(RpcAddr::no_id(addr), id, Duration::from_secs(5))
-            .await
+    if cmd.starts_with("cl") {
+        let res = client.find_closest_node_to(id, true).await;
+        format!("{:?}", res)
     } else {
-        return "command should be p, f or g".into();
-    };
-
-    match res {
-        Ok(r) => format!("result: {:?}", r),
-        Err(e) => format!("error {:?}", e),
+        let addr = if let Ok(a) = addr.parse() {
+            a
+        } else {
+            return "addr format wrong".into();
+        };
+        let res = if cmd.starts_with("p") {
+            client
+                .ping_rpc(RpcAddr::no_id(addr), Duration::from_secs(5))
+                .await
+        } else if cmd.starts_with("f") {
+            client
+                .find_node_rpc(RpcAddr::no_id(addr), id, Duration::from_secs(5))
+                .await
+        } else if cmd.starts_with("g") {
+            client
+                .get_peers_rpc(RpcAddr::no_id(addr), id, Duration::from_secs(5))
+                .await
+        } else {
+            return "command should be p, f or g".into();
+        };
+        match res {
+            Ok(r) => format!("result: {:?}", r),
+            Err(e) => format!("error {:?}", e),
+        }
     }
 }
 
