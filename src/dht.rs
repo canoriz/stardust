@@ -564,27 +564,6 @@ impl DHT {
             })
         };
 
-        struct Dist {
-            dist: NodeID,
-            addr: NodeAddr,
-        }
-        impl core::cmp::Ord for Dist {
-            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-                self.dist.cmp(&other.dist)
-            }
-        }
-        impl core::cmp::PartialOrd for Dist {
-            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-                self.dist.partial_cmp(&other.dist)
-            }
-        }
-        impl core::cmp::PartialEq for Dist {
-            fn eq(&self, other: &Self) -> bool {
-                self.dist == other.dist
-            }
-        }
-        impl core::cmp::Eq for Dist {}
-
         #[derive(Debug, Eq, PartialEq)]
         enum State {
             Seen,    // known but not queried nodes
@@ -592,6 +571,7 @@ impl DHT {
             Deleted, // unreachable nodes
         }
 
+        use routing::Dist;
         let (resp_tx, mut resp_rx) = mpsc::channel::<Result<Vec<NodeAddr>, NodeID>>(K);
         let mut node_state: HashMap<NodeID, State> = HashMap::new();
         let mut closest_nodes: BTreeSet<Dist> = BTreeSet::new();
@@ -811,7 +791,7 @@ impl Server {
                 });
                 self.nodes_buf.clear();
                 self.route
-                    .get_k_closest_nodes(&f.id, 8, &mut self.nodes_buf);
+                    .get_k_closest_nodes(&f.target, 8, &mut self.nodes_buf);
                 to_nodes64(&self.nodes_buf, &mut self.nodes4_buf, &mut self.nodes6_buf);
                 let resp = KRPC {
                     t: krpc.t,
@@ -835,7 +815,7 @@ impl Server {
                 });
                 self.nodes_buf.clear();
                 self.route
-                    .get_k_closest_nodes(&gp.id, 8, &mut self.nodes_buf);
+                    .get_k_closest_nodes(&gp.info_hash, 8, &mut self.nodes_buf);
                 to_nodes64(&self.nodes_buf, &mut self.nodes4_buf, &mut self.nodes6_buf);
                 let resp = KRPC {
                     t: krpc.t,
