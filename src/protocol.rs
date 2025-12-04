@@ -10,17 +10,35 @@ use std::collections::HashSet;
 use std::fmt::Formatter;
 use std::mem::MaybeUninit;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
 use std::sync::LazyLock;
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net;
 use tokio::net::tcp;
 use tracing::{info, warn};
 
-pub trait Split {
+const DEFAULT_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0);
+
+pub trait Split
+where
+    Self: Sized,
+{
     type R: AsyncRead + Send + Unpin + 'static;
     type W: AsyncWrite + Send + Unpin + 'static;
     fn split(self) -> (Self::R, Self::W);
-    fn peer_addr(&self) -> SocketAddr;
+    fn remote_addr(&self) -> SocketAddr;
+    fn reunite(r: Self::R, w: Self::W) -> Result<Self, ReuniteError>;
+}
+
+#[derive(Debug)]
+pub struct ReuniteError;
+impl fmt::Display for ReuniteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "reunite error, maybe write end and read end from different connection?"
+        )
+    }
 }
 
 impl Split for net::TcpStream {
@@ -31,7 +49,11 @@ impl Split for net::TcpStream {
         self.into_split()
     }
 
-    fn peer_addr(&self) -> SocketAddr {
+    fn reunite(r: Self::R, w: Self::W) -> Result<Self, ReuniteError> {
+        r.reunite(w).map_err(|_| ReuniteError)
+    }
+
+    fn remote_addr(&self) -> SocketAddr {
         const DEFAULT_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0);
         self.peer_addr().unwrap_or(DEFAULT_ADDR)
     }
@@ -120,11 +142,14 @@ pub struct BTStream<T> {
 
 #[derive(Debug)]
 pub struct ReadStream<T> {
-    inner: BufReader<T>,
+    inner: T,
     peer_addr: SocketAddr,
 
     // required to implement Cancel Safe for read_msg_header
     partial_header: PartialHeader,
+
+    peer_id: [u8; 20],
+    reserved: FuncBits,
 }
 
 // store partial received header,
@@ -141,14 +166,18 @@ struct PartialHeader {
     discard_remain: usize,
 }
 
+#[derive(Debug)]
 pub struct WriteStream<T> {
-    inner: BufWriter<T>,
+    inner: T,
     peer_addr: SocketAddr,
 
     extension_id: HashMap<ExtensionType, u8>,
 
     // what this peer knows about our connected peers
     pex_peers: HashMap<IpAddr, Option<PexFlag>>,
+
+    peer_id: [u8; 20],
+    reserved: FuncBits,
 }
 
 impl BTStream<net::TcpStream> {
@@ -226,19 +255,67 @@ where
     T: AsyncRead + AsyncWrite + Unpin + Split,
 {
     pub fn split(self) -> (ReadStream<<T as Split>::R>, WriteStream<<T as Split>::W>) {
-        let peer_addr = self.inner.peer_addr();
+        let peer_addr = self.inner.remote_addr();
+        let (read_end, write_end) = self.inner.split();
+        (
+            ReadStream {
+                inner: read_end,
+                peer_addr,
+                partial_header: self.partial_header,
+                peer_id: self.peer_id,
+                reserved: self.reserved,
+            },
+            WriteStream {
+                inner: write_end,
+                peer_addr,
+                extension_id: self.extension_id,
+                pex_peers: self.pex_peers,
+                peer_id: self.peer_id,
+                reserved: self.reserved,
+            },
+        )
+    }
+
+    pub fn reunite(
+        r: ReadStream<<T as Split>::R>,
+        w: WriteStream<<T as Split>::W>,
+    ) -> Result<Self, ReuniteError> {
+        if r.peer_id != w.peer_id {
+            return Err(ReuniteError);
+        }
+        Ok(Self {
+            inner: Split::reunite(r.inner, w.inner)?,
+            partial_header: r.partial_header,
+            extension_id: w.extension_id,
+            reserved: r.reserved,
+            peer_id: r.peer_id,
+            pex_peers: w.pex_peers,
+        })
+    }
+
+    pub fn split_buffered(
+        self,
+    ) -> (
+        ReadStream<BufReader<<T as Split>::R>>,
+        WriteStream<BufWriter<<T as Split>::W>>,
+    ) {
+        let peer_addr = self.inner.remote_addr();
         let (read_end, write_end) = self.inner.split();
         (
             ReadStream {
                 inner: BufReader::with_capacity(32768, read_end),
                 peer_addr,
                 partial_header: self.partial_header,
+                peer_id: self.peer_id,
+                reserved: self.reserved,
             },
             WriteStream {
                 inner: BufWriter::with_capacity(32768, write_end),
                 peer_addr,
                 extension_id: self.extension_id,
                 pex_peers: self.pex_peers,
+                peer_id: self.peer_id,
+                reserved: self.reserved,
             },
         )
     }
@@ -298,7 +375,7 @@ where
 
 impl<T> BTStream<T>
 where
-    T: AsyncRead + AsyncWrite + Unpin,
+    T: AsyncRead + AsyncWrite + Split + Unpin,
 {
     pub async fn connect(mut t: T, h: &Handshake, extend: &ExtendedHandshake) -> io::Result<Self>
     where
@@ -307,7 +384,7 @@ where
         send_handshake(&mut t, h).await?;
         let peer_handshake = recv_handshake(&mut t).await?;
 
-        let mut s = BTStream {
+        let s = BTStream {
             inner: t,
             partial_header: EMPTY_PARTIAL_HEADER,
             extension_id: HashMap::new(),
@@ -320,16 +397,34 @@ where
         let support_extension =
             peer_handshake.reserved.have_extension() & h.reserved.have_extension();
         if support_extension {
-            // TODO: will this block? both ends sending data while OS buffer full
-            // and waiting data sent not checking incoming handshake?
-            send_extension_handshake(&mut s.inner, extend).await?;
-            let exth = s.recv_extend_handshake().await?;
+            // Maybe over engineering.
+            // If both ends are sends handshake before recv handshake,
+            // and if both of OS buffer are full,
+            // both will wait other end recv data first, and both will blocks
+            // Resolve this by recv and send handshake in parallel,
+            // and later rejoins two ends.
+            let (mut read_end, mut write_end) = s.split();
+            let extend_clone = extend.clone(); // TODO: optimize
+            let send_ext_handshake = tokio::spawn(async move {
+                // this can not fail, this is the only Arc
+                send_extension_handshake(&mut write_end.inner, &extend_clone).await?;
+                io::Result::Ok(write_end)
+            });
+            let recv_ext_handshake = recv_extend_handshake(&mut read_end);
+            let (write_end, exth) = {
+                let (w, exth) = tokio::join!(send_ext_handshake, recv_ext_handshake);
+                (w??, exth?)
+            };
+
+            let mut s =
+                BTStream::<T>::reunite(read_end, write_end).expect("Reunite BTStream error");
             s.extension_id = exth
                 .m
                 .iter()
                 .filter_map(|(s, id)| extension_type(s).map(|ss| (ss, *id)))
                 .filter(|(_, id)| *id != 0)
                 .collect();
+            return Ok(s);
         }
         Ok(s)
     }
@@ -350,7 +445,7 @@ where
         )
         .await?;
 
-        let mut s = BTStream {
+        let s = BTStream {
             inner: t,
             partial_header: EMPTY_PARTIAL_HEADER,
             extension_id: HashMap::new(),
@@ -361,7 +456,7 @@ where
 
         let support_extension = peer_handshake.reserved.have_extension();
         if support_extension {
-            let exth = ExtendedHandshake {
+            let extend_sending = ExtendedHandshake {
                 // TODO: optimize: on sending, clone() can be optimized
                 m: EXTENSION_IDS_MAP.clone(),
                 p: 12345,
@@ -374,38 +469,29 @@ where
 
                 metadata_size: None,
             };
-            // TODO: will this block? both ends sending data while OS buffer full
-            // and waiting data sent not checking incoming handshake?
-            let exth = s.recv_extend_handshake().await?;
-            s.extension_id = exth
+            let (mut read_end, mut write_end) = s.split();
+            let send_ext_handshake = tokio::spawn(async move {
+                // this can not fail, this is the only Arc
+                send_extension_handshake(&mut write_end.inner, &extend_sending).await?;
+                io::Result::Ok(write_end)
+            });
+            let recv_ext_handshake = recv_extend_handshake(&mut read_end);
+            let (write_end, extend_received) = {
+                let (w, exth) = tokio::join!(send_ext_handshake, recv_ext_handshake);
+                (w??, exth?)
+            };
+
+            let mut s =
+                BTStream::<T>::reunite(read_end, write_end).expect("Reunite BTStream error");
+            s.extension_id = extend_received
                 .m
                 .iter()
                 .filter_map(|(s, id)| extension_type(s).map(|ss| (ss, *id)))
                 .filter(|(_, id)| *id != 0)
                 .collect();
-            send_extension_handshake(&mut s.inner, &exth).await?;
+            return Ok(s);
         }
         Ok(s)
-    }
-
-    async fn recv_extend_handshake(&mut self) -> io::Result<ExtendedHandshake> {
-        let msg = recv_msg_header(self).await?;
-        match msg {
-            Message::Extended(mut e) => {
-                let ext_msg = e.recv().await?;
-                match ext_msg {
-                    ExtendedMsg::Handshake(exth) => Ok(exth),
-                    other => Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("expecting extension handshake, receive extension msg {other:?}"),
-                    )),
-                }
-            }
-            other => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("expecting extension handshake, receive {other:?}"),
-            )),
-        }
     }
 
     pub async fn send_keepalive(&mut self) -> io::Result<()> {
@@ -623,7 +709,6 @@ where
     }
 
     pub fn peer_addr(&self) -> SocketAddr {
-        // TODO: change a different name
         self.peer_addr
     }
 }
@@ -632,7 +717,7 @@ impl<T> GeneralConnSealed for ReadStream<T>
 where
     T: AsyncRead + Unpin,
 {
-    type Read = BufReader<T>;
+    type Read = T;
 
     fn general_reader(&mut self) -> GeneralConnHandle<Self::Read> {
         GeneralConnHandle {
@@ -649,6 +734,20 @@ impl FuncBits {
         self.0[5] & 0x10 > 0
     }
 
+    pub const fn set_extension(mut self) -> Self {
+        self.0[5] |= 0x10;
+        self
+    }
+
+    pub const fn have_dht(&self) -> bool {
+        self.0[7] & 0x1 > 0
+    }
+
+    pub const fn set_dht(mut self) -> Self {
+        self.0[7] |= 0x1;
+        self
+    }
+
     pub const fn new(b: [u8; 8]) -> Self {
         Self(b)
     }
@@ -659,11 +758,6 @@ impl FuncBits {
 
     pub const fn basic() -> Self {
         Self::none().set_extension()
-    }
-
-    pub const fn set_extension(mut self) -> Self {
-        self.0[5] |= 0x10;
-        self
     }
 
     fn common(mut self, other: &Self) -> Self {
@@ -705,6 +799,7 @@ impl MsgTy {
     const REQUEST: u8 = 6;
     const PIECE: u8 = 7;
     const CANCEL: u8 = 8;
+    const PORT: u8 = 9;
     const EXTENDED: u8 = 20;
 
     const KEEPALIVE_LEN: u32 = 0;
@@ -731,6 +826,7 @@ pub enum Message<'a, T> {
     Request(Request),
     Piece(Piece<'a, T>),
     Cancel(Request),
+    Port(u16),
     Extended(ExtendedRecv<'a, T>),
 }
 
@@ -743,10 +839,11 @@ impl<T> Message<'_, T> {
             Message::Interested => 1,
             Message::NotInterested => 1,
             Message::Have(_) => 5,
-            Message::BitField(_) => unimplemented!(), //1 + ((3 + b.len()) >> 2),
+            Message::BitField(_) => unimplemented!(),
             Message::Request(_) => 13,
             Message::Piece(_) => unimplemented!(),
             Message::Cancel(_) => 13,
+            Message::Port(_) => 3,
             Message::Extended(_) => unimplemented!(),
         }
     }
@@ -762,6 +859,7 @@ impl<T> Message<'_, T> {
             Message::Request(_) => MsgTy::REQUEST,
             Message::Piece(_) => MsgTy::PIECE,
             Message::Cancel(_) => MsgTy::CANCEL,
+            Message::Port(_) => MsgTy::PORT,
             Message::Extended(_) => MsgTy::EXTENDED,
         }
     }
@@ -805,6 +903,9 @@ impl<T> std::fmt::Debug for Message<'_, T> {
             }
             Message::Cancel(request) => {
                 request.fmt(f)?;
+            }
+            Message::Port(p) => {
+                f.write_str(&format!("Port: {}", *p))?;
             }
             Message::Extended(extend) => {
                 extend.fmt(f)?;
@@ -1054,7 +1155,7 @@ pub enum ExtendedMsg {
     Unknown(u8),
 }
 
-#[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ExtendedHandshake {
     // TODO: when sending can use 'static ref
     pub m: HashMap<String, u8>, // supported extensions and id number
@@ -1764,6 +1865,24 @@ where
                 handle,
             }))
         }
+        MsgTy::PORT => {
+            assert!(state.filled >= 5);
+            let mut filled_len = state.filled - 5;
+            while filled_len < 2 {
+                let n = reader.read(&mut state.field1[filled_len..2]).await?;
+                state.filled += n;
+                filled_len += n;
+                if n == 0 {
+                    // Go has ZeroReadIsEof, in TCP, this should be true
+                    // TODO: use custom error
+                    warn!("closed conn");
+                    return Err(io::Error::new(io::ErrorKind::BrokenPipe, "!"));
+                }
+            }
+            state.filled = 0;
+            let port = u16::from_be_bytes([state.field1[0], state.field1[1]]);
+            Ok(Message::Port(port))
+        }
         MsgTy::CANCEL => {
             // TODO: check length match
             assert!(state.filled >= 5);
@@ -1838,6 +1957,29 @@ where
     }
 }
 
+async fn recv_extend_handshake<'a, T>(handle: &'a mut T) -> io::Result<ExtendedHandshake>
+where
+    T: GeneralConn,
+{
+    let msg = recv_msg_header(handle).await?;
+    match msg {
+        Message::Extended(mut e) => {
+            let ext_msg = e.recv().await?;
+            match ext_msg {
+                ExtendedMsg::Handshake(exth) => Ok(exth),
+                other => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("expecting extension handshake, receive extension msg {other:?}"),
+                )),
+            }
+        }
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("expecting extension handshake, receive {other:?}"),
+        )),
+    }
+}
+
 async fn recv_handshake<T: AsyncRead + Unpin>(handle: &mut T) -> io::Result<Handshake> {
     let first = handle.read_u8().await?;
     if first != 19 {
@@ -1870,6 +2012,23 @@ mod tests {
 
     use super::*;
     use tokio::io::{duplex, split, DuplexStream, ReadHalf, WriteHalf};
+
+    impl Split for DuplexStream {
+        type R = ReadHalf<DuplexStream>;
+        type W = WriteHalf<DuplexStream>;
+
+        fn split(self) -> (Self::R, Self::W) {
+            tokio::io::split(self)
+        }
+
+        fn remote_addr(&self) -> SocketAddr {
+            DEFAULT_ADDR
+        }
+
+        fn reunite(r: Self::R, w: Self::W) -> Result<Self, ReuniteError> {
+            Ok(r.unsplit(w))
+        }
+    }
 
     macro_rules! extract_enum {
         ($expression:expr, $pattern:path) => {
@@ -1949,20 +2108,22 @@ mod tests {
             ReadStream<ReadHalf<DuplexStream>>,
             WriteStream<WriteHalf<DuplexStream>>,
         ) {
-            const DEFAULT_ADDR: SocketAddr =
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0);
             let (read_end, write_end) = split(self.inner);
             (
                 ReadStream {
-                    inner: BufReader::new(read_end),
+                    inner: read_end,
                     peer_addr: DEFAULT_ADDR,
                     partial_header: EMPTY_PARTIAL_HEADER,
+                    peer_id: [0; 20],
+                    reserved: [0; 8].into(),
                 },
                 WriteStream {
-                    inner: BufWriter::new(write_end),
+                    inner: write_end,
                     peer_addr: DEFAULT_ADDR,
                     extension_id: self.extension_id,
                     pex_peers: HashMap::new(),
+                    peer_id: [0; 20],
+                    reserved: [0; 8].into(),
                 },
             )
         }

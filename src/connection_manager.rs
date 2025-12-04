@@ -42,12 +42,13 @@ impl ConnectionManagerHandle {
     where
         T: AsyncRead + AsyncWrite + Split + Unpin + Send + 'static,
     {
-        let (read_stream, write_stream) = conn.split();
+        use tokio::io::{BufReader, BufWriter};
+        let (read_stream, write_stream) = conn.split_buffered();
 
         let (recv_tx, recv_rx) = mpsc::unbounded_channel();
         let (recv_done_tx, recv_done_rx) = oneshot::channel();
         let recv_cancel = CancellationToken::new();
-        let recv_stream: RecvStream<T> = RecvStream {
+        let recv_stream = RecvStream::<BufReader<<T as Split>::R>> {
             receiver: recv_rx,
             read_stream,
             transmit_handle: trh,
@@ -57,7 +58,7 @@ impl ConnectionManagerHandle {
         let (send_tx, send_rx) = mpsc::unbounded_channel();
         let send_cancel = CancellationToken::new();
         let (send_done_tx, send_done_rx) = oneshot::channel();
-        let send_stream: SendStream<T> = SendStream {
+        let send_stream = SendStream::<BufWriter<<T as Split>::W>> {
             receiver: send_rx,
             write_stream,
         };
@@ -132,12 +133,9 @@ struct RecvStreamHandle {
     done: oneshot::Receiver<()>,
 }
 
-struct RecvStream<T>
-where
-    T: Split,
-{
+struct RecvStream<T> {
     receiver: mpsc::UnboundedReceiver<Msg>,
-    read_stream: ReadStream<<T as Split>::R>,
+    read_stream: ReadStream<T>,
     transmit_handle: TransmitManagerHandle,
 
     blk_recv_count: u32,
@@ -149,12 +147,9 @@ struct SendStreamHandle {
     done: oneshot::Receiver<()>,
 }
 
-struct SendStream<T>
-where
-    T: Split,
-{
+struct SendStream<T> {
     receiver: mpsc::UnboundedReceiver<Msg>,
-    write_stream: WriteStream<<T as Split>::W>,
+    write_stream: WriteStream<T>,
     // TODO: do we use this to get blocks to requests?
     // so we can receive requests from recv_handle
     // transmit_handle: TransmitManagerHandle,
@@ -165,7 +160,7 @@ async fn run_recv_stream<T>(
     cancel: CancellationToken,
     done: oneshot::Sender<()>,
 ) where
-    T: Split,
+    T: AsyncRead + Unpin,
 {
     info!("in recv stream");
     let mut ticker = tokio::time::interval(time::Duration::from_millis(1000));
@@ -298,6 +293,9 @@ where
             todo!();
             0
         }
+        Message::Port(port) => {
+            todo!()
+        }
         Message::Extended(extend) => {
             handle_extended_msg(&addr, tmh, extend).await;
             1
@@ -310,7 +308,7 @@ async fn run_send_stream<T>(
     cancel: CancellationToken,
     done: oneshot::Sender<()>,
 ) where
-    T: Split,
+    T: AsyncWrite + Unpin,
 {
     let mut interval = tokio::time::interval(time::Duration::from_secs(120));
     // conn.write_stream.send_interested().await;
@@ -341,7 +339,7 @@ async fn run_send_stream<T>(
 
 impl<T> SendStream<T>
 where
-    T: Split,
+    T: AsyncWrite + Unpin,
 {
     async fn handle_cmd(&mut self, msg: Msg) {
         match msg {

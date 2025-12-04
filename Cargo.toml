@@ -44,3 +44,5 @@ path = "src/main.rs"
 name = "dht-client"
 path = "src/dht-client/main.rs"
 
+[lib]
+path = "src/lib.rs"
