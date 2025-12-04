@@ -1,6 +1,5 @@
 use bt_bencode::ByteString;
 use bt_bencode::Value as BtValue;
-use core::time;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::collections::HashMap;
@@ -12,6 +11,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::{CancellationToken, DropGuard};
@@ -269,6 +269,8 @@ impl DHT {
             route4: RoutingTable::new(id),
             route6: RoutingTable::new(id),
             tmap,
+            storage: Storage::new(),
+
             nodes_buf: Vec::with_capacity(8),
             nodes4_buf: VecNode4(Vec::with_capacity(8)),
             nodes6_buf: VecNode6(Vec::with_capacity(8)),
@@ -582,6 +584,9 @@ struct Server {
     route6: RoutingTable,
     route4: RoutingTable,
 
+    // peer info storage
+    storage: Storage,
+
     /// transaction id map
     tmap: Arc<Mutex<TransactionMap>>,
 
@@ -722,13 +727,36 @@ impl Server {
             KRPCInner::Request(Arg::AnnouncePeer(a)) => {
                 info!("receive announce_peer from {}", from_addr);
                 add_route(a.id);
-                // todo!("add data to storage")
+                let port = if a.implied_port == 1 {
+                    from_addr.port()
+                } else {
+                    a.port
+                };
+                let naddr = NodeAddr {
+                    id: a.id,
+                    addr: SocketAddr::new(from_addr.ip(), port),
+                };
+                self.storage.add(a.info_hash, naddr);
+                let resp = KRPC {
+                    t: krpc.t,
+                    v: version,
+                    inner: KRPCInner::Response(Resp {
+                        id: self.id,
+                        nodes: None,
+                        nodes6: None,
+                        token: None,
+                        values: None,
+                    }),
+                };
+                _ = self.send_response(from_addr, &resp).await;
+                // TODO:("remove old peer entries");
             }
             KRPCInner::Request(Arg::FindNode(f)) => {
                 info!("receive find_node from {}", from_addr);
                 add_route(f.id);
                 self.nodes_buf.clear();
                 if ipv6 {
+                    // TODO: support "want" field
                     self.route6
                         .get_k_closest_nodes(&f.target, 8, &mut self.nodes_buf);
                 } else {
@@ -763,6 +791,12 @@ impl Server {
                         .get_k_closest_nodes(&gp.info_hash, 8, &mut self.nodes_buf);
                 }
                 to_nodes64(&self.nodes_buf, &mut self.nodes4_buf, &mut self.nodes6_buf);
+                let peers: Vec<ByteSocketAddr> = self
+                    .storage
+                    .get(&gp.info_hash, ipv6)
+                    .into_iter()
+                    .map(|v| v.addr.into())
+                    .collect();
                 let resp = KRPC {
                     t: krpc.t,
                     v: version,
@@ -771,7 +805,7 @@ impl Server {
                         nodes: (!ipv6).then_some(self.nodes4_buf.clone()),
                         nodes6: (ipv6).then_some(self.nodes6_buf.clone()),
                         token: Some("abaaabba".into()), // TODO generate token
-                        values: None,                   // TODO: return peers from storage
+                        values: if peers.is_empty() { None } else { Some(peers) },
                     }),
                 };
                 _ = self.send_response(from_addr, &resp).await;
@@ -817,6 +851,54 @@ impl Server {
         };
         if let Err(e) = self.s.send_to(&self.out_buf, addr).await {
             warn!("send udp packet failed error {e}");
+        }
+    }
+}
+
+type ContactInfo = (NodeAddr, time::Instant);
+struct Storage {
+    peers4: HashMap<NodeID, Vec<ContactInfo>>,
+    peers6: HashMap<NodeID, Vec<ContactInfo>>,
+}
+
+impl Storage {
+    fn new() -> Self {
+        Self {
+            peers4: HashMap::new(),
+            peers6: HashMap::new(),
+        }
+    }
+
+    fn add(&mut self, id: NodeID, naddr: NodeAddr) {
+        let ipv6 = is_ipv6(naddr.addr);
+
+        // the ipv4/v6 aware representation
+        // must convert v6 to v4 because the bencode serialization format
+        // is different
+        let naddr = NodeAddr {
+            id: naddr.id,
+            addr: SocketAddr::new(naddr.addr.ip().to_canonical(), naddr.addr.port()),
+        };
+
+        if ipv6 {
+            self.peers6
+                .entry(id)
+                .and_modify(|v| v.push((naddr, time::Instant::now())))
+                .or_insert(vec![(naddr, time::Instant::now())]);
+        } else {
+            self.peers4
+                .entry(id)
+                .and_modify(|v| v.push((naddr, time::Instant::now())))
+                .or_insert(vec![(naddr, time::Instant::now())]);
+        }
+    }
+
+    fn get(&self, id: &NodeID, ipv6: bool) -> Vec<NodeAddr> {
+        let map = if ipv6 { &self.peers6 } else { &self.peers4 };
+        if let Some(v) = map.get(id) {
+            v.iter().map(|(n, _)| *n).collect()
+        } else {
+            vec![]
         }
     }
 }

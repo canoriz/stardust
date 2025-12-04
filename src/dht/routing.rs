@@ -116,18 +116,13 @@ impl RoutingTable {
             // let upper = bitwise_op(tmp, mask_upper, u8::bitor);
             let lower = bitwise_op(tmp, mask_lower, u8::bitand);
 
-            let add_nodes = if closest.len() < k {
-                true
+            let add_nodes = if let Some(Dist { dist, .. }) = closest.last() {
+                // only add nodes closest have less than k node inside
+                // of if this bucket's possible minimum distance is lesser
+                // than closest have.
+                lower < *dist || closest.len() < k
             } else {
-                if let Some(s) = closest.last() {
-                    if lower < s.dist {
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    unreachable!()
-                }
+                true
             };
 
             if add_nodes {
