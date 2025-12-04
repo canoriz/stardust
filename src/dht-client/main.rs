@@ -1,7 +1,7 @@
 use core::time;
 use std::{sync::Arc, time::Duration};
 
-use stardust::dht::{NetType, NodeID, RpcAddr, DHT};
+use stardust::dht::{NodeID, RpcAddr, DHT};
 use tokio::{
     io::{stdin, stdout, AsyncBufReadExt, AsyncWriteExt, BufReader},
     time::timeout,
@@ -30,12 +30,7 @@ async fn main() -> std::io::Result<()> {
     //     0xbb, 0x73, 0xfa, 0x11, 0x7e,
     // ];
 
-    let client = Arc::new(DHT::new(
-        id,
-        49999,
-        "ST01".into(),
-        NetType::V4 | NetType::V6,
-    ));
+    let client = Arc::new(DHT::new(id, 49999, "ST01".into()));
     let r = timeout(
         time::Duration::from_millis(5000),
         client.ping_rpc(

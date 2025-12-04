@@ -34,12 +34,8 @@ pub struct DHT {
 
     tid: AtomicU64,
 
-    net_type: NetType,
-
-    // ipv6 request sender
-    tx6: mpsc::Sender<Req>,
-    // ipv4 request sender
-    tx4: mpsc::Sender<Req>,
+    // request sender
+    tx: mpsc::Sender<Req>,
 
     tmap: Arc<Mutex<TransactionMap>>,
     _cancel_token: DropGuard,
@@ -214,107 +210,29 @@ impl Drop for TransactionGuard {
     }
 }
 
-pub struct NetType(u32);
-
-impl NetType {
-    pub const V4: NetType = NetType(0b1);
-    pub const V6: NetType = NetType(0b10);
-
-    fn enabled(&self, nt: Self) -> bool {
-        self.0 & nt.0 > 0
-    }
-}
-
-impl std::ops::BitOr for NetType {
-    type Output = Self;
-
-    #[inline]
-    fn bitor(self, other: Self) -> Self {
-        Self(self.0 | other.0)
-    }
-}
-
-impl std::fmt::Debug for NetType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.0 & (Self::V4.0 | Self::V6.0) > 0 {
-            write!(f, "DUAL STACK")
-        } else if self.0 & (Self::V4.0) > 0 {
-            write!(f, "IPV4 ONLY")
-        } else if self.0 & (Self::V6.0) > 0 {
-            write!(f, "IPV6 ONLY")
-        } else {
-            write!(f, "NONE")
-        }
-    }
-}
-
 impl DHT {
-    pub fn new(id: NodeID, port: u16, version: String, nt: NetType) -> Self {
-        let mut nt = nt;
-        let (tx6, rx6) = mpsc::channel(2048);
-        let (tx4, rx4) = mpsc::channel(2048);
+    pub fn new(id: NodeID, port: u16, version: String) -> Self {
+        let (tx, rx) = mpsc::channel(2048);
         let tmap = Arc::new(Mutex::new(HashMap::new()));
         let cancel_token = CancellationToken::new();
 
-        if nt.enabled(NetType::V6) {
-            if let Err(e) = DHT::run_ipv6(id, port, rx6, tmap.clone(), cancel_token.clone()) {
-                warn!("dht start v6 server error {e}");
-                nt = NetType(nt.0 & !(NetType::V6.0));
-            }
-        }
-        if nt.enabled(NetType::V4) {
-            if let Err(e) = DHT::run_ipv4(id, port, rx4, tmap.clone(), cancel_token.clone()) {
-                warn!("dht start v4 server error {e}");
-                nt = NetType(nt.0 & !(NetType::V4.0));
-            }
+        if let Err(e) = DHT::run_ipv6(id, port, rx, tmap.clone(), cancel_token.clone()) {
+            warn!("dht start v6 server error {e}");
         }
         Self {
             id,
             port,
             version,
-            tx6,
-            tx4,
+            tx,
             tid: 0.into(),
             tmap,
-            net_type: nt,
             _cancel_token: cancel_token.drop_guard(),
         }
     }
 
-    fn run_ipv4(
-        id: NodeID,
-        port: u16,
-        rx: mpsc::Receiver<Req>,
-        tmap: Arc<Mutex<TransactionMap>>,
-        cancel: CancellationToken,
-    ) -> io::Result<()> {
-        let addr = format!("0.0.0.0:{}", port);
-        let socket = match std::net::UdpSocket::bind(&addr) {
-            Ok(s) => {
-                s.set_nonblocking(true)?;
-                UdpSocket::from_std(s)?
-            }
-            Err(e) => {
-                warn!("error binding dht v4 socket at {addr}, reason {e}");
-                return Err(e);
-            }
-        };
-
-        let server = Server {
-            ipv6: false,
-            id,
-            s: socket,
-            route: RoutingTable::new(id),
-            tmap,
-            nodes_buf: Vec::with_capacity(8),
-            nodes4_buf: VecNode4(Vec::with_capacity(8)),
-            nodes6_buf: VecNode6(Vec::with_capacity(8)),
-            out_buf: Vec::with_capacity(BUF_MAX),
-        };
-        tokio::spawn(server.serve(rx, cancel));
-        Ok(())
-    }
-
+    /// Run a dual-stack ipv6 socket listening port.
+    /// This socket can receive ipv4 packets from a
+    /// v4 mapped v6 address.
     fn run_ipv6(
         id: NodeID,
         port: u16,
@@ -322,25 +240,34 @@ impl DHT {
         tmap: Arc<Mutex<TransactionMap>>,
         cancel: CancellationToken,
     ) -> io::Result<()> {
+        use socket2::{Domain, Protocol, Socket, Type};
+
         // TODO: multi-homing is common in ipv6
         // should bind to public address, see BEP 32
-        let addr = format!("[::]:{}", port);
-        let socket = match std::net::UdpSocket::bind(&addr) {
-            Ok(s) => {
+        let addr: std::net::SocketAddr = format!("[::]:{}", port).parse().unwrap();
+        let sock = socket2::Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+        if let Err(e) = sock.set_only_v6(false) {
+            warn!("set socket dual-stack error {e}");
+            return Err(e);
+        }
+
+        let socket = match sock.bind(&addr.into()) {
+            Ok(_) => {
+                let s: std::net::UdpSocket = sock.into();
                 s.set_nonblocking(true)?;
                 UdpSocket::from_std(s)?
             }
             Err(e) => {
-                warn!("error binding dht v6 socket at {addr}, reason {e}");
+                warn!("error binding dht v6 dual stack socket at {addr}, reason {e}");
                 return Err(e);
             }
         };
 
         let server = Server {
-            ipv6: true,
             id,
             s: socket,
-            route: RoutingTable::new(id),
+            route4: RoutingTable::new(id),
+            route6: RoutingTable::new(id),
             tmap,
             nodes_buf: Vec::with_capacity(8),
             nodes4_buf: VecNode4(Vec::with_capacity(8)),
@@ -351,9 +278,9 @@ impl DHT {
         Ok(())
     }
 
-    async fn remove_route(&self, id: NodeID) -> io::Result<()> {
-        let req = Req::RemoveRoute { id };
-        self.tx6.send(req).await.map_err(|_| {
+    async fn remove_route(&self, ipv6: bool, id: NodeID) -> io::Result<()> {
+        let req = Req::RemoveRoute { ipv6, id };
+        self.tx.send(req).await.map_err(|_| {
             io::Error::new(
                 io::ErrorKind::Other,
                 "send remove-route request to worker error",
@@ -369,21 +296,18 @@ impl DHT {
     ) -> io::Result<Resp> {
         let (tx, rx) = oneshot::channel();
         let tid = krpc.t.clone();
-        let ip_addr = match addr {
+        let sock_addr = match addr {
             RpcAddr::ID(na) => na.addr,
             RpcAddr::NoID(a) => a,
         };
+        let ipv6 = is_ipv6(sock_addr);
         let req = Req::KRPC {
-            addr: ip_addr,
+            addr: sock_addr,
             krpc,
         };
 
         let _drop_guard = TransactionGuard::new(tid.into_vec(), self.tmap.clone(), tx);
-        let send_to_worker = match ip_addr {
-            SocketAddr::V4(_) => self.tx4.send(req).await,
-            SocketAddr::V6(_) => self.tx6.send(req).await,
-        };
-        if send_to_worker.is_err() {
+        if self.tx.send(req).await.is_err() {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
                 "send KRPC request to worker error",
@@ -398,7 +322,7 @@ impl DHT {
             )),
             Err(_) => {
                 if let RpcAddr::ID(na) = addr {
-                    self.remove_route(na.id).await?;
+                    self.remove_route(ipv6, na.id).await?;
                 }
                 Err(io::Error::new(io::ErrorKind::Other, "timeout"))
             }
@@ -420,26 +344,16 @@ impl DHT {
             }
         }
 
-        let mut nodes = if !ipv6 && self.net_type.enabled(NetType::V4) {
-            self.tx4.send(Req::GetClosestNodes { id, k, tx: tx }).await;
+        let mut nodes = {
+            _ = self.tx.send(Req::GetClosestNodes { ipv6, id, k, tx }).await;
             match wait_result(rx).await {
                 Ok(r) => r,
                 Err(e) => {
-                    warn!("dht: ipv4 get_k_closest err {}", e);
+                    let protocol = if ipv6 { "ipv6" } else { "ipv4" };
+                    warn!("dht: {protocol} get_k_closest err {e}");
                     vec![]
                 }
             }
-        } else if ipv6 && self.net_type.enabled(NetType::V6) {
-            self.tx6.send(Req::GetClosestNodes { id, k, tx }).await;
-            match wait_result(rx).await {
-                Ok(r) => r,
-                Err(e) => {
-                    warn!("dht: ipv6 get_k_closest err {}", e);
-                    vec![]
-                }
-            }
-        } else {
-            vec![]
         };
 
         nodes.sort_by_cached_key(|n| dist(&id, &n.id));
@@ -644,9 +558,11 @@ impl DHT {
 
 enum Req {
     RemoveRoute {
+        ipv6: bool,
         id: NodeID,
     },
     GetClosestNodes {
+        ipv6: bool,
         id: NodeID,
         k: usize,
         tx: oneshot::Sender<Vec<NodeAddr>>,
@@ -660,11 +576,11 @@ enum Req {
 type TransactionMap = HashMap<Vec<u8>, oneshot::Sender<io::Result<Resp>>>;
 
 struct Server {
-    ipv6: bool,
     s: UdpSocket,
     id: NodeID,
 
-    route: RoutingTable,
+    route6: RoutingTable,
+    route4: RoutingTable,
 
     /// transaction id map
     tmap: Arc<Mutex<TransactionMap>>,
@@ -685,6 +601,13 @@ fn to_nodes64(ns: &[NodeAddr], v4: &mut VecNode4, v6: &mut VecNode6) {
             SocketAddr::V4(s4) => r4.push((na.id, s4)),
             SocketAddr::V6(s6) => r6.push((na.id, s6)),
         }
+    }
+}
+
+fn is_ipv6(addr: SocketAddr) -> bool {
+    match addr {
+        SocketAddr::V4(_) => true,
+        SocketAddr::V6(v6) => v6.ip().to_ipv4_mapped().is_none(),
     }
 }
 
@@ -709,10 +632,20 @@ impl Server {
     async fn handle_user_req(&mut self, req: Req) {
         match req {
             Req::KRPC { addr, krpc } => self.handle_out_req(addr, krpc).await,
-            Req::RemoveRoute { id } => self.route.remove_route(&id),
-            Req::GetClosestNodes { id, k, tx } => {
+            Req::RemoveRoute { ipv6, id } => {
+                if ipv6 {
+                    self.route6.remove_route(&id);
+                } else {
+                    self.route4.remove_route(&id);
+                }
+            }
+            Req::GetClosestNodes { ipv6, id, k, tx } => {
                 let mut nodes = Vec::with_capacity(8);
-                self.route.get_k_closest_nodes(&id, k, &mut nodes);
+                if ipv6 {
+                    self.route6.get_k_closest_nodes(&id, k, &mut nodes);
+                } else {
+                    self.route4.get_k_closest_nodes(&id, k, &mut nodes);
+                }
                 _ = tx.send(nodes);
             }
         }
@@ -755,6 +688,20 @@ impl Server {
 
     async fn handle_krpc_in(&mut self, krpc: KRPC, from_addr: SocketAddr) {
         let version: ByteString = "st01".into();
+        let ipv6 = is_ipv6(from_addr);
+        let mut add_route = |id: NodeID| {
+            if ipv6 {
+                self.route6.add_route(NodeAddr {
+                    id,
+                    addr: from_addr,
+                });
+            } else {
+                self.route4.add_route(NodeAddr {
+                    id,
+                    addr: from_addr,
+                });
+            }
+        };
         match krpc.inner {
             KRPCInner::Request(Arg::Ping(p)) => {
                 info!("receive ping from {}", from_addr);
@@ -769,29 +716,25 @@ impl Server {
                         values: None,
                     }),
                 };
-                self.route.add_route(NodeAddr {
-                    id: p.id,
-                    addr: from_addr,
-                });
+                add_route(p.id);
                 _ = self.send_response(from_addr, &resp).await;
             }
             KRPCInner::Request(Arg::AnnouncePeer(a)) => {
                 info!("receive announce_peer from {}", from_addr);
-                self.route.add_route(NodeAddr {
-                    id: a.id,
-                    addr: from_addr,
-                });
+                add_route(a.id);
                 // todo!("add data to storage")
             }
             KRPCInner::Request(Arg::FindNode(f)) => {
                 info!("receive find_node from {}", from_addr);
-                self.route.add_route(NodeAddr {
-                    id: f.id,
-                    addr: from_addr,
-                });
+                add_route(f.id);
                 self.nodes_buf.clear();
-                self.route
-                    .get_k_closest_nodes(&f.target, 8, &mut self.nodes_buf);
+                if ipv6 {
+                    self.route6
+                        .get_k_closest_nodes(&f.target, 8, &mut self.nodes_buf);
+                } else {
+                    self.route4
+                        .get_k_closest_nodes(&f.target, 8, &mut self.nodes_buf);
+                }
                 to_nodes64(&self.nodes_buf, &mut self.nodes4_buf, &mut self.nodes6_buf);
                 let resp = KRPC {
                     t: krpc.t,
@@ -799,8 +742,8 @@ impl Server {
                     inner: KRPCInner::Response(Resp {
                         id: self.id,
                         // TODO: optimize clone, use ref or cow
-                        nodes: (!self.ipv6).then_some(self.nodes4_buf.clone()),
-                        nodes6: (self.ipv6).then_some(self.nodes6_buf.clone()),
+                        nodes: (!ipv6).then_some(self.nodes4_buf.clone()),
+                        nodes6: (ipv6).then_some(self.nodes6_buf.clone()),
                         token: None,
                         values: None,
                     }),
@@ -809,21 +752,24 @@ impl Server {
             }
             KRPCInner::Request(Arg::GetPeers(gp)) => {
                 info!("receive get_peer from {}", from_addr);
-                self.route.add_route(NodeAddr {
-                    id: gp.id,
-                    addr: from_addr,
-                });
+                add_route(gp.id);
                 self.nodes_buf.clear();
-                self.route
-                    .get_k_closest_nodes(&gp.info_hash, 8, &mut self.nodes_buf);
+                if ipv6 {
+                    // TODO: support "want" field
+                    self.route6
+                        .get_k_closest_nodes(&gp.info_hash, 8, &mut self.nodes_buf);
+                } else {
+                    self.route4
+                        .get_k_closest_nodes(&gp.info_hash, 8, &mut self.nodes_buf);
+                }
                 to_nodes64(&self.nodes_buf, &mut self.nodes4_buf, &mut self.nodes6_buf);
                 let resp = KRPC {
                     t: krpc.t,
                     v: version,
                     inner: KRPCInner::Response(Resp {
                         id: self.id,
-                        nodes: (!self.ipv6).then_some(self.nodes4_buf.clone()),
-                        nodes6: (self.ipv6).then_some(self.nodes6_buf.clone()),
+                        nodes: (!ipv6).then_some(self.nodes4_buf.clone()),
+                        nodes6: (ipv6).then_some(self.nodes6_buf.clone()),
                         token: Some("abaaabba".into()), // TODO generate token
                         values: None,                   // TODO: return peers from storage
                     }),
@@ -831,28 +777,21 @@ impl Server {
                 _ = self.send_response(from_addr, &resp).await;
             }
             KRPCInner::Response(resp) => {
-                self.route.add_route(NodeAddr {
-                    id: resp.id,
-                    addr: from_addr,
-                });
+                add_route(resp.id);
                 if let Some(ns) = &resp.nodes6 {
-                    if self.ipv6 {
-                        for (id, addr) in &ns.0 {
-                            self.route.add_route(NodeAddr {
-                                id: *id,
-                                addr: SocketAddr::V6(*addr),
-                            });
-                        }
+                    for (id, addr) in &ns.0 {
+                        self.route6.add_route(NodeAddr {
+                            id: *id,
+                            addr: SocketAddr::V6(*addr),
+                        });
                     }
                 }
                 if let Some(ns) = &resp.nodes {
-                    if !self.ipv6 {
-                        for (id, addr) in &ns.0 {
-                            self.route.add_route(NodeAddr {
-                                id: *id,
-                                addr: SocketAddr::V4(*addr),
-                            });
-                        }
+                    for (id, addr) in &ns.0 {
+                        self.route4.add_route(NodeAddr {
+                            id: *id,
+                            addr: SocketAddr::V4(*addr),
+                        });
                     }
                 }
                 if let Some(ret) = self.tmap.lock().unwrap().remove(krpc.t.as_slice()) {
