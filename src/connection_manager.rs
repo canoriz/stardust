@@ -12,7 +12,8 @@ use crate::cache::{AbortErr, ArcCache, GetRefErr, PieceBuf, PieceKey, Ref};
 use crate::metadata;
 use crate::picker::{start_receive_piece_block, BlockRequests};
 use crate::protocol::{
-    self, BTStream, ExtendedMsg, GeneralConn, Message, Piece, ReadStream, Split, WriteStream,
+    self, BTStream, Conn, ExtendedMsg, GeneralConn, Message, Piece, ReadStream, Reader, Split,
+    WriteStream, Writer,
 };
 use crate::transmit_manager::Msg as TransmitMsg;
 use crate::transmit_manager::TransmitManagerHandle;
@@ -40,7 +41,7 @@ pub(crate) struct ConnectionManagerHandle {
 impl ConnectionManagerHandle {
     pub fn new<T>(conn: BTStream<T>, trh: TransmitManagerHandle, m: Arc<metadata::Metadata>) -> Self
     where
-        T: AsyncRead + AsyncWrite + Split + Unpin + Send + 'static,
+        T: AsyncRead + AsyncWrite + Split+ Unpin + Send + 'static,
     {
         use tokio::io::{BufReader, BufWriter};
         let (read_stream, write_stream) = conn.split_buffered();
@@ -59,6 +60,59 @@ impl ConnectionManagerHandle {
         let send_cancel = CancellationToken::new();
         let (send_done_tx, send_done_rx) = oneshot::channel();
         let send_stream = SendStream::<BufWriter<<T as Split>::W>> {
+            receiver: send_rx,
+            write_stream,
+        };
+
+        tokio::spawn(run_recv_stream(
+            recv_stream,
+            recv_cancel.clone(),
+            recv_done_tx,
+        ));
+        tokio::spawn(run_send_stream(
+            send_stream,
+            send_cancel.clone(),
+            send_done_tx,
+        ));
+        let recv_stream_handle = RecvStreamHandle {
+            sender: recv_tx,
+            cancel: recv_cancel.drop_guard(),
+            done: recv_done_rx,
+        };
+        let send_stream_handle = SendStreamHandle {
+            sender: send_tx,
+            cancel: send_cancel.drop_guard(),
+            done: send_done_rx,
+        };
+
+        Self {
+            recv_stream: recv_stream_handle,
+            send_stream: send_stream_handle,
+        }
+    }
+
+    pub fn new_dyn(
+        conn: BTStream<Box<dyn Conn>>,
+        trh: TransmitManagerHandle,
+        m: Arc<metadata::Metadata>,
+    ) -> Self {
+        use tokio::io::{BufReader, BufWriter};
+        let (read_stream, write_stream) = conn.split_buffered();
+
+        let (recv_tx, recv_rx) = mpsc::unbounded_channel();
+        let (recv_done_tx, recv_done_rx) = oneshot::channel();
+        let recv_cancel = CancellationToken::new();
+        let recv_stream = RecvStream::<BufReader<Box<dyn Reader>>> {
+            receiver: recv_rx,
+            read_stream,
+            transmit_handle: trh,
+            blk_recv_count: 0,
+        };
+
+        let (send_tx, send_rx) = mpsc::unbounded_channel();
+        let send_cancel = CancellationToken::new();
+        let (send_done_tx, send_done_rx) = oneshot::channel();
+        let send_stream = SendStream::<BufWriter<Box<dyn Writer>>> {
             receiver: send_rx,
             write_stream,
         };

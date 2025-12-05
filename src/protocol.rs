@@ -19,15 +19,65 @@ use tracing::{info, warn};
 
 const DEFAULT_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0);
 
-pub trait Split
-where
-    Self: Sized,
-{
-    type R: AsyncRead + Send + Unpin + 'static;
-    type W: AsyncWrite + Send + Unpin + 'static;
+pub trait Reader: AsyncRead + Send + Unpin + 'static {}
+pub trait Writer: AsyncWrite + Send + Unpin + 'static {}
+impl<T> Reader for T where T: AsyncRead + Send + Unpin + 'static {}
+impl<T> Writer for T where T: AsyncWrite + Send + Unpin + 'static {}
+
+pub trait Split {
+    type R: Reader;
+    type W: Writer;
+
+    /// split connection to two individual read end and write end
     fn split(self) -> (Self::R, Self::W);
+
+    /// the remote address of this connection
     fn remote_addr(&self) -> SocketAddr;
-    fn reunite(r: Self::R, w: Self::W) -> Result<Self, ReuniteError>;
+
+    /// the underlying protocol
+    fn protocol() -> &'static str;
+}
+
+/// Dynamic connection
+/// BTStream can operate with any connection implemented this.
+// prepared for utp/tcp/proxy support
+pub trait Conn: Send {
+    fn split(self: Box<Self>) -> (Box<dyn Reader>, Box<dyn Writer>);
+    fn remote_addr(&self) -> SocketAddr;
+    fn protocol(&self) -> &'static str;
+}
+
+impl fmt::Debug for dyn Conn {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("dyn Connection")
+            .field("remote_addr", &self.remote_addr())
+            .field("protocol", &self.protocol())
+            .finish()
+    }
+}
+
+impl<T> Conn for T
+where
+    T: Split + Send,
+{
+    fn split(self: Box<Self>) -> (Box<dyn Reader>, Box<dyn Writer>) {
+        let (r, w) = Split::split(*self);
+        (Box::new(r), Box::new(w))
+    }
+
+    fn remote_addr(&self) -> SocketAddr {
+        Split::remote_addr(self)
+    }
+
+    fn protocol(&self) -> &'static str {
+        T::protocol()
+    }
+}
+
+pub trait Reunite {
+    type W;
+    type U;
+    fn reunite(self, w: Self::W) -> Result<Self::U, ReuniteError>;
 }
 
 #[derive(Debug)]
@@ -49,13 +99,22 @@ impl Split for net::TcpStream {
         self.into_split()
     }
 
-    fn reunite(r: Self::R, w: Self::W) -> Result<Self, ReuniteError> {
-        r.reunite(w).map_err(|_| ReuniteError)
-    }
-
     fn remote_addr(&self) -> SocketAddr {
         const DEFAULT_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0);
         self.peer_addr().unwrap_or(DEFAULT_ADDR)
+    }
+
+    fn protocol() -> &'static str {
+        "tcp"
+    }
+}
+
+impl Reunite for tcp::OwnedReadHalf {
+    type U = net::TcpStream;
+    type W = tcp::OwnedWriteHalf;
+
+    fn reunite(self, w: Self::W) -> Result<Self::U, ReuniteError> {
+        self.reunite(w).map_err(|_| ReuniteError)
     }
 }
 
@@ -140,6 +199,45 @@ pub struct BTStream<T> {
     pex_peers: HashMap<IpAddr, Option<PexFlag>>,
 }
 
+impl<T> BTStream<T>
+where
+    T: Split + Send + 'static,
+{
+    pub fn peer_addr(&self) -> SocketAddr {
+        self.inner.remote_addr()
+    }
+
+    pub fn to_dyn(self) -> BTStream<Box<dyn Conn>> {
+        BTStream {
+            inner: Box::new(self.inner),
+            partial_header: self.partial_header,
+            extension_id: self.extension_id,
+            reserved: self.reserved,
+            peer_id: self.peer_id,
+            pex_peers: self.pex_peers,
+        }
+    }
+}
+
+impl BTStream<Box<dyn Conn>> {
+    pub fn peer_addr(&self) -> SocketAddr {
+        self.inner.remote_addr()
+    }
+}
+
+impl<T> fmt::Debug for BTStream<T>
+where
+    T: fmt::Debug,
+{
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BTStream")
+            .field("connection", &self.inner)
+            .field("extension_id", &self.extension_id)
+            .field("peer_id", &self.peer_id)
+            .finish()
+    }
+}
+
 #[derive(Debug)]
 pub struct ReadStream<T> {
     inner: T,
@@ -200,12 +298,6 @@ impl BTStream<net::TcpStream> {
     //         extension_id: HashMap::new(),
     //     })
     // }
-
-    pub fn peer_addr(&self) -> SocketAddr {
-        // TODO: is this possible to be error?
-        // self.inner.get_ref().peer_addr().expect("expect ok")
-        self.inner.peer_addr().expect("expect ok")
-    }
 
     pub fn local_addr(&self) -> SocketAddr {
         // TODO: is this possible to be error?
@@ -279,12 +371,15 @@ where
     pub fn reunite(
         r: ReadStream<<T as Split>::R>,
         w: WriteStream<<T as Split>::W>,
-    ) -> Result<Self, ReuniteError> {
+    ) -> Result<Self, ReuniteError>
+    where
+        <T as Split>::R: Reunite<W = <T as Split>::W, U = T>,
+    {
         if r.peer_id != w.peer_id {
             return Err(ReuniteError);
         }
         Ok(Self {
-            inner: Split::reunite(r.inner, w.inner)?,
+            inner: r.inner.reunite(w.inner)?,
             partial_header: r.partial_header,
             extension_id: w.extension_id,
             reserved: r.reserved,
@@ -321,15 +416,54 @@ where
     }
 }
 
-impl fmt::Debug for BTStream<net::TcpStream> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), std::fmt::Error> {
-        f.write_fmt(format_args!(
-            "tcp conn from {:?} to {:?}",
-            // self.inner.get_ref().local_addr(),
-            // self.inner.get_ref().peer_addr(),
-            self.inner.local_addr(),
-            self.inner.peer_addr(),
-        ))
+impl BTStream<Box<dyn Conn>> {
+    pub fn split(self) -> (ReadStream<Box<dyn Reader>>, WriteStream<Box<dyn Writer>>) {
+        let peer_addr = self.inner.remote_addr();
+        let (read_end, write_end) = self.inner.split();
+        (
+            ReadStream {
+                inner: read_end,
+                peer_addr,
+                partial_header: self.partial_header,
+                peer_id: self.peer_id,
+                reserved: self.reserved,
+            },
+            WriteStream {
+                inner: write_end,
+                peer_addr,
+                extension_id: self.extension_id,
+                pex_peers: self.pex_peers,
+                peer_id: self.peer_id,
+                reserved: self.reserved,
+            },
+        )
+    }
+
+    pub fn split_buffered(
+        self,
+    ) -> (
+        ReadStream<BufReader<Box<dyn Reader>>>,
+        WriteStream<BufWriter<Box<dyn Writer>>>,
+    ) {
+        let peer_addr = self.inner.remote_addr();
+        let (read_end, write_end) = (self.inner).split();
+        (
+            ReadStream {
+                inner: BufReader::with_capacity(32768, read_end),
+                peer_addr,
+                partial_header: self.partial_header,
+                peer_id: self.peer_id,
+                reserved: self.reserved,
+            },
+            WriteStream {
+                inner: BufWriter::with_capacity(32768, write_end),
+                peer_addr,
+                extension_id: self.extension_id,
+                pex_peers: self.pex_peers,
+                peer_id: self.peer_id,
+                reserved: self.reserved,
+            },
+        )
     }
 }
 
@@ -379,7 +513,7 @@ where
 {
     pub async fn connect(mut t: T, h: &Handshake, extend: &ExtendedHandshake) -> io::Result<Self>
     where
-        T: AsyncRead + AsyncWrite + Unpin,
+        <T as Split>::R: Reunite<W = <T as Split>::W, U = T>,
     {
         send_handshake(&mut t, h).await?;
         let peer_handshake = recv_handshake(&mut t).await?;
@@ -417,7 +551,7 @@ where
             };
 
             let mut s =
-                BTStream::<T>::reunite(read_end, write_end).expect("Reunite BTStream error");
+                BTStream::<T>::reunite(read_end, write_end).expect("reunite BTStream should OK");
             s.extension_id = exth
                 .m
                 .iter()
@@ -431,7 +565,7 @@ where
 
     pub async fn accept(mut t: T, funcbits: &FuncBits, client_id: &[u8; 20]) -> io::Result<Self>
     where
-        T: AsyncRead + AsyncWrite + Unpin,
+        <T as Split>::R: Reunite<W = <T as Split>::W, U = T>,
     {
         let peer_handshake = recv_handshake(&mut t).await?;
         // TODO: check the id, if no same id, close connection
@@ -482,7 +616,7 @@ where
             };
 
             let mut s =
-                BTStream::<T>::reunite(read_end, write_end).expect("Reunite BTStream error");
+                BTStream::<T>::reunite(read_end, write_end).expect("reunite BTStream should OK");
             s.extension_id = extend_received
                 .m
                 .iter()
@@ -757,7 +891,7 @@ impl FuncBits {
     }
 
     pub const fn basic() -> Self {
-        Self::none().set_extension()
+        Self::none().set_extension().set_dht()
     }
 
     fn common(mut self, other: &Self) -> Self {
@@ -2025,8 +2159,16 @@ mod tests {
             DEFAULT_ADDR
         }
 
-        fn reunite(r: Self::R, w: Self::W) -> Result<Self, ReuniteError> {
-            Ok(r.unsplit(w))
+        fn protocol() -> &'static str {
+            "tokio-duplex"
+        }
+    }
+
+    impl Reunite for ReadHalf<DuplexStream> {
+        type U = DuplexStream;
+        type W = WriteHalf<DuplexStream>;
+        fn reunite(self, w: Self::W) -> Result<Self::U, ReuniteError> {
+            Ok(self.unsplit(w))
         }
     }
 

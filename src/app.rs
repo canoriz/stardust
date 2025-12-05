@@ -8,7 +8,7 @@ use tokio::time::Duration;
 use tokio::{net, time};
 use tracing::{error, info, warn};
 
-use crate::protocol::{self, BTStream, Message, Split};
+use crate::protocol::{self, BTStream, Message, Reunite, Split};
 use crate::torrent_manager::TorrentManagerHandle;
 use crate::{announce_manager, metadata};
 
@@ -178,6 +178,7 @@ async fn handle_income_connection<T>(
 ) -> Result<()>
 where
     T: AsyncRead + AsyncWrite + Split + Unpin + std::fmt::Debug, // TODO: maybe remove this Debug
+    <T as Split>::R: Reunite<W = <T as Split>::W, U = T>,
 {
     let client_id = [
         0x54, 0x42, 0x54, 0x69, 0x21, 0x58, 0x21, 0x58, 0x68, 0x69, 0x93, 0x51, 0x54, 0x42, 0x54,

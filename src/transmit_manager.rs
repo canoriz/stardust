@@ -5,6 +5,7 @@ use crate::connection_manager::ConnectionManagerHandle;
 use crate::connection_manager::Msg as ConnMsg;
 use crate::metadata::{self, Metadata};
 use crate::picker::HeapPiecePicker;
+use crate::protocol::Conn;
 use crate::protocol::FuncBits;
 use crate::protocol::{self, BitField};
 
@@ -23,9 +24,8 @@ use tracing::{info, warn};
 pub(crate) enum Msg {
     AnnounceFinish(Result<metadata::AnnounceResp, metadata::AnnounceError>),
 
-    // TODO: support uTP/proxy
-    NewPeer(protocol::BTStream<TcpStream>),
-    NewIncomePeer(protocol::BTStream<TcpStream>),
+    NewPeer(protocol::BTStream<Box<dyn Conn>>),
+    NewIncomePeer(protocol::BTStream<Box<dyn Conn>>),
 
     // TODO: use a structure ptr to connection_peer struct
     // to replace SocketAddr
@@ -265,7 +265,7 @@ impl TransmitManager {
             Msg::NewPeer(bt_conn) => {
                 info!("new outward connection {:?}", bt_conn);
                 let peer_addr = bt_conn.peer_addr();
-                let cm = ConnectionManagerHandle::new(
+                let cm = ConnectionManagerHandle::new_dyn(
                     bt_conn,
                     self.self_handle.clone(),
                     self.metadata.clone(),
@@ -447,7 +447,7 @@ async fn connect_peer(
     m: Arc<Metadata>,
 ) -> Result<(), std::io::Error> {
     let tcp_stream = TcpStream::connect(addr).await?;
-    let mut func = FuncBits::default();
+    let func = FuncBits::default().set_dht().set_extension();
     func.set_extension();
     let conn = protocol::BTStream::connect(
         tcp_stream,
@@ -474,8 +474,8 @@ async fn connect_peer(
     )
     .await;
     match conn {
-        Ok(mut c) => {
-            if let Err(e) = main_tx.sender.send(Msg::NewPeer(c)) {
+        Ok(c) => {
+            if let Err(e) = main_tx.sender.send(Msg::NewPeer(c.to_dyn())) {
                 info!("send new peer to main {e}");
             }
             Ok(())
