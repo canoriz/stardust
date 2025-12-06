@@ -668,6 +668,10 @@ where
         send_cancel(&mut self.inner, index, begin, len).await
     }
 
+    pub async fn send_port(&mut self, port: u16) -> io::Result<()> {
+        send_port(&mut self.inner, port).await
+    }
+
     pub async fn send_extend_pex(
         &mut self,
         now_connected: &HashMap<IpAddr, Option<PexFlag>>,
@@ -775,6 +779,10 @@ where
 
     pub async fn send_cancel(&mut self, index: u32, begin: u32, len: u32) -> io::Result<()> {
         send_cancel(&mut self.inner, index, begin, len).await
+    }
+
+    pub async fn send_port(&mut self, port: u16) -> io::Result<()> {
+        send_port(&mut self.inner, port).await
     }
 
     pub async fn send_extend_pex(
@@ -946,6 +954,7 @@ impl MsgTy {
     const REQUEST_LEN: u32 = 13;
     // const  PIECE_LEN(_) : u32= unimplemented!();
     const CANCEL_LEN: u32 = 13;
+    const PORT_LEN: u32 = 3;
 }
 
 #[derive(Eq, PartialEq)]
@@ -1791,12 +1800,18 @@ async fn send_cancel<T: AsyncWrite + Unpin>(
     begin: u32,
     len: u32,
 ) -> io::Result<()> {
-    // TODO: len must be 16KiB unless end of file
     handle.write_u32(MsgTy::CANCEL_LEN).await?; // length
     handle.write_u8(MsgTy::CANCEL).await?;
     handle.write_u32(index).await?;
     handle.write_u32(begin).await?;
     handle.write_u32(len).await?;
+    handle.flush().await
+}
+
+async fn send_port<T: AsyncWrite + Unpin>(handle: &mut T, port: u16) -> io::Result<()> {
+    handle.write_u32(MsgTy::PORT_LEN).await?; // length
+    handle.write_u8(MsgTy::PORT).await?;
+    handle.write_u16(port).await?;
     handle.flush().await
 }
 
@@ -2593,6 +2608,24 @@ mod tests {
         assert_eq!(msg.index, index);
         assert_eq!(msg.len, 4);
         // TODO: test long request
+    }
+
+    #[tokio::test]
+    async fn port() {
+        let (mut peer1, mut peer2) = make_ends().await;
+        let index = rand::random::<u32>();
+        let begin = rand::random::<u32>();
+        peer1.send_port(4133).await.expect("should send ok");
+        let received = peer2.recv_msg_header().await.expect("should recv ok");
+
+        let msg = extract_enum!(received, Message::Port);
+        assert_eq!(msg, 4133);
+
+        let ((_, mut p1w), (mut p2r, _)) = make_ends_split().await;
+        p1w.send_port(4133).await.expect("should send ok");
+        let received = p2r.recv_msg_header().await.expect("should recv ok");
+        let msg = extract_enum!(received, Message::Port);
+        assert_eq!(msg, 4133);
     }
 
     #[tokio::test]

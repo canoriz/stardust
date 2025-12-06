@@ -232,18 +232,6 @@ fn bitwise_not(mut a: [u8; 20]) -> [u8; 20] {
     a
 }
 
-fn u32_to_id(a: [u32; 5]) -> NodeID {
-    let mut ret = [0u8; 20];
-    for i in 0..5 {
-        let b = a[i].to_be_bytes();
-        ret[i * 4] = b[0];
-        ret[i * 4 + 1] = b[1];
-        ret[i * 4 + 2] = b[2];
-        ret[i * 4 + 3] = b[3];
-    }
-    ret
-}
-
 #[cfg(test)]
 mod test {
     use super::*;
@@ -332,6 +320,18 @@ mod test {
         ];
         let c = bitwise_op(a, b, |x, y| x & y);
         assert_eq!(a, c);
+    }
+
+    fn u32_to_id(a: [u32; 5]) -> NodeID {
+        let mut ret = [0u8; 20];
+        for i in 0..5 {
+            let b = a[i].to_be_bytes();
+            ret[i * 4] = b[0];
+            ret[i * 4 + 1] = b[1];
+            ret[i * 4 + 2] = b[2];
+            ret[i * 4 + 3] = b[3];
+        }
+        ret
     }
 
     #[test]
