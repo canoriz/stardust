@@ -1,17 +1,13 @@
 use crate::announce_manager::{self, AnnounceManagerHandle};
 use crate::metadata::Metadata;
-use crate::transmit_manager::{self, run_transmit_manager};
+use crate::transmit_manager::{self, TransmitManager};
 use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot};
-
-use tokio_util::sync::{CancellationToken, DropGuard};
-pub use transmit_manager::TransmitManager;
+use tokio::sync::mpsc;
 
 pub struct TorrentManagerHandle {
     sender: mpsc::UnboundedSender<transmit_manager::Msg>,
 
-    transmit_manager_cancel: DropGuard,
-    transmit_manager_done: oneshot::Receiver<()>,
+    transmit_manager: TransmitManager,
 
     announce_manager: AnnounceManagerHandle,
 }
@@ -21,24 +17,11 @@ impl TorrentManagerHandle {
         let (tx, rx) = mpsc::unbounded_channel::<transmit_manager::Msg>();
 
         let tm = TransmitManager::new(m.clone(), tx.clone(), rx);
-        let cancel_transmit = CancellationToken::new();
-        let (done_transmit, done_transmit_rx) = oneshot::channel::<()>();
-
-        // TODO: convention: let TransmitManager::new call run_transmit_manager
-        tokio::spawn(run_transmit_manager(
-            tm,
-            cancel_transmit.clone(),
-            done_transmit,
-        ));
 
         let am = AnnounceManagerHandle::new(m, tx.clone());
-        // let mut am = AnnounceManager::new()
-        // tokio::spwan(run_announce_manager());
         Self {
             sender: tx,
-            transmit_manager_cancel: cancel_transmit.drop_guard(),
-            transmit_manager_done: done_transmit_rx,
-
+            transmit_manager: tm,
             announce_manager: am,
         }
     }
@@ -52,8 +35,7 @@ impl TorrentManagerHandle {
     }
 
     pub async fn stop_wait(self) {
-        self.transmit_manager_cancel.disarm().cancel();
+        self.transmit_manager.stop_wait().await;
         self.announce_manager.stop_wait().await;
-        _ = self.transmit_manager_done.await;
     }
 }

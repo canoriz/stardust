@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time;
-use tokio_util::sync::CancellationToken;
+use tokio_util::sync::{CancellationToken, DropGuard as CancelDropGuard};
 use tracing::{info, warn};
 
 #[derive(Debug)]
@@ -86,7 +86,38 @@ pub(crate) struct TransmitManagerHandle {
     pub storage: Arc<BufStorage>,
 }
 
-pub struct TransmitManager {
+pub(crate) struct TransmitManager {
+    cancel: CancelDropGuard,
+    worker_stop: oneshot::Receiver<()>,
+}
+
+impl TransmitManager {
+    pub fn new(
+        m: Arc<Metadata>,
+        cmd_sender: mpsc::UnboundedSender<Msg>,
+        cmd_receiver: mpsc::UnboundedReceiver<Msg>,
+    ) -> Self {
+        let worker = TransmitWorker::new(m, cmd_sender, cmd_receiver);
+        let cancel_transmit = CancellationToken::new();
+        let (done_transmit, done_transmit_rx) = oneshot::channel::<()>();
+        tokio::spawn(run_transmit_worker(
+            worker,
+            cancel_transmit.clone(),
+            done_transmit,
+        ));
+        Self {
+            cancel: cancel_transmit.drop_guard(),
+            worker_stop: done_transmit_rx,
+        }
+    }
+
+    pub async fn stop_wait(self) {
+        self.cancel.disarm().cancel();
+        _ = self.worker_stop.await;
+    }
+}
+
+pub struct TransmitWorker {
     metadata: Arc<Metadata>,
 
     receiver: mpsc::UnboundedReceiver<Msg>,
@@ -108,7 +139,7 @@ pub struct TransmitManager {
     storage: Arc<BufStorage>,
 }
 
-impl TransmitManager {
+impl TransmitWorker {
     pub fn new(
         m: Arc<Metadata>,
         cmd_sender: mpsc::UnboundedSender<Msg>,
@@ -129,7 +160,7 @@ impl TransmitManager {
             m.regular_piece_size(),
             back_file,
         ));
-        // TODO: let cancellation token cancel this
+
         Self {
             metadata: m.clone(),
             receiver: cmd_receiver,
@@ -412,8 +443,8 @@ impl TransmitManager {
     }
 }
 
-pub(crate) async fn run_transmit_manager(
-    mut transmit: TransmitManager,
+pub(crate) async fn run_transmit_worker(
+    mut transmit: TransmitWorker,
     cancel: CancellationToken,
     done: oneshot::Sender<()>,
 ) {

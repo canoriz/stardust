@@ -114,6 +114,7 @@ impl FileMetadata {
         Ok(torrent)
     }
 
+    /// convert FileMetadata to Metadata and announce list
     pub fn to_metadata(self) -> (Metadata, Vec<Vec<String>>) {
         let (len, files) = match &self.info.len_or_files {
             LenFiles::Length(l) => (
