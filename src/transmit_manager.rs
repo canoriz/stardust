@@ -3,9 +3,10 @@ use crate::backfile::NormalFile;
 use crate::cache::BufStorage;
 use crate::connection_manager::ConnectionManagerHandle;
 use crate::connection_manager::Msg as ConnMsg;
-use crate::metadata::{self, Metadata};
+use crate::metadata::{self, Magnet, Metadata};
 use crate::picker::HeapPiecePicker;
 use crate::protocol::Conn;
+use crate::protocol::ExtendedMetadata;
 use crate::protocol::FuncBits;
 use crate::protocol::{self, BitField};
 
@@ -19,27 +20,36 @@ use tokio::time;
 use tokio_util::sync::{CancellationToken, DropGuard as CancelDropGuard};
 use tracing::{info, warn};
 
+pub enum TorrentTask {
+    Torrent(Metadata),
+    Magnet(Magnet),
+}
+
+type PeerAddr = SocketAddr;
+
 #[derive(Debug)]
 #[non_exhaustive]
 pub(crate) enum Msg {
     AnnounceFinish(Result<metadata::AnnounceResp, metadata::AnnounceError>),
 
-    NewPeer(protocol::BTStream<Box<dyn Conn>>),
+    NewPeer(Result<protocol::BTStream<Box<dyn Conn>>, SocketAddr>),
     NewIncomePeer(protocol::BTStream<Box<dyn Conn>>),
 
     // TODO: use a structure ptr to connection_peer struct
     // to replace SocketAddr
     // which removes the HashMap cost
-    PeerChoke(SocketAddr),
-    PeerUnchoke(SocketAddr),
-    PeerInterested,
-    PeerUninterested,
-    PeerBitField(SocketAddr, BitField),
-    PeerHave(SocketAddr, u32),
+    PeerChoke(PeerAddr),
+    PeerUnchoke(PeerAddr),
+    PeerInterested(PeerAddr),
+    PeerUninterested(PeerAddr),
+    PeerBitField(PeerAddr, BitField),
+    PeerHave(PeerAddr, u32),
 
     PieceReceived(u32),
 
-    BlockReceived(SocketAddr, u32),
+    BlockReceived(PeerAddr, u32),
+
+    ExtendMetadata(ExtendedMetadata),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -75,15 +85,9 @@ struct PeerConn {
 
 #[derive(Clone)]
 pub(crate) struct TransmitManagerHandle {
-    pub metadata: Arc<Metadata>,
     pub sender: mpsc::UnboundedSender<Msg>,
 
-    // TODO: maybe not use Arc<Mutex<..>> but use a splitted lock structure to
-    // reduce contention?
-    // TODO: using dyn <trait Picker>?
-    pub picker: Arc<Mutex<HeapPiecePicker>>,
-
-    pub storage: Arc<BufStorage>,
+    pub torrent_state: Arc<TorrentState>,
 }
 
 pub(crate) struct TransmitManager {
@@ -93,11 +97,11 @@ pub(crate) struct TransmitManager {
 
 impl TransmitManager {
     pub fn new(
-        m: Arc<Metadata>,
+        t: TorrentTask,
         cmd_sender: mpsc::UnboundedSender<Msg>,
         cmd_receiver: mpsc::UnboundedReceiver<Msg>,
     ) -> Self {
-        let worker = TransmitWorker::new(m, cmd_sender, cmd_receiver);
+        let worker = TransmitWorker::new(t, cmd_sender, cmd_receiver);
         let cancel_transmit = CancellationToken::new();
         let (done_transmit, done_transmit_rx) = oneshot::channel::<()>();
         tokio::spawn(run_transmit_worker(
@@ -117,8 +121,34 @@ impl TransmitManager {
     }
 }
 
+pub enum TorrentState {
+    Metadata(Downloading),
+    Fetching(FetchingMetadata),
+}
+
+/// The fetching information of a torrent
+/// still downloading metadata
+pub struct FetchingMetadata {
+    pub metadata: Vec<u8>,
+    pub magnet: Magnet,
+}
+
+/// The concrete download information of a
+/// torrent with full(verified) metadata
+pub struct Downloading {
+    pub metadata: Arc<Metadata>,
+
+    // TODO: maybe not use Arc<Mutex<..>> but use a splitted lock structure to
+    // reduce contention?
+    // TODO: using dyn <trait Picker>?
+    pub piece_picker: Arc<Mutex<HeapPiecePicker>>,
+    pub storage: Arc<BufStorage>,
+}
+
 pub struct TransmitWorker {
-    metadata: Arc<Metadata>,
+    /// The state of the torrent
+    /// whether have metadata or not
+    torrent_state: Arc<TorrentState>,
 
     receiver: mpsc::UnboundedReceiver<Msg>,
 
@@ -134,17 +164,45 @@ pub struct TransmitWorker {
     // TODO: change V type
     connected_peers: HashMap<SocketAddr, PeerConn>,
     connecting_peers: HashSet<SocketAddr>,
-
-    piece_picker: Arc<Mutex<HeapPiecePicker>>,
-    storage: Arc<BufStorage>,
 }
 
 impl TransmitWorker {
     pub fn new(
-        m: Arc<Metadata>,
+        t: TorrentTask,
         cmd_sender: mpsc::UnboundedSender<Msg>,
         cmd_receiver: mpsc::UnboundedReceiver<Msg>,
     ) -> Self {
+        match t {
+            TorrentTask::Torrent(m) => Self::new_with_metadata(m, cmd_sender, cmd_receiver),
+            TorrentTask::Magnet(m) => Self::new_without_metadata(m, cmd_sender, cmd_receiver),
+        }
+    }
+
+    fn new_without_metadata(
+        m: Magnet,
+        cmd_sender: mpsc::UnboundedSender<Msg>,
+        cmd_receiver: mpsc::UnboundedReceiver<Msg>,
+    ) -> Self {
+        let state = Arc::new(TorrentState::Fetching(FetchingMetadata {
+            metadata: Vec::new(),
+            magnet: m,
+        }));
+        Self {
+            torrent_state: state.clone(),
+            receiver: cmd_receiver,
+            self_handle: TransmitManagerHandle {
+                torrent_state: state,
+                sender: cmd_sender,
+            },
+            // announce_handle: None,
+            // announce_tx: None,
+            connected_peers: HashMap::new(),
+            connecting_peers: HashSet::new(),
+        }
+    }
+
+    fn metadata_into_downloading(m: Metadata) -> Downloading {
+        let m = Arc::new(m);
         let piece_size = m.regular_piece_size() as u32;
         let total_length = m.len();
         let piece_picker = Arc::new(Mutex::new(HeapPiecePicker::new(total_length, piece_size)));
@@ -161,21 +219,30 @@ impl TransmitWorker {
             back_file,
         ));
 
+        Downloading {
+            metadata: m,
+            piece_picker,
+            storage: buf_storage,
+        }
+    }
+
+    fn new_with_metadata(
+        m: Metadata,
+        cmd_sender: mpsc::UnboundedSender<Msg>,
+        cmd_receiver: mpsc::UnboundedReceiver<Msg>,
+    ) -> Self {
+        let state = Arc::new(TorrentState::Metadata(Self::metadata_into_downloading(m)));
         Self {
-            metadata: m.clone(),
+            torrent_state: state.clone(),
             receiver: cmd_receiver,
             self_handle: TransmitManagerHandle {
-                metadata: m,
+                torrent_state: state,
                 sender: cmd_sender,
-                picker: piece_picker.clone(),
-                storage: buf_storage.clone(),
             },
             // announce_handle: None,
             // announce_tx: None,
             connected_peers: HashMap::new(),
             connecting_peers: HashSet::new(),
-            piece_picker,
-            storage: buf_storage,
         }
     }
 
@@ -191,12 +258,18 @@ impl TransmitWorker {
     //     self
     // }
     fn pick_blocks_for_all_peers(&mut self, n_blocks: usize) {
+        let piece_picker = match &*self.torrent_state {
+            TorrentState::Metadata(d) => &d.piece_picker,
+            TorrentState::Fetching(_) => {
+                return;
+            }
+        };
+
         let now = std::time::Instant::now();
         for (addr, h) in &mut self.connected_peers {
             info!("peer status {addr}: {:?}", h.state);
             if h.state.peer_choke_status == ChokeStatus::Unchoked {
-                let (reqs, n) = self
-                    .piece_picker
+                let (reqs, n) = piece_picker
                     .lock()
                     .unwrap() // TODO: fix unwrap
                     .pick_blocks(addr, n_blocks, now);
@@ -209,13 +282,20 @@ impl TransmitWorker {
     // fn pick_blocks_for_peer(&mut self, addr: &SocketAddr, n_blocks: usize) {
     // Fn: n_blk_received, n_blk_in_flight -> n_this_time_pick
     fn pick_blocks_for_peer(&mut self, addr: &SocketAddr, n_received: u32) {
+        let piece_picker = match &*self.torrent_state {
+            TorrentState::Metadata(d) => &d.piece_picker,
+            TorrentState::Fetching(_) => {
+                return;
+            }
+        };
+
         // n_block_in_flight = estimated_bandwidth * response_time
         // response_time = RTT + process_time
         // estimated_bandwidth = ALPHA * n_received_per_second
         let now = std::time::Instant::now();
         if let Some(h) = self.connected_peers.get_mut(addr) {
             if h.state.peer_choke_status == ChokeStatus::Unchoked {
-                let mut picker = self.piece_picker.lock().unwrap(); // TODO: fix unwrap
+                let mut picker = piece_picker.lock().unwrap(); // TODO: fix unwrap
 
                 h.n_block_in_flight = picker
                     .get_status(addr)
@@ -275,7 +355,10 @@ impl TransmitWorker {
                     use std::str::FromStr;
                     if let Ok(ip) = std::net::IpAddr::from_str(&p.ip) {
                         let h_clone = self.self_handle.clone();
-                        let m_clone = self.metadata.clone();
+                        let info_hash = match &*self.torrent_state {
+                            TorrentState::Metadata(d) => d.metadata.info_hash,
+                            TorrentState::Fetching(f) => f.magnet.info_hash,
+                        };
                         // TODO: store peers in a map, if cannot connect this time
                         // try re-connect later
                         // TODO: if we already connected to a lot of active peers,
@@ -285,7 +368,7 @@ impl TransmitWorker {
                         if !self.connected_peers.contains_key(&s)
                             && !self.connecting_peers.contains(&s)
                         {
-                            tokio::spawn(connect_peer(h_clone, s, m_clone));
+                            tokio::spawn(connect_peer(h_clone, s, info_hash));
                         }
                     }
                 }
@@ -293,14 +376,10 @@ impl TransmitWorker {
             Msg::AnnounceFinish(Err(e)) => {
                 info!("announce error {}", e);
             }
-            Msg::NewPeer(bt_conn) => {
+            Msg::NewPeer(Ok(bt_conn)) => {
                 info!("new outward connection {:?}", bt_conn);
                 let peer_addr = bt_conn.peer_addr();
-                let cm = ConnectionManagerHandle::new_dyn(
-                    bt_conn,
-                    self.self_handle.clone(),
-                    self.metadata.clone(),
-                );
+                let cm = ConnectionManagerHandle::new_dyn(bt_conn, self.self_handle.clone());
                 self.connected_peers.insert(
                     peer_addr,
                     PeerConn {
@@ -317,20 +396,33 @@ impl TransmitWorker {
                 );
                 self.connecting_peers.remove(&peer_addr);
             }
+            Msg::NewPeer(Err(addr)) => {
+                info!("err connect to {:?}", addr);
+                self.connecting_peers.remove(&addr);
+            }
             Msg::PeerBitField(addr, bitfield) => {
                 info!("new BitField msg from peer {addr}");
-                self.piece_picker.lock().unwrap().peer_add(addr, bitfield);
+                let piece_picker = match &*self.torrent_state {
+                    TorrentState::Metadata(d) => &d.piece_picker,
+                    TorrentState::Fetching(_) => return,
+                };
+                piece_picker.lock().unwrap().peer_add(addr, bitfield);
             }
             Msg::PeerHave(peer, i) => {
                 info!("peer {peer} have piece {i}");
-                self.piece_picker.lock().unwrap().peer_have(&peer, i);
+                let piece_picker = match &*self.torrent_state {
+                    TorrentState::Metadata(d) => &d.piece_picker,
+                    TorrentState::Fetching(_) => return,
+                };
+                piece_picker.lock().unwrap().peer_have(&peer, i);
             }
             Msg::PeerChoke(peer) => {
                 warn!("{peer} choked us");
-                self.piece_picker
-                    .lock()
-                    .unwrap()
-                    .peer_mark_not_requested(&peer);
+                let piece_picker = match &*self.torrent_state {
+                    TorrentState::Metadata(d) => &d.piece_picker,
+                    TorrentState::Fetching(_) => return,
+                };
+                piece_picker.lock().unwrap().peer_mark_not_requested(&peer);
                 self.connected_peers.entry(peer).and_modify(|st| {
                     st.state.peer_choke_status = ChokeStatus::Choked;
                 });
@@ -357,6 +449,17 @@ impl TransmitWorker {
                 );
                 // TODO: are we interested in this peer?
                 self.pick_blocks_for_peer(&peer, 0);
+            }
+            Msg::NewIncomePeer(btstream) => todo!(),
+            Msg::PeerInterested(peer) => {
+                self.connected_peers.entry(peer).and_modify(|st| {
+                    st.state.peer_interest_status = InterestStatus::Interested;
+                });
+            }
+            Msg::PeerUninterested(peer) => {
+                self.connected_peers.entry(peer).and_modify(|st| {
+                    st.state.peer_interest_status = InterestStatus::Uninterested;
+                });
             }
             Msg::PieceReceived(i) => {
                 for (_, h) in self.connected_peers.iter() {
@@ -390,9 +493,8 @@ impl TransmitWorker {
 
                 // TODO: if peer is choking us?
             }
-            other => {
-                info!("unhandled other {:?}", other);
-                // todo!()
+            Msg::ExtendMetadata(m) => {
+                todo!()
             }
         }
     }
@@ -475,7 +577,7 @@ pub(crate) async fn run_transmit_worker(
 async fn connect_peer(
     main_tx: TransmitManagerHandle,
     addr: SocketAddr,
-    m: Arc<Metadata>,
+    info_hash: [u8; 20],
 ) -> Result<(), std::io::Error> {
     let tcp_stream = TcpStream::connect(addr).await?;
     let func = FuncBits::default().set_dht().set_extension();
@@ -488,7 +590,7 @@ async fn connect_peer(
                 0x54, 0x42, 0x54, 0x69, 0x21, 0x58, 0x21, 0x58, 0x68, 0x69, 0x93, 0x51, 0x54, 0x42,
                 0x54, 0x69, 0x21, 0x58, 0x21, 0x58,
             ],
-            torrent_hash: m.info_hash,
+            torrent_hash: info_hash,
         },
         &protocol::ExtendedHandshake {
             m: protocol::EXTENSION_IDS_MAP.clone(), // supported extensions and id number
@@ -506,13 +608,14 @@ async fn connect_peer(
     .await;
     match conn {
         Ok(c) => {
-            if let Err(e) = main_tx.sender.send(Msg::NewPeer(c.to_dyn())) {
+            if let Err(e) = main_tx.sender.send(Msg::NewPeer(Ok(c.to_dyn()))) {
                 info!("send new peer to main {e}");
             }
             Ok(())
         }
         Err(e) => {
             info!("tcp handshake {addr} error {e}");
+            _ = main_tx.sender.send(Msg::NewPeer(Err(addr)));
             Err(e)
         }
     }

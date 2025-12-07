@@ -22,7 +22,7 @@ pub struct AnnounceManagerHandle {
 }
 
 impl AnnounceManagerHandle {
-    pub fn new(m: Arc<Metadata>, tx: mpsc::UnboundedSender<transmit_manager::Msg>) -> Self {
+    pub fn new(info_hash: [u8; 20], tx: mpsc::UnboundedSender<transmit_manager::Msg>) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
 
         let cancel = CancellationToken::new();
@@ -42,7 +42,7 @@ impl AnnounceManagerHandle {
         // tokio::spawn(run_announce_manager::<metadata::Announcer>(
         tokio::spawn(run_announce_manager::<FakeAnnouncer>(
             manager,
-            m,
+            info_hash,
             cancel.clone(),
             done_tx,
         ));
@@ -131,7 +131,7 @@ impl AnnounceManager {
 
 async fn run_announce_manager<A>(
     mut manager: AnnounceManager,
-    m: Arc<Metadata>,
+    info_hash: [u8; 20],
     cancel: CancellationToken,
     done: oneshot::Sender<()>,
 ) where
@@ -158,7 +158,7 @@ async fn run_announce_manager<A>(
         announce_task_rx,
         output_tx,
         cancel.child_token(),
-        m,
+        info_hash,
     ));
     loop {
         tokio::select! {
@@ -178,7 +178,7 @@ async fn run_announce_manager<A>(
             Some(r) = manager.announce_timer.join_next() => {
                 if let Ok(t) = r {
                     info!("announce url {}", t.url);
-                    if manager.url_list.get(&(AnnounceType::V4, t.url.clone())).is_some() {
+                    if manager.url_list.get(&(t.announce_type, t.url.clone())).is_some() {
                         announce_task_tx.send(t);
                     }
                 } else {
@@ -235,7 +235,7 @@ impl metadata::Announce for FakeAnnouncer {
     async fn announce_tier(
         _net_type: metadata::AnnounceType,
         _req: &TrackerGet<'_>,
-        _torrent: &Metadata,
+        _torrent: &[u8; 20],
         _url: String,
     ) -> metadata::AnnounceResult {
         // return Err(metadata::AnnounceError::ClientErr(
@@ -272,7 +272,7 @@ async fn announce_task<A>(
     mut rx: mpsc::UnboundedReceiver<TimeUp>,
     output: mpsc::UnboundedSender<(AnnounceResult, TimeUp)>,
     cancel: CancellationToken,
-    m: Arc<Metadata>,
+    info_hash: [u8; 20],
     // timers: &mut task::JoinSet<TimeUp>,
 ) where
     A: metadata::Announce,
@@ -289,7 +289,12 @@ async fn announce_task<A>(
         tokio::select! {
             r = rx.recv() => {
                 if let Some(req) = r{
-                    let resp = A::announce_tier(AnnounceType::V4, &tg, m.as_ref(), req.url.as_ref().clone()).await;
+                    let resp = A::announce_tier(
+                        req.announce_type,
+                        &tg,
+                        &info_hash,
+                        req.url.as_ref().clone(),
+                    ).await;
                     info!("announce {} response result {resp:?}", &req.url);
                     output.send((resp, req));
                 } else {

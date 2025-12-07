@@ -9,6 +9,9 @@ use std::sync::LazyLock;
 use thiserror::Error;
 use tracing::warn;
 
+mod magnet;
+pub use magnet::Magnet;
+
 // Metadata is a universal structure
 #[derive(Debug, Clone)]
 pub struct Metadata {
@@ -184,7 +187,7 @@ pub struct TrackerGet<'a> {
 }
 
 impl TrackerGet<'_> {
-    pub fn url(&self, meta: &Metadata, url: String) -> String {
+    pub fn url(&self, info_hash: &[u8; 20], url: String) -> String {
         fn percent_encoding_str<T: AsRef<[u8]>, P: AsRef<[u8]>>(k: &T, v: &P) -> String {
             percent_encoding::percent_encode(k.as_ref(), percent_encoding::NON_ALPHANUMERIC)
                 .collect::<String>()
@@ -194,7 +197,7 @@ impl TrackerGet<'_> {
         }
 
         let mut query = [
-            percent_encoding_str(&"info_hash", &meta.info_hash),
+            percent_encoding_str(&"info_hash", &info_hash),
             percent_encoding_str(&"peer_id", &self.peer_id),
             percent_encoding_str(&"port", &self.port.to_string()),
             percent_encoding_str(&"uploaded", &self.uploaded.to_string()),
@@ -295,7 +298,7 @@ pub trait Announce {
     fn announce_tier(
         net_type: AnnounceType,
         req: &TrackerGet<'_>,
-        torrent: &Metadata,
+        torrent: &[u8; 20],
         url: String,
     ) -> impl Future<Output = AnnounceResult> + Send;
 }
@@ -307,27 +310,27 @@ impl Announce for Announcer {
     async fn announce_tier(
         net_type: AnnounceType,
         req: &TrackerGet<'_>,
-        torrent: &Metadata,
+        info_hash: &[u8; 20],
         url: String,
     ) -> AnnounceResult {
-        announce_one(net_type, req, torrent, url).await
+        announce_one(net_type, req, info_hash, url).await
     }
 }
 
 async fn announce_one<'a>(
     net_type: AnnounceType,
     req: &TrackerGet<'a>,
-    torrent: &Metadata,
+    info_hash: &[u8; 20],
     url: String,
 ) -> AnnounceResult {
     let url2 = url.clone();
     let request = match net_type {
         AnnounceType::V4 => match *IPV4_CLIENT {
-            Some(ref client) => client.get(req.url(torrent, url)),
+            Some(ref client) => client.get(req.url(info_hash, url)),
             None => return Err(ClientErr::Ipv4Err.into()),
         },
         AnnounceType::V6 => match *IPV6_CLIENT {
-            Some(ref client) => client.get(req.url(torrent, url)),
+            Some(ref client) => client.get(req.url(info_hash, url)),
             None => return Err(ClientErr::Ipv6Err.into()),
         },
     }; // TODO: request more tiers url
@@ -370,7 +373,7 @@ mod tests {
         let z = Announcer::announce_tier(
             AnnounceType::V4,
             &announce_req,
-            &metadata,
+            &metadata.info_hash,
             announce_list[0][0].clone(),
         )
         .await

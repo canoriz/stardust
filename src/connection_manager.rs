@@ -12,11 +12,11 @@ use crate::cache::{AbortErr, ArcCache, GetRefErr, PieceBuf, PieceKey, Ref};
 use crate::metadata;
 use crate::picker::{start_receive_piece_block, BlockRequests};
 use crate::protocol::{
-    self, BTStream, Conn, ExtendedMsg, GeneralConn, Message, Piece, ReadStream, Reader, Split,
-    WriteStream, Writer,
+    self, BTStream, Conn, ExtendedMetadata, ExtendedMsg, GeneralConn, Message, Piece, ReadStream,
+    Reader, Split, WriteStream, Writer,
 };
-use crate::transmit_manager::Msg as TransmitMsg;
-use crate::transmit_manager::TransmitManagerHandle;
+use crate::transmit_manager::{Downloading, TransmitManagerHandle};
+use crate::transmit_manager::{Msg as TransmitMsg, TorrentState};
 
 #[derive(Debug)]
 pub(crate) enum WakeUpOption {
@@ -41,7 +41,7 @@ pub(crate) struct ConnectionManagerHandle {
 impl ConnectionManagerHandle {
     pub fn new<T>(conn: BTStream<T>, trh: TransmitManagerHandle, m: Arc<metadata::Metadata>) -> Self
     where
-        T: AsyncRead + AsyncWrite + Split+ Unpin + Send + 'static,
+        T: AsyncRead + AsyncWrite + Split + Unpin + Send + 'static,
     {
         use tokio::io::{BufReader, BufWriter};
         let (read_stream, write_stream) = conn.split_buffered();
@@ -91,11 +91,7 @@ impl ConnectionManagerHandle {
         }
     }
 
-    pub fn new_dyn(
-        conn: BTStream<Box<dyn Conn>>,
-        trh: TransmitManagerHandle,
-        m: Arc<metadata::Metadata>,
-    ) -> Self {
+    pub fn new_dyn(conn: BTStream<Box<dyn Conn>>, trh: TransmitManagerHandle) -> Self {
         use tokio::io::{BufReader, BufWriter};
         let (read_stream, write_stream) = conn.split_buffered();
 
@@ -246,6 +242,7 @@ async fn run_recv_stream<T>(
                     }
                     Err(e) => {
                         warn!("recv stream read header error {e}");
+                        // TODO: notify controller and maybe try re-connect
                         break;
                     }
                 }
@@ -311,12 +308,12 @@ where
         }
         Message::Interested => {
             // TODO: update peer state
-            tmh.sender.send(TransmitMsg::PeerInterested);
+            tmh.sender.send(TransmitMsg::PeerInterested(addr));
             0
         }
         Message::NotInterested => {
             // TODO: update peer state
-            tmh.sender.send(TransmitMsg::PeerUninterested);
+            tmh.sender.send(TransmitMsg::PeerUninterested(addr));
             0
         }
         Message::Have(i) => {
@@ -476,8 +473,21 @@ where
         begin: piece.begin,
         len: piece.len,
     };
+    let dl = match &*tmh.torrent_state {
+        TorrentState::Metadata(d) => d,
+        TorrentState::Fetching(_) => {
+            info!(
+                "receive PIECE msg {} {} {} block index {} before having metadata",
+                piece.index,
+                piece.begin,
+                piece.len,
+                piece.begin >> 14,
+            );
+            return Ok(());
+        }
+    };
     let mut receiving_guard =
-        if let Some(g) = start_receive_piece_block(tmh.picker.clone(), peer, &blk) {
+        if let Some(g) = start_receive_piece_block(dl.piece_picker.clone(), peer, &blk) {
             g
         } else {
             // TODO: make this persistent
@@ -503,7 +513,7 @@ where
         piece.begin >> 14,
     );
 
-    let (piece_buf, block_buf) = read_block_from_peer(tmh, &mut piece).await?;
+    let (piece_buf, block_buf) = read_block_from_peer(dl, &mut piece).await?;
 
     let received_piece = receiving_guard.block_received();
     if let Some(i) = received_piece {
@@ -517,13 +527,13 @@ where
         // TODO: change this to disable_new_write_ref
         // and start allow read_refs(for future seeding feature)
         piece_buf.disable_new_ref();
-        tmh.storage.set_can_flush(i);
+        dl.storage.set_can_flush(i);
     }
     Ok(())
 }
 
 async fn read_block_from_peer<'a, T>(
-    tmh: &mut TransmitManagerHandle,
+    dl: &Downloading,
     piece: &mut Piece<'a, T>,
 ) -> Result<(ArcCache<PieceBuf>, Ref<PieceBuf>), ()>
 where
@@ -534,12 +544,12 @@ where
 
     let key = PieceKey {
         // TODO: OPTIMIZE: avoid allocation
-        hash: Arc::new(tmh.metadata.info_hash),
-        offset: piece.index as usize * tmh.metadata.regular_piece_size(),
+        hash: Arc::new(dl.metadata.info_hash),
+        offset: piece.index as usize * dl.metadata.regular_piece_size(),
     };
 
     'outer: loop {
-        let piece_and_block_buf = tmh
+        let piece_and_block_buf = dl
             .storage
             .get_part_ref(piece.index, piece.begin, piece.len, key.clone())
             .await;
@@ -615,7 +625,10 @@ where
                 info!("received pex from {peer}, {extended_pex:?}");
                 Ok(())
             }
-            ExtendedMsg::Metadata(extended_metadata) => todo!(),
+            ExtendedMsg::Metadata(m) => {
+                _ = tmh.sender.send(TransmitMsg::ExtendMetadata(m));
+                Ok(())
+            }
             ExtendedMsg::Unknown(id) => {
                 warn!("received unknown extend message: id {id}");
                 Ok(())

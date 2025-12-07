@@ -1,7 +1,5 @@
 use crate::announce_manager::{self, AnnounceManagerHandle};
-use crate::metadata::Metadata;
-use crate::transmit_manager::{self, TransmitManager};
-use std::sync::Arc;
+use crate::transmit_manager::{self, TorrentTask, TransmitManager};
 use tokio::sync::mpsc;
 
 pub struct TorrentManagerHandle {
@@ -13,12 +11,16 @@ pub struct TorrentManagerHandle {
 }
 
 impl TorrentManagerHandle {
-    pub fn new(m: Arc<Metadata>) -> Self {
+    pub fn new(t: TorrentTask) -> Self {
         let (tx, rx) = mpsc::unbounded_channel::<transmit_manager::Msg>();
 
-        let tm = TransmitManager::new(m.clone(), tx.clone(), rx);
+        let info_hash = match &t {
+            TorrentTask::Torrent(m) => m.info_hash,
+            TorrentTask::Magnet(m) => m.info_hash,
+        };
+        let tm = TransmitManager::new(t, tx.clone(), rx);
 
-        let am = AnnounceManagerHandle::new(m, tx.clone());
+        let am = AnnounceManagerHandle::new(info_hash, tx.clone());
         Self {
             sender: tx,
             transmit_manager: tm,

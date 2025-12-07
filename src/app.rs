@@ -10,6 +10,7 @@ use tracing::{error, info, warn};
 
 use crate::protocol::{self, BTStream, Message, Reunite, Split};
 use crate::torrent_manager::TorrentManagerHandle;
+use crate::transmit_manager::TorrentTask;
 use crate::{announce_manager, metadata};
 
 pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -113,7 +114,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let info_hash = metadata.info_hash;
     // let mut tm = TransmitManager::new(metadata).with_announce_list(announce_list);
-    let mut tm = TorrentManagerHandle::new(Arc::new(metadata));
+    let mut tm = TorrentManagerHandle::new(TorrentTask::Torrent(metadata));
     info!("{announce_list:?}");
     for addr in announce_list {
         tm.send_announce_msg(announce_manager::Msg::AddUrl(addr));
