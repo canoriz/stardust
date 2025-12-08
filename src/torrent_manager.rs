@@ -1,4 +1,7 @@
+use std::sync::Arc;
+
 use crate::announce_manager::{self, AnnounceManagerHandle};
+use crate::dht::DHT;
 use crate::transmit_manager::{self, TorrentTask, TransmitManager};
 use tokio::sync::mpsc;
 
@@ -11,16 +14,16 @@ pub struct TorrentManagerHandle {
 }
 
 impl TorrentManagerHandle {
-    pub fn new(t: TorrentTask) -> Self {
+    pub fn new(t: TorrentTask, id: [u8; 20], port: u16, dht_client: Option<Arc<DHT>>) -> Self {
         let (tx, rx) = mpsc::unbounded_channel::<transmit_manager::Msg>();
 
         let info_hash = match &t {
             TorrentTask::Torrent(m) => m.info_hash,
             TorrentTask::Magnet(m) => m.info_hash,
         };
-        let tm = TransmitManager::new(t, tx.clone(), rx);
+        let tm = TransmitManager::new(t, id, tx.clone(), rx, dht_client);
 
-        let am = AnnounceManagerHandle::new(info_hash, tx.clone());
+        let am = AnnounceManagerHandle::new(id, port, info_hash, tx.clone());
         Self {
             sender: tx,
             transmit_manager: tm,

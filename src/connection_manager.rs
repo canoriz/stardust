@@ -8,12 +8,12 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{info, warn};
 
-use crate::cache::{AbortErr, ArcCache, GetRefErr, PieceBuf, PieceKey, Ref};
-use crate::metadata;
-use crate::picker::{start_receive_piece_block, BlockRequests};
+use crate::cache::{AbortErr, ArcCache, BufStorage, GetRefErr, PieceBuf, PieceKey, Ref};
+use crate::metadata::{self, Metadata};
+use crate::picker::{start_receive_piece_block, BlockRequests, HeapPiecePicker};
 use crate::protocol::{
-    self, BTStream, Conn, ExtendedMetadata, ExtendedMsg, GeneralConn, Message, Piece, ReadStream,
-    Reader, Split, WriteStream, Writer,
+    self, BTStream, Capability, CapabilityMap, Conn, ExtendedMetadata, ExtendedMsg, GeneralConn,
+    Message, Piece, ReadStream, Reader, Split, WriteStream, Writer,
 };
 use crate::transmit_manager::{Downloading, TransmitManagerHandle};
 use crate::transmit_manager::{Msg as TransmitMsg, TorrentState};
@@ -28,6 +28,8 @@ pub(crate) enum WakeUpOption {
 pub(crate) enum Msg {
     RequestBlocks(BlockRequests),
     Have(u32),
+    Extend(ExtendedMsg),
+
     // SendBlocks(BlockRange),
     SetWakeUp(WakeUpOption),
     ResetWakeUp(WakeUpOption),
@@ -36,6 +38,7 @@ pub(crate) enum Msg {
 pub(crate) struct ConnectionManagerHandle {
     recv_stream: RecvStreamHandle,
     send_stream: SendStreamHandle,
+    capability: CapabilityMap,
 }
 
 impl ConnectionManagerHandle {
@@ -43,6 +46,7 @@ impl ConnectionManagerHandle {
     where
         T: AsyncRead + AsyncWrite + Split + Unpin + Send + 'static,
     {
+        let capability = conn.capability();
         use tokio::io::{BufReader, BufWriter};
         let (read_stream, write_stream) = conn.split_buffered();
 
@@ -88,10 +92,12 @@ impl ConnectionManagerHandle {
         Self {
             recv_stream: recv_stream_handle,
             send_stream: send_stream_handle,
+            capability,
         }
     }
 
     pub fn new_dyn(conn: BTStream<Box<dyn Conn>>, trh: TransmitManagerHandle) -> Self {
+        let capability = conn.capability();
         use tokio::io::{BufReader, BufWriter};
         let (read_stream, write_stream) = conn.split_buffered();
 
@@ -137,6 +143,7 @@ impl ConnectionManagerHandle {
         Self {
             recv_stream: recv_stream_handle,
             send_stream: send_stream_handle,
+            capability,
         }
     }
 
@@ -162,6 +169,14 @@ impl ConnectionManagerHandle {
 
     pub fn send_stream_cmd(&self, m: Msg) {
         self.send_stream.sender.send(m);
+    }
+
+    pub fn support_metadata_extension(&self) -> bool {
+        self.capability.contains(&Capability::Metadata)
+    }
+
+    pub fn metadata_size(&self) -> usize {
+        0
     }
 
     // pub fn request(&self, br: BlockRange) {
@@ -473,8 +488,13 @@ where
         begin: piece.begin,
         len: piece.len,
     };
-    let dl = match &*tmh.torrent_state {
-        TorrentState::Metadata(d) => d,
+
+    let (piece_picker, metadata, storage) = match &*tmh.torrent_state.lock().unwrap() {
+        TorrentState::Metadata(d) => (
+            d.piece_picker.clone(),
+            d.metadata.clone(),
+            d.storage.clone(),
+        ),
         TorrentState::Fetching(_) => {
             info!(
                 "receive PIECE msg {} {} {} block index {} before having metadata",
@@ -486,24 +506,23 @@ where
             return Ok(());
         }
     };
-    let mut receiving_guard =
-        if let Some(g) = start_receive_piece_block(dl.piece_picker.clone(), peer, &blk) {
-            g
-        } else {
-            // TODO: make this persistent
-            let mut drain = vec![0u8; piece.len as usize];
-            piece.read_exact(&mut drain).await;
-            // TODO: why this happen (at testing)?
-            // seems we are requesting twice for each piece
-            warn!(
-                "drain PIECE msg {} {} {} block index {}",
-                piece.index,
-                piece.begin,
-                piece.len,
-                piece.begin >> 14,
-            );
-            return Ok(());
-        };
+    let mut receiving_guard = if let Some(g) = start_receive_piece_block(piece_picker, peer, &blk) {
+        g
+    } else {
+        // TODO: make this persistent
+        let mut drain = vec![0u8; piece.len as usize];
+        piece.read_exact(&mut drain).await;
+        // TODO: why this happen (at testing)?
+        // seems we are requesting twice for each piece
+        warn!(
+            "drain PIECE msg {} {} {} block index {}",
+            piece.index,
+            piece.begin,
+            piece.len,
+            piece.begin >> 14,
+        );
+        return Ok(());
+    };
 
     info!(
         "receive PIECE msg {} {} {} block index {}",
@@ -513,7 +532,8 @@ where
         piece.begin >> 14,
     );
 
-    let (piece_buf, block_buf) = read_block_from_peer(dl, &mut piece).await?;
+    let (piece_buf, block_buf) =
+        read_block_from_peer(metadata, storage.clone(), &mut piece).await?;
 
     let received_piece = receiving_guard.block_received();
     if let Some(i) = received_piece {
@@ -527,13 +547,14 @@ where
         // TODO: change this to disable_new_write_ref
         // and start allow read_refs(for future seeding feature)
         piece_buf.disable_new_ref();
-        dl.storage.set_can_flush(i);
+        storage.set_can_flush(i);
     }
     Ok(())
 }
 
 async fn read_block_from_peer<'a, T>(
-    dl: &Downloading,
+    metadata: Arc<Metadata>,
+    storage: Arc<BufStorage>,
     piece: &mut Piece<'a, T>,
 ) -> Result<(ArcCache<PieceBuf>, Ref<PieceBuf>), ()>
 where
@@ -544,13 +565,12 @@ where
 
     let key = PieceKey {
         // TODO: OPTIMIZE: avoid allocation
-        hash: Arc::new(dl.metadata.info_hash),
-        offset: piece.index as usize * dl.metadata.regular_piece_size(),
+        hash: Arc::new(metadata.info_hash),
+        offset: piece.index as usize * metadata.regular_piece_size(),
     };
 
     'outer: loop {
-        let piece_and_block_buf = dl
-            .storage
+        let piece_and_block_buf = storage
             .get_part_ref(piece.index, piece.begin, piece.len, key.clone())
             .await;
         // TODO: need a biglock. What if some peer else is doing operation now?
@@ -620,13 +640,13 @@ where
 
     match extended.recv().await {
         Ok(extend_msg) => match extend_msg {
-            ExtendedMsg::Handshake(extended_handshake) => todo!(),
-            ExtendedMsg::Pex(extended_pex) => {
-                info!("received pex from {peer}, {extended_pex:?}");
+            ExtendedMsg::Handshake(hs) => todo!(),
+            ExtendedMsg::Pex(pex) => {
+                info!("received pex from {peer}, {pex:?}");
                 Ok(())
             }
             ExtendedMsg::Metadata(m) => {
-                _ = tmh.sender.send(TransmitMsg::ExtendMetadata(m));
+                _ = tmh.sender.send(TransmitMsg::ExtendMetadata(*peer, m));
                 Ok(())
             }
             ExtendedMsg::Unknown(id) => {

@@ -4,6 +4,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use std::future::Future;
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::LazyLock;
 use thiserror::Error;
@@ -18,12 +19,12 @@ pub struct Metadata {
     pub info: Info,
     pub info_hash: [u8; 20],
 
-    len: usize,
+    pub len: usize,
 
-    files: Vec<File>,
-    comment: Option<String>,
-    created_by: Option<String>,
-    creation_date: Option<u64>,
+    pub files: Vec<File>,
+    pub comment: Option<String>,
+    pub created_by: Option<String>,
+    pub creation_date: Option<u64>,
 }
 
 impl Metadata {
@@ -62,7 +63,7 @@ impl Metadata {
         }
     }
 
-    pub fn verify_info_hash(&self) -> anyhow::Result<bool> {
+    pub fn verify_info_hash(&self) -> io::Result<bool> {
         let mut hasher = Sha1::new();
         bt_bencode::to_writer(&mut hasher, &self.info)?;
         let info_hash: [u8; 20] = hasher.finalize().into();
@@ -97,6 +98,46 @@ pub struct Info {
     pub pieces: ByteString,
     #[serde(flatten)]
     len_or_files: LenFiles,
+
+    // raw, byte-format info, for sending metadata to peers
+    #[serde(skip)]
+    pub raw: Vec<u8>,
+}
+
+impl Info {
+    pub fn to_metadata(self, info_hash: [u8; 20]) -> Metadata {
+        let (len, files) = match &self.len_or_files {
+            LenFiles::Length(l) => (
+                *l,
+                vec![File {
+                    length: *l,
+                    path: vec![self.name.clone()],
+                }],
+            ),
+            LenFiles::Files(fs) => (
+                fs.iter().map(|f| f.length).sum(),
+                fs.iter()
+                    .map(|sub| {
+                        let mut path = vec![self.name.clone()];
+                        path.extend_from_slice(&sub.path);
+                        File {
+                            length: sub.length,
+                            path,
+                        }
+                    })
+                    .collect(),
+            ),
+        };
+        Metadata {
+            info: self,
+            info_hash: info_hash,
+            comment: None,
+            created_by: None,
+            creation_date: None,
+            len,
+            files,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -109,7 +150,7 @@ enum LenFiles {
 }
 
 impl FileMetadata {
-    pub fn load<T: AsRef<[u8]>>(input: T) -> anyhow::Result<Self> {
+    pub fn load<T: AsRef<[u8]>>(input: T) -> io::Result<Self> {
         let mut torrent: FileMetadata = bt_bencode::from_slice(input.as_ref())?;
         let mut hasher = Sha1::new();
         bt_bencode::to_writer(&mut hasher, &torrent.info)?;
@@ -119,37 +160,13 @@ impl FileMetadata {
 
     /// convert FileMetadata to Metadata and announce list
     pub fn to_metadata(self) -> (Metadata, Vec<Vec<String>>) {
-        let (len, files) = match &self.info.len_or_files {
-            LenFiles::Length(l) => (
-                *l,
-                vec![File {
-                    length: *l,
-                    path: vec![self.info.name.clone()],
-                }],
-            ),
-            LenFiles::Files(fs) => (
-                fs.iter().map(|f| f.length).sum(),
-                fs.iter()
-                    .map(|sub| {
-                        let mut path = vec![self.info.name.clone()];
-                        path.extend_from_slice(&sub.path);
-                        File {
-                            length: sub.length,
-                            path,
-                        }
-                    })
-                    .collect(),
-            ),
-        };
+        let m = self.info.to_metadata(self.info_hash);
         (
             Metadata {
-                info: self.info,
-                info_hash: self.info_hash,
                 comment: self.comment,
                 created_by: self.created_by,
                 creation_date: self.creation_date,
-                len,
-                files,
+                ..m
             },
             if let Some(li) = self.announce_list {
                 li
@@ -176,17 +193,17 @@ pub struct File {
 }
 
 #[derive(Debug, Clone)]
-pub struct TrackerGet<'a> {
-    pub peer_id: &'a str,
+pub struct TrackerGet {
+    pub peer_id: [u8; 20],
     pub ip: Option<Ipv4Addr>,
-    pub port: u32,
+    pub port: u16,
     pub uploaded: usize,
     pub downloaded: usize,
     pub left: usize,
     // event: Option<Enum<...>>
 }
 
-impl TrackerGet<'_> {
+impl TrackerGet {
     pub fn url(&self, info_hash: &[u8; 20], url: String) -> String {
         fn percent_encoding_str<T: AsRef<[u8]>, P: AsRef<[u8]>>(k: &T, v: &P) -> String {
             percent_encoding::percent_encode(k.as_ref(), percent_encoding::NON_ALPHANUMERIC)
@@ -297,7 +314,7 @@ pub trait Announce {
     // TODO: maybe don't need announcer, just a function is enough
     fn announce_tier(
         net_type: AnnounceType,
-        req: &TrackerGet<'_>,
+        req: &TrackerGet,
         torrent: &[u8; 20],
         url: String,
     ) -> impl Future<Output = AnnounceResult> + Send;
@@ -309,7 +326,7 @@ pub struct Announcer {}
 impl Announce for Announcer {
     async fn announce_tier(
         net_type: AnnounceType,
-        req: &TrackerGet<'_>,
+        req: &TrackerGet,
         info_hash: &[u8; 20],
         url: String,
     ) -> AnnounceResult {
@@ -317,9 +334,9 @@ impl Announce for Announcer {
     }
 }
 
-async fn announce_one<'a>(
+async fn announce_one(
     net_type: AnnounceType,
-    req: &TrackerGet<'a>,
+    req: &TrackerGet,
     info_hash: &[u8; 20],
     url: String,
 ) -> AnnounceResult {
@@ -362,7 +379,7 @@ mod tests {
         let (metadata, announce_list) = torrent.to_metadata();
 
         let announce_req = TrackerGet {
-            peer_id: "-ZS0405-qwerasdfzxcv",
+            peer_id: *b"-ZS0405-qwerasdfzxcv",
             uploaded: 0,
             port: 35515,
             downloaded: 0,

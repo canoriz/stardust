@@ -168,8 +168,8 @@ pub struct Resp {
 
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
 pub struct NodeAddr {
-    id: NodeID,
-    addr: SocketAddr,
+    pub id: NodeID,
+    pub addr: SocketAddr,
 }
 
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
@@ -435,6 +435,36 @@ impl DHT {
             })),
         };
         self.do_rpc_req(addr, krpc, timeout).await
+    }
+
+    pub async fn get_peers(self: Arc<Self>, target: NodeID, ipv6: bool) -> Vec<SocketAddr> {
+        let timeout = time::Duration::from_secs(5);
+        let ns = self.find_closest_node_to(target, ipv6).await;
+
+        use tokio::task::JoinSet;
+        let mut js = JoinSet::new();
+
+        for n in ns {
+            let cl = self.clone();
+            js.spawn(async move { cl.get_peers_rpc(RpcAddr::ID(n), target, timeout).await });
+        }
+
+        let mut ret = vec![];
+        for r in js.join_all().await {
+            if let Ok(resp) = r {
+                if let Some(ps) = resp.nodes {
+                    for (_, addr) in ps.0 {
+                        ret.push(SocketAddr::V4(addr))
+                    }
+                }
+                if let Some(ps) = resp.nodes6 {
+                    for (_, addr) in ps.0 {
+                        ret.push(SocketAddr::V6(addr))
+                    }
+                }
+            }
+        }
+        ret
     }
 
     /// find closest nodes to target, returns closest IPV4 or IPV6 nodes

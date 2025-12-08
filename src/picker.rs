@@ -743,7 +743,7 @@ impl HeapPiecePicker {
         let mut n_want_blocks = n_blocks;
         let mut picked = Vec::new();
 
-        // TODO: those timeout block requestes, corresponding peers' n_block_in_flight must be decreased
+        // TODO: those timeout block requests' corresponding peers' n_block_in_flight must be decreased
         // maybe maintain n_block_in_flight in PiecePicker?
         // or maybe revoke at a higher level?
         if now.duration_since(self.last_check_timeout) > time::Duration::from_secs(2) {

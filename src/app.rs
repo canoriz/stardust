@@ -8,12 +8,21 @@ use tokio::time::Duration;
 use tokio::{net, time};
 use tracing::{error, info, warn};
 
+use crate::dht::DHT;
 use crate::protocol::{self, BTStream, Message, Reunite, Split};
 use crate::torrent_manager::TorrentManagerHandle;
 use crate::transmit_manager::TorrentTask;
 use crate::{announce_manager, metadata};
 
 pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    const SELF_ID: [u8; 20] = [
+        0x54, 0x42, 0x54, 0x69, 0x21, 0x58, 0x21, 0x58, 0x68, 0x69, 0x93, 0x51, 0x54, 0x42, 0x54,
+        0x69, 0x21, 0x58, 0x21, 0x58,
+    ];
+    const SELF_PORT: u16 = 41773;
+    const DHT_PORT: u16 = 42773;
+    let dht_client = Arc::new(DHT::new(SELF_ID, DHT_PORT, "ST01".into()));
+
     println!("Hello, world!");
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -114,7 +123,12 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let info_hash = metadata.info_hash;
     // let mut tm = TransmitManager::new(metadata).with_announce_list(announce_list);
-    let mut tm = TorrentManagerHandle::new(TorrentTask::Torrent(metadata));
+    let mut tm = TorrentManagerHandle::new(
+        TorrentTask::Torrent(metadata),
+        SELF_ID,
+        SELF_PORT,
+        Some(dht_client),
+    );
     info!("{announce_list:?}");
     for addr in announce_list {
         tm.send_announce_msg(announce_manager::Msg::AddUrl(addr));

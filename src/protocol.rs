@@ -190,6 +190,8 @@ pub struct BTStream<T> {
     partial_header: PartialHeader,
     extension_id: HashMap<ExtensionType, u8>,
 
+    metadata_size: usize,
+
     reserved: FuncBits,
     peer_id: [u8; 20],
     // TODO: maybe add a torrent hash Arc<>
@@ -215,6 +217,7 @@ where
             reserved: self.reserved,
             peer_id: self.peer_id,
             pex_peers: self.pex_peers,
+            metadata_size: self.metadata_size,
         }
     }
 }
@@ -246,6 +249,8 @@ pub struct ReadStream<T> {
     // required to implement Cancel Safe for read_msg_header
     partial_header: PartialHeader,
 
+    metadata_size: usize,
+
     peer_id: [u8; 20],
     reserved: FuncBits,
 }
@@ -270,6 +275,8 @@ pub struct WriteStream<T> {
     peer_addr: SocketAddr,
 
     extension_id: HashMap<ExtensionType, u8>,
+
+    metadata_size: usize,
 
     // what this peer knows about our connected peers
     pex_peers: HashMap<IpAddr, Option<PexFlag>>,
@@ -306,6 +313,15 @@ impl BTStream<net::TcpStream> {
     }
 }
 
+pub type CapabilityMap = HashSet<Capability>;
+
+#[derive(Eq, Hash, PartialEq)]
+pub enum Capability {
+    DHT,
+    Metadata,
+    Pex,
+}
+
 pub struct ConnInfo<'a> {
     func_bits: &'a FuncBits,
     peer_id: &'a [u8; 20],
@@ -317,6 +333,20 @@ impl<T> BTStream<T> {
             func_bits: &self.reserved,
             peer_id: &self.peer_id,
         }
+    }
+
+    pub fn capability(&self) -> CapabilityMap {
+        let mut ret = CapabilityMap::new();
+        if self.reserved.have_dht() {
+            ret.insert(Capability::DHT);
+        }
+        for id in self.extension_id.keys() {
+            match id {
+                ExtensionType::Metadata => ret.insert(Capability::Metadata),
+                ExtensionType::Pex => ret.insert(Capability::Pex),
+            };
+        }
+        ret
     }
 }
 
@@ -356,6 +386,7 @@ where
                 partial_header: self.partial_header,
                 peer_id: self.peer_id,
                 reserved: self.reserved,
+                metadata_size: self.metadata_size,
             },
             WriteStream {
                 inner: write_end,
@@ -364,6 +395,7 @@ where
                 pex_peers: self.pex_peers,
                 peer_id: self.peer_id,
                 reserved: self.reserved,
+                metadata_size: self.metadata_size,
             },
         )
     }
@@ -385,6 +417,7 @@ where
             reserved: r.reserved,
             peer_id: r.peer_id,
             pex_peers: w.pex_peers,
+            metadata_size: r.metadata_size,
         })
     }
 
@@ -403,6 +436,7 @@ where
                 partial_header: self.partial_header,
                 peer_id: self.peer_id,
                 reserved: self.reserved,
+                metadata_size: self.metadata_size,
             },
             WriteStream {
                 inner: BufWriter::with_capacity(32768, write_end),
@@ -411,6 +445,7 @@ where
                 pex_peers: self.pex_peers,
                 peer_id: self.peer_id,
                 reserved: self.reserved,
+                metadata_size: self.metadata_size,
             },
         )
     }
@@ -427,6 +462,7 @@ impl BTStream<Box<dyn Conn>> {
                 partial_header: self.partial_header,
                 peer_id: self.peer_id,
                 reserved: self.reserved,
+                metadata_size: self.metadata_size,
             },
             WriteStream {
                 inner: write_end,
@@ -435,6 +471,7 @@ impl BTStream<Box<dyn Conn>> {
                 pex_peers: self.pex_peers,
                 peer_id: self.peer_id,
                 reserved: self.reserved,
+                metadata_size: self.metadata_size,
             },
         )
     }
@@ -454,6 +491,7 @@ impl BTStream<Box<dyn Conn>> {
                 partial_header: self.partial_header,
                 peer_id: self.peer_id,
                 reserved: self.reserved,
+                metadata_size: self.metadata_size,
             },
             WriteStream {
                 inner: BufWriter::with_capacity(32768, write_end),
@@ -462,6 +500,7 @@ impl BTStream<Box<dyn Conn>> {
                 pex_peers: self.pex_peers,
                 peer_id: self.peer_id,
                 reserved: self.reserved,
+                metadata_size: self.metadata_size,
             },
         )
     }
@@ -526,6 +565,7 @@ where
             peer_id: peer_handshake.client_id,
             reserved: peer_handshake.reserved,
             pex_peers: HashMap::new(),
+            metadata_size: 0,
         };
 
         let support_extension =
@@ -558,6 +598,7 @@ where
                 .filter_map(|(s, id)| extension_type(s).map(|ss| (ss, *id)))
                 .filter(|(_, id)| *id != 0)
                 .collect();
+            s.metadata_size = exth.metadata_size.unwrap_or(0) as usize;
             return Ok(s);
         }
         Ok(s)
@@ -586,6 +627,7 @@ where
             peer_id: peer_handshake.client_id,
             reserved: peer_handshake.reserved.common(funcbits),
             pex_peers: HashMap::new(),
+            metadata_size: 0,
         };
 
         let support_extension = peer_handshake.reserved.have_extension();
@@ -2273,6 +2315,7 @@ mod tests {
                     partial_header: EMPTY_PARTIAL_HEADER,
                     peer_id: [0; 20],
                     reserved: [0; 8].into(),
+                    metadata_size: 0,
                 },
                 WriteStream {
                     inner: write_end,
@@ -2281,6 +2324,7 @@ mod tests {
                     pex_peers: HashMap::new(),
                     peer_id: [0; 20],
                     reserved: [0; 8].into(),
+                    metadata_size: 0,
                 },
             )
         }

@@ -22,13 +22,20 @@ pub struct AnnounceManagerHandle {
 }
 
 impl AnnounceManagerHandle {
-    pub fn new(info_hash: [u8; 20], tx: mpsc::UnboundedSender<transmit_manager::Msg>) -> Self {
+    pub fn new(
+        peer_id: [u8; 20],
+        port: u16,
+        info_hash: [u8; 20],
+        tx: mpsc::UnboundedSender<transmit_manager::Msg>,
+    ) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
 
         let cancel = CancellationToken::new();
         let (done_tx, done_rx) = oneshot::channel();
 
         let manager = AnnounceManager {
+            peer_id,
+            port,
             announce_list: vec![
                 vec!["https://torrent.ubuntu.com/announce".into()],
                 vec!["https://ipv6.torrent.ubuntu.com/announce".into()],
@@ -64,6 +71,8 @@ impl AnnounceManagerHandle {
 }
 
 struct AnnounceManager {
+    peer_id: [u8; 20],
+    port: u16,
     announce_list: Vec<Vec<String>>,
     receiver: mpsc::UnboundedReceiver<Msg>,
     transmit_mgr: mpsc::UnboundedSender<transmit_manager::Msg>,
@@ -159,6 +168,8 @@ async fn run_announce_manager<A>(
         output_tx,
         cancel.child_token(),
         info_hash,
+        manager.peer_id,
+        manager.port,
     ));
     loop {
         tokio::select! {
@@ -234,7 +245,7 @@ struct FakeAnnouncer {}
 impl metadata::Announce for FakeAnnouncer {
     async fn announce_tier(
         _net_type: metadata::AnnounceType,
-        _req: &TrackerGet<'_>,
+        _req: &TrackerGet,
         _torrent: &[u8; 20],
         _url: String,
     ) -> metadata::AnnounceResult {
@@ -273,13 +284,14 @@ async fn announce_task<A>(
     output: mpsc::UnboundedSender<(AnnounceResult, TimeUp)>,
     cancel: CancellationToken,
     info_hash: [u8; 20],
-    // timers: &mut task::JoinSet<TimeUp>,
+    id: [u8; 20],
+    port: u16,
 ) where
     A: metadata::Announce,
 {
     let tg = TrackerGet {
-        peer_id: "-ZS0405-qwerasdfzxcv",
-        port: 4567,
+        peer_id: id,
+        port: port,
         uploaded: 0,
         downloaded: 0,
         ip: None,
