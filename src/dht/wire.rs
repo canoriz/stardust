@@ -143,8 +143,10 @@ impl TryFrom<WireKRPC> for KRPC {
                         })
                     }
                     ANNOUNCE_PEER => {
-                        let ap: AnnouncePeerArg = bt_bencode::from_value(a)
-                            .map_err(|_| r#"fail to bdecode "a" to announce_peer"#)?;
+                        let ap: AnnouncePeerArg = bt_bencode::from_value(a).map_err(|e| {
+                            info!(r#"bdecode "a" to announce_peer err {e}"#);
+                            r#"fail to bdecode "a" to announce_peer err {e}"#
+                        })?;
                         Ok(KRPC {
                             t: w.t,
                             v: w.v,
@@ -262,7 +264,7 @@ mod test {
                         token: [0x77, 0x35, 0x25, 0x6, 0x1, 0x60, 0xb7, 0x82]
                             .as_ref()
                             .into(),
-                        implied_port: 1,
+                        implied_port: Some(1),
                         port: 6829,
                         id: [
                             0x24, 0x12, 0xbe, 0xa8, 0x73, 0x50, 0x5e, 0x58, 0x30, 0x41, 0x8b, 0x99,

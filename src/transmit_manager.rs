@@ -14,7 +14,7 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time;
 use tokio_util::sync::{CancellationToken, DropGuard as CancelDropGuard};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 pub enum TorrentTask {
     Torrent(Metadata),
@@ -73,6 +73,7 @@ struct PeerStatus {
 struct PeerConn {
     conn: ConnectionManagerHandle,
     state: PeerStatus,
+    bitmap: Option<BitField>,
 
     last_pick_time: time::Instant,
 
@@ -160,6 +161,37 @@ impl MetadataBuffer {
             not_requested: BTreeSet::new(),
             requesting: BTreeMap::new(),
         }
+    }
+
+    fn add_size_to_bucket(&mut self, sz: usize) {
+        self.size_bucket
+            .entry(sz)
+            .and_modify(|c| *c += 1)
+            .or_insert(1);
+        if let Some(cc) = self.size_bucket.get(&sz) {
+            if *cc > self.most_frequent_size {
+                if sz > self.most_frequent_size {
+                    for p in (self.most_frequent_size / 16384)..=((sz - 1) / 16384) {
+                        self.not_requested.insert(p as u32);
+                    }
+                } else {
+                    for p in (sz / 16384)..=((self.most_frequent_size - 1) / 16384) {
+                        self.not_requested.insert(p as u32);
+                    }
+                }
+                self.most_frequent_size = sz;
+            }
+        }
+
+        let buf = &mut self.metadata;
+
+        // TODO: filter out malicious very large size
+        let expand_to = buf.len().max(self.most_frequent_size);
+        buf.resize(expand_to, 0);
+    }
+
+    fn probable_total_size(&self) -> usize {
+        self.most_frequent_size
     }
 }
 
@@ -432,6 +464,7 @@ impl TransmitWorker {
                         if !self.connected_peers.contains_key(&s)
                             && !self.connecting_peers.contains(&s)
                         {
+                            self.connecting_peers.insert(s);
                             tokio::spawn(connect_peer(h_clone, self.id, s, info_hash));
                         }
                     }
@@ -454,6 +487,7 @@ impl TransmitWorker {
                             peer_choke_status: ChokeStatus::Unknown,
                             peer_interest_status: InterestStatus::Unknown,
                         },
+                        bitmap: None,
                         last_pick_time: time::Instant::now(),
                         n_block_in_flight: 0,
                     },
@@ -469,6 +503,11 @@ impl TransmitWorker {
                 let piece_picker = match &*guard {
                     TorrentState::Metadata(d) => &d.piece_picker,
                     TorrentState::Fetching(_) => {
+                        let mut pc = self
+                            .connected_peers
+                            .get_mut(&addr)
+                            .expect("connection should in map");
+                        pc.bitmap = Some(bitfield);
                         return;
                     }
                 };
@@ -546,7 +585,7 @@ impl TransmitWorker {
                 // packet_size is known
                 // bandwitdh is unknown and ?difficult to measure
                 let conn_stat = self.connected_peers.get_mut(&peer).expect("should exist");
-                warn!(
+                debug!(
                     "peer {peer} received {n} block in prev period, in flight {}",
                     conn_stat.n_block_in_flight
                 );
@@ -650,39 +689,12 @@ impl TransmitWorker {
 
                     let have_metadata = {
                         let mut mbuf = f.meta_buf.lock().unwrap();
-                        let probably_tot_size = if let Some(sz) = total_size {
-                            mbuf.size_bucket
-                                .entry(sz)
-                                .and_modify(|c| *c += 1)
-                                .or_insert(1);
-                            if let Some(cc) = mbuf.size_bucket.get(&sz) {
-                                if *cc > mbuf.most_frequent_size {
-                                    if sz > mbuf.most_frequent_size {
-                                        for p in
-                                            (mbuf.most_frequent_size / 16384)..=((sz - 1) / 16384)
-                                        {
-                                            mbuf.not_requested.insert(p as u32);
-                                        }
-                                    } else {
-                                        for p in
-                                            (sz / 16384)..=((mbuf.most_frequent_size - 1) / 16384)
-                                        {
-                                            mbuf.not_requested.insert(p as u32);
-                                        }
-                                    }
-                                    mbuf.most_frequent_size = sz;
-                                }
-                            }
-                            mbuf.most_frequent_size
-                        } else {
-                            mbuf.most_frequent_size
-                        };
+                        if let Some(sz) = total_size {
+                            mbuf.add_size_to_bucket(sz);
+                        }
+                        let probably_tot_size = mbuf.probable_total_size();
                         let buf = &mut mbuf.metadata;
                         let offset = (piece * 16384) as usize;
-
-                        // TODO: filter out malicious very large size
-                        let expand_to = buf.len().max(probably_tot_size).max(offset + data.len());
-                        buf.resize(expand_to, 0);
                         buf[offset..offset + data.len()].copy_from_slice(&data);
                         mbuf.requesting.remove(&piece);
                         mbuf.not_requested.remove(&piece);
@@ -713,7 +725,17 @@ impl TransmitWorker {
                     };
 
                     if let Some(m) = have_metadata {
-                        *torrent_state = TorrentState::Metadata(Self::metadata_into_downloading(m));
+                        let metadata = Self::metadata_into_downloading(m);
+                        // TODO: fix this
+                        {
+                            let mut piece_picker = metadata.piece_picker.lock().unwrap();
+                            for (addr, pc) in &mut self.connected_peers {
+                                if let Some(map) = pc.bitmap.take() {
+                                    piece_picker.peer_add(*addr, map);
+                                }
+                            }
+                        }
+                        *torrent_state = TorrentState::Metadata(metadata);
                     }
                 }
                 TorrentState::Metadata(m) => {
@@ -761,6 +783,7 @@ impl TransmitWorker {
         for (_, h) in &mut self.connected_peers {
             if h.conn.support_metadata_extension() && h.conn.metadata_size() > 0 {
                 // TODO: adaptively set value of n
+                meta_buf.add_size_to_bucket(h.conn.metadata_size());
                 Self::fetching_metadata_from_peer(h, 2, &mut meta_buf, now);
             }
         }
@@ -817,14 +840,14 @@ pub(crate) async fn run_transmit_worker(
         // TODO: lets use notify?
         tokio::select! {
             Some(msg) = transmit.receiver.recv() => {
-                info!("transmit manager received msg {msg:?}");
+                debug!("transmit manager received msg {msg:?}");
                 transmit.handle_msg(msg);
             }
             _ = dht_ticker.tick() => {
+                info!("dht ticker tick");
                 run_dht(&mut transmit);
             }
             _ = ticker.tick() => {
-                info!("transmit ticker tick");
                 transmit.pick_blocks_for_all_peers(2);
                 transmit.fetching_metadata();
             }
@@ -841,7 +864,7 @@ pub(crate) async fn run_transmit_worker(
 fn run_dht(transmit: &mut TransmitWorker) {
     if let Some(c) = &transmit.dht_client {
         let cl = c.clone();
-        tokio::spawn(dht_find_nodes(
+        tokio::spawn(dht_get_peers(
             cl,
             transmit.id,
             transmit.info_hash,
@@ -850,17 +873,17 @@ fn run_dht(transmit: &mut TransmitWorker) {
     }
 }
 
-async fn dht_find_nodes(
+async fn dht_get_peers(
     client: Arc<DHT>,
     self_id: [u8; 20],
     target: [u8; 20],
     tmh: TransmitManagerHandle,
 ) {
-    let mut nodes = client.find_closest_node_to(target, false).await;
-    nodes.extend_from_slice(&client.find_closest_node_to(target, true).await);
-    for n in nodes {
+    let mut addrs = client.get_peers(target, false).await;
+    addrs.extend_from_slice(&client.get_peers(target, true).await);
+    for a in addrs {
         let t = tmh.clone();
-        tokio::spawn(connect_peer(t, self_id, n.addr, target));
+        tokio::spawn(connect_peer(t, self_id, a, target));
     }
 }
 

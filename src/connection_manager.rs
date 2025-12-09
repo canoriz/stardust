@@ -39,6 +39,7 @@ pub(crate) struct ConnectionManagerHandle {
     recv_stream: RecvStreamHandle,
     send_stream: SendStreamHandle,
     capability: CapabilityMap,
+    metadata_size: usize,
 }
 
 impl ConnectionManagerHandle {
@@ -47,6 +48,7 @@ impl ConnectionManagerHandle {
         T: AsyncRead + AsyncWrite + Split + Unpin + Send + 'static,
     {
         let capability = conn.capability();
+        let metadata_size = conn.metadata_size();
         use tokio::io::{BufReader, BufWriter};
         let (read_stream, write_stream) = conn.split_buffered();
 
@@ -93,11 +95,13 @@ impl ConnectionManagerHandle {
             recv_stream: recv_stream_handle,
             send_stream: send_stream_handle,
             capability,
+            metadata_size,
         }
     }
 
     pub fn new_dyn(conn: BTStream<Box<dyn Conn>>, trh: TransmitManagerHandle) -> Self {
         let capability = conn.capability();
+        let metadata_size = conn.metadata_size();
         use tokio::io::{BufReader, BufWriter};
         let (read_stream, write_stream) = conn.split_buffered();
 
@@ -144,6 +148,7 @@ impl ConnectionManagerHandle {
             recv_stream: recv_stream_handle,
             send_stream: send_stream_handle,
             capability,
+            metadata_size,
         }
     }
 
@@ -176,7 +181,7 @@ impl ConnectionManagerHandle {
     }
 
     pub fn metadata_size(&self) -> usize {
-        0
+        self.metadata_size
     }
 
     // pub fn request(&self, br: BlockRange) {
@@ -243,7 +248,7 @@ async fn run_recv_stream<T>(
             }
             _ = ticker.tick() => {
                 // TODO: many ticks may come together, unfair
-                info!("recv conn ticker tick {} block received in this epoch", conn.blk_recv_count);
+                // debug!("recv conn ticker tick {} block received in this epoch", conn.blk_recv_count);
                 conn.transmit_handle.sender.send(TransmitMsg::BlockReceived(conn.read_stream.peer_addr(), conn.blk_recv_count));
                 conn.blk_recv_count = 0;
             }
@@ -348,11 +353,12 @@ async fn handle_peer_msg(tmh: &mut TransmitManagerHandle, addr: SocketAddr, m: M
         }
         Message::Cancel(request) => {
             // TODO: cancel pending request/fetch task
-            todo!();
+            // todo!();
             0
         }
         Message::Port(port) => {
-            todo!()
+            // TODO
+            0
         }
         Message::Extended(extend) => {
             handle_extended_msg(&addr, tmh, extend).await;
@@ -414,6 +420,9 @@ where
             Msg::Have(i) => {
                 self.write_stream.send_have(i).await;
             }
+            Msg::Extend(ExtendedMsg::Metadata(m)) => {
+                self.write_stream.send_extend_metadata(m).await;
+            }
             other => {}
         }
     }
@@ -466,7 +475,7 @@ async fn handle_piece_msg(
     // if coming piece have cache, store it in cache
     // if coming piece don't have cache, ???
     // tell manager?
-    info!("handle_piece_msg {piece:?}");
+    // info!("handle_piece_msg {piece:?}");
 
     // TODO: if coming block is already received and checked,
     // then discard this block, don't alloc (if needed) piece buffer.

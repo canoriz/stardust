@@ -15,7 +15,7 @@ use std::time;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::{CancellationToken, DropGuard};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 mod routing;
 mod wire;
@@ -120,7 +120,8 @@ struct GetPeersArg {
 struct AnnouncePeerArg {
     #[serde(with = "serde_bytes")]
     id: NodeID,
-    implied_port: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    implied_port: Option<u32>,
     #[serde(with = "serde_bytes")]
     info_hash: NodeID,
     port: u16,
@@ -379,7 +380,7 @@ impl DHT {
         target: NodeID,
         timeout: time::Duration,
     ) -> io::Result<Resp> {
-        info!("request find_node {target:?} to {addr:?}");
+        debug!("request find_node {target:?} to {addr:?}");
         let tid = self.tid.fetch_add(1, Ordering::Relaxed).to_be_bytes();
         let tid: ByteString = tid[..].into();
         let krpc = KRPC {
@@ -428,7 +429,7 @@ impl DHT {
             v: self.version.clone().into(),
             inner: KRPCInner::Request(Arg::AnnouncePeer(AnnouncePeerArg {
                 id: self.id,
-                implied_port: if implied { 1 } else { 0 },
+                implied_port: if implied { Some(1) } else { Some(0) },
                 info_hash,
                 port,
                 token: token.into(),
@@ -437,7 +438,7 @@ impl DHT {
         self.do_rpc_req(addr, krpc, timeout).await
     }
 
-    pub async fn get_peers(self: Arc<Self>, target: NodeID, ipv6: bool) -> Vec<SocketAddr> {
+    pub async fn get_peers(self: &Arc<Self>, target: NodeID, ipv6: bool) -> Vec<SocketAddr> {
         let timeout = time::Duration::from_secs(5);
         let ns = self.find_closest_node_to(target, ipv6).await;
 
@@ -503,7 +504,7 @@ impl DHT {
                         _ = resp.send(Ok(ns)).await;
                     }
                     Err(e) => {
-                        info!("in find_closest_node, node {target:?} does not respond, error {e}");
+                        debug!("in find_closest_node, node {target:?} does not respond, error {e}");
                         _ = resp.send(Err(target)).await;
                     }
                 };
@@ -551,7 +552,7 @@ impl DHT {
                     }
                 }
                 Err(id) => {
-                    info!("receive response from {id:?} error");
+                    debug!("receive response from {id:?} error");
                     node_state.insert(id, State::Deleted);
                     closest_nodes.retain(|x| x.addr.id != id);
                 }
@@ -739,7 +740,7 @@ impl Server {
         };
         match krpc.inner {
             KRPCInner::Request(Arg::Ping(p)) => {
-                info!("receive ping from {}", from_addr);
+                debug!("receive ping from {}", from_addr);
                 let resp = KRPC {
                     t: krpc.t,
                     v: version,
@@ -755,9 +756,9 @@ impl Server {
                 _ = self.send_response(from_addr, &resp).await;
             }
             KRPCInner::Request(Arg::AnnouncePeer(a)) => {
-                info!("receive announce_peer from {}", from_addr);
+                debug!("receive announce_peer from {}", from_addr);
                 add_route(a.id);
-                let port = if a.implied_port == 1 {
+                let port = if let Some(1) = a.implied_port {
                     from_addr.port()
                 } else {
                     a.port
@@ -782,7 +783,7 @@ impl Server {
                 // TODO:("remove old peer entries");
             }
             KRPCInner::Request(Arg::FindNode(f)) => {
-                info!("receive find_node from {}", from_addr);
+                debug!("receive find_node from {}", from_addr);
                 add_route(f.id);
                 self.nodes_buf.clear();
                 if ipv6 {
@@ -809,7 +810,7 @@ impl Server {
                 _ = self.send_response(from_addr, &resp).await;
             }
             KRPCInner::Request(Arg::GetPeers(gp)) => {
-                info!("receive get_peer from {}", from_addr);
+                debug!("receive get_peer from {}", from_addr);
                 add_route(gp.id);
                 self.nodes_buf.clear();
                 if ipv6 {
@@ -861,7 +862,7 @@ impl Server {
                 if let Some(ret) = self.tmap.lock().unwrap().remove(krpc.t.as_slice()) {
                     _ = ret.send(Ok(resp));
                 } else {
-                    info!("dht unknown transaction id");
+                    debug!("dht unknown transaction id");
                 }
             }
             KRPCInner::Err(items) => todo!(),

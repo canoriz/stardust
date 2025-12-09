@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::time::Instant;
 
-use tracing::info;
+use tracing::{debug, info};
 
 use super::{NodeAddr, NodeID};
 const BUCKET_MAX: usize = 160;
@@ -60,27 +60,27 @@ impl RoutingTable {
         let contact_info = (addr.addr, Instant::now());
         if bucket.inuse.len() < K {
             bucket.inuse.insert(addr.id, contact_info);
-            info!("dht routing: add route to bucket {:?}", addr);
+            debug!("dht routing: add route to bucket {:?}", addr);
         } else {
             while bucket.backup.len() > K {
                 // nodes at front will always be the early ones
                 bucket.backup.pop_front();
             }
             bucket.backup.push_back((addr.id, contact_info));
-            info!("dht routing: add route to backup {:?}", addr);
+            debug!("dht routing: add route to backup {:?}", addr);
         }
     }
 
     pub fn remove_route(&mut self, id: &NodeID) {
         // TODO: give node some limit of times to fail?
-        info!("dht routing: remove route to {:?}", id);
+        debug!("dht routing: remove route to {:?}", id);
         let prefix = common_bits(&self.id, id) as usize;
         let bucket = &mut self.bucket[prefix];
         bucket.inuse.remove(id);
         if bucket.inuse.len() < K {
             if let Some((node, t)) = bucket.backup.pop_back() {
                 bucket.inuse.insert(node, t);
-                info!("dht routing: add route from backup {:?}", node);
+                debug!("dht routing: add route from backup {:?}", node);
             }
         }
     }

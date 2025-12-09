@@ -362,6 +362,10 @@ impl<T> BTStream<T> {
         }
         ret
     }
+
+    pub fn metadata_size(&self) -> usize {
+        self.metadata_size
+    }
 }
 
 // impl<T> From<T> for BTStream<T>
@@ -764,7 +768,7 @@ where
         }
     }
 
-    pub async fn send_extend_metadata(&mut self, meta: SendExtendMeta<'_>) -> io::Result<()> {
+    pub async fn send_extend_metadata(&mut self, meta: ExtendedMetadata) -> io::Result<()> {
         send_extend_metadata(&mut self.inner, meta, &self.extension_id).await
     }
 }
@@ -877,7 +881,7 @@ where
         }
     }
 
-    pub async fn send_extend_metadata(&mut self, meta: SendExtendMeta<'_>) -> io::Result<()> {
+    pub async fn send_extend_metadata(&mut self, meta: ExtendedMetadata) -> io::Result<()> {
         send_extend_metadata(&mut self.inner, meta, &self.extension_id).await
     }
 }
@@ -1194,21 +1198,6 @@ pub struct PieceHeader {
     pub len: u32,
 
     read: u32,
-}
-
-#[derive(Debug, Eq, PartialEq)]
-pub enum SendExtendMeta<'a> {
-    Request {
-        piece: u32,
-    },
-    Data {
-        piece: u32,
-        data: &'a [u8],
-        total_size: Option<usize>,
-    },
-    Reject {
-        piece: u32,
-    },
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -1557,7 +1546,7 @@ async fn send_piece<T: AsyncWrite + Unpin>(
 
 async fn send_extend_metadata<T: AsyncWrite + Unpin>(
     handle: &mut T,
-    meta: SendExtendMeta<'_>,
+    meta: ExtendedMetadata,
     extend_idmap: &HashMap<ExtensionType, u8>,
 ) -> io::Result<()> {
     // TODO: len must be 16KiB unless end of file
@@ -1572,7 +1561,7 @@ async fn send_extend_metadata<T: AsyncWrite + Unpin>(
 
     let mut bencode_part = Vec::new();
     let data_part = match meta {
-        SendExtendMeta::Request { piece } => {
+        ExtendedMetadata::Request { piece } => {
             bt_bencode::to_writer(
                 &mut bencode_part,
                 &ExtendedMetadataWire {
@@ -1583,7 +1572,7 @@ async fn send_extend_metadata<T: AsyncWrite + Unpin>(
             )?;
             None
         }
-        SendExtendMeta::Data {
+        ExtendedMetadata::Data {
             piece,
             data,
             total_size,
@@ -1598,7 +1587,7 @@ async fn send_extend_metadata<T: AsyncWrite + Unpin>(
             )?;
             Some(data)
         }
-        SendExtendMeta::Reject { piece } => {
+        ExtendedMetadata::Reject { piece } => {
             bt_bencode::to_writer(
                 &mut bencode_part,
                 &ExtendedMetadataWire {
@@ -1611,13 +1600,19 @@ async fn send_extend_metadata<T: AsyncWrite + Unpin>(
         }
     };
 
-    let len = 2 + bencode_part.len() + if let Some(d) = data_part { d.len() } else { 0 };
+    let len = 2
+        + bencode_part.len()
+        + if let Some(ref d) = data_part {
+            d.len()
+        } else {
+            0
+        };
     handle.write_u32(len as u32).await?; // length
     handle.write_u8(MsgTy::EXTENDED).await?;
     handle.write_u8(extension_id).await?;
     handle.write_all(&bencode_part).await?;
     if let Some(data) = data_part {
-        handle.write_all(data).await?;
+        handle.write_all(&data).await?;
     }
     handle.flush().await
 }
@@ -2734,9 +2729,9 @@ mod tests {
         let (mut peer1, mut peer2) = make_ends().await;
 
         peer1
-            .send_extend_metadata(SendExtendMeta::Data {
+            .send_extend_metadata(ExtendedMetadata::Data {
                 piece: 0,
-                data: &[1, 2, 3, 4, 5],
+                data: [1, 2, 3, 4, 5].into(),
                 total_size: Some(5),
             })
             .await
@@ -2755,9 +2750,9 @@ mod tests {
         );
 
         let ((_, mut p1w), (mut p2r, _)) = make_ends_split().await;
-        p1w.send_extend_metadata(SendExtendMeta::Data {
+        p1w.send_extend_metadata(ExtendedMetadata::Data {
             piece: 0,
-            data: &[1, 2, 3, 4, 5],
+            data: [1, 2, 3, 4, 5].into(),
             total_size: Some(5),
         })
         .await
