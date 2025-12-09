@@ -127,6 +127,7 @@ const EMPTY_PARTIAL_HEADER: PartialHeader = PartialHeader {
     filled: 0,
     discard_remain: 0,
 };
+const INITIAL_PARTIAL_READ: PartialRead = PartialRead::Header(EMPTY_PARTIAL_HEADER);
 
 const EXTENSION_NAME_PEX: &str = "ut_pex";
 const EXTENSION_NAME_METADATA: &str = "ut_metadata";
@@ -152,24 +153,6 @@ fn extension_type(ext_name: &str) -> Option<ExtensionType> {
     }
 }
 
-struct GeneralConnHandle<'a, T> {
-    reader: &'a mut T,
-    partial_header: &'a mut PartialHeader,
-}
-
-pub trait GeneralConn: sealed::GeneralConnSealed {}
-impl<T: GeneralConnSealed> GeneralConn for T {}
-
-use sealed::GeneralConnSealed;
-mod sealed {
-    use tokio::io::AsyncRead;
-    pub trait GeneralConnSealed {
-        type Read: AsyncRead + Unpin;
-
-        fn general_reader(&mut self) -> super::GeneralConnHandle<Self::Read>;
-    }
-}
-
 #[derive(Hash, Debug, Eq, PartialEq)]
 pub enum ExtensionType {
     Metadata,
@@ -187,7 +170,7 @@ impl ExtensionType {
 
 pub struct BTStream<T> {
     inner: T,
-    partial_header: PartialHeader,
+    partial_read: PartialRead,
     extension_id: HashMap<ExtensionType, u8>,
 
     metadata_size: usize,
@@ -199,6 +182,9 @@ pub struct BTStream<T> {
 
     // what this peer knows about our connected peers
     pex_peers: HashMap<IpAddr, Option<PexFlag>>,
+
+    // buffer for incoming piece
+    piece_buf: BytesMut,
 }
 
 impl<T> BTStream<T>
@@ -212,12 +198,13 @@ where
     pub fn to_dyn(self) -> BTStream<Box<dyn Conn>> {
         BTStream {
             inner: Box::new(self.inner),
-            partial_header: self.partial_header,
+            partial_read: self.partial_read,
             extension_id: self.extension_id,
             reserved: self.reserved,
             peer_id: self.peer_id,
             pex_peers: self.pex_peers,
             metadata_size: self.metadata_size,
+            piece_buf: BytesMut::new(),
         }
     }
 }
@@ -246,13 +233,25 @@ pub struct ReadStream<T> {
     inner: T,
     peer_addr: SocketAddr,
 
-    // required to implement Cancel Safe for read_msg_header
-    partial_header: PartialHeader,
+    // required to implement Cancel Safe for read_msg
+    partial_read: PartialRead,
 
     metadata_size: usize,
 
     peer_id: [u8; 20],
     reserved: FuncBits,
+
+    // buffer for incoming piece
+    piece_buf: BytesMut,
+}
+
+#[derive(Debug)]
+enum PartialRead {
+    Header(PartialHeader),
+    BitField(PartialExtend),
+    Extend(PartialExtend),
+    Piece(PartialPiece),
+    Discard(PartialExtend),
 }
 
 // store partial received header,
@@ -267,6 +266,21 @@ struct PartialHeader {
     filled: usize,
 
     discard_remain: usize,
+}
+
+#[derive(Debug)]
+struct PartialPiece {
+    index: u32,
+    begin: u32,
+    len: usize,
+    remain: usize,
+}
+
+#[derive(Debug)]
+struct PartialExtend {
+    id: u8,
+    remain: usize,
+    buf: BytesMut,
 }
 
 #[derive(Debug)]
@@ -383,10 +397,11 @@ where
             ReadStream {
                 inner: read_end,
                 peer_addr,
-                partial_header: self.partial_header,
+                partial_read: self.partial_read,
                 peer_id: self.peer_id,
                 reserved: self.reserved,
                 metadata_size: self.metadata_size,
+                piece_buf: self.piece_buf,
             },
             WriteStream {
                 inner: write_end,
@@ -412,12 +427,13 @@ where
         }
         Ok(Self {
             inner: r.inner.reunite(w.inner)?,
-            partial_header: r.partial_header,
+            partial_read: r.partial_read,
             extension_id: w.extension_id,
             reserved: r.reserved,
             peer_id: r.peer_id,
             pex_peers: w.pex_peers,
             metadata_size: r.metadata_size,
+            piece_buf: r.piece_buf,
         })
     }
 
@@ -433,10 +449,11 @@ where
             ReadStream {
                 inner: BufReader::with_capacity(32768, read_end),
                 peer_addr,
-                partial_header: self.partial_header,
+                partial_read: self.partial_read,
                 peer_id: self.peer_id,
                 reserved: self.reserved,
                 metadata_size: self.metadata_size,
+                piece_buf: self.piece_buf,
             },
             WriteStream {
                 inner: BufWriter::with_capacity(32768, write_end),
@@ -459,10 +476,11 @@ impl BTStream<Box<dyn Conn>> {
             ReadStream {
                 inner: read_end,
                 peer_addr,
-                partial_header: self.partial_header,
+                partial_read: self.partial_read,
                 peer_id: self.peer_id,
                 reserved: self.reserved,
                 metadata_size: self.metadata_size,
+                piece_buf: self.piece_buf,
             },
             WriteStream {
                 inner: write_end,
@@ -488,10 +506,11 @@ impl BTStream<Box<dyn Conn>> {
             ReadStream {
                 inner: BufReader::with_capacity(32768, read_end),
                 peer_addr,
-                partial_header: self.partial_header,
+                partial_read: self.partial_read,
                 peer_id: self.peer_id,
                 reserved: self.reserved,
                 metadata_size: self.metadata_size,
+                piece_buf: self.piece_buf,
             },
             WriteStream {
                 inner: BufWriter::with_capacity(32768, write_end),
@@ -559,13 +578,14 @@ where
 
         let s = BTStream {
             inner: t,
-            partial_header: EMPTY_PARTIAL_HEADER,
+            partial_read: INITIAL_PARTIAL_READ,
             extension_id: HashMap::new(),
 
             peer_id: peer_handshake.client_id,
             reserved: peer_handshake.reserved,
             pex_peers: HashMap::new(),
             metadata_size: 0,
+            piece_buf: BytesMut::new(),
         };
 
         let support_extension =
@@ -584,7 +604,11 @@ where
                 send_extension_handshake(&mut write_end.inner, &extend_clone).await?;
                 io::Result::Ok(write_end)
             });
-            let recv_ext_handshake = recv_extend_handshake(&mut read_end);
+            let recv_ext_handshake = recv_extend_handshake(
+                &mut read_end.inner,
+                &mut read_end.partial_read,
+                &mut read_end.piece_buf,
+            );
             let (write_end, exth) = {
                 let (w, exth) = tokio::join!(send_ext_handshake, recv_ext_handshake);
                 (w??, exth?)
@@ -622,12 +646,13 @@ where
 
         let s = BTStream {
             inner: t,
-            partial_header: EMPTY_PARTIAL_HEADER,
+            partial_read: INITIAL_PARTIAL_READ,
             extension_id: HashMap::new(),
             peer_id: peer_handshake.client_id,
             reserved: peer_handshake.reserved.common(funcbits),
             pex_peers: HashMap::new(),
             metadata_size: 0,
+            piece_buf: BytesMut::new(),
         };
 
         let support_extension = peer_handshake.reserved.have_extension();
@@ -651,7 +676,11 @@ where
                 send_extension_handshake(&mut write_end.inner, &extend_sending).await?;
                 io::Result::Ok(write_end)
             });
-            let recv_ext_handshake = recv_extend_handshake(&mut read_end);
+            let recv_ext_handshake = recv_extend_handshake(
+                &mut read_end.inner,
+                &mut read_end.partial_read,
+                &mut read_end.piece_buf,
+            );
             let (write_end, extend_received) = {
                 let (w, exth) = tokio::join!(send_ext_handshake, recv_ext_handshake);
                 (w??, exth?)
@@ -859,23 +888,8 @@ where
 {
     /// # Cancel Safety
     /// this is safe
-    pub async fn recv_msg_header(&mut self) -> io::Result<Message<'_, Self>> {
-        recv_msg_header(self).await
-    }
-}
-
-impl<T> GeneralConnSealed for BTStream<T>
-where
-    T: AsyncRead + AsyncWrite + Unpin,
-{
-    type Read = T;
-
-    fn general_reader(&mut self) -> GeneralConnHandle<Self::Read> {
-        GeneralConnHandle {
-            reader: &mut self.inner,
-            partial_header: &mut self.partial_header,
-            // extension_id: &mut self.extension_id,
-        }
+    pub async fn recv_msg(&mut self) -> io::Result<Message> {
+        recv_msg(&mut self.inner, &mut self.partial_read, &mut self.piece_buf).await
     }
 }
 
@@ -883,31 +897,15 @@ impl<T> ReadStream<T>
 where
     T: AsyncRead + Unpin,
 {
-    /// receive one message header
-    /// It's header because if it's a piece message,
-    /// further handling of body is required
-    /// # Cancel safety
-    /// this is cancel safe
-    pub async fn recv_msg_header(&mut self) -> io::Result<Message<'_, Self>> {
-        recv_msg_header(self).await
-    }
-
     pub fn peer_addr(&self) -> SocketAddr {
         self.peer_addr
     }
-}
 
-impl<T> GeneralConnSealed for ReadStream<T>
-where
-    T: AsyncRead + Unpin,
-{
-    type Read = T;
-
-    fn general_reader(&mut self) -> GeneralConnHandle<Self::Read> {
-        GeneralConnHandle {
-            reader: &mut self.inner,
-            partial_header: &mut self.partial_header,
-        }
+    /// receive one message
+    /// # Cancel safety
+    /// this is cancel safe
+    pub async fn recv_msg(&mut self) -> io::Result<Message> {
+        recv_msg(&mut self.inner, &mut self.partial_read, &mut self.piece_buf).await
     }
 }
 
@@ -1000,57 +998,39 @@ impl MsgTy {
 }
 
 #[derive(Eq, PartialEq)]
-pub enum Message<'a, T> {
+pub enum Message<'a> {
     KeepAlive,
     Choke,
     Unchoke,
     Interested,
     NotInterested,
     Have(u32),
-    BitField(BitFieldRecv<'a, T>),
+    BitField(BitField),
     Request(Request),
-    Piece(Piece<'a, T>),
+    Piece(Piece<'a>),
     Cancel(Request),
     Port(u16),
-    Extended(ExtendedRecv<'a, T>),
+    Extended(ExtendedMsg),
 }
 
-impl<T> Message<'_, T> {
-    const fn len(&self) -> u32 {
-        match self {
-            Message::KeepAlive => 0,
-            Message::Choke => 1,
-            Message::Unchoke => 1,
-            Message::Interested => 1,
-            Message::NotInterested => 1,
-            Message::Have(_) => 5,
-            Message::BitField(_) => unimplemented!(),
-            Message::Request(_) => 13,
-            Message::Piece(_) => unimplemented!(),
-            Message::Cancel(_) => 13,
-            Message::Port(_) => 3,
-            Message::Extended(_) => unimplemented!(),
-        }
-    }
-    fn ty(&self) -> u8 {
-        match self {
-            Message::KeepAlive => unimplemented!(),
-            Message::Choke => MsgTy::CHOKE,
-            Message::Unchoke => MsgTy::UNCHOKE,
-            Message::Interested => MsgTy::INTERESTED,
-            Message::NotInterested => MsgTy::NOTINTERESTED,
-            Message::Have(_) => MsgTy::HAVE,
-            Message::BitField(_) => MsgTy::BITFIELD,
-            Message::Request(_) => MsgTy::REQUEST,
-            Message::Piece(_) => MsgTy::PIECE,
-            Message::Cancel(_) => MsgTy::CANCEL,
-            Message::Port(_) => MsgTy::PORT,
-            Message::Extended(_) => MsgTy::EXTENDED,
-        }
-    }
+#[derive(Eq, PartialEq)]
+pub enum MessageHeader {
+    KeepAlive,
+    Choke,
+    Unchoke,
+    Interested,
+    NotInterested,
+    Have(u32),
+    BitField { capacity: usize },
+    Request(Request),
+    Piece { index: u32, begin: u32, len: u32 },
+    Cancel(Request),
+    Port(u16),
+    Extended { id: u8, len: usize },
+    Discard { len: usize },
 }
 
-impl<T> std::fmt::Debug for Message<'_, T> {
+impl std::fmt::Debug for Message<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Message::KeepAlive => {
@@ -1073,7 +1053,7 @@ impl<T> std::fmt::Debug for Message<'_, T> {
             }
             Message::BitField(bit_field) => {
                 f.debug_struct("BitField")
-                    .field("capacity", &bit_field.capacity)
+                    .field("byte length", &bit_field.u8_len())
                     .finish()?;
             }
             Message::Request(request) => {
@@ -1199,122 +1179,21 @@ pub struct Request {
     pub len: u32,
 }
 
+#[derive(Eq, PartialEq, Debug)]
+pub struct Piece<'a> {
+    pub index: u32,
+    pub begin: u32,
+    pub len: u32,
+    pub piece: &'a BytesMut,
+}
+
 #[derive(Eq, PartialEq)]
-pub struct Piece<'a, T> {
+pub struct PieceHeader {
     pub index: u32,
     pub begin: u32,
     pub len: u32,
 
     read: u32,
-
-    handle: &'a mut T,
-}
-
-impl<T> Piece<'_, T>
-where
-    T: GeneralConn,
-{
-    // read all remaining piece(block) data into buf
-    // read should be called once, buf.len should
-    // be large enough to store the entire block
-    pub async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        // TODO: test the limit part
-        let GeneralConnHandle { reader, .. } = self.handle.general_reader();
-
-        let remain = (self.len - self.read) as usize;
-        let limit = remain.min(buf.len());
-
-        // TODO: Transmission sends data in seperate packets
-        // and 500ms after first packet
-        // maybe make this read() instead of read_exact
-        let res = reader.read(&mut buf[..limit]).await?;
-        self.read += res as u32;
-        Ok(res)
-    }
-
-    pub async fn read_to_ref<U>(
-        &mut self,
-        mut buf: Ref<U>,
-        offset: usize,
-    ) -> Result<(usize, Ref<U>), AbortErr<io::Error>>
-    where
-        U: AsMut<[u8]>,
-    {
-        let GeneralConnHandle { reader, .. } = self.handle.general_reader();
-        match reader.read_abort(&mut buf, offset).await {
-            Ok(n) => Ok((n, buf)),
-            Err(e) => Err(e),
-        }
-    }
-
-    // read until buf is full or all the "PIECE" message received
-    pub async fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let remain = (self.len - self.read) as usize;
-        let limit = remain.min(buf.len());
-        assert!(buf.len() >= remain);
-
-        // TODO: Transmission sends data in seperate packets
-        // and 500ms after first packet
-        // maybe make this read() instead of read_exact
-        let GeneralConnHandle { reader, .. } = self.handle.general_reader();
-        reader.read_exact(&mut buf[..limit]).await
-    }
-}
-
-impl<T> std::fmt::Debug for Piece<'_, T> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.write_fmt(format_args!(
-            "Piece index {}, begin {}, len {}",
-            self.index, self.begin, self.len,
-        ))
-    }
-}
-
-#[derive(Eq, PartialEq)]
-pub struct ExtendedRecv<'a, T> {
-    id: u8,
-    len: usize,
-    handle: &'a mut T,
-}
-
-impl<T> ExtendedRecv<'_, T>
-where
-    T: GeneralConn,
-{
-    pub async fn recv(&mut self) -> Result<ExtendedMsg, io::Error> {
-        let GeneralConnHandle { reader, .. } = self.handle.general_reader();
-        let mut limit_reader = reader.take(self.len as u64);
-        let mut data = BytesMut::new();
-        let mut read = 0;
-
-        while read < self.len {
-            read += limit_reader.read_buf(&mut data).await?;
-        }
-
-        match self.id {
-            0 => {
-                // 0 is handshake
-                let handshake: ExtendedHandshake = bt_bencode::from_reader(data.as_ref())?;
-                Ok(ExtendedMsg::Handshake(handshake))
-            }
-            EXTENSION_ID_METADATA => Ok(ExtendedMsg::Metadata(bytes_to_metadata(data)?)),
-            EXTENSION_ID_PEX => {
-                let pex: ExtendedPexWire = bt_bencode::from_reader(data.as_ref())?;
-                Ok(ExtendedMsg::Pex(pex.into()))
-            }
-            other => {
-                warn!("received unknown extension id {other}");
-                // TODO: maybe store the unknown extension's name?
-                Ok(ExtendedMsg::Unknown(other))
-            }
-        }
-    }
-}
-
-impl<T> std::fmt::Debug for ExtendedRecv<'_, T> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.write_fmt(format_args!("Extended id {}, len {}", self.id, self.len))
-    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -1578,36 +1457,6 @@ pub enum ExtendedMetadata {
     },
 }
 
-#[derive(Eq, PartialEq)]
-pub struct BitFieldRecv<'a, T> {
-    capacity: usize,
-    handle: &'a mut T,
-}
-
-impl<T, U> BitFieldRecv<'_, T>
-where
-    T: GeneralConn<Read = U>,
-    U: AsyncRead + Unpin,
-{
-    // read all remaining piece(block) data into buf
-    // read should be called once, buf.len should
-    // be large enough to store the entire block
-
-    pub async fn read(&mut self) -> io::Result<BitField> {
-        info!("BitFieldRecv read capacity {}", self.capacity);
-        let GeneralConnHandle { reader, .. } = self.handle.general_reader();
-
-        let mut bitfield: Vec<u8> = unsafe {
-            let mut piece: Vec<MaybeUninit<u8>> = Vec::with_capacity(self.capacity);
-            piece.set_len(self.capacity);
-            std::mem::transmute(piece)
-        };
-        let n_read = reader.read_exact(bitfield.as_mut_slice()).await?;
-        assert_eq!(n_read, self.capacity);
-        Ok(BitField::new(bitfield))
-    }
-}
-
 async fn send_handshake<T: AsyncWrite + Unpin>(handle: &mut T, h: &Handshake) -> io::Result<()> {
     handle.write_u8(19).await?;
     handle.write_all(b"BitTorrent protocol").await?;
@@ -1857,49 +1706,113 @@ async fn send_port<T: AsyncWrite + Unpin>(handle: &mut T, port: u16) -> io::Resu
     handle.flush().await
 }
 
-async fn discard_remain<T: AsyncRead + Unpin>(
-    handle: &mut T,
-    state: &mut PartialHeader,
-) -> io::Result<()> {
-    // there should not be many unread bytes, 1024 should be enough
-    #[allow(invalid_value)]
-    #[allow(clippy::uninit_assumed_init)]
-    #[allow(clippy::uninit_vec)]
-    let mut buf = {
-        let mut v = Vec::with_capacity(1024);
-        unsafe {
-            v.set_len(1024);
-        }
-        v
-    };
-
-    while state.discard_remain > 0 {
-        let n_read = if state.discard_remain > buf.len() {
-            handle.read(&mut buf).await?
-        } else {
-            handle.read(&mut buf[..state.discard_remain]).await?
+async fn discard_remain<T>(reader: &mut T, state: &mut PartialExtend) -> io::Result<()>
+where
+    T: AsyncRead + Unpin,
+{
+    let buf = &mut state.buf;
+    while state.remain > 0 {
+        let mut limit_reader = reader.take(16384);
+        state.remain -= match limit_reader.read_buf(buf).await? {
+            0 => {
+                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "!"));
+            }
+            n => n,
         };
-        state.discard_remain -= n_read;
+        buf.clear();
     }
-    state.filled = 0;
     Ok(())
 }
 
-async fn recv_msg_header<'a, T>(handle: &'a mut T) -> io::Result<Message<'a, T>>
+async fn recv_msg<'a, T>(
+    reader: &'a mut T,
+    partial_read: &'a mut PartialRead,
+    piece_buf: &'a mut BytesMut,
+) -> io::Result<Message<'a>>
 where
-    T: GeneralConn,
+    T: AsyncRead + Unpin,
+{
+    loop {
+        match partial_read {
+            PartialRead::Header(partial_header) => {
+                match recv_msg_header(reader, partial_header).await? {
+                    MessageHeader::BitField { capacity } => {
+                        *partial_read = PartialRead::BitField(PartialExtend {
+                            id: 0,
+                            remain: capacity,
+                            buf: BytesMut::new(),
+                        });
+                    }
+                    MessageHeader::Piece { index, begin, len } => {
+                        piece_buf.clear();
+                        *partial_read = PartialRead::Piece(PartialPiece {
+                            index,
+                            begin,
+                            len: len as usize,
+                            remain: len as usize,
+                        })
+                    }
+                    MessageHeader::Extended { id, len } => {
+                        *partial_read = PartialRead::Extend(PartialExtend {
+                            id,
+                            remain: len,
+                            buf: BytesMut::new(),
+                        })
+                    }
+                    MessageHeader::Discard { len } => {
+                        *partial_read = PartialRead::Discard(PartialExtend {
+                            id: 0,
+                            remain: len,
+                            buf: BytesMut::new(),
+                        })
+                    }
+                    MessageHeader::KeepAlive => return Ok(Message::KeepAlive),
+                    MessageHeader::Choke => return Ok(Message::Choke),
+                    MessageHeader::Unchoke => return Ok(Message::Unchoke),
+                    MessageHeader::Interested => return Ok(Message::Interested),
+                    MessageHeader::NotInterested => return Ok(Message::NotInterested),
+                    MessageHeader::Have(have) => return Ok(Message::Have(have)),
+                    MessageHeader::Request(req) => return Ok(Message::Request(req)),
+                    MessageHeader::Cancel(req) => return Ok(Message::Cancel(req)),
+                    MessageHeader::Port(port) => return Ok(Message::Port(port)),
+                }
+            }
+            PartialRead::BitField(p) => {
+                let res = Ok(Message::BitField(recv_bitfield_msg(reader, p).await?));
+                *partial_read = INITIAL_PARTIAL_READ;
+                return res;
+            }
+            PartialRead::Extend(p) => {
+                let res = Ok(Message::Extended(recv_extend_msg(reader, p).await?));
+                *partial_read = INITIAL_PARTIAL_READ;
+                return res;
+            }
+            PartialRead::Piece(p) => {
+                let res = Ok(Message::Piece(recv_piece_msg(reader, p, piece_buf).await?));
+                *partial_read = INITIAL_PARTIAL_READ;
+                return res;
+            }
+            PartialRead::Discard(p) => {
+                discard_remain(reader, p).await?;
+                *partial_read = INITIAL_PARTIAL_READ;
+            }
+        }
+    }
+}
+
+/// read header and output msg header
+async fn recv_msg_header<'a, T>(
+    reader: &'a mut T,
+    state: &mut PartialHeader,
+) -> io::Result<MessageHeader>
+where
+    T: AsyncRead + Unpin,
 {
     // TODO: what to do if some malicious peer sends a long len data
     // and a lot of garbage data? use timeout
     // TODO: what if some bug happens in peer and peer shutdown connection
     // leaving data unsend?
     // TODO: what if peer claims to send data, but does not really send?
-
-    let GeneralConnHandle {
-        reader,
-        partial_header: state,
-        ..
-    } = handle.general_reader();
 
     while state.filled < 4 {
         let n = reader.read(&mut state.field_len[state.filled..4]).await?;
@@ -1915,7 +1828,7 @@ where
     let len = u32::from_be_bytes(state.field_len);
     if len == 0 {
         state.filled = 0;
-        return Ok(Message::KeepAlive);
+        return Ok(MessageHeader::KeepAlive);
     }
 
     if state.filled <= 4 {
@@ -1927,19 +1840,19 @@ where
     match state.field_ty {
         MsgTy::CHOKE => {
             state.filled = 0;
-            Ok(Message::Choke)
+            Ok(MessageHeader::Choke)
         }
         MsgTy::UNCHOKE => {
             state.filled = 0;
-            Ok(Message::Unchoke)
+            Ok(MessageHeader::Unchoke)
         }
         MsgTy::INTERESTED => {
             state.filled = 0;
-            Ok(Message::Interested)
+            Ok(MessageHeader::Interested)
         }
         MsgTy::NOTINTERESTED => {
             state.filled = 0;
-            Ok(Message::NotInterested)
+            Ok(MessageHeader::NotInterested)
         }
         MsgTy::HAVE => {
             // TODO: check length match, absorb remain length in case
@@ -1957,12 +1870,12 @@ where
                 filled_len += n;
             }
             state.filled = 0;
-            Ok(Message::Have(u32::from_be_bytes(state.field1)))
+            Ok(MessageHeader::Have(u32::from_be_bytes(state.field1)))
         }
         MsgTy::BITFIELD => {
             let capacity = (len - 1) as usize;
             state.filled = 0;
-            Ok(Message::BitField(BitFieldRecv { capacity, handle }))
+            Ok(MessageHeader::BitField { capacity })
         }
         MsgTy::REQUEST => {
             // TODO: check length match
@@ -2011,7 +1924,7 @@ where
             }
             let len = u32::from_be_bytes(state.field3);
             state.filled = 0;
-            Ok(Message::Request(Request { index, begin, len }))
+            Ok(MessageHeader::Request(Request { index, begin, len }))
         }
         MsgTy::PIECE => {
             // TODO: check length match
@@ -2048,13 +1961,11 @@ where
             let begin = u32::from_be_bytes(state.field2);
 
             state.filled = 0;
-            Ok(Message::Piece(Piece {
+            Ok(MessageHeader::Piece {
                 index,
                 begin,
                 len: capacity as u32,
-                read: 0,
-                handle,
-            }))
+            })
         }
         MsgTy::PORT => {
             assert!(state.filled >= 5);
@@ -2072,7 +1983,7 @@ where
             }
             state.filled = 0;
             let port = u16::from_be_bytes([state.field1[0], state.field1[1]]);
-            Ok(Message::Port(port))
+            Ok(MessageHeader::Port(port))
         }
         MsgTy::CANCEL => {
             // TODO: check length match
@@ -2122,7 +2033,7 @@ where
             let len = u32::from_be_bytes(state.field3);
 
             state.filled = 0;
-            Ok(Message::Cancel(Request { index, begin, len }))
+            Ok(MessageHeader::Cancel(Request { index, begin, len }))
         }
         MsgTy::EXTENDED => {
             let capacity = (len - 2) as usize;
@@ -2134,36 +2045,120 @@ where
             let ext_id = reader.read_u8().await?;
             state.filled = 0;
 
-            Ok(Message::Extended(ExtendedRecv {
+            Ok(MessageHeader::Extended {
                 id: ext_id,
                 len: capacity,
-                handle,
-            }))
+            })
         }
         other => {
             warn!("received unknown Msg type {other}, length {len}");
-            discard_remain(reader, state).await?;
-            todo!("loop and receive next packet");
+            Ok(MessageHeader::Discard { len: len as usize })
         }
     }
 }
 
-async fn recv_extend_handshake<'a, T>(handle: &'a mut T) -> io::Result<ExtendedHandshake>
+async fn recv_piece_msg<'a, 'b, T>(
+    reader: &'a mut T,
+    state: &'a mut PartialPiece,
+    piece_buf: &'b mut BytesMut,
+) -> io::Result<Piece<'b>>
 where
-    T: GeneralConn,
+    T: AsyncRead + Unpin,
 {
-    let msg = recv_msg_header(handle).await?;
-    match msg {
-        Message::Extended(mut e) => {
-            let ext_msg = e.recv().await?;
-            match ext_msg {
-                ExtendedMsg::Handshake(exth) => Ok(exth),
-                other => Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("expecting extension handshake, receive extension msg {other:?}"),
-                )),
+    let mut limit_reader = reader.take(state.remain as u64);
+
+    while state.remain > 0 {
+        state.remain -= match limit_reader.read_buf(piece_buf).await? {
+            0 => {
+                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "!"));
             }
+            n => n,
+        };
+    }
+
+    Ok(Piece {
+        index: state.index,
+        begin: state.begin,
+        len: state.len as u32,
+        piece: piece_buf,
+    })
+}
+
+async fn recv_extend_msg<'a, T>(
+    reader: &'a mut T,
+    state: &mut PartialExtend,
+) -> io::Result<ExtendedMsg>
+where
+    T: AsyncRead + Unpin,
+{
+    let mut limit_reader = reader.take(state.remain as u64);
+
+    while state.remain > 0 {
+        state.remain -= match limit_reader.read_buf(&mut state.buf).await? {
+            0 => {
+                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "!"));
+            }
+            n => n,
+        };
+    }
+
+    match state.id {
+        0 => {
+            // 0 is handshake
+            let handshake: ExtendedHandshake = bt_bencode::from_reader(state.buf.as_ref())?;
+            Ok(ExtendedMsg::Handshake(handshake))
         }
+        EXTENSION_ID_METADATA => {
+            let mut new_buf = BytesMut::new();
+            std::mem::swap(&mut state.buf, &mut new_buf);
+            Ok(ExtendedMsg::Metadata(bytes_to_metadata(new_buf)?))
+        }
+        EXTENSION_ID_PEX => {
+            let pex: ExtendedPexWire = bt_bencode::from_reader(state.buf.as_ref())?;
+            Ok(ExtendedMsg::Pex(pex.into()))
+        }
+        other => {
+            warn!("received unknown extension id {other}");
+            // TODO: maybe store the unknown extension's name?
+            Ok(ExtendedMsg::Unknown(other))
+        }
+    }
+}
+
+async fn recv_bitfield_msg<'a, T>(
+    reader: &'a mut T,
+    state: &mut PartialExtend,
+) -> io::Result<BitField>
+where
+    T: AsyncRead + Unpin,
+{
+    let mut limit_reader = reader.take(state.remain as u64);
+    while state.remain > 0 {
+        state.remain -= match limit_reader.read_buf(&mut state.buf).await? {
+            0 => {
+                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "!"));
+            }
+            n => n,
+        };
+    }
+
+    let mut new_buf = BytesMut::new();
+    std::mem::swap(&mut state.buf, &mut new_buf);
+
+    Ok(BitField::new(new_buf.into()))
+}
+
+async fn recv_extend_handshake<'a, T>(
+    reader: &'a mut T,
+    pr: &mut PartialRead,
+    buf: &mut BytesMut, // not used here
+) -> io::Result<ExtendedHandshake>
+where
+    T: AsyncRead + Unpin,
+{
+    let msg = recv_msg(reader, pr, buf).await?;
+    match msg {
+        Message::Extended(ExtendedMsg::Handshake(e)) => Ok(e),
         other => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("expecting extension handshake, receive {other:?}"),
@@ -2312,10 +2307,11 @@ mod tests {
                 ReadStream {
                     inner: read_end,
                     peer_addr: DEFAULT_ADDR,
-                    partial_header: EMPTY_PARTIAL_HEADER,
+                    partial_read: INITIAL_PARTIAL_READ,
                     peer_id: [0; 20],
                     reserved: [0; 8].into(),
                     metadata_size: 0,
+                    piece_buf: BytesMut::new(),
                 },
                 WriteStream {
                     inner: write_end,
@@ -2367,7 +2363,6 @@ mod tests {
             reqq: None, // request queue limit before drop any message
             metadata_size: None,
         };
-        let (peer1, peer2) = duplex(1024);
         make_ends_tune(HANDSHAKE, exth, HANDSHAKE.reserved, HANDSHAKE.client_id).await;
         // TODO: test info
     }
@@ -2383,7 +2378,6 @@ mod tests {
             ],
             client_id: *b"-ST0010-qwertyuiopas",
         };
-        let (mut peer1, mut peer2) = duplex(1024);
         let exth = ExtendedHandshake {
             // TODO: optimize: on sending, clone() can be optimized
             m: EXTENSION_IDS_MAP.clone(),
@@ -2396,7 +2390,6 @@ mod tests {
             reqq: None, // request queue limit before drop any message
             metadata_size: None,
         };
-        let (peer1, peer2) = duplex(1024);
         make_ends_tune(HANDSHAKE, exth, HANDSHAKE.reserved, HANDSHAKE.client_id).await;
         // TODO: test info
     }
@@ -2434,12 +2427,12 @@ mod tests {
     async fn keepalive() {
         let (mut peer1, mut peer2) = make_ends().await;
         peer1.send_keepalive().await.expect("should send ok");
-        let received = peer2.recv_msg_header().await.expect("should recv ok");
+        let received = peer2.recv_msg().await.expect("should recv ok");
         assert!(matches!(received, Message::KeepAlive));
 
         let ((_, mut p1w), (mut p2r, _)) = make_ends_split().await;
         p1w.send_keepalive().await.expect("should send ok");
-        let received = p2r.recv_msg_header().await.expect("should recv ok");
+        let received = p2r.recv_msg().await.expect("should recv ok");
         assert!(matches!(received, Message::KeepAlive));
     }
 
@@ -2447,12 +2440,12 @@ mod tests {
     async fn keepalive_split() {
         let (mut peer1, mut peer2) = make_ends().await;
         peer1.send_keepalive().await.expect("should send ok");
-        let received = peer2.recv_msg_header().await.expect("should recv ok");
+        let received = peer2.recv_msg().await.expect("should recv ok");
         assert!(matches!(received, Message::KeepAlive));
 
         let ((_, mut p1w), (mut p2r, _)) = make_ends_split().await;
         p1w.send_keepalive().await.expect("should send ok");
-        let received = p2r.recv_msg_header().await.expect("should recv ok");
+        let received = p2r.recv_msg().await.expect("should recv ok");
         assert!(matches!(received, Message::KeepAlive));
     }
 
@@ -2460,12 +2453,12 @@ mod tests {
     async fn choke() {
         let (mut peer1, mut peer2) = make_ends().await;
         peer1.send_choke().await.expect("should send ok");
-        let received = peer2.recv_msg_header().await.expect("should recv ok");
+        let received = peer2.recv_msg().await.expect("should recv ok");
         assert!(matches!(received, Message::Choke));
 
         let ((_, mut p1w), (mut p2r, _)) = make_ends_split().await;
         p1w.send_choke().await.expect("should send ok");
-        let received = p2r.recv_msg_header().await.expect("should recv ok");
+        let received = p2r.recv_msg().await.expect("should recv ok");
         assert!(matches!(received, Message::Choke));
     }
 
@@ -2473,12 +2466,12 @@ mod tests {
     async fn unchoke() {
         let (mut peer1, mut peer2) = make_ends().await;
         peer1.send_unchoke().await.expect("should send ok");
-        let received = peer2.recv_msg_header().await.expect("should recv ok");
+        let received = peer2.recv_msg().await.expect("should recv ok");
         assert!(matches!(received, Message::Unchoke));
 
         let ((_, mut p1w), (mut p2r, _)) = make_ends_split().await;
         p1w.send_unchoke().await.expect("should send ok");
-        let received = p2r.recv_msg_header().await.expect("should recv ok");
+        let received = p2r.recv_msg().await.expect("should recv ok");
         assert!(matches!(received, Message::Unchoke));
     }
 
@@ -2486,12 +2479,12 @@ mod tests {
     async fn intrested() {
         let (mut peer1, mut peer2) = make_ends().await;
         peer1.send_interested().await.expect("should send ok");
-        let received = peer2.recv_msg_header().await.expect("should recv ok");
+        let received = peer2.recv_msg().await.expect("should recv ok");
         assert!(matches!(received, Message::Interested));
 
         let ((_, mut p1w), (mut p2r, _)) = make_ends_split().await;
         p1w.send_interested().await.expect("should send ok");
-        let received = p2r.recv_msg_header().await.expect("should recv ok");
+        let received = p2r.recv_msg().await.expect("should recv ok");
         assert!(matches!(received, Message::Interested));
     }
 
@@ -2499,12 +2492,12 @@ mod tests {
     async fn notintrested() {
         let (mut peer1, mut peer2) = make_ends().await;
         peer1.send_notinterested().await.expect("should send ok");
-        let received = peer2.recv_msg_header().await.expect("should recv ok");
+        let received = peer2.recv_msg().await.expect("should recv ok");
         assert!(matches!(received, Message::NotInterested));
 
         let ((_, mut p1w), (mut p2r, _)) = make_ends_split().await;
         p1w.send_notinterested().await.expect("should send ok");
-        let received = p2r.recv_msg_header().await.expect("should recv ok");
+        let received = p2r.recv_msg().await.expect("should recv ok");
         assert!(matches!(received, Message::NotInterested));
     }
 
@@ -2512,12 +2505,12 @@ mod tests {
     async fn have() {
         let (mut peer1, mut peer2) = make_ends().await;
         peer1.send_have(533).await.expect("should send ok");
-        let received = peer2.recv_msg_header().await.expect("should recv ok");
+        let received = peer2.recv_msg().await.expect("should recv ok");
         assert!(matches!(received, Message::Have(533)));
 
         let ((_, mut p1w), (mut p2r, _)) = make_ends_split().await;
         p1w.send_have(533).await.expect("should send ok");
-        let received = p2r.recv_msg_header().await.expect("should recv ok");
+        let received = p2r.recv_msg().await.expect("should recv ok");
         assert!(matches!(received, Message::Have(533)));
     }
 
@@ -2529,20 +2522,18 @@ mod tests {
             .send_bitfield(&BitField::new(fields.into()))
             .await
             .expect("should send ok");
-        let received = peer2.recv_msg_header().await.expect("should recv ok");
-        let mut b = extract_enum!(received, Message::BitField);
-        let bf = b.read().await.unwrap();
-        assert_eq!(bf, BitField::new(fields.into()));
+        let received = peer2.recv_msg().await.expect("should recv ok");
+        let b = extract_enum!(received, Message::BitField);
+        assert_eq!(b, BitField::new(fields.into()));
 
         let ((_, mut p1w), (mut p2r, _)) = make_ends_split().await;
         let fields = rand::random::<[u8; 143]>();
         p1w.send_bitfield(&BitField::new(fields.into()))
             .await
             .expect("should send ok");
-        let received = p2r.recv_msg_header().await.expect("should recv ok");
-        let mut b = extract_enum!(received, Message::BitField);
-        let bf = b.read().await.unwrap();
-        assert_eq!(bf, BitField::new(fields.into()));
+        let received = p2r.recv_msg().await.expect("should recv ok");
+        let b = extract_enum!(received, Message::BitField);
+        assert_eq!(b, BitField::new(fields.into()));
     }
 
     #[tokio::test]
@@ -2554,7 +2545,7 @@ mod tests {
             .send_request(index, begin, 4)
             .await
             .expect("should send ok");
-        let received = peer2.recv_msg_header().await.expect("should recv ok");
+        let received = peer2.recv_msg().await.expect("should recv ok");
         let r = extract_enum!(received, Message::Request);
         assert_eq!(
             r,
@@ -2570,7 +2561,7 @@ mod tests {
         p1w.send_request(index, begin, 4)
             .await
             .expect("should send ok");
-        let received = p2r.recv_msg_header().await.expect("should recv ok");
+        let received = p2r.recv_msg().await.expect("should recv ok");
         let r = extract_enum!(received, Message::Request);
         assert_eq!(
             r,
@@ -2593,16 +2584,12 @@ mod tests {
             .send_piece(index, begin, &random_bytes)
             .await
             .expect("should send ok");
-        let received = peer2.recv_msg_header().await.expect("should recv ok");
-        let mut piece = extract_enum!(received, Message::Piece);
+        let received = peer2.recv_msg().await.expect("should recv ok");
+        let piece = extract_enum!(received, Message::Piece);
         assert_eq!(piece.index, index);
         assert_eq!(piece.begin, begin);
         assert_eq!(piece.len, random_bytes.len() as u32);
-
-        let mut buf = [0u8; 143];
-        let n = piece.read_exact(&mut buf).await;
-        assert!(matches!(n, Ok(143)));
-        assert_eq!(random_bytes, buf);
+        assert_eq!(piece.piece.as_ref(), random_bytes);
 
         // TODO: test long piece are dropped
 
@@ -2611,17 +2598,13 @@ mod tests {
         p1w.send_piece(index, begin, &random_bytes)
             .await
             .expect("should send ok");
-        let received = p2r.recv_msg_header().await.expect("should recv ok");
+        let received = p2r.recv_msg().await.expect("should recv ok");
 
-        let mut piece = extract_enum!(received, Message::Piece);
+        let piece = extract_enum!(received, Message::Piece);
         assert_eq!(piece.index, index);
         assert_eq!(piece.begin, begin);
         assert_eq!(piece.len, random_bytes.len() as u32);
-
-        let mut buf = [0u8; 143];
-        let n = piece.read_exact(&mut buf).await;
-        assert!(matches!(n, Ok(143)));
-        assert_eq!(random_bytes, buf);
+        assert_eq!(piece.piece.as_ref(), random_bytes);
         // TODO: test long piece are dropped
     }
 
@@ -2634,7 +2617,7 @@ mod tests {
             .send_cancel(index, begin, 4)
             .await
             .expect("should send ok");
-        let received = peer2.recv_msg_header().await.expect("should recv ok");
+        let received = peer2.recv_msg().await.expect("should recv ok");
 
         let msg = extract_enum!(received, Message::Cancel);
         assert_eq!(msg.begin, begin);
@@ -2646,7 +2629,7 @@ mod tests {
         p1w.send_cancel(index, begin, 4)
             .await
             .expect("should send ok");
-        let received = p2r.recv_msg_header().await.expect("should recv ok");
+        let received = p2r.recv_msg().await.expect("should recv ok");
         let msg = extract_enum!(received, Message::Cancel);
         assert_eq!(msg.begin, begin);
         assert_eq!(msg.index, index);
@@ -2657,17 +2640,15 @@ mod tests {
     #[tokio::test]
     async fn port() {
         let (mut peer1, mut peer2) = make_ends().await;
-        let index = rand::random::<u32>();
-        let begin = rand::random::<u32>();
         peer1.send_port(4133).await.expect("should send ok");
-        let received = peer2.recv_msg_header().await.expect("should recv ok");
+        let received = peer2.recv_msg().await.expect("should recv ok");
 
         let msg = extract_enum!(received, Message::Port);
         assert_eq!(msg, 4133);
 
         let ((_, mut p1w), (mut p2r, _)) = make_ends_split().await;
         p1w.send_port(4133).await.expect("should send ok");
-        let received = p2r.recv_msg_header().await.expect("should recv ok");
+        let received = p2r.recv_msg().await.expect("should recv ok");
         let msg = extract_enum!(received, Message::Port);
         assert_eq!(msg, 4133);
     }
@@ -2676,9 +2657,9 @@ mod tests {
     async fn bi_direction() {
         let ((mut p1r, mut p1w), (mut p2r, mut p2w)) = make_ends_split().await;
         p1w.send_interested().await.expect("p1 should send ok");
-        let p2_recv = p2r.recv_msg_header().await.expect("p2 should recv ok");
+        let p2_recv = p2r.recv_msg().await.expect("p2 should recv ok");
         p2w.send_choke().await.expect("p2 should send ok");
-        let p1_recv = p1r.recv_msg_header().await.expect("p1 should recv ok");
+        let p1_recv = p1r.recv_msg().await.expect("p1 should recv ok");
         assert!(matches!(p2_recv, Message::Interested));
         assert!(matches!(p1_recv, Message::Choke));
     }
@@ -2695,10 +2676,9 @@ mod tests {
             .send_extend_pex(&HashMap::from_iter(initial.clone().into_iter()))
             .await
             .expect("should send ok");
-        let hdr = peer2.recv_msg_header().await.unwrap();
-        let mut extend_recv = extract_enum!(hdr, Message::Extended);
-        let msg = extend_recv.recv().await.unwrap();
-        let pex_msg = extract_enum!(msg, ExtendedMsg::Pex);
+        let hdr = peer2.recv_msg().await.unwrap();
+        let extend_recv = extract_enum!(hdr, Message::Extended);
+        let pex_msg = extract_enum!(extend_recv, ExtendedMsg::Pex);
         assert_eq!(
             pex_msg,
             ExtendedPex {
@@ -2718,10 +2698,9 @@ mod tests {
             .send_extend_pex(&HashMap::from_iter(then.clone().into_iter()))
             .await
             .expect("should send ok");
-        let hdr = peer2.recv_msg_header().await.unwrap();
-        let mut extend_recv = extract_enum!(hdr, Message::Extended);
-        let msg = extend_recv.recv().await.unwrap();
-        let pex_msg = extract_enum!(msg, ExtendedMsg::Pex);
+        let hdr = peer2.recv_msg().await.unwrap();
+        let extend_recv = extract_enum!(hdr, Message::Extended);
+        let pex_msg = extract_enum!(extend_recv, ExtendedMsg::Pex);
         assert_eq!(
             pex_msg,
             ExtendedPex {
@@ -2736,10 +2715,9 @@ mod tests {
         p1w.send_extend_pex(&HashMap::from_iter(initial.clone().into_iter()))
             .await
             .expect("should send ok");
-        let hdr = p2r.recv_msg_header().await.unwrap();
-        let mut extend_recv = extract_enum!(hdr, Message::Extended);
-        let msg = extend_recv.recv().await.unwrap();
-        let pex_msg = extract_enum!(msg, ExtendedMsg::Pex);
+        let hdr = p2r.recv_msg().await.unwrap();
+        let extend_recv = extract_enum!(hdr, Message::Extended);
+        let pex_msg = extract_enum!(extend_recv, ExtendedMsg::Pex);
         assert_eq!(
             pex_msg,
             ExtendedPex {
@@ -2764,12 +2742,11 @@ mod tests {
             .await
             .expect("should send ok");
 
-        let hdr = peer2.recv_msg_header().await.unwrap();
-        let mut extend_recv = extract_enum!(hdr, Message::Extended);
-        let msg = extend_recv.recv().await.unwrap();
-        let pex_msg = extract_enum!(msg, ExtendedMsg::Metadata);
+        let hdr = peer2.recv_msg().await.unwrap();
+        let extend_recv = extract_enum!(hdr, Message::Extended);
+        let meta_msg = extract_enum!(extend_recv, ExtendedMsg::Metadata);
         assert_eq!(
-            pex_msg,
+            meta_msg,
             ExtendedMetadata::Data {
                 piece: 0,
                 total_size: Some(5),
@@ -2786,12 +2763,11 @@ mod tests {
         .await
         .expect("should send ok");
 
-        let hdr = p2r.recv_msg_header().await.unwrap();
-        let mut extend_recv = extract_enum!(hdr, Message::Extended);
-        let msg = extend_recv.recv().await.unwrap();
-        let pex_msg = extract_enum!(msg, ExtendedMsg::Metadata);
+        let hdr = p2r.recv_msg().await.unwrap();
+        let extend_recv = extract_enum!(hdr, Message::Extended);
+        let meta_msg = extract_enum!(extend_recv, ExtendedMsg::Metadata);
         assert_eq!(
-            pex_msg,
+            meta_msg,
             ExtendedMetadata::Data {
                 piece: 0,
                 total_size: Some(5),
@@ -2829,7 +2805,7 @@ mod tests {
         }
 
         for (i, j) in split {
-            let p2_recv_fut = p2r.recv_msg_header();
+            let p2_recv_fut = p2r.recv_msg();
             let mut fut_pin = Box::pin(p2_recv_fut);
 
             // write 0..i

@@ -224,7 +224,7 @@ where
     const A: [u8; 16384] = [0u8; 16384];
     loop {
         tokio::select! {
-            msg = bt_stream.recv_msg_header() => {
+            msg = bt_stream.recv_msg() => {
                 match msg {
                     Ok(m) => match m {
                         Message::Request(r) => {

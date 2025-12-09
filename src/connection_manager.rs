@@ -12,8 +12,8 @@ use crate::cache::{AbortErr, ArcCache, BufStorage, GetRefErr, PieceBuf, PieceKey
 use crate::metadata::{self, Metadata};
 use crate::picker::{start_receive_piece_block, BlockRequests, HeapPiecePicker};
 use crate::protocol::{
-    self, BTStream, Capability, CapabilityMap, Conn, ExtendedMetadata, ExtendedMsg, GeneralConn,
-    Message, Piece, ReadStream, Reader, Split, WriteStream, Writer,
+    self, BTStream, Capability, CapabilityMap, Conn, ExtendedMetadata, ExtendedMsg, Message, Piece,
+    ReadStream, Reader, Split, WriteStream, Writer,
 };
 use crate::transmit_manager::{Downloading, TransmitManagerHandle};
 use crate::transmit_manager::{Msg as TransmitMsg, TorrentState};
@@ -247,12 +247,12 @@ async fn run_recv_stream<T>(
                 conn.transmit_handle.sender.send(TransmitMsg::BlockReceived(conn.read_stream.peer_addr(), conn.blk_recv_count));
                 conn.blk_recv_count = 0;
             }
-            r = conn.read_stream.recv_msg_header() => {
+            r = conn.read_stream.recv_msg() => {
                 // r = receive_peer_msg(&mut conn.read_stream, &mut conn.transmit_handle) => {
                 match r {
-                    Ok(hdr) => {
+                    Ok(msg) => {
                         // (handle_peer_hdr(&mut conn, addr, hdr));
-                        let n_blk = handle_peer_msg(&mut conn.transmit_handle, addr, hdr).await;
+                        let n_blk = handle_peer_msg(&mut conn.transmit_handle, addr, msg).await;
                         conn.blk_recv_count += n_blk;
                     }
                     Err(e) => {
@@ -285,14 +285,7 @@ async fn run_recv_stream<T>(
 // TODO: socketaddr use ref?
 // TODO: returns some more meaningful val
 // returns if one block is received
-async fn handle_peer_msg<'a, R>(
-    tmh: &'a mut TransmitManagerHandle,
-    addr: SocketAddr,
-    m: Message<'a, R>,
-) -> u32
-where
-    R: GeneralConn,
-{
+async fn handle_peer_msg(tmh: &mut TransmitManagerHandle, addr: SocketAddr, m: Message<'_>) -> u32 {
     info!("handle_peer_msg from {addr} {m:?}");
     // TODO: send statistics to transmit handle
 
@@ -335,11 +328,10 @@ where
             tmh.sender.send(TransmitMsg::PeerHave(addr, i));
             0
         }
-        Message::BitField(mut bf_recv) => {
+        Message::BitField(bf) => {
             info!("bf");
             // TODO: handle error
-            let bit_field = bf_recv.read().await.unwrap();
-            tmh.sender.send(TransmitMsg::PeerBitField(addr, bit_field));
+            tmh.sender.send(TransmitMsg::PeerBitField(addr, bf));
             0
         }
         Message::Request(request) => {
@@ -465,14 +457,11 @@ where
 */
 
 // TODO: use &mut piece?
-async fn handle_piece_msg<T>(
+async fn handle_piece_msg(
     peer: &SocketAddr,
     tmh: &mut TransmitManagerHandle,
-    mut piece: protocol::Piece<'_, T>,
-) -> Result<(), ()>
-where
-    T: GeneralConn,
-{
+    mut piece: protocol::Piece<'_>,
+) -> Result<(), ()> {
     // TODO:
     // if coming piece have cache, store it in cache
     // if coming piece don't have cache, ???
@@ -509,9 +498,6 @@ where
     let mut receiving_guard = if let Some(g) = start_receive_piece_block(piece_picker, peer, &blk) {
         g
     } else {
-        // TODO: make this persistent
-        let mut drain = vec![0u8; piece.len as usize];
-        piece.read_exact(&mut drain).await;
         // TODO: why this happen (at testing)?
         // seems we are requesting twice for each piece
         warn!(
@@ -552,15 +538,11 @@ where
     Ok(())
 }
 
-async fn read_block_from_peer<'a, T>(
+async fn read_block_from_peer(
     metadata: Arc<Metadata>,
     storage: Arc<BufStorage>,
-    piece: &mut Piece<'a, T>,
-) -> Result<(ArcCache<PieceBuf>, Ref<PieceBuf>), ()>
-where
-    T: GeneralConn,
-{
-    let mut written = 0usize;
+    piece: &mut Piece<'_>,
+) -> Result<(ArcCache<PieceBuf>, Ref<PieceBuf>), ()> {
     let target_len = piece.len as usize;
 
     let key = PieceKey {
@@ -577,26 +559,8 @@ where
         // i.e. operation between two locks?
         match piece_and_block_buf {
             Ok((piece_buf, mut bbuf)) => {
-                while written < target_len {
-                    let read_fut = piece.read_to_ref(bbuf, written);
-                    match read_fut.await {
-                        Ok((n, bbuf_alive)) => {
-                            written += n;
-                            bbuf = bbuf_alive;
-                        }
-                        Err(AbortErr::IO(e)) => {
-                            // not aborted, but underlying read error
-                            // TODO: do something
-                            warn!("error while receiving piece {e}");
-                            return Err(()); // TODO: return error code
-                        }
-                        Err(e) => {
-                            // go to next round
-                            continue 'outer;
-                        }
-                    }
-                }
-                assert_eq!(written, target_len);
+                let v = bbuf.as_mut();
+                v[..target_len].copy_from_slice(&piece.piece);
                 return Ok((piece_buf, bbuf));
             }
             Err(GetRefErr::Invalidated) => {
@@ -611,9 +575,6 @@ where
                 unreachable!()
             }
             Err(e) => {
-                let mut drain = vec![0u8; target_len - written];
-                let _ = piece.read_exact(&mut drain).await; // TODO: FIXME: use result
-
                 warn!(
                     "get ref error: {e:?} drain PIECE msg {} {} {}",
                     piece.index, piece.begin, piece.len
@@ -628,35 +589,26 @@ where
     }
 }
 
-async fn handle_extended_msg<T>(
+async fn handle_extended_msg(
     peer: &SocketAddr,
     tmh: &mut TransmitManagerHandle,
-    mut extended: protocol::ExtendedRecv<'_, T>,
-) -> io::Result<()>
-where
-    T: GeneralConn,
-{
+    extended: protocol::ExtendedMsg,
+) -> io::Result<()> {
     info!("handle_extended_msg {extended:?}");
 
-    match extended.recv().await {
-        Ok(extend_msg) => match extend_msg {
-            ExtendedMsg::Handshake(hs) => todo!(),
-            ExtendedMsg::Pex(pex) => {
-                info!("received pex from {peer}, {pex:?}");
-                Ok(())
-            }
-            ExtendedMsg::Metadata(m) => {
-                _ = tmh.sender.send(TransmitMsg::ExtendMetadata(*peer, m));
-                Ok(())
-            }
-            ExtendedMsg::Unknown(id) => {
-                warn!("received unknown extend message: id {id}");
-                Ok(())
-            }
-        },
-        Err(e) => {
-            warn!("receive extend msg error {e}");
-            Err(e)
+    match extended {
+        ExtendedMsg::Handshake(hs) => todo!(),
+        ExtendedMsg::Pex(pex) => {
+            info!("received pex from {peer}, {pex:?}");
+            Ok(())
+        }
+        ExtendedMsg::Metadata(m) => {
+            _ = tmh.sender.send(TransmitMsg::ExtendMetadata(*peer, m));
+            Ok(())
+        }
+        ExtendedMsg::Unknown(id) => {
+            warn!("received unknown extend message: id {id}");
+            Ok(())
         }
     }
 }
