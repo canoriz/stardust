@@ -95,6 +95,12 @@ impl From<SocketAddr> for ByteSocketAddr {
     }
 }
 
+impl From<ByteSocketAddr> for SocketAddr {
+    fn from(value: ByteSocketAddr) -> Self {
+        value.0
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct FindNodeResp {
     #[serde(with = "serde_bytes")]
@@ -453,14 +459,9 @@ impl DHT {
         let mut ret = vec![];
         for r in js.join_all().await {
             if let Ok(resp) = r {
-                if let Some(ps) = resp.nodes {
-                    for (_, addr) in ps.0 {
-                        ret.push(SocketAddr::V4(addr))
-                    }
-                }
-                if let Some(ps) = resp.nodes6 {
-                    for (_, addr) in ps.0 {
-                        ret.push(SocketAddr::V6(addr))
+                if let Some(ps) = resp.values {
+                    for addr in ps {
+                        ret.push(addr.into());
                     }
                 }
             }

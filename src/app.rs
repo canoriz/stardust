@@ -19,13 +19,11 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
     const SELF_ID: [u8; 20] = *b"-TR0300-fjbo402nczk3";
     const SELF_PORT: u16 = 41773;
     const DHT_PORT: u16 = 42773;
-    let magnet: Magnet = "magnet:?xt=urn:btih:4bef6307728fee46c66873173df43d407dad8500&dn=%5BANi%5D%20%E8%BA%AB%E7%82%BA%E6%9A%97%E6%AE%BA%E8%80%85%E7%9A%84%E6%88%91%E6%98%8E%E9%A1%AF%E6%AF%94%E5%8B%87%E8%80%85%E9%82%84%E5%BC%B7%20-%2010%20%5B1080P%5D%5BBaha%5D%5BWEB-DL%5D%5BAAC%20AVC%5D%5BCHT%5D.mp4&tr=http%3A%2F%2Ft.nyaatracker.com%2Fannounce&tr=http%3A%2F%2Ftracker.kamigami.org%3A2710%2Fannounce&tr=http%3A%2F%2Fshare.camoe.cn%3A8080%2Fannounce&tr=http%3A%2F%2Fopentracker.acgnx.se%2Fannounce&tr=http%3A%2F%2Fanidex.moe%3A6969%2Fannounce&tr=http%3A%2F%2Ft.acg.rip%3A6699%2Fannounce&tr=https%3A%2F%2Ftr.bangumi.moe%3A9696%2Fannounce&tr=udp%3A%2F%2Ftr.bangumi.moe%3A6969%2Fannounce&tr=http%3A%2F%2Fopen.acgtracker.com%3A1096%2Fannounce&tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337%2Fannounce".parse()?;
-    let trackers = magnet.tr.clone();
     let dht_client = Arc::new(DHT::new(SELF_ID, DHT_PORT, "ST01".into()));
     _ = dht_client
         .ping_rpc(
             dht::RpcAddr::NoID(
-                "[240e:b8f:5c68:8400:4c07:3e69:7b5a:741]:59999"
+                "[240e:b8f:5c68:8400:4c07:3e69:7b5a:741]:54032"
                     .parse()
                     .unwrap(),
             ),
@@ -133,18 +131,20 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // let mut tm = TransmitManager::new(metadata).with_announce_list(announce_list);
-    let magnet: Magnet = "magnet:?xt=urn:btih:4bef6307728fee46c66873173df43d407dad8500&dn=%5BANi%5D%20%E8%BA%AB%E7%82%BA%E6%9A%97%E6%AE%BA%E8%80%85%E7%9A%84%E6%88%91%E6%98%8E%E9%A1%AF%E6%AF%94%E5%8B%87%E8%80%85%E9%82%84%E5%BC%B7%20-%2010%20%5B1080P%5D%5BBaha%5D%5BWEB-DL%5D%5BAAC%20AVC%5D%5BCHT%5D.mp4&tr=http%3A%2F%2Ft.nyaatracker.com%2Fannounce&tr=http%3A%2F%2Ftracker.kamigami.org%3A2710%2Fannounce&tr=http%3A%2F%2Fshare.camoe.cn%3A8080%2Fannounce&tr=http%3A%2F%2Fopentracker.acgnx.se%2Fannounce&tr=http%3A%2F%2Fanidex.moe%3A6969%2Fannounce&tr=http%3A%2F%2Ft.acg.rip%3A6699%2Fannounce&tr=https%3A%2F%2Ftr.bangumi.moe%3A9696%2Fannounce&tr=udp%3A%2F%2Ftr.bangumi.moe%3A6969%2Fannounce&tr=http%3A%2F%2Fopen.acgtracker.com%3A1096%2Fannounce&tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337%2Fannounce".parse()?;
+    let magnet: Magnet = "magnet:?xt=urn:btih:be195f263108ad2241c2ae1fb9e277f7731fbe5f".parse()?;
     let trackers = magnet.tr.clone();
     let mut tm = TorrentManagerHandle::new(
         TorrentTask::Magnet(magnet),
+        // TorrentTask::Torrent(metadata),
         SELF_ID,
         SELF_PORT,
         Some(dht_client),
+        // None,
     );
     // info!("{announce_list:?}");
-    if let Some(addr) = trackers {
-        tm.send_announce_msg(announce_manager::Msg::AddUrl(addr));
-    }
+    // if let Some(addr) = trackers {
+    //     tm.send_announce_msg(announce_manager::Msg::AddUrl(addr));
+    // }
     wait_ready.notified().await;
     wait_ready2.notified().await;
 

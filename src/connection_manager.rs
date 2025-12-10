@@ -290,7 +290,7 @@ async fn run_recv_stream<T>(
 // TODO: socketaddr use ref?
 // TODO: returns some more meaningful val
 // returns if one block is received
-async fn handle_peer_msg(tmh: &mut TransmitManagerHandle, addr: SocketAddr, m: Message<'_>) -> u32 {
+async fn handle_peer_msg(tmh: &mut TransmitManagerHandle, addr: SocketAddr, m: Message) -> u32 {
     info!("handle_peer_msg from {addr} {m:?}");
     // TODO: send statistics to transmit handle
 
@@ -469,7 +469,7 @@ where
 async fn handle_piece_msg(
     peer: &SocketAddr,
     tmh: &mut TransmitManagerHandle,
-    mut piece: protocol::Piece<'_>,
+    mut piece: protocol::Piece,
 ) -> Result<(), ()> {
     // TODO:
     // if coming piece have cache, store it in cache
@@ -550,7 +550,7 @@ async fn handle_piece_msg(
 async fn read_block_from_peer(
     metadata: Arc<Metadata>,
     storage: Arc<BufStorage>,
-    piece: &mut Piece<'_>,
+    piece: &mut Piece,
 ) -> Result<(ArcCache<PieceBuf>, Ref<PieceBuf>), ()> {
     let target_len = piece.len as usize;
 
@@ -569,7 +569,8 @@ async fn read_block_from_peer(
         match piece_and_block_buf {
             Ok((piece_buf, mut bbuf)) => {
                 let v = bbuf.as_mut();
-                v[..target_len].copy_from_slice(&piece.piece);
+                v[..target_len]
+                    .copy_from_slice(&piece.buf().expect("returned piece should have buf"));
                 return Ok((piece_buf, bbuf));
             }
             Err(GetRefErr::Invalidated) => {

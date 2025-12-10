@@ -36,18 +36,15 @@ impl AnnounceManagerHandle {
         let manager = AnnounceManager {
             peer_id,
             port,
-            announce_list: vec![
-                vec!["https://torrent.ubuntu.com/announce".into()],
-                vec!["https://ipv6.torrent.ubuntu.com/announce".into()],
-            ],
+            announce_list: vec![],
             receiver: cmd_rx,
 
             transmit_mgr: tx,
             announce_timer: task::JoinSet::new(),
             url_list: HashMap::new(),
         };
-        // tokio::spawn(run_announce_manager::<metadata::Announcer>(
-        tokio::spawn(run_announce_manager::<FakeAnnouncer>(
+        tokio::spawn(run_announce_manager::<metadata::Announcer>(
+            // tokio::spawn(run_announce_manager::<FakeAnnouncer>(
             manager,
             info_hash,
             cancel.clone(),

@@ -15,6 +15,7 @@ use std::sync::LazyLock;
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net;
 use tokio::net::tcp;
+use tokio::sync::oneshot;
 use tracing::{info, warn};
 
 const DEFAULT_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0);
@@ -184,7 +185,9 @@ pub struct BTStream<T> {
     pex_peers: HashMap<IpAddr, Option<PexFlag>>,
 
     // buffer for incoming piece
-    piece_buf: BytesMut,
+    // this might be transferred to other place for further
+    // processing and returns back when done
+    piece_buf: Option<BytesMut>,
 }
 
 impl<T> BTStream<T>
@@ -204,7 +207,7 @@ where
             peer_id: self.peer_id,
             pex_peers: self.pex_peers,
             metadata_size: self.metadata_size,
-            piece_buf: BytesMut::new(),
+            piece_buf: Some(BytesMut::new()),
         }
     }
 }
@@ -242,7 +245,7 @@ pub struct ReadStream<T> {
     reserved: FuncBits,
 
     // buffer for incoming piece
-    piece_buf: BytesMut,
+    piece_buf: Option<BytesMut>,
 }
 
 #[derive(Debug)]
@@ -252,6 +255,7 @@ enum PartialRead {
     Extend(PartialExtend),
     Piece(PartialPiece),
     Discard(PartialExtend),
+    Processing(oneshot::Receiver<BytesMut>),
 }
 
 // store partial received header,
@@ -589,7 +593,7 @@ where
             reserved: peer_handshake.reserved,
             pex_peers: HashMap::new(),
             metadata_size: 0,
-            piece_buf: BytesMut::new(),
+            piece_buf: Some(BytesMut::new()),
         };
 
         let support_extension =
@@ -656,7 +660,7 @@ where
             reserved: peer_handshake.reserved.common(funcbits),
             pex_peers: HashMap::new(),
             metadata_size: 0,
-            piece_buf: BytesMut::new(),
+            piece_buf: Some(BytesMut::new()),
         };
 
         let support_extension = peer_handshake.reserved.have_extension();
@@ -1002,7 +1006,7 @@ impl MsgTy {
 }
 
 #[derive(Eq, PartialEq)]
-pub enum Message<'a> {
+pub enum Message {
     KeepAlive,
     Choke,
     Unchoke,
@@ -1011,7 +1015,7 @@ pub enum Message<'a> {
     Have(u32),
     BitField(BitField),
     Request(Request),
-    Piece(Piece<'a>),
+    Piece(Piece),
     Cancel(Request),
     Port(u16),
     Extended(ExtendedMsg),
@@ -1034,7 +1038,7 @@ pub enum MessageHeader {
     Discard { len: usize },
 }
 
-impl std::fmt::Debug for Message<'_> {
+impl std::fmt::Debug for Message {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Message::KeepAlive => {
@@ -1183,12 +1187,49 @@ pub struct Request {
     pub len: u32,
 }
 
-#[derive(Eq, PartialEq, Debug)]
-pub struct Piece<'a> {
+pub struct Piece {
     pub index: u32,
     pub begin: u32,
     pub len: u32,
-    pub piece: &'a BytesMut,
+    pub piece: Option<(BytesMut, oneshot::Sender<BytesMut>)>,
+}
+
+impl Piece {
+    pub fn buf(&self) -> Option<&BytesMut> {
+        self.piece.as_ref().map(|(p, _)| p)
+    }
+}
+
+impl Eq for Piece {}
+impl PartialEq for Piece {
+    fn eq(&self, other: &Self) -> bool {
+        let range_ok =
+            self.index == other.index && self.begin == other.begin && self.len == other.len;
+        let all_none = self.piece.is_none() && other.piece.is_none();
+        let all_same = self
+            .buf()
+            .is_some_and(|b| other.buf().is_some_and(|ob| b.as_ref() == ob.as_ref()));
+        range_ok && (all_none || all_same)
+    }
+}
+
+impl fmt::Debug for Piece {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Piece")
+            .field("index", &self.index)
+            .field("begin", &self.begin)
+            .field("len", &self.len)
+            .field("buffer len", &self.buf().map_or(0, |b| b.len()))
+            .finish()
+    }
+}
+
+impl Drop for Piece {
+    fn drop(&mut self) {
+        if let Some((buf, tx)) = self.piece.take() {
+            _ = tx.send(buf);
+        }
+    }
 }
 
 #[derive(Eq, PartialEq)]
@@ -1722,8 +1763,8 @@ where
 async fn recv_msg<'a, T>(
     reader: &'a mut T,
     partial_read: &'a mut PartialRead,
-    piece_buf: &'a mut BytesMut,
-) -> io::Result<Message<'a>>
+    piece_buf: &'a mut Option<BytesMut>,
+) -> io::Result<Message>
 where
     T: AsyncRead + Unpin,
 {
@@ -1739,7 +1780,10 @@ where
                         });
                     }
                     MessageHeader::Piece { index, begin, len } => {
-                        piece_buf.clear();
+                        piece_buf
+                            .as_mut()
+                            .expect("when receiving a PIECE, piece_buf should be Some")
+                            .clear();
                         *partial_read = PartialRead::Piece(PartialPiece {
                             index,
                             begin,
@@ -1783,12 +1827,47 @@ where
                 return res;
             }
             PartialRead::Piece(p) => {
-                let res = Ok(Message::Piece(recv_piece_msg(reader, p, piece_buf).await?));
-                *partial_read = INITIAL_PARTIAL_READ;
-                return res;
+                recv_piece_msg(
+                    reader,
+                    p,
+                    piece_buf
+                        .as_mut()
+                        .expect("when receiving a PIECE, piece_buf should be Some"),
+                )
+                .await?;
+                let piece = piece_buf
+                    .take()
+                    .expect("when receiving a PIECE, piece_buf should be Some");
+                let (tx, rx) = oneshot::channel();
+                let ret = Ok(Message::Piece(Piece {
+                    index: p.index,
+                    begin: p.begin,
+                    len: p.len as u32,
+                    piece: Some((piece, tx)),
+                }));
+                *partial_read = PartialRead::Processing(rx);
+                return ret;
             }
             PartialRead::Discard(p) => {
                 discard_remain(reader, p).await?;
+                *partial_read = INITIAL_PARTIAL_READ;
+            }
+            PartialRead::Processing(done) => {
+                let timeout = tokio::time::Duration::from_secs(1);
+                match tokio::time::timeout(timeout, done).await {
+                    Ok(Ok(buf)) => *piece_buf = Some(buf),
+                    // the buffer is returned
+                    Ok(_) => {
+                        warn!("receive BytesMut failed");
+                        *piece_buf = Some(BytesMut::new());
+                    }
+                    Err(_) => {
+                        // for any reason buffer are not returned
+                        // make a new one
+                        warn!("receive BytesMut time elapsed, make a new one");
+                        *piece_buf = Some(BytesMut::new());
+                    }
+                }
                 *partial_read = INITIAL_PARTIAL_READ;
             }
         }
@@ -2052,11 +2131,11 @@ where
     }
 }
 
-async fn recv_piece_msg<'a, 'b, T>(
+async fn recv_piece_msg<'a, T>(
     reader: &'a mut T,
     state: &'a mut PartialPiece,
-    piece_buf: &'b mut BytesMut,
-) -> io::Result<Piece<'b>>
+    piece_buf: &'a mut BytesMut,
+) -> io::Result<()>
 where
     T: AsyncRead + Unpin,
 {
@@ -2071,12 +2150,7 @@ where
         };
     }
 
-    Ok(Piece {
-        index: state.index,
-        begin: state.begin,
-        len: state.len as u32,
-        piece: piece_buf,
-    })
+    Ok(())
 }
 
 async fn recv_extend_msg<'a, T>(
@@ -2146,7 +2220,7 @@ where
 async fn recv_extend_handshake<'a, T>(
     reader: &'a mut T,
     pr: &mut PartialRead,
-    buf: &mut BytesMut, // not used here
+    buf: &mut Option<BytesMut>, // not used here
 ) -> io::Result<ExtendedHandshake>
 where
     T: AsyncRead + Unpin,
@@ -2306,7 +2380,7 @@ mod tests {
                     peer_id: [0; 20],
                     reserved: [0; 8].into(),
                     metadata_size: 0,
-                    piece_buf: BytesMut::new(),
+                    piece_buf: Some(BytesMut::new()),
                 },
                 WriteStream {
                     inner: write_end,
@@ -2584,7 +2658,7 @@ mod tests {
         assert_eq!(piece.index, index);
         assert_eq!(piece.begin, begin);
         assert_eq!(piece.len, random_bytes.len() as u32);
-        assert_eq!(piece.piece.as_ref(), random_bytes);
+        assert_eq!(piece.buf().unwrap().as_ref(), random_bytes);
 
         // TODO: test long piece are dropped
 
@@ -2599,8 +2673,40 @@ mod tests {
         assert_eq!(piece.index, index);
         assert_eq!(piece.begin, begin);
         assert_eq!(piece.len, random_bytes.len() as u32);
-        assert_eq!(piece.piece.as_ref(), random_bytes);
+        assert_eq!(piece.buf().unwrap().as_ref(), random_bytes);
         // TODO: test long piece are dropped
+    }
+
+    #[tokio::test]
+    async fn many_piece() {
+        let (mut peer1, mut peer2) = make_ends().await;
+        let random_bytes = rand::random::<[u8; 143]>();
+        let index = rand::random::<u32>();
+        let begin = rand::random::<u32>();
+        peer1
+            .send_piece(index, begin, &random_bytes)
+            .await
+            .expect("should send ok");
+        let received = peer2.recv_msg().await.expect("should recv ok");
+        let piece = extract_enum!(received, Message::Piece);
+        assert_eq!(piece.index, index);
+        assert_eq!(piece.begin, begin);
+        assert_eq!(piece.len, random_bytes.len() as u32);
+        assert_eq!(piece.buf().unwrap().as_ref(), random_bytes);
+
+        // drop this piece so the buffer can be returned
+        drop(piece);
+
+        peer1
+            .send_piece(index, begin, &random_bytes)
+            .await
+            .expect("should send ok");
+        let received = peer2.recv_msg().await.expect("should recv ok");
+        let piece = extract_enum!(received, Message::Piece);
+        assert_eq!(piece.index, index);
+        assert_eq!(piece.begin, begin);
+        assert_eq!(piece.len, random_bytes.len() as u32);
+        assert_eq!(piece.buf().unwrap().as_ref(), random_bytes);
     }
 
     #[tokio::test]
