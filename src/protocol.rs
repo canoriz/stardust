@@ -1198,6 +1198,15 @@ impl Piece {
     pub fn buf(&self) -> Option<&BytesMut> {
         self.piece.as_ref().map(|(p, _)| p)
     }
+
+    /// Drops the sender so that the connection receiver may
+    /// unblock. The bytes used is not recycled
+    pub fn unblock_conn(&mut self) {
+        self.piece.as_mut().map(|(_, s)| {
+            let (mut ns, _) = oneshot::channel();
+            std::mem::swap(s, &mut ns);
+        });
+    }
 }
 
 impl Eq for Piece {}
@@ -1253,10 +1262,12 @@ pub enum ExtendedMsg {
 pub struct ExtendedHandshake {
     // TODO: when sending can use 'static ref
     pub m: HashMap<String, u8>, // supported extensions and id number
-    //
+
+    // TODO: this field is optional
     pub p: u16, // TCP listen port
-    //
+
     // TODO: when sending can use 'static ref
+    // TODO: this field is optional
     pub v: String, // client name and version
 
     // A string containing the compact representation of the ip address this peer

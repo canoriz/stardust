@@ -8,7 +8,7 @@ use crate::metadata::Metadata;
 
 #[cfg(unix)]
 use std::os::unix::prelude::*;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 pub struct FileMetadata {
     pub len: usize, // length of file
@@ -218,7 +218,7 @@ impl BackFile {
         let opener = self.opener;
         let wops = self.find_files(offset, buf);
         for w in wops {
-            warn!(
+            debug!(
                 "write path {} offset {} len {}",
                 w.file.path, w.offset, w.buf_len
             );

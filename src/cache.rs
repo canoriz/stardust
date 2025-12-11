@@ -1,6 +1,7 @@
 mod buffer_storage;
 mod global;
 mod piece;
+pub mod simple_buffer;
 use std::sync::{Arc, Mutex};
 
 pub(crate) use buffer_storage::BufStorage;

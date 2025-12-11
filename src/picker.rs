@@ -1291,8 +1291,8 @@ pub struct ReceiveBlockGuard<'a> {
 }
 
 impl ReceiveBlockGuard<'_> {
-    // returns if one piece is completed
-    pub fn block_received(&mut self) -> Option<u32> {
+    // returns which piece is completed
+    pub fn piece_received(&mut self) -> Option<u32> {
         let mut picker = self.picker.lock().expect("block received lock should OK");
         self.received = true;
         picker.block_received(self.peer, *self.blk)
@@ -1313,7 +1313,6 @@ impl Drop for ReceiveBlockGuard<'_> {
             let br = BlockRange::one_block(self.blk.index, self.blk.begin, self.blk.len);
             picker.blocks_revoke(&br);
         }
-        info!("block {:?} received when guard dropped", self.blk);
     }
 }
 

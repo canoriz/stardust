@@ -291,7 +291,6 @@ async fn run_recv_stream<T>(
 // TODO: returns some more meaningful val
 // returns if one block is received
 async fn handle_peer_msg(tmh: &mut TransmitManagerHandle, addr: SocketAddr, m: Message) -> u32 {
-    info!("handle_peer_msg from {addr} {m:?}");
     // TODO: send statistics to transmit handle
 
     // TODO: shall we use mpsc or just lock the manager and set it
@@ -348,7 +347,7 @@ async fn handle_peer_msg(tmh: &mut TransmitManagerHandle, addr: SocketAddr, m: M
             0
         }
         Message::Piece(piece) => {
-            handle_piece_msg(&addr, tmh, piece).await;
+            tmh.sender.send(TransmitMsg::PeerRecvPiece(addr, piece));
             1
         }
         Message::Cancel(request) => {
@@ -464,140 +463,6 @@ where
     }
 }
 */
-
-// TODO: use &mut piece?
-async fn handle_piece_msg(
-    peer: &SocketAddr,
-    tmh: &mut TransmitManagerHandle,
-    mut piece: protocol::Piece,
-) -> Result<(), ()> {
-    // TODO:
-    // if coming piece have cache, store it in cache
-    // if coming piece don't have cache, ???
-    // tell manager?
-    // info!("handle_piece_msg {piece:?}");
-
-    // TODO: if coming block is already received and checked,
-    // then discard this block, don't alloc (if needed) piece buffer.
-    // And there should be no piece buffer of this piece in pb_map
-
-    let blk = protocol::Request {
-        index: piece.index,
-        begin: piece.begin,
-        len: piece.len,
-    };
-
-    let (piece_picker, metadata, storage) = match &*tmh.torrent_state.lock().unwrap() {
-        TorrentState::Metadata(d) => (
-            d.piece_picker.clone(),
-            d.metadata.clone(),
-            d.storage.clone(),
-        ),
-        TorrentState::Fetching(_) => {
-            info!(
-                "receive PIECE msg {} {} {} block index {} before having metadata",
-                piece.index,
-                piece.begin,
-                piece.len,
-                piece.begin >> 14,
-            );
-            return Ok(());
-        }
-    };
-    let mut receiving_guard = if let Some(g) = start_receive_piece_block(piece_picker, peer, &blk) {
-        g
-    } else {
-        // TODO: why this happen (at testing)?
-        // seems we are requesting twice for each piece
-        warn!(
-            "drain PIECE msg {} {} {} block index {}",
-            piece.index,
-            piece.begin,
-            piece.len,
-            piece.begin >> 14,
-        );
-        return Ok(());
-    };
-
-    info!(
-        "receive PIECE msg {} {} {} block index {}",
-        piece.index,
-        piece.begin,
-        piece.len,
-        piece.begin >> 14,
-    );
-
-    let (piece_buf, block_buf) =
-        read_block_from_peer(metadata, storage.clone(), &mut piece).await?;
-
-    let received_piece = receiving_guard.block_received();
-    if let Some(i) = received_piece {
-        info!("piece {i} received");
-        assert_eq!(piece.index, i);
-        // TODO: maybe returns and let upper fn sends this message
-        tmh.sender.send(TransmitMsg::PieceReceived(i));
-
-        // block new ref to piece buffer
-        // so ref count only decreases
-        // TODO: change this to disable_new_write_ref
-        // and start allow read_refs(for future seeding feature)
-        piece_buf.disable_new_ref();
-        storage.set_can_flush(i);
-    }
-    Ok(())
-}
-
-async fn read_block_from_peer(
-    metadata: Arc<Metadata>,
-    storage: Arc<BufStorage>,
-    piece: &mut Piece,
-) -> Result<(ArcCache<PieceBuf>, Ref<PieceBuf>), ()> {
-    let target_len = piece.len as usize;
-
-    let key = PieceKey {
-        // TODO: OPTIMIZE: avoid allocation
-        hash: Arc::new(metadata.info_hash),
-        offset: piece.index as usize * metadata.regular_piece_size(),
-    };
-
-    'outer: loop {
-        let piece_and_block_buf = storage
-            .get_part_ref(piece.index, piece.begin, piece.len, key.clone())
-            .await;
-        // TODO: need a biglock. What if some peer else is doing operation now?
-        // i.e. operation between two locks?
-        match piece_and_block_buf {
-            Ok((piece_buf, mut bbuf)) => {
-                let v = bbuf.as_mut();
-                v[..target_len]
-                    .copy_from_slice(&piece.buf().expect("returned piece should have buf"));
-                return Ok((piece_buf, bbuf));
-            }
-            Err(GetRefErr::Invalidated) => {
-                // TODO: FIXME: will this cause dead loop?
-                // get buffer then invalidated by other, then re-get
-                // re-invalidate and loops forever?
-                warn!("piece invalidated");
-                continue 'outer;
-            }
-            Err(GetRefErr::Paused) => {
-                // if using async mode, won't return paused
-                unreachable!()
-            }
-            Err(e) => {
-                warn!(
-                    "get ref error: {e:?} drain PIECE msg {} {} {}",
-                    piece.index, piece.begin, piece.len
-                );
-                // TODO: what should we do now?
-                // we don't have that space
-                // maybe reads to supplementary buffer?
-                // just return now
-                return Err(());
-            }
-        }
-    }
-}
 
 async fn handle_extended_msg(
     peer: &SocketAddr,
