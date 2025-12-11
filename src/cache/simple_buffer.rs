@@ -2,14 +2,13 @@ use std::{
     collections::{HashMap, VecDeque},
     fmt, io,
     sync::{
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         Arc, Mutex,
     },
 };
 
 use super::{BackFile, MutexBackFile};
 use bytes::BytesMut;
-use futures::io::Flush;
 use tokio::time;
 
 const FLUSHING: u32 = 0b1;
@@ -57,6 +56,7 @@ pub struct PieceBuf {
     index: usize,
     touch: time::Instant,
     state: Arc<AtomicU32>,
+    dropping: Arc<AtomicBool>,
     file: MutexBackFile,
     pool: Arc<Mutex<Pool<BytesMut>>>,
     on_error: Option<Box<dyn ErrorCallback>>,
@@ -93,13 +93,30 @@ impl AsRef<[u8]> for PieceBuf {
 
 impl Drop for PieceBuf {
     fn drop(&mut self) {
-        let on_err = self.on_error.take().unwrap();
-        self.flush(on_err);
+        let on_err = self.on_error.take();
+
+        let f = self.file.clone();
+        let s = self.state.clone();
+        let offset = self.offset;
+        let pool = self.pool.clone();
+        let buf = self.buf.take().unwrap();
+        let dropping = self.dropping.clone();
+
+        // if drop is running, all background flush should stop
+        // set in_drop, if other worker see in_drop is true, they stop
+        dropping.swap(true, Ordering::Acquire);
+        let old_state = s.fetch_or(FLUSHING, Ordering::Acquire);
+        if old_state & FLUSHING > 0 || old_state & DIRTY > 0 {
+            // buffer may be dirty while DIRTY bit is 0 if other is FLUSHING
+            tokio::task::spawn_blocking(move || {
+                Self::force_flush(buf, f, pool, offset, s, dropping, true, on_err)
+            });
+        }
     }
 }
 
 impl PieceBuf {
-    pub fn flush(&mut self, on_err: Box<dyn ErrorCallback>) {
+    pub fn flush(&mut self, on_err: Option<Box<dyn ErrorCallback>>) {
         // set flushing bit and clear dirty bit
         // dirty flushing
         // 00 -> 00 and return
@@ -107,8 +124,9 @@ impl PieceBuf {
         // 10 -> 01 dirty, flushing not in progress, start one
         // 11 -> 11 dirty, flushing in progress, not more flush, return
 
-        // we have the &mut, dirty bit won't change. If parallel flushing
-        // working, flushing bit may change from 1 to 0
+        // we have the &mut, only we can caange flushing bit from 0 to 1.
+        // If parallel flushing working, flushing bit may change from 1 to 0,
+        // dirty bit may change from 0 to 1
 
         let state = self.state.load(Ordering::Acquire);
         match state {
@@ -123,10 +141,11 @@ impl PieceBuf {
                 let s = self.state.clone();
                 let offset = self.offset;
                 let pool = self.pool.clone();
+                let dropping = self.dropping.clone();
 
                 let buf = self.buf.clone().unwrap();
                 tokio::task::spawn_blocking(move || {
-                    Self::force_flush(buf, f, pool, offset, s, on_err)
+                    Self::force_flush(buf, f, pool, offset, s, dropping, false, on_err)
                 });
             }
             0b11 => {}
@@ -140,13 +159,17 @@ impl PieceBuf {
         pool: Arc<Mutex<Pool<BytesMut>>>,
         offset: usize,
         state: Arc<AtomicU32>,
-        on_err: Box<dyn ErrorCallback>,
+        dropping: Arc<AtomicBool>,
+        from_drop: bool,
+        on_err: Option<Box<dyn ErrorCallback>>,
     ) {
         flush_buf_to_file(
             buf,
             offset,
             state,
             file,
+            dropping,
+            from_drop,
             move |b| {
                 pool.lock().unwrap().put(b);
             },
@@ -157,37 +180,52 @@ impl PieceBuf {
 
 /// flush buffer to file
 /// recycle_buf should recycle BytesMut
+/// dirty may change from 0 to 1
+/// flushing must change from 1 to 0
 fn flush_buf_to_file<F>(
     buf: BytesMut,
     offset: usize,
     state: Arc<AtomicU32>,
     file: MutexBackFile,
+    dropping: Arc<AtomicBool>,
+    from_drop: bool,
     recycle_buf: F,
-    on_err: Box<dyn ErrorCallback>,
+    on_err: Option<Box<dyn ErrorCallback>>,
 ) where
     F: FnOnce(BytesMut) + Send + 'static,
 {
     let r = {
         let mut f = file.lock().unwrap();
-        f.write_all_at(offset, buf.as_ref())
+        let dropping = dropping.load(Ordering::Relaxed);
+        if dropping && from_drop || !dropping {
+            f.write_all_at(offset, buf.as_ref())
+        } else {
+            Ok(())
+        }
     };
-
-    // flush done, we should be the only flushing thread,
-    // thus FLUSHING bit is set
-    // dirty flush
-    // 01 -> 00 no new write after flushing begins
-    // 11 -> 10 new write after flushing begins, the dirty bit is set by others
-    let old_state = state.fetch_and(!FLUSHING, Ordering::Release);
-    assert!(old_state & FLUSHING > 0);
 
     let len = buf.len();
     recycle_buf(buf);
     if let Err(e) = r {
-        on_err(FlushErr {
-            offset,
-            len,
-            err: e,
-        })
+        if let Some(cb) = on_err {
+            cb(FlushErr {
+                offset,
+                len,
+                err: e,
+            })
+        }
+        // dirty flush bits
+        // 01 -> 10 no new write after flushing begins
+        // 11 -> 10 new write after flushing begins, the dirty bit is set by others
+        // in all cases, should set dirty=1, flush=0
+        let _old_state = state.swap(DIRTY, Ordering::Release);
+        // assert!(old_state & FLUSHING > 0);
+    } else {
+        // dirty flush bits
+        // 01 -> 00 no new write after flushing begins
+        // 11 -> 10 new write after flushing begins, the dirty bit is set by others
+        let _old_state = state.fetch_and(!FLUSHING, Ordering::Release);
+        // assert!(old_state & FLUSHING > 0);
     }
 }
 
@@ -299,6 +337,7 @@ impl BufStorage {
                 index: piece_idx,
                 offset,
                 state: Arc::new(AtomicU32::new(0)),
+                dropping: Arc::new(AtomicBool::new(false)),
                 file: self.back_file.clone(),
                 pool: self.pool.clone(),
                 on_error: Some(on_flush_err),

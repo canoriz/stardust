@@ -657,13 +657,6 @@ impl TransmitWorker {
         true
     }
 
-    fn on_flush_err(sender: mpsc::UnboundedSender<Msg>) -> Box<dyn ErrorCallback> {
-        let on_err = move |e| {
-            _ = sender.send(Msg::FlushError(e));
-        };
-        Box::new(on_err)
-    }
-
     fn get_piecebuf(
         torrent_state: &mut TorrentState,
         sender: mpsc::UnboundedSender<Msg>,
@@ -748,7 +741,7 @@ impl TransmitWorker {
                 copy_to_piecebuf(&piece, piecebuf);
                 if let Some(p) = received_full_piece {
                     if Self::handle_full_piece_received(&mut self.connected_peers, p as usize) {
-                        piecebuf.flush(Self::on_flush_err(sender));
+                        piecebuf.flush(None);
                     }
                 }
             }
