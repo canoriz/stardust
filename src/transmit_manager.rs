@@ -10,7 +10,7 @@ use crate::protocol::{self, BitField, Conn, ExtendedMetadata, ExtendedMsg, FuncB
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time;
@@ -133,7 +133,7 @@ pub enum TorrentState {
 /// The fetching information of a torrent
 /// still downloading metadata
 pub struct FetchingMetadata {
-    meta_buf: Arc<Mutex<MetadataBuffer>>,
+    meta_buf: MetadataBuffer,
     pub magnet: Magnet,
 }
 
@@ -205,10 +205,7 @@ impl MetadataBuffer {
 pub struct Downloading {
     pub metadata: Arc<Metadata>,
 
-    // TODO: maybe not use Arc<Mutex<..>> but use a splitted lock structure to
-    // reduce contention?
-    // TODO: using dyn <trait Picker>?
-    pub piece_picker: Arc<Mutex<HeapPiecePicker>>,
+    pub piece_picker: HeapPiecePicker,
     pub storage: BufStorage,
 }
 
@@ -268,7 +265,7 @@ impl TransmitWorker {
     ) -> Self {
         let info_hash = m.info_hash;
         let state = TorrentState::Fetching(FetchingMetadata {
-            meta_buf: Arc::new(Mutex::new(MetadataBuffer::new())),
+            meta_buf: MetadataBuffer::new(),
             magnet: m,
         });
         Self {
@@ -290,7 +287,7 @@ impl TransmitWorker {
         let m = Arc::new(m);
         let piece_size = m.regular_piece_size() as u32;
         let total_length = m.len();
-        let piece_picker = Arc::new(Mutex::new(HeapPiecePicker::new(total_length, piece_size)));
+        let piece_picker = HeapPiecePicker::new(total_length, piece_size);
 
         let (piece_total, last_piece_size) = (
             m.total_pieces(),
@@ -344,7 +341,7 @@ impl TransmitWorker {
     // }
     fn pick_blocks_for_all_peers(&mut self, n_blocks: usize) {
         let piece_picker = match &mut self.torrent_state {
-            TorrentState::Metadata(d) => d.piece_picker.clone(),
+            TorrentState::Metadata(d) => &mut d.piece_picker,
             TorrentState::Fetching(_) => {
                 return;
             }
@@ -354,10 +351,7 @@ impl TransmitWorker {
         for (addr, h) in &mut self.connected_peers {
             info!("peer status {addr}: {:?}", h.state);
             if h.state.peer_choke_status == ChokeStatus::Unchoked {
-                let (reqs, n) = piece_picker
-                    .lock()
-                    .unwrap() // TODO: fix unwrap
-                    .pick_blocks(addr, n_blocks, now);
+                let (reqs, n) = piece_picker.pick_blocks(addr, n_blocks, now);
                 h.conn.send_stream_cmd(ConnMsg::RequestBlocks(reqs));
             }
         }
@@ -366,8 +360,8 @@ impl TransmitWorker {
     // fn pick_blocks_for_peer(&mut self, addr: &SocketAddr, n_blocks: usize) {
     // Fn: n_blk_received, n_blk_in_flight -> n_this_time_pick
     fn pick_blocks_for_peer(&mut self, addr: &SocketAddr, n_received: u32) {
-        let piece_picker = match &self.torrent_state {
-            TorrentState::Metadata(d) => d.piece_picker.clone(),
+        let piece_picker = match &mut self.torrent_state {
+            TorrentState::Metadata(d) => &mut d.piece_picker,
             TorrentState::Fetching(_) => {
                 return;
             }
@@ -379,9 +373,7 @@ impl TransmitWorker {
         let now = std::time::Instant::now();
         if let Some(h) = self.connected_peers.get_mut(addr) {
             if h.state.peer_choke_status == ChokeStatus::Unchoked {
-                let mut picker = piece_picker.lock().unwrap(); // TODO: fix unwrap
-
-                h.n_block_in_flight = picker
+                h.n_block_in_flight = piece_picker
                     .get_status(addr)
                     .map(|s| s.n_in_flight as u32)
                     .unwrap_or(0);
@@ -391,7 +383,7 @@ impl TransmitWorker {
                 if n_received > 0 {
                     let period_duration = h.last_pick_time.elapsed();
                     h.last_pick_time = time::Instant::now();
-                    let estm_bw_bps = if let Some(status) = picker.get_status(addr) {
+                    let estm_bw_bps = if let Some(status) = piece_picker.get_status(addr) {
                         (status.bandwidth.count(period_duration) as f32)
                             / period_duration.div_duration_f32(time::Duration::from_secs(1))
                     } else {
@@ -418,7 +410,7 @@ impl TransmitWorker {
                     "peer {addr} picking {n_blk} block in next period, {} in flight",
                     h.n_block_in_flight
                 );
-                let (reqs, n) = picker.pick_blocks(addr, n_blk as usize, now);
+                let (reqs, n) = piece_picker.pick_blocks(addr, n_blk as usize, now);
                 h.conn.send_stream_cmd(ConnMsg::RequestBlocks(reqs));
             }
         }
@@ -493,8 +485,8 @@ impl TransmitWorker {
                 Ok(())
             }
             Msg::PeerBitField(addr, bitfield) => {
-                let piece_picker = match &self.torrent_state {
-                    TorrentState::Metadata(d) => d.piece_picker.clone(),
+                let piece_picker = match &mut self.torrent_state {
+                    TorrentState::Metadata(d) => &mut d.piece_picker,
                     TorrentState::Fetching(_) => {
                         let mut pc = self
                             .connected_peers
@@ -504,30 +496,30 @@ impl TransmitWorker {
                         return Ok(());
                     }
                 };
-                piece_picker.lock().unwrap().peer_add(addr, bitfield);
+                piece_picker.peer_add(addr, bitfield);
                 Ok(())
             }
             Msg::PeerHave(peer, i) => {
                 info!("peer {peer} have piece {i}");
-                let piece_picker = match &self.torrent_state {
-                    TorrentState::Metadata(d) => d.piece_picker.clone(),
+                let piece_picker = match &mut self.torrent_state {
+                    TorrentState::Metadata(d) => &mut d.piece_picker,
                     TorrentState::Fetching(_) => {
                         return Ok(());
                     }
                 };
 
-                piece_picker.lock().unwrap().peer_have(&peer, i);
+                piece_picker.peer_have(&peer, i);
                 Ok(())
             }
             Msg::PeerChoke(peer) => {
                 warn!("{peer} choked us");
-                let piece_picker = match &self.torrent_state {
-                    TorrentState::Metadata(d) => d.piece_picker.clone(),
+                let piece_picker = match &mut self.torrent_state {
+                    TorrentState::Metadata(d) => &mut d.piece_picker,
                     TorrentState::Fetching(_) => {
                         return Ok(());
                     }
                 };
-                piece_picker.lock().unwrap().peer_mark_not_requested(&peer);
+                piece_picker.peer_mark_not_requested(&peer);
                 self.connected_peers.entry(peer).and_modify(|st| {
                     st.state.peer_choke_status = ChokeStatus::Choked;
                 });
@@ -665,9 +657,7 @@ impl TransmitWorker {
         };
 
         let (piece_picker, metadata, storage) = match &mut self.torrent_state {
-            TorrentState::Metadata(d) => {
-                (d.piece_picker.clone(), d.metadata.clone(), &mut d.storage)
-            }
+            TorrentState::Metadata(d) => (&mut d.piece_picker, d.metadata.clone(), &mut d.storage),
             TorrentState::Fetching(_) => {
                 info!(
                     "receive PIECE msg {} {} {} block index {} before having metadata",
@@ -759,61 +749,55 @@ impl TransmitWorker {
                 piece,
                 data,
                 total_size,
-            } => match &self.torrent_state {
+            } => match &mut self.torrent_state {
                 TorrentState::Fetching(f) => {
                     // Don't use a shared buffer like PIECE message, since
                     // the data has already been received. Copying should be
                     // relatively fast.
 
-                    let have_metadata = {
-                        let mut mbuf = f.meta_buf.lock().unwrap();
-                        if let Some(sz) = total_size {
-                            mbuf.add_size_to_bucket(sz);
-                        }
-                        let probably_tot_size = mbuf.probable_total_size();
-                        let buf = &mut mbuf.metadata;
-                        let offset = (piece * 16384) as usize;
-                        buf[offset..offset + data.len()].copy_from_slice(&data);
-                        mbuf.requesting.remove(&piece);
-                        mbuf.not_requested.remove(&piece);
+                    let mbuf = &mut f.meta_buf;
+                    if let Some(sz) = total_size {
+                        mbuf.add_size_to_bucket(sz);
+                    }
+                    let probably_tot_size = mbuf.probable_total_size();
+                    let buf = &mut mbuf.metadata;
+                    let offset = (piece * 16384) as usize;
+                    buf[offset..offset + data.len()].copy_from_slice(&data);
+                    mbuf.requesting.remove(&piece);
+                    mbuf.not_requested.remove(&piece);
 
-                        self.fetching_metadata_from_peer_addr(&addr, 3, &mut mbuf);
+                    Self::fetching_metadata_from_peer_addr(&self.connected_peers, &addr, 3, mbuf);
 
-                        let have_metadata = if probably_tot_size > 0
-                            && mbuf.not_requested.len() == 0
-                            && mbuf.requesting.len() == 0
-                        {
-                            match check_received_metadata(&mut mbuf, f.magnet.info_hash) {
-                                Ok(m) => {
-                                    warn!("metadata received");
-                                    Some(m)
-                                }
-                                Err(_) => {
-                                    warn!("metadata verify failed, needs re-download");
-                                    for p in 0..=((mbuf.most_frequent_size - 1) / 16384) {
-                                        let p = p as u32;
-                                        if !mbuf.requesting.contains_key(&p) {
-                                            mbuf.not_requested.insert(p);
-                                        }
-                                    }
-                                    None
-                                }
+                    let have_metadata = if probably_tot_size > 0
+                        && mbuf.not_requested.len() == 0
+                        && mbuf.requesting.len() == 0
+                    {
+                        match check_received_metadata(mbuf, f.magnet.info_hash) {
+                            Ok(m) => {
+                                warn!("metadata received");
+                                Some(m)
                             }
-                        } else {
-                            None
-                        };
-                        have_metadata
+                            Err(_) => {
+                                warn!("metadata verify failed, needs re-download");
+                                for p in 0..=((mbuf.most_frequent_size - 1) / 16384) {
+                                    let p = p as u32;
+                                    if !mbuf.requesting.contains_key(&p) {
+                                        mbuf.not_requested.insert(p);
+                                    }
+                                }
+                                None
+                            }
+                        }
+                    } else {
+                        None
                     };
 
                     if let Some(m) = have_metadata {
-                        let metadata = Self::metadata_into_downloading(m);
-                        // TODO: fix this
-                        {
-                            let mut piece_picker = metadata.piece_picker.lock().unwrap();
-                            for (addr, pc) in &mut self.connected_peers {
-                                if let Some(map) = pc.bitmap.take() {
-                                    piece_picker.peer_add(*addr, map);
-                                }
+                        let mut metadata = Self::metadata_into_downloading(m);
+                        let piece_picker = &mut metadata.piece_picker;
+                        for (addr, pc) in &mut self.connected_peers {
+                            if let Some(map) = pc.bitmap.take() {
+                                piece_picker.peer_add(*addr, map);
                             }
                         }
                         self.torrent_state = TorrentState::Metadata(metadata);
@@ -823,9 +807,9 @@ impl TransmitWorker {
                     // simply ignore them
                 }
             },
-            ExtendedMetadata::Reject { piece } => match &self.torrent_state {
+            ExtendedMetadata::Reject { piece } => match &mut self.torrent_state {
                 TorrentState::Fetching(f) => {
-                    let mut mbuf = f.meta_buf.lock().unwrap();
+                    let mbuf = &mut f.meta_buf;
                     mbuf.requesting.remove(&piece);
                     mbuf.not_requested.insert(piece);
                     info!("metadata request of piece {piece} to {addr:?} is rejected");
@@ -838,13 +822,12 @@ impl TransmitWorker {
     }
 
     fn fetching_metadata(&mut self) {
-        let meta_buf = match &self.torrent_state {
+        let meta_buf = match &mut self.torrent_state {
             TorrentState::Metadata(_) => {
                 return;
             }
-            TorrentState::Fetching(f) => f.meta_buf.clone(),
+            TorrentState::Fetching(f) => &mut f.meta_buf,
         };
-        let mut meta_buf = meta_buf.lock().unwrap();
 
         let now = tokio::time::Instant::now();
         let timeout = tokio::time::Duration::from_secs(5);
@@ -865,18 +848,18 @@ impl TransmitWorker {
             if h.conn.support_metadata_extension() && h.conn.metadata_size() > 0 {
                 // TODO: adaptively set value of n
                 meta_buf.add_size_to_bucket(h.conn.metadata_size());
-                Self::fetching_metadata_from_peer(h, 2, &mut meta_buf, now);
+                Self::fetching_metadata_from_peer(h, 2, meta_buf, now);
             }
         }
     }
 
     fn fetching_metadata_from_peer_addr(
-        &self,
+        peers: &HashMap<PeerAddr, PeerConn>,
         addr: &PeerAddr,
         n: usize,
         meta_buf: &mut MetadataBuffer,
     ) {
-        if let Some(c) = self.connected_peers.get(addr) {
+        if let Some(c) = peers.get(addr) {
             Self::fetching_metadata_from_peer(c, n, meta_buf, time::Instant::now());
         }
     }

@@ -1265,17 +1265,16 @@ impl HeapPiecePicker {
 }
 
 pub fn start_receive_piece_block<'a>(
-    picker: Arc<Mutex<HeapPiecePicker>>,
+    picker: &'a mut HeapPiecePicker,
     peer: &'a SocketAddr,
     blk: &'a protocol::Request,
 ) -> Option<ReceiveBlockGuard<'a>> {
-    let mut p = picker.lock().expect("start receiving should lock OK");
-    if p.block_start_receiving(peer, blk) {
+    if picker.block_start_receiving(peer, blk) {
         Some(ReceiveBlockGuard {
             received: false,
             blk,
             peer,
-            picker: picker.clone(),
+            picker: picker,
         })
     } else {
         None
@@ -1287,31 +1286,26 @@ pub struct ReceiveBlockGuard<'a> {
     received: bool,
     blk: &'a protocol::Request,
     peer: &'a SocketAddr,
-    picker: Arc<Mutex<HeapPiecePicker>>,
+    picker: &'a mut HeapPiecePicker,
 }
 
 impl ReceiveBlockGuard<'_> {
     // returns which piece is completed
     pub fn piece_received(&mut self) -> Option<u32> {
-        let mut picker = self.picker.lock().expect("block received lock should OK");
         self.received = true;
-        picker.block_received(self.peer, *self.blk)
+        self.picker.block_received(self.peer, *self.blk)
     }
 }
 
 impl Drop for ReceiveBlockGuard<'_> {
     fn drop(&mut self) {
         if !self.received {
-            let mut picker = self
-                .picker
-                .lock()
-                .expect("drop receive block guard lock should OK");
             warn!(
                 "block {:?} not received when guard dropped, revoke block",
                 self.blk
             );
             let br = BlockRange::one_block(self.blk.index, self.blk.begin, self.blk.len);
-            picker.blocks_revoke(&br);
+            self.picker.blocks_revoke(&br);
         }
     }
 }
