@@ -9,6 +9,7 @@ use std::{
 
 use super::{BackFile, MutexBackFile};
 use bytes::BytesMut;
+use futures::io::Flush;
 use tokio::time;
 
 const FLUSHING: u32 = 0b1;
@@ -39,6 +40,16 @@ impl<T> Pool<T> {
     }
 }
 
+#[derive(Debug)]
+pub struct FlushErr {
+    pub offset: usize,
+    pub len: usize,
+    pub err: io::Error,
+}
+
+pub trait ErrorCallback: FnOnce(FlushErr) + Send + 'static {}
+impl<T> ErrorCallback for T where T: FnOnce(FlushErr) + Send + 'static {}
+
 pub struct PieceBuf {
     /// always Some, except in drop
     buf: Option<BytesMut>,
@@ -48,6 +59,7 @@ pub struct PieceBuf {
     state: Arc<AtomicU32>,
     file: MutexBackFile,
     pool: Arc<Mutex<Pool<BytesMut>>>,
+    on_error: Option<Box<dyn ErrorCallback>>,
 }
 
 impl fmt::Debug for PieceBuf {
@@ -88,10 +100,18 @@ impl Drop for PieceBuf {
             let s = self.state.clone();
             let offset = self.offset;
             let pool = self.pool.clone();
+            let on_err = self.on_error.take().unwrap();
             tokio::task::spawn_blocking(move || {
-                flush_buf_to_file(buf, offset, s, f, move |b| {
-                    pool.lock().unwrap().put(b);
-                })
+                flush_buf_to_file(
+                    buf,
+                    offset,
+                    s,
+                    f,
+                    move |b| {
+                        pool.lock().unwrap().put(b);
+                    },
+                    on_err,
+                )
             });
         }
     }
@@ -153,6 +173,7 @@ impl BufStorage {
         &mut self,
         piece_idx: usize,
         on_ready: F,
+        on_err: Box<dyn ErrorCallback>,
     ) -> Result<&mut PieceBuf, GetPieceErr>
     where
         F: FnOnce(io::Result<PieceBuf>) + Send + 'static,
@@ -200,6 +221,7 @@ impl BufStorage {
                 state: Arc::new(AtomicU32::new(0)),
                 file: self.back_file.clone(),
                 pool: self.pool.clone(),
+                on_error: Some(on_err),
             };
             let f = self.back_file.clone();
             let loading_map = self.loading.clone();
@@ -258,8 +280,8 @@ fn flush_buf_to_file<F>(
     state: Arc<AtomicU32>,
     file: MutexBackFile,
     recycle_buf: F,
-) -> io::Result<()>
-where
+    on_err: Box<dyn ErrorCallback>,
+) where
     F: FnOnce(BytesMut) + Send + 'static,
 {
     let r = {
@@ -267,9 +289,15 @@ where
         f.write_all_at(offset, buf.as_ref())
     };
     state.fetch_and(!FLUSHING, Ordering::Release);
+    let len = buf.len();
     recycle_buf(buf);
-    // TODO: report error to BufStorage
-    r
+    if let Err(e) = r {
+        on_err(FlushErr {
+            offset,
+            len,
+            err: e,
+        })
+    }
 }
 
 fn read_from_file(mut p: PieceBuf, file: MutexBackFile) -> io::Result<PieceBuf> {

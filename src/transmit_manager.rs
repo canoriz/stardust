@@ -1,5 +1,5 @@
 use crate::backfile::{BackFile, NormalFile};
-use crate::cache::simple_buffer::BufStorage;
+use crate::cache::simple_buffer::{BufStorage, FlushErr};
 use crate::cache::simple_buffer::{GetPieceErr, PieceBuf};
 use crate::connection_manager::{ConnectionManagerHandle, Msg as ConnMsg};
 use crate::dht::DHT;
@@ -47,6 +47,8 @@ pub(crate) enum Msg {
         index: usize,
         buf: io::Result<PieceBuf>,
     },
+
+    FlushError(FlushErr),
 
     PieceReceived(u32),
 
@@ -601,6 +603,9 @@ impl TransmitWorker {
                 self.handle_piece_msg(&addr, piece)?;
                 Ok(())
             }
+            Msg::FlushError(_) => {
+                todo!()
+            }
             Msg::PieceBufReady { index, buf } => match buf {
                 Ok(mut buf) => {
                     let pending = self.waiting_for_piecebuf.remove(&(index as u32));
@@ -620,7 +625,11 @@ impl TransmitWorker {
                     }
                     Ok(())
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    // TODO: why that's error
+                    // shall we reload?
+                    return Err(e);
+                }
             },
             Msg::ExtendMetadata(pa, m) => {
                 self.handle_extend_metadata(pa, m);
@@ -694,11 +703,16 @@ impl TransmitWorker {
         );
 
         let sender = self.self_handle.sender.clone();
+        let err_sender = self.self_handle.sender.clone();
         let index = piece.index as usize;
         let on_ready = move |p| {
             _ = sender.send(Msg::PieceBufReady { index, buf: p });
         };
-        match storage.get_piece(piece.index as usize, on_ready) {
+        let on_err = move |e| {
+            _ = err_sender.send(Msg::FlushError(e));
+        };
+
+        match storage.get_piece(piece.index as usize, on_ready, Box::new(on_err)) {
             Ok(piecebuf) => copy_to_piecebuf(&piece, piecebuf),
             Err(GetPieceErr::InvalidPiece) => {
                 info!("invalid piece {piece:?}");
