@@ -668,8 +668,8 @@ where
             let extend_sending = ExtendedHandshake {
                 // TODO: optimize: on sending, clone() can be optimized
                 m: EXTENSION_IDS_MAP.clone(),
-                p: 12345,
-                v: "stardust 0.1.0".into(),
+                p: None,
+                v: Some("stardust 0.1.0".into()),
                 yourip: None,
 
                 ipv6: None,
@@ -1263,12 +1263,11 @@ pub struct ExtendedHandshake {
     // TODO: when sending can use 'static ref
     pub m: HashMap<String, u8>, // supported extensions and id number
 
-    // TODO: this field is optional
-    pub p: u16, // TCP listen port
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub p: Option<u16>, // TCP listen port
 
-    // TODO: when sending can use 'static ref
-    // TODO: this field is optional
-    pub v: String, // client name and version
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub v: Option<String>, // client name and version
 
     // A string containing the compact representation of the ip address this peer
     // sees you as. i.e. this is the receiver's external ip address (no port is
@@ -1307,8 +1306,8 @@ impl ExtendedHandshake {
         ExtendedHandshakeBuilder {
             h: ExtendedHandshake {
                 m: EXTENSION_IDS_MAP.clone(),
-                p: port,
-                v: version.into(),
+                p: Some(port),
+                v: Some(version.into()),
                 yourip: None,
                 ipv6: None,
                 ipv4: None,
@@ -1867,8 +1866,8 @@ where
                 let timeout = tokio::time::Duration::from_secs(1);
                 match tokio::time::timeout(timeout, done).await {
                     Ok(Ok(buf)) => *piece_buf = Some(buf),
-                    // the buffer is returned
                     Ok(_) => {
+                        // sender not sends buffer back, make a new one
                         warn!("receive BytesMut failed");
                         *piece_buf = Some(BytesMut::new());
                     }
@@ -2362,8 +2361,8 @@ mod tests {
         let exth = ExtendedHandshake {
             // TODO: optimize: on sending, clone() can be optimized
             m: EXTENSION_IDS_MAP.clone(),
-            p: 12345,
-            v: "stardust 0.1.0".into(),
+            p: Some(12345),
+            v: Some("stardust 0.1.0".into()),
             yourip: None,
 
             ipv6: None,
@@ -2434,8 +2433,8 @@ mod tests {
         let exth = ExtendedHandshake {
             // TODO: optimize: on sending, clone() can be optimized
             m: EXTENSION_IDS_MAP.clone(),
-            p: 12345,
-            v: "stardust 0.1.0".into(),
+            p: None,
+            v: Some("stardust 0.1.0".into()),
             yourip: None,
 
             ipv6: None,
@@ -2461,8 +2460,8 @@ mod tests {
         let exth = ExtendedHandshake {
             // TODO: optimize: on sending, clone() can be optimized
             m: EXTENSION_IDS_MAP.clone(),
-            p: 12345,
-            v: "stardust 0.1.0".into(),
+            p: Some(12345),
+            v: Some("stardust 0.1.0".into()),
             yourip: None,
 
             ipv6: None,
@@ -2489,8 +2488,8 @@ mod tests {
             },
             &ExtendedHandshake {
                 m: EXTENSION_IDS_MAP.clone(),
-                p: 12345,
-                v: "stardust 0.1.0".into(),
+                p: Some(12345),
+                v: Some("stardust 0.1.0".into()),
                 yourip: None,
 
                 ipv6: None,

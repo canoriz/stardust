@@ -96,14 +96,14 @@ impl Access for NormalFile {
 
     fn write_all_at(&mut self, buf: &[u8], offset: usize) -> Result<()> {
         info!("write_all at offset {offset} len {}", buf.len());
-        // self.file.write_all_at(buf, offset as u64)
-        Ok(())
+        self.file.write_all_at(buf, offset as u64)
+        // Ok(())
     }
 
     fn read_exact_at(&mut self, buf: &mut [u8], offset: usize) -> Result<()> {
         info!("read_exact at offset {offset} len {}", buf.len());
-        // self.file.read_exact_at(buf, offset as u64)
-        Ok(())
+        self.file.read_exact_at(buf, offset as u64)
+        // Ok(())
     }
 
     fn metadata(&self) -> Result<FileMetadata> {

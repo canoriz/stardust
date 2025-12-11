@@ -469,8 +469,6 @@ async fn handle_extended_msg(
     tmh: &mut TransmitManagerHandle,
     extended: protocol::ExtendedMsg,
 ) -> io::Result<()> {
-    info!("handle_extended_msg {extended:?}");
-
     match extended {
         ExtendedMsg::Handshake(hs) => todo!(),
         ExtendedMsg::Pex(pex) => {

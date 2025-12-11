@@ -18,7 +18,7 @@ use crate::{announce_manager, metadata};
 pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
     const SELF_ID: [u8; 20] = *b"-TR0300-fjbo402nczk3";
     const SELF_PORT: u16 = 41773;
-    const DHT_PORT: u16 = 42773;
+    const DHT_PORT: u16 = 41773;
     let dht_client = Arc::new(DHT::new(SELF_ID, DHT_PORT, "ST01".into()));
     _ = dht_client
         .ping_rpc(
