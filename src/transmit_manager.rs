@@ -1,5 +1,5 @@
 use crate::backfile::{BackFile, NormalFile};
-use crate::cache::simple_buffer::{BufStorage, FlushErr};
+use crate::cache::simple_buffer::{BufStorage, ErrorCallback, FlushErr};
 use crate::cache::simple_buffer::{GetPieceErr, PieceBuf};
 use crate::connection_manager::{ConnectionManagerHandle, Msg as ConnMsg};
 use crate::dht::DHT;
@@ -49,8 +49,6 @@ pub(crate) enum Msg {
     },
 
     FlushError(FlushErr),
-
-    PieceReceived(u32),
 
     BlockReceived(PeerAddr, u32),
 
@@ -564,12 +562,6 @@ impl TransmitWorker {
                 });
                 Ok(())
             }
-            Msg::PieceReceived(i) => {
-                for (_, h) in self.connected_peers.iter() {
-                    h.conn.send_stream_cmd(ConnMsg::Have(i));
-                }
-                Ok(())
-            }
             Msg::BlockReceived(peer, n) => {
                 // optimally
                 // n_packet_in_flight = (bandwidth * response_time) / packet_size
@@ -652,6 +644,45 @@ impl TransmitWorker {
         // }
     }
 
+    /// called when a full piece received
+    /// return verify result of this piece
+    fn handle_full_piece_received(
+        connected_peers: &mut HashMap<PeerAddr, PeerConn>,
+        piece_idx: usize,
+    ) -> bool {
+        // TODO: check piece, if check failed, reset picker
+        for (_, h) in connected_peers.iter() {
+            h.conn.send_stream_cmd(ConnMsg::Have(piece_idx as u32));
+        }
+        true
+    }
+
+    fn on_flush_err(sender: mpsc::UnboundedSender<Msg>) -> Box<dyn ErrorCallback> {
+        let on_err = move |e| {
+            _ = sender.send(Msg::FlushError(e));
+        };
+        Box::new(on_err)
+    }
+
+    fn get_piecebuf(
+        torrent_state: &mut TorrentState,
+        sender: mpsc::UnboundedSender<Msg>,
+        index: usize,
+    ) -> Result<&mut PieceBuf, GetPieceErr> {
+        let storage = match torrent_state {
+            TorrentState::Metadata(m) => &mut m.storage,
+            TorrentState::Fetching(_) => unreachable!(),
+        };
+        let err_sender = sender.clone();
+        let on_ready = move |p| {
+            _ = sender.send(Msg::PieceBufReady { index, buf: p });
+        };
+        let on_err = move |e| {
+            _ = err_sender.send(Msg::FlushError(e));
+        };
+        storage.get_piece(index, on_ready, Box::new(on_err))
+    }
+
     /// handle PIECE message
     // TODO: fix the return type
     fn handle_piece_msg(
@@ -665,55 +696,62 @@ impl TransmitWorker {
             len: piece.len,
         };
 
-        let (piece_picker, metadata, storage) = match &mut self.torrent_state {
-            TorrentState::Metadata(d) => (&mut d.piece_picker, d.metadata.clone(), &mut d.storage),
-            TorrentState::Fetching(_) => {
-                info!(
-                    "receive PIECE msg {} {} {} block index {} before having metadata",
-                    piece.index,
-                    piece.begin,
-                    piece.len,
-                    piece.begin >> 14,
-                );
-                return Ok(());
-            }
-        };
-        let mut receiving_guard =
-            if let Some(g) = start_receive_piece_block(piece_picker, peer, &blk) {
-                g
-            } else {
-                // TODO: why this happen (at testing)?
-                // seems we are requesting twice for each piece
-                warn!(
-                    "drain PIECE msg {} {} {} block index {}",
-                    piece.index,
-                    piece.begin,
-                    piece.len,
-                    piece.begin >> 14,
-                );
-                return Ok(());
+        let received_full_piece = {
+            let (piece_picker, metadata, storage) = match &mut self.torrent_state {
+                TorrentState::Metadata(d) => {
+                    (&mut d.piece_picker, d.metadata.clone(), &mut d.storage)
+                }
+                TorrentState::Fetching(_) => {
+                    info!(
+                        "receive PIECE msg {} {} {} block index {} before having metadata",
+                        piece.index,
+                        piece.begin,
+                        piece.len,
+                        piece.begin >> 14,
+                    );
+                    return Ok(());
+                }
             };
+            let mut receiving_guard =
+                if let Some(g) = start_receive_piece_block(piece_picker, peer, &blk) {
+                    g
+                } else {
+                    // TODO: why this happen (at testing)?
+                    // seems we are requesting twice for each piece
+                    warn!(
+                        "drain PIECE msg {} {} {} block index {}",
+                        piece.index,
+                        piece.begin,
+                        piece.len,
+                        piece.begin >> 14,
+                    );
+                    return Ok(());
+                };
 
-        debug!(
-            "receive PIECE msg {} {} {} block index {}",
-            piece.index,
-            piece.begin,
-            piece.len,
-            piece.begin >> 14,
-        );
+            debug!(
+                "receive PIECE msg {} {} {} block index {}",
+                piece.index,
+                piece.begin,
+                piece.len,
+                piece.begin >> 14,
+            );
+            receiving_guard.piece_received()
+        };
 
         let sender = self.self_handle.sender.clone();
-        let err_sender = self.self_handle.sender.clone();
-        let index = piece.index as usize;
-        let on_ready = move |p| {
-            _ = sender.send(Msg::PieceBufReady { index, buf: p });
-        };
-        let on_err = move |e| {
-            _ = err_sender.send(Msg::FlushError(e));
-        };
-
-        match storage.get_piece(piece.index as usize, on_ready, Box::new(on_err)) {
-            Ok(piecebuf) => copy_to_piecebuf(&piece, piecebuf),
+        match Self::get_piecebuf(
+            &mut self.torrent_state,
+            self.self_handle.sender.clone(),
+            piece.index as usize,
+        ) {
+            Ok(piecebuf) => {
+                copy_to_piecebuf(&piece, piecebuf);
+                if let Some(p) = received_full_piece {
+                    if Self::handle_full_piece_received(&mut self.connected_peers, p as usize) {
+                        piecebuf.flush(Self::on_flush_err(sender));
+                    }
+                }
+            }
             Err(GetPieceErr::InvalidPiece) => {
                 info!("invalid piece {piece:?}");
             }
@@ -729,12 +767,6 @@ impl TransmitWorker {
                 }
                 info!("piecebuf not present err {e:?}");
             }
-        }
-        if let Some(p) = receiving_guard.piece_received() {
-            // TODO: if using bounded channel, don't do this as this might
-            // dead lock the loop.
-            // instead, deal with piece received at here.
-            _ = self.self_handle.sender.send(Msg::PieceReceived(p));
         }
         Ok(())
     }
