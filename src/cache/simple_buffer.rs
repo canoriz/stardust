@@ -143,7 +143,14 @@ impl PieceBuf {
                 let pool = self.pool.clone();
                 let dropping = self.dropping.clone();
 
-                let buf = self.buf.clone().unwrap();
+                let buf = if let Some(mut p) = self.pool.lock().unwrap().get() {
+                    let buf = self.buf.as_ref().unwrap();
+                    p.resize(buf.len(), 0u8);
+                    p.as_mut().copy_from_slice(buf.as_ref());
+                    p
+                } else {
+                    self.buf.clone().unwrap()
+                };
                 tokio::task::spawn_blocking(move || {
                     Self::force_flush(buf, f, pool, offset, s, dropping, false, on_err)
                 });
