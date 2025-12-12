@@ -116,6 +116,10 @@ impl Drop for PieceBuf {
 }
 
 impl PieceBuf {
+    pub fn index(&self) -> usize {
+        self.index
+    }
+
     pub fn flush(&mut self, on_err: Option<Box<dyn ErrorCallback>>) {
         // set flushing bit and clear dirty bit
         // dirty flushing

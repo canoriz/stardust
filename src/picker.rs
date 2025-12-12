@@ -1,7 +1,7 @@
 mod heap;
 use crate::bandwidth::Bandwidth;
-use crate::protocol;
 pub use crate::protocol::BitField;
+use crate::protocol::{self, Request};
 use heap::Heap;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
@@ -1186,6 +1186,30 @@ impl HeapPiecePicker {
         for blk in block.iter(self.piece_size) {
             self.block_received(peer, blk);
         }
+    }
+
+    /// call this to re-add piece to don't have list
+    /// mostly called when a piece verify failed
+    pub fn piece_revoke(&mut self, piece_index: u32) {
+        let piece_len = if self.piece_total == piece_index + 1 {
+            self.last_piece_size
+        } else {
+            self.piece_size
+        };
+
+        let from = Request {
+            index: piece_index,
+            begin: 0,
+            len: BLOCK_SIZE.min(piece_len),
+        };
+
+        let len = (piece_len - 1) % BLOCK_SIZE + 1;
+        let to = Request {
+            index: piece_index,
+            begin: piece_len - len,
+            len,
+        };
+        self.blocks_revoke(&BlockRange { from, to })
     }
 
     // TODO: test. this might be wrong

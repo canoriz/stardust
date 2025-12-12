@@ -44,10 +44,13 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
         }
     }
 
+    /// updates bandwidth status
+    /// how many new bytes received
     pub fn add(&mut self, size: usize) {
         self.add_with_time(size, 1, Duration::from_secs(1));
     }
 
+    /// how many new bytes received within a response time of resp_time
     pub fn add_with_time(&mut self, size: usize, n: u32, resp_time: Duration) {
         if self.circular[self.head].time.elapsed() > self.interval {
             if self.head + 1 >= SLOT_SIZE {
@@ -64,6 +67,7 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
         self.count_with_time(back_interval).0
     }
 
+    /// returns how many bytes received in back_interval, and average response latency
     pub fn count_with_time(&self, back_interval: Duration) -> (usize, Duration) {
         let mut total = 0usize;
         let mut slot_id = self.head;

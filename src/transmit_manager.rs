@@ -9,6 +9,7 @@ use crate::protocol::{
     self, BitField, Conn, ExtendedMetadata, ExtendedMsg, FuncBits, HandshakeOption, Piece,
 };
 
+use sha1::{Digest, Sha1};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io;
 use std::net::SocketAddr;
@@ -652,28 +653,40 @@ impl TransmitWorker {
         // }
     }
 
+    fn verify_piece(p: &PieceBuf, metadata: &Metadata) -> bool {
+        use std::io::Write;
+        let target = &metadata.info.pieces[p.index() * 20..p.index() * 20 + 20];
+        let mut hasher = Sha1::new();
+        _ = hasher.write_all(p.as_ref());
+        let res: [u8; 20] = hasher.finalize().into();
+        res == target
+    }
+
     /// called when a full piece received
     /// return verify result of this piece
     fn handle_full_piece_received(
+        p: &mut PieceBuf,
+        metadata: &Metadata,
         connected_peers: &mut HashMap<PeerAddr, PeerConn>,
-        piece_idx: usize,
-    ) -> bool {
-        // TODO: check piece, if check failed, reset picker
-        for (_, h) in connected_peers.iter() {
-            h.conn.send_stream_cmd(ConnMsg::Have(piece_idx as u32));
+        piece_picker: &mut HeapPiecePicker,
+    ) {
+        if Self::verify_piece(p, metadata) {
+            p.flush(None);
+            for (_, h) in connected_peers.iter() {
+                h.conn.send_stream_cmd(ConnMsg::Have(p.index() as u32));
+            }
+            piece_picker.piece_checked(p.index() as u32);
+        } else {
+            info!("piece {} verify failed", p.index());
+            piece_picker.piece_revoke(p.index() as u32);
         }
-        true
     }
 
     fn get_piecebuf(
-        torrent_state: &mut TorrentState,
+        storage: &mut BufStorage,
         sender: mpsc::UnboundedSender<Msg>,
         index: usize,
     ) -> Result<&mut PieceBuf, GetPieceErr> {
-        let storage = match torrent_state {
-            TorrentState::Metadata(m) => &mut m.storage,
-            TorrentState::Fetching(_) => unreachable!(),
-        };
         let err_sender = sender.clone();
         let on_ready = move |p| {
             _ = sender.send(Msg::PieceBufReady { index, buf: p });
@@ -694,22 +707,20 @@ impl TransmitWorker {
             len: piece.len,
         };
 
-        let received_full_piece = {
-            let (piece_picker, metadata, storage) = match &mut self.torrent_state {
-                TorrentState::Metadata(d) => {
-                    (&mut d.piece_picker, d.metadata.clone(), &mut d.storage)
-                }
-                TorrentState::Fetching(_) => {
-                    info!(
-                        "receive PIECE msg {} {} {} block index {} before having metadata",
-                        piece.index,
-                        piece.begin,
-                        piece.len,
-                        piece.begin >> 14,
-                    );
-                    return Ok(());
-                }
-            };
+        let (piece_picker, metadata, storage) = match &mut self.torrent_state {
+            TorrentState::Metadata(d) => (&mut d.piece_picker, d.metadata.clone(), &mut d.storage),
+            TorrentState::Fetching(_) => {
+                info!(
+                    "receive PIECE msg {} {} {} block index {} before having metadata",
+                    piece.index,
+                    piece.begin,
+                    piece.len,
+                    piece.begin >> 14,
+                );
+                return Ok(());
+            }
+        };
+        let piece_received = {
             let mut receiving_guard =
                 if let Some(g) = start_receive_piece_block(piece_picker, peer, &blk) {
                     g
@@ -737,16 +748,19 @@ impl TransmitWorker {
         };
 
         match Self::get_piecebuf(
-            &mut self.torrent_state,
+            storage,
             self.self_handle.sender.clone(),
             piece.index as usize,
         ) {
             Ok(piecebuf) => {
                 copy_to_piecebuf(&piece, piecebuf);
-                if let Some(p) = received_full_piece {
-                    if Self::handle_full_piece_received(&mut self.connected_peers, p as usize) {
-                        piecebuf.flush(None);
-                    }
+                if let Some(_) = piece_received {
+                    Self::handle_full_piece_received(
+                        piecebuf,
+                        &metadata,
+                        &mut self.connected_peers,
+                        piece_picker,
+                    );
                 }
             }
             Err(GetPieceErr::InvalidPiece) => {
@@ -756,7 +770,7 @@ impl TransmitWorker {
                 // TODO: maybe set some unblock_conn upper limit
                 // piece.unblock_conn();
                 let index = piece.index;
-                let full_received = received_full_piece.is_some();
+                let full_received = piece_received.is_some();
                 match self.waiting_for_piecebuf.get_mut(&index) {
                     Some(v) => v.push(BlockWatingBuf {
                         piece,
