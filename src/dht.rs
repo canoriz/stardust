@@ -237,6 +237,10 @@ impl DHT {
         }
     }
 
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
     /// Run a dual-stack ipv6 socket listening port.
     /// This socket can receive ipv4 packets from a
     /// v4 mapped v6 address.

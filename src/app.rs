@@ -10,7 +10,7 @@ use tracing::{error, info, warn};
 
 use crate::dht::{self, DHT};
 use crate::metadata::Magnet;
-use crate::protocol::{self, BTStream, Message, Reunite, Split};
+use crate::protocol::{self, BTStream, HandshakeOption, Message, Reunite, Split};
 use crate::torrent_manager::TorrentManagerHandle;
 use crate::transmit_manager::TorrentTask;
 use crate::{announce_manager, metadata};
@@ -211,9 +211,16 @@ where
         0x54, 0x42, 0x54, 0x69, 0x21, 0x58, 0x21, 0x58, 0x68, 0x69, 0x93, 0x51, 0x54, 0x42, 0x54,
         0x69, 0x21, 0x58, 0x21, 0x58,
     ];
+    let opt = HandshakeOption::builder()
+        .client_id(client_id)
+        .client_version("1".into())
+        .pex(true)
+        .metadata(true)
+        .info_hash([0; 20])
+        .dht_port(None)
+        .build();
 
-    let mut bt_stream =
-        protocol::BTStream::accept(raw_conn, &protocol::FuncBits::default(), &client_id).await?;
+    let mut bt_stream = protocol::BTStream::accept(raw_conn, opt).await?;
     info!("handshake done");
 
     let bitfield_total = (metadata.info.pieces.len() / 20).div_ceil(8);

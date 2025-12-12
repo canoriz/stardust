@@ -5,7 +5,9 @@ use crate::connection_manager::{ConnectionManagerHandle, Msg as ConnMsg};
 use crate::dht::DHT;
 use crate::metadata::{self, Magnet, Metadata};
 use crate::picker::{start_receive_piece_block, HeapPiecePicker};
-use crate::protocol::{self, BitField, Conn, ExtendedMetadata, ExtendedMsg, FuncBits, Piece};
+use crate::protocol::{
+    self, BitField, Conn, ExtendedMetadata, ExtendedMsg, FuncBits, HandshakeOption, Piece,
+};
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io;
@@ -138,6 +140,48 @@ pub struct FetchingMetadata {
     pub magnet: Magnet,
 }
 
+impl FetchingMetadata {
+    /// Receive a new metadata part.
+    /// Returns: if metadata is complete and verified
+    fn receive_metadata_part(
+        &mut self,
+        piece: u32,
+        data: Vec<u8>,
+        total_size: Option<usize>,
+    ) -> Option<Metadata> {
+        let mbuf = &mut self.meta_buf;
+        if let Some(sz) = total_size {
+            mbuf.add_size_to_bucket(sz);
+        }
+        let probably_tot_size = mbuf.probable_total_size();
+        let buf = &mut mbuf.metadata;
+        let offset = (piece * 16384) as usize;
+        buf[offset..offset + data.len()].copy_from_slice(&data);
+        mbuf.requesting.remove(&piece);
+        mbuf.not_requested.remove(&piece);
+
+        if probably_tot_size > 0 && mbuf.not_requested.len() == 0 && mbuf.requesting.len() == 0 {
+            // received full metadata
+            match check_received_metadata(mbuf, self.magnet.info_hash) {
+                Ok(m) => Some(m),
+                Err(_) => {
+                    warn!("metadata verify failed, needs re-download");
+                    for p in 0..=((probably_tot_size - 1) / 16384) {
+                        let p = p as u32;
+                        if !mbuf.requesting.contains_key(&p) {
+                            mbuf.not_requested.insert(p);
+                        }
+                    }
+                    None
+                }
+            }
+        } else {
+            // did not receive full metadata yet
+            None
+        }
+    }
+}
+
 struct MetadataBuffer {
     // stores total_piece map
     // any honest peers should sends same size
@@ -215,6 +259,8 @@ pub struct TransmitWorker {
     id: [u8; 20],
     info_hash: [u8; 20],
 
+    handshake_opt: HandshakeOption,
+
     dht_client: Option<Arc<DHT>>,
 
     /// The state of the torrent
@@ -251,31 +297,30 @@ impl TransmitWorker {
         cmd_sender: mpsc::UnboundedSender<Msg>,
         cmd_receiver: mpsc::UnboundedReceiver<Msg>,
     ) -> Self {
-        match t {
+        let (info_hash, state) = match t {
             TorrentTask::Torrent(m) => {
-                Self::new_with_metadata(m, id, dht_client, cmd_sender, cmd_receiver)
+                let info_hash = m.info_hash;
+                let state = TorrentState::Metadata(Self::metadata_into_downloading(m));
+                (info_hash, state)
             }
             TorrentTask::Magnet(m) => {
-                Self::new_without_metadata(m, id, dht_client, cmd_sender, cmd_receiver)
+                let info_hash = m.info_hash;
+                let state = TorrentState::Fetching(FetchingMetadata {
+                    meta_buf: MetadataBuffer::new(),
+                    magnet: m,
+                });
+                (info_hash, state)
             }
-        }
-    }
-
-    fn new_without_metadata(
-        m: Magnet,
-        id: [u8; 20],
-        dht_client: Option<Arc<DHT>>,
-        cmd_sender: mpsc::UnboundedSender<Msg>,
-        cmd_receiver: mpsc::UnboundedReceiver<Msg>,
-    ) -> Self {
-        let info_hash = m.info_hash;
-        let state = TorrentState::Fetching(FetchingMetadata {
-            meta_buf: MetadataBuffer::new(),
-            magnet: m,
-        });
+        };
+        let opt = HandshakeOption::builder()
+            .client_id(id)
+            .info_hash(info_hash)
+            .dht_port(dht_client.as_ref().map(|c| c.port()))
+            .build();
         Self {
             id,
             info_hash,
+            handshake_opt: opt,
             dht_client,
             torrent_state: state,
             receiver: cmd_receiver,
@@ -306,30 +351,6 @@ impl TransmitWorker {
             metadata: m,
             piece_picker,
             storage: buf_storage,
-        }
-    }
-
-    fn new_with_metadata(
-        m: Metadata,
-        id: [u8; 20],
-        dht_client: Option<Arc<DHT>>,
-        cmd_sender: mpsc::UnboundedSender<Msg>,
-        cmd_receiver: mpsc::UnboundedReceiver<Msg>,
-    ) -> Self {
-        let info_hash = m.info_hash;
-        let state = TorrentState::Metadata(Self::metadata_into_downloading(m));
-        Self {
-            id,
-            info_hash,
-            dht_client,
-            torrent_state: state,
-            receiver: cmd_receiver,
-            self_handle: TransmitManagerHandle { sender: cmd_sender },
-            // announce_handle: None,
-            // announce_tx: None,
-            connected_peers: HashMap::new(),
-            connecting_peers: HashSet::new(),
-            waiting_for_piecebuf: HashMap::new(),
         }
     }
 
@@ -452,7 +473,8 @@ impl TransmitWorker {
                             && !self.connecting_peers.contains(&s)
                         {
                             self.connecting_peers.insert(s);
-                            tokio::spawn(connect_peer(h_clone, self.id, s, info_hash));
+                            let dht_port = self.dht_client.as_ref().map(|c| c.port());
+                            tokio::spawn(connect_peer(h_clone, s, self.handshake_opt.clone()));
                         }
                     }
                 }
@@ -1000,6 +1022,7 @@ fn run_dht(transmit: &mut TransmitWorker) {
             cl,
             transmit.id,
             transmit.info_hash,
+            transmit.handshake_opt.clone(),
             transmit.self_handle.clone(),
         ));
     }
@@ -1009,46 +1032,25 @@ async fn dht_get_peers(
     client: Arc<DHT>,
     self_id: [u8; 20],
     target: [u8; 20],
+    handshake_opt: HandshakeOption,
     tmh: TransmitManagerHandle,
 ) {
     let mut addrs = client.get_peers(target, false).await;
     addrs.extend_from_slice(&client.get_peers(target, true).await);
     for a in addrs {
         let t = tmh.clone();
-        tokio::spawn(connect_peer(t, self_id, a, target));
+        let opt = handshake_opt.clone();
+        tokio::spawn(connect_peer(t, a, opt));
     }
 }
 
 async fn connect_peer(
     main_tx: TransmitManagerHandle,
-    id: [u8; 20],
     addr: SocketAddr,
-    info_hash: [u8; 20],
+    opt: HandshakeOption,
 ) -> Result<(), std::io::Error> {
     let tcp_stream = TcpStream::connect(addr).await?;
-    let func = FuncBits::default().set_dht().set_extension();
-    func.set_extension();
-    let conn = protocol::BTStream::connect(
-        tcp_stream,
-        &protocol::Handshake {
-            reserved: func,
-            client_id: id,
-            torrent_hash: info_hash,
-        },
-        &protocol::ExtendedHandshake {
-            m: protocol::EXTENSION_IDS_MAP.clone(), // supported extensions and id number
-            p: None,                                // TCP listen port
-            v: Some("stardust 0.1.0".into()),       // client name and version
-
-            yourip: None,
-
-            ipv6: None,
-            ipv4: None,
-            reqq: None,          // request queue limit before drop any message
-            metadata_size: None, // TODO: FIXME: send correct metadata size
-        },
-    )
-    .await;
+    let conn = protocol::BTStream::connect(tcp_stream, opt).await;
     match conn {
         Ok(c) => {
             if let Err(e) = main_tx.sender.send(Msg::NewPeer(Ok(c.to_dyn()))) {

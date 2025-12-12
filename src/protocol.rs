@@ -1,4 +1,6 @@
 use crate::cache::{AbortErr, AsyncAbortRead, Ref};
+use crate::dht;
+use bon::Builder;
 use bt_bencode::ByteIpAddr;
 use bt_bencode::ByteString;
 
@@ -188,6 +190,11 @@ pub struct BTStream<T> {
     // this might be transferred to other place for further
     // processing and returns back when done
     piece_buf: Option<BytesMut>,
+
+    // pending PORT message to be sent later by splitted writer
+    // not sending it in connect(), because not sure if both ends
+    // sends and no one receives.
+    pending_dht_port: Option<u16>,
 }
 
 impl<T> BTStream<T>
@@ -208,6 +215,7 @@ where
             pex_peers: self.pex_peers,
             metadata_size: self.metadata_size,
             piece_buf: Some(BytesMut::new()),
+            pending_dht_port: self.pending_dht_port,
         }
     }
 }
@@ -301,6 +309,8 @@ pub struct WriteStream<T> {
 
     peer_id: [u8; 20],
     reserved: FuncBits,
+
+    pending_dht_port: Option<u16>,
 }
 
 impl BTStream<net::TcpStream> {
@@ -372,28 +382,6 @@ impl<T> BTStream<T> {
     }
 }
 
-// impl<T> From<T> for BTStream<T>
-// where
-//     T: AsyncRead + AsyncWrite,
-// {
-//     fn from(t: T) -> Self {
-//         Self {
-//             // inner: BufStream::new(t),
-//             inner: t,
-//             partial_header: PartialHeader {
-//                 field_len: [0; 4],
-//                 field_ty: 0,
-//                 field1: [0; 4],
-//                 field2: [0; 4],
-//                 field3: [0; 4],
-//                 filled: 0,
-//                 discard_remain: 0,
-//             },
-//             extension_id: HashMap::new(),
-//         }
-//     }
-// }
-
 impl<T> BTStream<T>
 where
     T: AsyncRead + AsyncWrite + Unpin + Split,
@@ -419,6 +407,7 @@ where
                 peer_id: self.peer_id,
                 reserved: self.reserved,
                 metadata_size: self.metadata_size,
+                pending_dht_port: self.pending_dht_port,
             },
         )
     }
@@ -442,6 +431,7 @@ where
             pex_peers: w.pex_peers,
             metadata_size: r.metadata_size,
             piece_buf: r.piece_buf,
+            pending_dht_port: w.pending_dht_port,
         })
     }
 
@@ -471,6 +461,7 @@ where
                 peer_id: self.peer_id,
                 reserved: self.reserved,
                 metadata_size: self.metadata_size,
+                pending_dht_port: self.pending_dht_port,
             },
         )
     }
@@ -498,6 +489,7 @@ impl BTStream<Box<dyn Conn>> {
                 peer_id: self.peer_id,
                 reserved: self.reserved,
                 metadata_size: self.metadata_size,
+                pending_dht_port: self.pending_dht_port,
             },
         )
     }
@@ -528,6 +520,7 @@ impl BTStream<Box<dyn Conn>> {
                 peer_id: self.peer_id,
                 reserved: self.reserved,
                 metadata_size: self.metadata_size,
+                pending_dht_port: self.pending_dht_port,
             },
         )
     }
@@ -573,32 +566,91 @@ where
     }
 }
 
+#[derive(Builder, Clone)]
+pub struct HandshakeOption {
+    #[builder(default = true)]
+    pex: bool,
+    #[builder(default = true)]
+    metadata: bool,
+    port: Option<u16>,
+
+    #[builder(required)]
+    dht_port: Option<u16>, // dht port
+    // fast: bool,       // fast extension
+    client_id: [u8; 20],
+    info_hash: [u8; 20],
+    client_version: Option<String>, // used in extension
+}
+
+impl HandshakeOption {
+    fn handshake(self) -> (Handshake, Option<ExtendedHandshake>) {
+        let mut func = FuncBits::none();
+        let mut map = HashMap::new();
+        if self.metadata {
+            func = func.set_extension();
+            map.insert(EXTENSION_NAME_METADATA.into(), EXTENSION_ID_METADATA);
+        }
+        if self.pex {
+            func = func.set_extension();
+            map.insert(EXTENSION_NAME_PEX.into(), EXTENSION_ID_PEX);
+        }
+        if self.dht_port.is_some() {
+            func = func.set_dht();
+        }
+        let exth = ExtendedHandshake {
+            m: map,
+            p: self.port,
+            v: self.client_version,
+            yourip: None,
+            ipv6: None,
+            ipv4: None,
+            reqq: None,
+            metadata_size: None,
+        };
+        let h = Handshake {
+            reserved: func,
+            torrent_hash: self.info_hash,
+            client_id: self.client_id,
+        };
+        (
+            h,
+            if func.have_extension() {
+                Some(exth)
+            } else {
+                None
+            },
+        )
+    }
+}
+
 impl<T> BTStream<T>
 where
     T: AsyncRead + AsyncWrite + Split + Unpin,
 {
-    pub async fn connect(mut t: T, h: &Handshake, extend: &ExtendedHandshake) -> io::Result<Self>
+    pub async fn connect(mut t: T, opt: HandshakeOption) -> io::Result<Self>
     where
         <T as Split>::R: Reunite<W = <T as Split>::W, U = T>,
     {
-        send_handshake(&mut t, h).await?;
+        let dht_port = opt.dht_port;
+        let (h, eh) = opt.handshake();
+        send_handshake(&mut t, &h).await?;
         let peer_handshake = recv_handshake(&mut t).await?;
 
+        let reserved = peer_handshake.reserved.common(&h.reserved);
+        // TODO: check peer_handshake's client id
         let s = BTStream {
             inner: t,
             partial_read: INITIAL_PARTIAL_READ,
             extension_id: HashMap::new(),
-
             peer_id: peer_handshake.client_id,
-            reserved: peer_handshake.reserved,
+            reserved,
             pex_peers: HashMap::new(),
             metadata_size: 0,
             piece_buf: Some(BytesMut::new()),
+            pending_dht_port: if reserved.have_dht() { dht_port } else { None },
         };
 
-        let support_extension =
-            peer_handshake.reserved.have_extension() & h.reserved.have_extension();
-        if support_extension {
+        if reserved.have_extension() {
             // Maybe over engineering.
             // If both ends are sends handshake before recv handshake,
             // and if both of OS buffer are full,
@@ -606,10 +658,13 @@ where
             // Resolve this by recv and send handshake in parallel,
             // and later rejoins two ends.
             let (mut read_end, mut write_end) = s.split();
-            let extend_clone = extend.clone(); // TODO: optimize
             let send_ext_handshake = tokio::spawn(async move {
                 // this can not fail, this is the only Arc
-                send_extension_handshake(&mut write_end.inner, &extend_clone).await?;
+                send_extension_handshake(
+                    &mut write_end.inner,
+                    &eh.expect("if negotiates extension, the extension from builder must be Some"),
+                )
+                .await?;
                 io::Result::Ok(write_end)
             });
             let recv_ext_handshake = recv_extend_handshake(
@@ -636,52 +691,40 @@ where
         Ok(s)
     }
 
-    pub async fn accept(mut t: T, funcbits: &FuncBits, client_id: &[u8; 20]) -> io::Result<Self>
+    pub async fn accept(mut t: T, opt: HandshakeOption) -> io::Result<Self>
     where
         <T as Split>::R: Reunite<W = <T as Split>::W, U = T>,
     {
+        let dht_port = opt.dht_port;
+        let (h, eh) = opt.handshake();
         let peer_handshake = recv_handshake(&mut t).await?;
         // TODO: check the id, if no same id, close connection
-        send_handshake(
-            &mut t,
-            &Handshake {
-                reserved: *funcbits,
-                torrent_hash: peer_handshake.torrent_hash,
-                client_id: *client_id,
-            },
-        )
-        .await?;
+        send_handshake(&mut t, &h).await?;
 
+        let reserved = peer_handshake.reserved.common(&h.reserved);
+        let support_dht = reserved.have_dht();
         let s = BTStream {
             inner: t,
             partial_read: INITIAL_PARTIAL_READ,
             extension_id: HashMap::new(),
             peer_id: peer_handshake.client_id,
-            reserved: peer_handshake.reserved.common(funcbits),
+            reserved,
             pex_peers: HashMap::new(),
             metadata_size: 0,
             piece_buf: Some(BytesMut::new()),
+            pending_dht_port: if support_dht { dht_port } else { None },
         };
 
-        let support_extension = peer_handshake.reserved.have_extension();
+        let support_extension = reserved.have_extension();
         if support_extension {
-            let extend_sending = ExtendedHandshake {
-                // TODO: optimize: on sending, clone() can be optimized
-                m: EXTENSION_IDS_MAP.clone(),
-                p: None,
-                v: Some("stardust 0.1.0".into()),
-                yourip: None,
-
-                ipv6: None,
-                ipv4: None,
-                reqq: None, // request queue limit before drop any message
-
-                metadata_size: None,
-            };
             let (mut read_end, mut write_end) = s.split();
             let send_ext_handshake = tokio::spawn(async move {
                 // this can not fail, this is the only Arc
-                send_extension_handshake(&mut write_end.inner, &extend_sending).await?;
+                send_extension_handshake(
+                    &mut write_end.inner,
+                    &eh.expect("if negotiates extension, the extension from builder must be Some"),
+                )
+                .await?;
                 io::Result::Ok(write_end)
             });
             let recv_ext_handshake = recv_extend_handshake(
@@ -936,6 +979,15 @@ impl FuncBits {
     pub const fn set_dht(mut self) -> Self {
         self.0[7] |= 0x1;
         self
+    }
+
+    pub const fn set_fast(mut self) -> Self {
+        self.0[7] |= 0x4;
+        self
+    }
+
+    pub const fn have_fast(&self) -> bool {
+        self.0[7] & 0x1 > 0
     }
 
     pub const fn new(b: [u8; 8]) -> Self {
@@ -2328,50 +2380,26 @@ mod tests {
     }
 
     async fn make_ends_tune(
-        connect_shake: Handshake,
-        connect_ext_shake: ExtendedHandshake,
-        accept_func: FuncBits,
-        accept_client_id: [u8; 20],
+        opt: HandshakeOption,
+        opt2: HandshakeOption,
     ) -> (BTStream<DuplexStream>, BTStream<DuplexStream>) {
         let (peer1, peer2) = duplex(1024 * 1024);
-        let p1 = tokio::spawn(async move {
-            BTStream::connect(peer1, &connect_shake, &connect_ext_shake)
-                .await
-                .unwrap()
-        });
-
-        let p2 = tokio::spawn(async move {
-            BTStream::accept(peer2, &accept_func, &accept_client_id)
-                .await
-                .unwrap()
-        });
+        let p1 = tokio::spawn(async move { BTStream::connect(peer1, opt).await.unwrap() });
+        let p2 = tokio::spawn(async move { BTStream::accept(peer2, opt2).await.unwrap() });
 
         (p1.await.unwrap(), p2.await.unwrap())
     }
 
     async fn make_ends() -> (BTStream<DuplexStream>, BTStream<DuplexStream>) {
-        const HANDSHAKE: Handshake = Handshake {
-            reserved: FuncBits::new([0x0, 0x0, 0x0, 0x0, 0x0, 0x10, 0x0, 0x0]), // extension bit
-            torrent_hash: [
-                0x05, 0xb7, 0x49, 0x26, 0xfc, 0xb6, 0x0e, 0x28, 0x87, 0x02, 0xb4, 0x89, 0xc9, 0x99,
-                0x88, 0x6d, 0x0d, 0x08, 0xcc, 0x90,
-            ],
-            client_id: *b"-ST0010-qwertyuiopas",
-        };
-        let exth = ExtendedHandshake {
-            // TODO: optimize: on sending, clone() can be optimized
-            m: EXTENSION_IDS_MAP.clone(),
-            p: Some(12345),
-            v: Some("stardust 0.1.0".into()),
-            yourip: None,
-
-            ipv6: None,
-            ipv4: None,
-            reqq: None, // request queue limit before drop any message
-            metadata_size: None,
-        };
-
-        make_ends_tune(HANDSHAKE, exth, HANDSHAKE.reserved, HANDSHAKE.client_id).await
+        let opt = HandshakeOption::builder()
+            .client_id([0; 20])
+            .client_version("1".into())
+            .pex(true)
+            .metadata(true)
+            .info_hash([0; 20])
+            .dht_port(None)
+            .build();
+        make_ends_tune(opt.clone(), opt).await
     }
 
     impl BTStream<DuplexStream> {
@@ -2400,6 +2428,7 @@ mod tests {
                     peer_id: [0; 20],
                     reserved: [0; 8].into(),
                     metadata_size: 0,
+                    pending_dht_port: None,
                 },
             )
         }
@@ -2422,84 +2451,42 @@ mod tests {
     #[tokio::test]
     async fn handshake() {
         // TODO: change value of hash, id and reserved
-        const HANDSHAKE: Handshake = Handshake {
-            reserved: FuncBits::new([0x1, 0x2, 0x3, 0x4, 0x1, 0x0, 0x3, 0x4]),
-            torrent_hash: [
-                0x05, 0xb7, 0x49, 0x26, 0xfc, 0xb6, 0x0e, 0x28, 0x87, 0x02, 0xb4, 0x89, 0xc9, 0x99,
-                0x88, 0x6d, 0x0d, 0x08, 0xcc, 0x90,
-            ],
-            client_id: *b"-ST0010-qwertyuiopas",
-        };
-        let exth = ExtendedHandshake {
-            // TODO: optimize: on sending, clone() can be optimized
-            m: EXTENSION_IDS_MAP.clone(),
-            p: None,
-            v: Some("stardust 0.1.0".into()),
-            yourip: None,
 
-            ipv6: None,
-            ipv4: None,
-            reqq: None, // request queue limit before drop any message
-            metadata_size: None,
-        };
-        make_ends_tune(HANDSHAKE, exth, HANDSHAKE.reserved, HANDSHAKE.client_id).await;
+        // opt1 does not support extension
+        let opt1 = HandshakeOption::builder()
+            .client_id([0; 20])
+            .client_version("1".into())
+            .pex(false)
+            .metadata(false)
+            .info_hash([0; 20])
+            .dht_port(None)
+            .build();
+        // opt2 supports extension
+        let opt2 = HandshakeOption::builder()
+            .client_id([0; 20])
+            .client_version("1".into())
+            .pex(true)
+            .metadata(true)
+            .info_hash([0; 20])
+            .dht_port(None)
+            .build();
+        make_ends_tune(opt1, opt2).await;
         // TODO: test info
     }
 
     #[tokio::test]
     async fn handshake_extend() {
         // TODO: change value of hash, id and reserved
-        const HANDSHAKE: Handshake = Handshake {
-            reserved: FuncBits::new([0x0, 0x0, 0x0, 0x0, 0x0, 0x10, 0x0, 0x0]), // extension bit
-            torrent_hash: [
-                0x05, 0xb7, 0x49, 0x26, 0xfc, 0xb6, 0x0e, 0x28, 0x87, 0x02, 0xb4, 0x89, 0xc9, 0x99,
-                0x88, 0x6d, 0x0d, 0x08, 0xcc, 0x90,
-            ],
-            client_id: *b"-ST0010-qwertyuiopas",
-        };
-        let exth = ExtendedHandshake {
-            // TODO: optimize: on sending, clone() can be optimized
-            m: EXTENSION_IDS_MAP.clone(),
-            p: Some(12345),
-            v: Some("stardust 0.1.0".into()),
-            yourip: None,
-
-            ipv6: None,
-            ipv4: None,
-            reqq: None, // request queue limit before drop any message
-            metadata_size: None,
-        };
-        make_ends_tune(HANDSHAKE, exth, HANDSHAKE.reserved, HANDSHAKE.client_id).await;
+        let opt = HandshakeOption::builder()
+            .client_id([0; 20])
+            .client_version("1".into())
+            .pex(true)
+            .metadata(true)
+            .info_hash([0; 20])
+            .dht_port(None)
+            .build();
+        make_ends_tune(opt.clone(), opt.clone()).await;
         // TODO: test info
-    }
-
-    #[tokio::test]
-    #[ignore]
-    async fn test_connect_real() {
-        let tcp_stream = net::TcpStream::connect("[::0]:35515".parse::<SocketAddr>().unwrap())
-            .await
-            .unwrap();
-        let bstream = BTStream::connect(
-            tcp_stream,
-            &Handshake {
-                reserved: FuncBits::new([0; 8]),
-                torrent_hash: [0; 20],
-                client_id: [0; 20],
-            },
-            &ExtendedHandshake {
-                m: EXTENSION_IDS_MAP.clone(),
-                p: Some(12345),
-                v: Some("stardust 0.1.0".into()),
-                yourip: None,
-
-                ipv6: None,
-                ipv4: None,
-                reqq: None, // request queue limit before drop any message
-                metadata_size: None,
-            },
-        )
-        .await
-        .unwrap();
     }
 
     #[tokio::test]
