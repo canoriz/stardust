@@ -220,22 +220,25 @@ pub struct TransmitWorker {
     /// whether have metadata or not
     torrent_state: TorrentState,
 
+    /// receives various events
     receiver: mpsc::UnboundedReceiver<Msg>,
 
+    /// contains sender of receiver
     self_handle: TransmitManagerHandle,
 
-    // change_rx: mpsc::UnboundedReceiver<Msg>,
-    // change_tx: mpsc::UnboundedSender<Msg>,
+    connected_peers: HashMap<PeerAddr, PeerConn>,
+    connecting_peers: HashSet<PeerAddr>,
 
-    // announce_handle: Option<AnnounceManagerHandle>,
-    // announce_tx: Option<mpsc::Sender<u32>>,
+    /// received blocks waiting writing to piece buf once
+    /// piece buf is ready
+    waiting_for_piecebuf: HashMap<u32, Vec<BlockWatingBuf>>,
+}
 
-    // TODO: use a Map instead of Vec?
-    // TODO: change V type
-    connected_peers: HashMap<SocketAddr, PeerConn>,
-    connecting_peers: HashSet<SocketAddr>,
+struct BlockWatingBuf {
+    piece: Piece,
 
-    waiting_for_piecebuf: HashMap<u32, Vec<Piece>>,
+    /// if this piece is all_received
+    full_received: bool,
 }
 
 impl TransmitWorker {
@@ -602,8 +605,15 @@ impl TransmitWorker {
                 Ok(mut buf) => {
                     let pending = self.waiting_for_piecebuf.remove(&(index as u32));
                     if let Some(ps) = pending {
-                        for piece in ps {
-                            copy_to_piecebuf(&piece, &mut buf);
+                        let mut full_received = false;
+                        for p in ps {
+                            // full_received should be set at most once
+                            assert!(!full_received);
+                            copy_to_piecebuf(&p.piece, &mut buf);
+                            if p.full_received {
+                                full_received = true;
+                                buf.flush(None);
+                            }
                         }
                     }
                     match &mut self.torrent_state {
@@ -731,7 +741,6 @@ impl TransmitWorker {
             receiving_guard.piece_received()
         };
 
-        let sender = self.self_handle.sender.clone();
         match Self::get_piecebuf(
             &mut self.torrent_state,
             self.self_handle.sender.clone(),
@@ -752,10 +761,20 @@ impl TransmitWorker {
                 // TODO: maybe set some unblock_conn upper limit
                 // piece.unblock_conn();
                 let index = piece.index;
+                let full_received = received_full_piece.is_some();
                 match self.waiting_for_piecebuf.get_mut(&index) {
-                    Some(v) => v.push(piece),
+                    Some(v) => v.push(BlockWatingBuf {
+                        piece,
+                        full_received,
+                    }),
                     None => {
-                        self.waiting_for_piecebuf.insert(index, vec![piece]);
+                        self.waiting_for_piecebuf.insert(
+                            index,
+                            vec![BlockWatingBuf {
+                                piece,
+                                full_received,
+                            }],
+                        );
                     }
                 }
                 info!("piecebuf not present err {e:?}");
