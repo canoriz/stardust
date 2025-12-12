@@ -931,6 +931,15 @@ where
     pub async fn send_extend_metadata(&mut self, meta: ExtendedMetadata) -> io::Result<()> {
         send_extend_metadata(&mut self.inner, meta, &self.extension_id).await
     }
+
+    /// called after split reader and writer
+    /// the pending DHT PORT message can now be sent
+    pub async fn maybe_send_pending_msg(&mut self) -> io::Result<()> {
+        if let Some(port) = self.pending_dht_port.take() {
+            send_port(&mut self.inner, port).await?;
+        }
+        Ok(())
+    }
 }
 
 impl<T> BTStream<T>

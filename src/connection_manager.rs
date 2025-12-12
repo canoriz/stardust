@@ -1,6 +1,6 @@
 use std::io;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use tokio::io::{BufReader, BufWriter};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time;
 
@@ -43,72 +43,38 @@ pub(crate) struct ConnectionManagerHandle {
 }
 
 impl ConnectionManagerHandle {
-    pub fn new<T>(conn: BTStream<T>, trh: TransmitManagerHandle, m: Arc<metadata::Metadata>) -> Self
+    pub fn new<T>(conn: BTStream<T>, trh: TransmitManagerHandle) -> Self
     where
         T: AsyncRead + AsyncWrite + Split + Unpin + Send + 'static,
     {
         let capability = conn.capability();
         let metadata_size = conn.metadata_size();
-        use tokio::io::{BufReader, BufWriter};
         let (read_stream, write_stream) = conn.split_buffered();
-
-        let (recv_tx, recv_rx) = mpsc::unbounded_channel();
-        let (recv_done_tx, recv_done_rx) = oneshot::channel();
-        let recv_cancel = CancellationToken::new();
-        let recv_stream = RecvStream::<BufReader<<T as Split>::R>> {
-            receiver: recv_rx,
-            read_stream,
-            transmit_handle: trh,
-            blk_recv_count: 0,
-        };
-
-        let (send_tx, send_rx) = mpsc::unbounded_channel();
-        let send_cancel = CancellationToken::new();
-        let (send_done_tx, send_done_rx) = oneshot::channel();
-        let send_stream = SendStream::<BufWriter<<T as Split>::W>> {
-            receiver: send_rx,
-            write_stream,
-        };
-
-        tokio::spawn(run_recv_stream(
-            recv_stream,
-            recv_cancel.clone(),
-            recv_done_tx,
-        ));
-        tokio::spawn(run_send_stream(
-            send_stream,
-            send_cancel.clone(),
-            send_done_tx,
-        ));
-        let recv_stream_handle = RecvStreamHandle {
-            sender: recv_tx,
-            cancel: recv_cancel.drop_guard(),
-            done: recv_done_rx,
-        };
-        let send_stream_handle = SendStreamHandle {
-            sender: send_tx,
-            cancel: send_cancel.drop_guard(),
-            done: send_done_rx,
-        };
-
-        Self {
-            recv_stream: recv_stream_handle,
-            send_stream: send_stream_handle,
-            capability,
-            metadata_size,
-        }
+        Self::from_splitted_buffered(read_stream, write_stream, trh, capability, metadata_size)
     }
 
     pub fn new_dyn(conn: BTStream<Box<dyn Conn>>, trh: TransmitManagerHandle) -> Self {
         let capability = conn.capability();
         let metadata_size = conn.metadata_size();
-        use tokio::io::{BufReader, BufWriter};
         let (read_stream, write_stream) = conn.split_buffered();
+        Self::from_splitted_buffered(read_stream, write_stream, trh, capability, metadata_size)
+    }
 
+    fn from_splitted_buffered<R, W>(
+        read_stream: ReadStream<BufReader<R>>,
+        write_stream: WriteStream<BufWriter<W>>,
+        trh: TransmitManagerHandle,
+        capability: CapabilityMap,
+        metadata_size: usize,
+    ) -> Self
+    where
+        R: protocol::Reader,
+        W: protocol::Writer,
+    {
         let (recv_tx, recv_rx) = mpsc::unbounded_channel();
         let (recv_done_tx, recv_done_rx) = oneshot::channel();
         let recv_cancel = CancellationToken::new();
-        let recv_stream = RecvStream::<BufReader<Box<dyn Reader>>> {
+        let recv_stream = RecvStream::<BufReader<R>> {
             receiver: recv_rx,
             read_stream,
             transmit_handle: trh,
@@ -118,7 +84,7 @@ impl ConnectionManagerHandle {
         let (send_tx, send_rx) = mpsc::unbounded_channel();
         let send_cancel = CancellationToken::new();
         let (send_done_tx, send_done_rx) = oneshot::channel();
-        let send_stream = SendStream::<BufWriter<Box<dyn Writer>>> {
+        let send_stream = SendStream::<BufWriter<W>> {
             receiver: send_rx,
             write_stream,
         };
@@ -370,11 +336,13 @@ async fn run_send_stream<T>(
     mut conn: SendStream<T>,
     cancel: CancellationToken,
     done: oneshot::Sender<()>,
-) where
+) -> io::Result<()>
+where
     T: AsyncWrite + Unpin,
 {
     let mut interval = tokio::time::interval(time::Duration::from_secs(120));
     // conn.write_stream.send_interested().await;
+    conn.write_stream.maybe_send_pending_msg().await?;
 
     loop {
         tokio::select! {
@@ -398,6 +366,7 @@ async fn run_send_stream<T>(
     }
     let _ = done.send(());
     info!("done send stream");
+    Ok(())
 }
 
 impl<T> SendStream<T>
