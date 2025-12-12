@@ -2331,7 +2331,7 @@ async fn recv_handshake<T: AsyncRead + Unpin>(handle: &mut T) -> io::Result<Hand
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use std::future::Future;
     use std::sync::Arc;
     use std::task::{Context, Poll, Wake};
@@ -2388,7 +2388,7 @@ mod tests {
         }
     }
 
-    async fn make_ends_tune(
+    pub async fn make_ends_tune(
         opt: HandshakeOption,
         opt2: HandshakeOption,
     ) -> (BTStream<DuplexStream>, BTStream<DuplexStream>) {

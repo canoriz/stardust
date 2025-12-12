@@ -478,3 +478,42 @@ async fn handle_extended_msg(
         }
     }
 }
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::protocol::{tests::make_ends_tune, HandshakeOption};
+    use crate::transmit_manager::Msg;
+
+    #[tokio::test]
+    async fn test_dht_delayed_msg() {
+        // opt support dht
+        let opt = HandshakeOption::builder()
+            .client_id([0; 20])
+            .client_version("1".into())
+            .info_hash([0; 20])
+            .dht_port(Some(1))
+            .build();
+        let (end1, end2) = make_ends_tune(opt.clone(), opt).await;
+
+        let (tx, mut rx1) = mpsc::unbounded_channel();
+        let tmh1 = TransmitManagerHandle { sender: tx };
+        let (tx, mut rx2) = mpsc::unbounded_channel();
+        let tmh2 = TransmitManagerHandle { sender: tx };
+
+        let _c1 = ConnectionManagerHandle::new(end1, tmh1.clone());
+        let _c2 = ConnectionManagerHandle::new(end2, tmh2.clone());
+        let first1 = rx1.recv().await.unwrap();
+        let first2 = rx2.recv().await.unwrap();
+        let inner1 = match first1 {
+            Msg::PeerDhtPort(sa, p) => (sa, p),
+            _ => unreachable!(),
+        };
+        let inner2 = match first2 {
+            Msg::PeerDhtPort(sa, p) => (sa, p),
+            _ => unreachable!(),
+        };
+        assert_eq!(inner1, inner2);
+        assert_eq!(inner1.1, 1);
+    }
+}
