@@ -813,7 +813,31 @@ impl TransmitWorker {
                     _ = c.conn.send_stream_cmd(ConnMsg::Extend(msg));
                 }
                 TorrentState::Metadata(m) => {
-                    todo!("sends them metadata")
+                    let reject = ExtendedMsg::Metadata(ExtendedMetadata::Reject { piece });
+                    let metadata = match bt_bencode::to_vec(&m.metadata.info) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            info!("respond metadata bt-bencode failed {e}");
+                            _ = c.conn.send_stream_cmd(ConnMsg::Extend(reject));
+                            return;
+                        }
+                    };
+
+                    let begin = (piece as usize) * 16384;
+                    let end = (piece as usize + 1) * 16384;
+                    if begin < metadata.len() {
+                        // TODO: OPTIMIZE: only reference to metadata.info should be
+                        // enough, no need to serialize and to_vec().
+                        let part = &metadata[begin..end.min(metadata.len())];
+                        let data = ExtendedMsg::Metadata(ExtendedMetadata::Data {
+                            total_size: Some(metadata.len()),
+                            piece,
+                            data: part.to_vec(),
+                        });
+                        _ = c.conn.send_stream_cmd(ConnMsg::Extend(data));
+                    } else {
+                        _ = c.conn.send_stream_cmd(ConnMsg::Extend(reject));
+                    }
                 }
             },
             ExtendedMetadata::Data {
@@ -822,48 +846,7 @@ impl TransmitWorker {
                 total_size,
             } => match &mut self.torrent_state {
                 TorrentState::Fetching(f) => {
-                    // Don't use a shared buffer like PIECE message, since
-                    // the data has already been received. Copying should be
-                    // relatively fast.
-
-                    let mbuf = &mut f.meta_buf;
-                    if let Some(sz) = total_size {
-                        mbuf.add_size_to_bucket(sz);
-                    }
-                    let probably_tot_size = mbuf.probable_total_size();
-                    let buf = &mut mbuf.metadata;
-                    let offset = (piece * 16384) as usize;
-                    buf[offset..offset + data.len()].copy_from_slice(&data);
-                    mbuf.requesting.remove(&piece);
-                    mbuf.not_requested.remove(&piece);
-
-                    Self::fetching_metadata_from_peer_addr(&self.connected_peers, &addr, 3, mbuf);
-
-                    let have_metadata = if probably_tot_size > 0
-                        && mbuf.not_requested.len() == 0
-                        && mbuf.requesting.len() == 0
-                    {
-                        match check_received_metadata(mbuf, f.magnet.info_hash) {
-                            Ok(m) => {
-                                warn!("metadata received");
-                                Some(m)
-                            }
-                            Err(_) => {
-                                warn!("metadata verify failed, needs re-download");
-                                for p in 0..=((mbuf.most_frequent_size - 1) / 16384) {
-                                    let p = p as u32;
-                                    if !mbuf.requesting.contains_key(&p) {
-                                        mbuf.not_requested.insert(p);
-                                    }
-                                }
-                                None
-                            }
-                        }
-                    } else {
-                        None
-                    };
-
-                    if let Some(m) = have_metadata {
+                    if let Some(m) = f.receive_metadata_part(piece, data, total_size) {
                         let mut metadata = Self::metadata_into_downloading(m);
                         let piece_picker = &mut metadata.piece_picker;
                         for (addr, pc) in &mut self.connected_peers {
@@ -872,9 +855,17 @@ impl TransmitWorker {
                             }
                         }
                         self.torrent_state = TorrentState::Metadata(metadata);
+                    } else {
+                        // if we don't have metadata yet, fetch more from this peer
+                        Self::fetching_metadata_from_peer_addr(
+                            &self.connected_peers,
+                            &addr,
+                            3,
+                            &mut f.meta_buf,
+                        );
                     }
                 }
-                TorrentState::Metadata(m) => {
+                TorrentState::Metadata(_) => {
                     // simply ignore them
                 }
             },
@@ -886,7 +877,7 @@ impl TransmitWorker {
                     info!("metadata request of piece {piece} to {addr:?} is rejected");
                 }
                 TorrentState::Metadata(_) => {
-                    // simply ignore them
+                    // already have metadata, simply ignore them
                 }
             },
         }
