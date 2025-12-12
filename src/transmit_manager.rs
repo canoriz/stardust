@@ -33,6 +33,7 @@ pub(crate) enum Msg {
 
     NewPeer(Result<protocol::BTStream<Box<dyn Conn>>, SocketAddr>),
     NewIncomePeer(protocol::BTStream<Box<dyn Conn>>),
+    PeerLeave(PeerAddr),
 
     // TODO: use a structure ptr to connection_peer struct
     // to replace SocketAddr
@@ -509,6 +510,13 @@ impl TransmitWorker {
             Msg::NewPeer(Err(addr)) => {
                 info!("err connect to {:?}", addr);
                 self.connecting_peers.remove(&addr);
+                Ok(())
+            }
+            Msg::PeerLeave(addr) => {
+                // receive twice from send end and recv end
+                // TODO: test this
+                info!("peer leave {addr}");
+                self.connected_peers.remove(&addr);
                 Ok(())
             }
             Msg::PeerBitField(addr, bitfield) => {

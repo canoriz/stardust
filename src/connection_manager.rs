@@ -74,11 +74,16 @@ impl ConnectionManagerHandle {
         let (recv_tx, recv_rx) = mpsc::unbounded_channel();
         let (recv_done_tx, recv_done_rx) = oneshot::channel();
         let recv_cancel = CancellationToken::new();
+        let addr = read_stream.peer_addr();
         let recv_stream = RecvStream::<BufReader<R>> {
             receiver: recv_rx,
             read_stream,
-            transmit_handle: trh,
+            transmit_handle: trh.clone(),
             blk_recv_count: 0,
+            _drop_guard: NotifyTransmitGuard {
+                addr,
+                transmit_handle: trh.clone(),
+            },
         };
 
         let (send_tx, send_rx) = mpsc::unbounded_channel();
@@ -87,6 +92,10 @@ impl ConnectionManagerHandle {
         let send_stream = SendStream::<BufWriter<W>> {
             receiver: send_rx,
             write_stream,
+            _drop_guard: NotifyTransmitGuard {
+                addr,
+                transmit_handle: trh,
+            },
         };
 
         tokio::spawn(run_recv_stream(
@@ -163,6 +172,20 @@ impl ConnectionManagerHandle {
     }
 }
 
+type PeerAddr = SocketAddr;
+struct NotifyTransmitGuard {
+    addr: PeerAddr,
+    transmit_handle: TransmitManagerHandle,
+}
+
+impl Drop for NotifyTransmitGuard {
+    fn drop(&mut self) {
+        self.transmit_handle
+            .sender
+            .send(TransmitMsg::PeerLeave(self.addr));
+    }
+}
+
 struct RecvStreamHandle {
     sender: mpsc::UnboundedSender<Msg>,
     cancel: DropGuard,
@@ -173,6 +196,7 @@ struct RecvStream<T> {
     receiver: mpsc::UnboundedReceiver<Msg>,
     read_stream: ReadStream<T>,
     transmit_handle: TransmitManagerHandle,
+    _drop_guard: NotifyTransmitGuard,
 
     blk_recv_count: u32,
 }
@@ -186,9 +210,8 @@ struct SendStreamHandle {
 struct SendStream<T> {
     receiver: mpsc::UnboundedReceiver<Msg>,
     write_stream: WriteStream<T>,
-    // TODO: do we use this to get blocks to requests?
-    // so we can receive requests from recv_handle
-    // transmit_handle: TransmitManagerHandle,
+
+    _drop_guard: NotifyTransmitGuard,
 }
 
 async fn run_recv_stream<T>(
@@ -209,6 +232,7 @@ async fn run_recv_stream<T>(
                 break;
             }
             Some(msg) = conn.receiver.recv() => {
+                // TODO: need handle None case
                 // TODO: use buffer and tokio::Notify
                 // info!("connection manager recv stream of {} received msg {msg:?}", &manager.conn);
             }
