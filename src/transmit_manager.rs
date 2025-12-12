@@ -42,6 +42,7 @@ pub(crate) enum Msg {
     PeerBitField(PeerAddr, BitField),
     PeerHave(PeerAddr, u32),
     PeerRecvPiece(PeerAddr, Piece),
+    PeerDhtPort(PeerAddr, u16),
 
     PieceBufReady {
         index: usize,
@@ -242,6 +243,7 @@ struct BlockWatingBuf {
 }
 
 impl TransmitWorker {
+    const DHT_TIMEOUT: time::Duration = time::Duration::from_secs(3);
     pub fn new(
         t: TorrentTask,
         id: [u8; 20],
@@ -491,7 +493,7 @@ impl TransmitWorker {
                 let piece_picker = match &mut self.torrent_state {
                     TorrentState::Metadata(d) => &mut d.piece_picker,
                     TorrentState::Fetching(_) => {
-                        let mut pc = self
+                        let pc = self
                             .connected_peers
                             .get_mut(&addr)
                             .expect("connection should in map");
@@ -593,46 +595,12 @@ impl TransmitWorker {
 
                 // TODO: if peer is choking us?
             }
-            Msg::PeerRecvPiece(addr, piece) => {
-                debug!("recv {piece:?} from {addr:?}");
-                self.handle_piece_msg(&addr, piece)?;
-                Ok(())
-            }
+            Msg::PeerRecvPiece(addr, piece) => self.handle_piece_msg(&addr, piece),
             Msg::FlushError(_) => {
                 todo!()
             }
-            Msg::PieceBufReady { index, buf } => match buf {
-                Ok(mut buf) => {
-                    let pending = self.waiting_for_piecebuf.remove(&(index as u32));
-                    if let Some(ps) = pending {
-                        let mut full_received = false;
-                        for p in ps {
-                            // full_received should be set at most once
-                            assert!(!full_received);
-                            copy_to_piecebuf(&p.piece, &mut buf);
-                            if p.full_received {
-                                full_received = true;
-                                buf.flush(None);
-                            }
-                        }
-                    }
-                    match &mut self.torrent_state {
-                        TorrentState::Metadata(d) => {
-                            d.storage.add_piece(buf);
-                        }
-                        TorrentState::Fetching(_) => {
-                            info!("piece buf ready when fetching, maybe unreachable");
-                            unreachable!()
-                        }
-                    }
-                    Ok(())
-                }
-                Err(e) => {
-                    // TODO: why that's error
-                    // shall we reload?
-                    return Err(e);
-                }
-            },
+            Msg::PeerDhtPort(addr, port) => self.handle_dht_port_msg(addr, port),
+            Msg::PieceBufReady { index, buf } => self.handle_piecebuf_ready(index, buf),
             Msg::ExtendMetadata(pa, m) => {
                 self.handle_extend_metadata(pa, m);
                 Ok(())
@@ -688,11 +656,8 @@ impl TransmitWorker {
 
     /// handle PIECE message
     // TODO: fix the return type
-    fn handle_piece_msg(
-        &mut self,
-        peer: &SocketAddr,
-        mut piece: protocol::Piece,
-    ) -> io::Result<()> {
+    fn handle_piece_msg(&mut self, peer: &SocketAddr, piece: protocol::Piece) -> io::Result<()> {
+        debug!("recv {piece:?} from {peer:?}");
         let blk = protocol::Request {
             index: piece.index,
             begin: piece.begin,
@@ -779,6 +744,54 @@ impl TransmitWorker {
                 }
                 info!("piecebuf not present err {e:?}");
             }
+        }
+        Ok(())
+    }
+
+    fn handle_piecebuf_ready(&mut self, index: usize, buf: io::Result<PieceBuf>) -> io::Result<()> {
+        match buf {
+            Ok(mut buf) => {
+                let pending = self.waiting_for_piecebuf.remove(&(index as u32));
+                if let Some(ps) = pending {
+                    let mut full_received = false;
+                    for p in ps {
+                        // full_received should be set at most once
+                        assert!(!full_received);
+                        copy_to_piecebuf(&p.piece, &mut buf);
+                        if p.full_received {
+                            full_received = true;
+                            println!("flush new ready piecebuf {index}");
+                            buf.flush(None);
+                        }
+                    }
+                }
+                match &mut self.torrent_state {
+                    TorrentState::Metadata(d) => {
+                        d.storage.add_piece(buf);
+                    }
+                    TorrentState::Fetching(_) => {
+                        info!("piece buf ready when fetching, maybe unreachable");
+                        unreachable!()
+                    }
+                }
+                Ok(())
+            }
+            Err(e) => {
+                // TODO: why that's error
+                // shall we reload?
+                return Err(e);
+            }
+        }
+    }
+
+    fn handle_dht_port_msg(&mut self, mut addr: PeerAddr, port: u16) -> io::Result<()> {
+        use crate::dht::RpcAddr;
+        if let Some(c) = &self.dht_client {
+            let c = c.clone();
+            addr.set_port(port);
+            tokio::spawn(async move {
+                _ = c.ping_rpc(RpcAddr::NoID(addr), Self::DHT_TIMEOUT).await;
+            });
         }
         Ok(())
     }

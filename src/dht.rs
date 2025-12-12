@@ -369,7 +369,11 @@ impl DHT {
         nodes
     }
 
-    pub async fn ping_rpc(&self, addr: RpcAddr, timeout: time::Duration) -> io::Result<Resp> {
+    pub async fn ping_rpc(
+        self: &Arc<Self>,
+        addr: RpcAddr,
+        timeout: time::Duration,
+    ) -> io::Result<Resp> {
         let tid = self.tid.fetch_add(1, Ordering::Relaxed).to_be_bytes();
         let tid: ByteString = tid[..].into();
         let krpc = KRPC {
@@ -401,7 +405,7 @@ impl DHT {
     }
 
     pub async fn get_peers_rpc(
-        &self,
+        self: &Arc<Self>,
         addr: RpcAddr,
         info_hash: NodeID,
         timeout: time::Duration,
@@ -420,7 +424,7 @@ impl DHT {
     }
 
     pub async fn announce_peer_rpc(
-        &self,
+        self: &Arc<Self>,
         addr: RpcAddr,
         info_hash: NodeID,
         port: u16,

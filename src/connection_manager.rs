@@ -356,7 +356,7 @@ async fn handle_peer_msg(tmh: &mut TransmitManagerHandle, addr: SocketAddr, m: M
             0
         }
         Message::Port(port) => {
-            // TODO
+            tmh.sender.send(TransmitMsg::PeerDhtPort(addr, port));
             0
         }
         Message::Extended(extend) => {
