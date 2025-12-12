@@ -516,4 +516,31 @@ mod test {
         assert_eq!(inner1, inner2);
         assert_eq!(inner1.1, 1);
     }
+
+    #[tokio::test]
+    async fn test_notify_transit() {
+        // opt support dht
+        let opt = HandshakeOption::builder()
+            .client_id([0; 20])
+            .client_version("1".into())
+            .info_hash([0; 20])
+            .dht_port(None)
+            .build();
+        let (end1, end2) = make_ends_tune(opt.clone(), opt).await;
+
+        let (tx, mut rx1) = mpsc::unbounded_channel();
+        let tmh1 = TransmitManagerHandle { sender: tx };
+        let (tx, _rx2) = mpsc::unbounded_channel();
+        let tmh2 = TransmitManagerHandle { sender: tx };
+
+        let _c1 = ConnectionManagerHandle::new(end1, tmh1.clone());
+        let c2 = ConnectionManagerHandle::new(end2, tmh2.clone());
+
+        drop(c2);
+        // after drop, c1 recv should fail, and generate a PeerLeave to transmit handle
+        match rx1.recv().await {
+            Some(Msg::PeerLeave(_)) => {}
+            _ => unreachable!(),
+        }
+    }
 }
