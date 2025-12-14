@@ -237,7 +237,7 @@ where
     let ticker5 = tokio::time::interval(time::Duration::from_secs(3));
     let mut ticker1 = tokio::time::interval(time::Duration::from_millis(1000));
     bt_stream.send_unchoke().await;
-    let limit = 2000;
+    let limit = 10;
     let mut accum = 0;
     let choked = false;
     const A: [u8; 16384] = [0u8; 16384];

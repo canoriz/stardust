@@ -52,7 +52,7 @@ impl PieceBlocks {
     }
 
     /// try to pick n blocks, return blocks and how many blocks picked
-    fn pick(&mut self, n: usize) -> Option<(BlockRange, usize)> {
+    fn pick(&mut self, peer: PeerAddr, n: usize) -> Option<(BlockRange, usize)> {
         let mut from = None;
         let mut to = None;
         let mut count = 0;
@@ -69,6 +69,10 @@ impl PieceBlocks {
             }
             match b {
                 BlockStatus::NotRequested => {
+                    *b = BlockStatus::Requested {
+                        addr: peer,
+                        at: time::Instant::now(),
+                    };
                     self.all_request_or_received_before = i + 1;
                     let req = Some(Request {
                         index: self.piece_index,
@@ -247,8 +251,9 @@ impl BlockPicker {
 
     /// Pick n blocks from peer, returns picked blocks and number of picked blocks
     pub fn pick_blocks(&mut self, peer: &PeerAddr, n: usize) -> (BlockRequests, usize) {
-        if time::Instant::now().elapsed() > self.no_response_timeout {
+        if self.prev_time_check.elapsed() > self.no_response_timeout {
             self.revoke_unrespond(self.no_response_timeout);
+            self.prev_time_check = time::Instant::now();
         }
 
         let mut count = 0;
@@ -260,7 +265,7 @@ impl BlockPicker {
         let mut ret = Vec::new();
         for (index, blocks) in &mut self.requesting {
             if count < n && peer_status.have(*index) {
-                while let Some((blks, n_picked)) = blocks.pick(n) {
+                while let Some((blks, n_picked)) = blocks.pick(*peer, n) {
                     count += n_picked;
                     ret.push(blks);
                 }
@@ -271,7 +276,7 @@ impl BlockPicker {
             if let Some(index) = self.piece_picker.pick_next(peer) {
                 let mut blocks = self.piece_block_of(index);
 
-                if let Some((blks, n_picked)) = blocks.pick(n) {
+                if let Some((blks, n_picked)) = blocks.pick(*peer, n) {
                     count += n_picked;
                     ret.push(blks);
                 }
@@ -454,6 +459,10 @@ impl BlockPicker {
 }
 
 impl BlockPicker {
+    pub fn n_pieces(&self) -> usize {
+        self.n
+    }
+
     pub fn peer_add(&mut self, addr: PeerAddr, state: PieceState) {
         self.piece_picker.peer_add(addr, state);
     }

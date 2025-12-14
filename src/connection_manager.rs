@@ -1,5 +1,8 @@
+use std::collections::VecDeque;
 use std::io;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use tokio::io::{BufReader, BufWriter};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time;
@@ -8,6 +11,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{info, warn};
 
+use crate::bandwidth::Bandwidth;
 use crate::cache::{AbortErr, ArcCache, BufStorage, GetRefErr, PieceBuf, PieceKey, Ref};
 use crate::metadata::{self, Metadata};
 use crate::picker::{start_receive_piece_block, BlockRequests, HeapPiecePicker};
@@ -17,6 +21,8 @@ use crate::protocol::{
 };
 use crate::transmit_manager::{Downloading, TransmitManagerHandle};
 use crate::transmit_manager::{Msg as TransmitMsg, TorrentState};
+
+const BANDWIDTH_TIME_SLICE: time::Duration = time::Duration::from_millis(250);
 
 #[derive(Debug)]
 pub(crate) enum WakeUpOption {
@@ -75,11 +81,18 @@ impl ConnectionManagerHandle {
         let (recv_done_tx, recv_done_rx) = oneshot::channel();
         let recv_cancel = CancellationToken::new();
         let addr = read_stream.peer_addr();
+
+        let n_sent_req = Arc::new(AtomicU32::new(0));
+        let n_recv_req = Arc::new(AtomicU32::new(0));
         let recv_stream = RecvStream::<BufReader<R>> {
             receiver: recv_rx,
             read_stream,
             transmit_handle: trh.clone(),
-            blk_recv_count: 0,
+            bw: Bandwidth::new(BANDWIDTH_TIME_SLICE),
+            n_recv_req,
+            n_sent_req: n_sent_req.clone(),
+            history_n_recv_req: VecDeque::new(),
+            history_n_sent_req: VecDeque::new(),
             _drop_guard: NotifyTransmitGuard {
                 addr,
                 transmit_handle: trh.clone(),
@@ -92,6 +105,7 @@ impl ConnectionManagerHandle {
         let send_stream = SendStream::<BufWriter<W>> {
             receiver: send_rx,
             write_stream,
+            n_sent_req,
             _drop_guard: NotifyTransmitGuard {
                 addr,
                 transmit_handle: trh,
@@ -198,7 +212,19 @@ struct RecvStream<T> {
     transmit_handle: TransmitManagerHandle,
     _drop_guard: NotifyTransmitGuard,
 
-    blk_recv_count: u32,
+    /// number or received pieces in a period
+    n_recv_req: Arc<AtomicU32>,
+
+    /// number or sent pieces in a period
+    n_sent_req: Arc<AtomicU32>,
+
+    /// history of number of received requests in every tick
+    history_n_recv_req: VecDeque<u32>,
+
+    /// history of number of sent requests in every tick
+    history_n_sent_req: VecDeque<u32>,
+
+    bw: Bandwidth<10>,
 }
 
 struct SendStreamHandle {
@@ -211,6 +237,9 @@ struct SendStream<T> {
     receiver: mpsc::UnboundedReceiver<Msg>,
     write_stream: WriteStream<T>,
 
+    /// number or send requests in a period
+    n_sent_req: Arc<AtomicU32>,
+
     _drop_guard: NotifyTransmitGuard,
 }
 
@@ -222,8 +251,10 @@ async fn run_recv_stream<T>(
     T: AsyncRead + Unpin,
 {
     info!("in recv stream");
-    let mut ticker = tokio::time::interval(time::Duration::from_millis(1000));
+    let report_interval = time::Duration::from_millis(1000);
+    let mut ticker = tokio::time::interval(report_interval);
     let addr = conn.read_stream.peer_addr();
+
     loop {
         tokio::select! {
             biased;
@@ -239,16 +270,14 @@ async fn run_recv_stream<T>(
             _ = ticker.tick() => {
                 // TODO: many ticks may come together, unfair
                 // debug!("recv conn ticker tick {} block received in this epoch", conn.blk_recv_count);
-                conn.transmit_handle.sender.send(TransmitMsg::BlockReceived(conn.read_stream.peer_addr(), conn.blk_recv_count));
-                conn.blk_recv_count = 0;
+                conn.handle_report_tick(report_interval);
             }
             r = conn.read_stream.recv_msg() => {
                 // r = receive_peer_msg(&mut conn.read_stream, &mut conn.transmit_handle) => {
                 match r {
                     Ok(msg) => {
                         // (handle_peer_hdr(&mut conn, addr, hdr));
-                        let n_blk = handle_peer_msg(&mut conn.transmit_handle, addr, msg).await;
-                        conn.blk_recv_count += n_blk;
+                        conn.handle_peer_msg(addr, msg).await;
                     }
                     Err(e) => {
                         warn!("recv stream read header error {e}");
@@ -263,95 +292,120 @@ async fn run_recv_stream<T>(
     info!("done recv stream");
 }
 
-// // TODO: change a better name
-// async fn handle_peer_hdr<'a, T, U>(
-//     tmh: &'a mut TransmitManagerHandle,
-//     addr: SocketAddr,
-//     hdr: Message<'a, U>,
-// ) -> u32
-// where
-//     T: Split,
-//     U: AsyncRead + Unpin,
-// {
-//     info!("received BT msg hdr {hdr:?}");
-//     handle_peer_msg(tmh, addr, hdr).await
-// }
-
 // TODO: socketaddr use ref?
 // TODO: returns some more meaningful val
 // returns if one block is received
-async fn handle_peer_msg(tmh: &mut TransmitManagerHandle, addr: SocketAddr, m: Message) -> u32 {
-    // TODO: send statistics to transmit handle
+impl<T> RecvStream<T>
+where
+    T: AsyncRead + Unpin,
+{
+    fn handle_report_tick(&mut self, interval: time::Duration) {
+        const TRACE_WINDOW: usize = 8;
+        if self.history_n_recv_req.len() < TRACE_WINDOW {
+            self.history_n_recv_req
+                .push_back(self.n_recv_req.load(Ordering::Relaxed));
+            self.history_n_sent_req
+                .push_back(self.n_sent_req.load(Ordering::Relaxed));
+        } else {
+            let n_recv_ago = self.history_n_recv_req.pop_front().unwrap();
+            let n_sent_ago = self.history_n_sent_req.pop_front().unwrap();
 
-    // TODO: shall we use mpsc or just lock the manager and set it
-    // since this is generally a sync operation
+            self.n_recv_req.fetch_sub(n_recv_ago, Ordering::Relaxed);
+            self.n_sent_req.fetch_sub(n_sent_ago, Ordering::Relaxed);
 
-    // TODO: maybe use bounded channel?
-    match m {
-        Message::KeepAlive => {
-            // do nothing
-            info!("ka");
-            0
-        }
-        Message::Choke => {
-            info!("ck");
-            // TODO: drop all pending requests
-            // stop sending all requests
-            let r = tmh.sender.send(TransmitMsg::PeerChoke(addr));
-            if let Err(e) = r {
-                warn!("error send unchoke to transmit manager {e}")
+            for v in self.history_n_recv_req.iter_mut() {
+                *v = *v - n_recv_ago;
             }
-            0
+            for v in self.history_n_sent_req.iter_mut() {
+                *v = *v - n_sent_ago;
+            }
+
+            self.history_n_recv_req
+                .push_back(self.n_recv_req.load(Ordering::Relaxed));
+            self.history_n_sent_req
+                .push_back(self.n_sent_req.load(Ordering::Relaxed));
         }
-        Message::Unchoke => {
-            info!("uck");
-            tmh.sender.send(TransmitMsg::PeerUnchoke(addr));
-            0
-        }
-        Message::Interested => {
-            // TODO: update peer state
-            tmh.sender.send(TransmitMsg::PeerInterested(addr));
-            0
-        }
-        Message::NotInterested => {
-            // TODO: update peer state
-            tmh.sender.send(TransmitMsg::PeerUninterested(addr));
-            0
-        }
-        Message::Have(i) => {
-            tmh.sender.send(TransmitMsg::PeerHave(addr, i));
-            0
-        }
-        Message::BitField(bf) => {
-            info!("bf");
-            // TODO: handle error
-            tmh.sender.send(TransmitMsg::PeerBitField(addr, bf));
-            0
-        }
-        Message::Request(request) => {
-            // TODO:
-            // if in cache, mark cache in use
-            // add to send queue, wake sending task
-            // if not in cache, send to background fetch task
-            // when block fetched, wake sending task
-            0
-        }
-        Message::Piece(piece) => {
-            tmh.sender.send(TransmitMsg::PeerRecvPiece(addr, piece));
-            1
-        }
-        Message::Cancel(request) => {
-            // TODO: cancel pending request/fetch task
-            // todo!();
-            0
-        }
-        Message::Port(port) => {
-            tmh.sender.send(TransmitMsg::PeerDhtPort(addr, port));
-            0
-        }
-        Message::Extended(extend) => {
-            handle_extended_msg(&addr, tmh, extend).await;
-            1
+
+        let n_req_in_flight = {
+            let sent = self.n_sent_req.load(Ordering::Relaxed) as i32;
+            let recv = self.n_recv_req.load(Ordering::Relaxed) as i32;
+            warn!("sent: {sent}, recv: {recv}");
+            sent - recv
+        };
+
+        self.transmit_handle
+            .sender
+            .send(TransmitMsg::BlockReceived {
+                peer: self.read_stream.peer_addr(),
+                estimated_bw: self.bw.count(interval),
+                n_req_in_flight: n_req_in_flight.max(0) as usize,
+            });
+    }
+
+    async fn handle_peer_msg(&mut self, addr: SocketAddr, m: Message) {
+        // TODO: send statistics to transmit handle
+
+        // TODO: shall we use mpsc or just lock the manager and set it
+        // since this is generally a sync operation
+
+        // TODO: maybe use bounded channel?
+        let tmh = &mut self.transmit_handle;
+        match m {
+            Message::KeepAlive => {
+                // do nothing
+                info!("ka");
+            }
+            Message::Choke => {
+                info!("ck");
+                // TODO: drop all pending requests
+                // stop sending all requests
+                let r = tmh.sender.send(TransmitMsg::PeerChoke(addr));
+                if let Err(e) = r {
+                    warn!("error send unchoke to transmit manager {e}")
+                }
+            }
+            Message::Unchoke => {
+                info!("uck");
+                tmh.sender.send(TransmitMsg::PeerUnchoke(addr));
+            }
+            Message::Interested => {
+                // TODO: update peer state
+                tmh.sender.send(TransmitMsg::PeerInterested(addr));
+            }
+            Message::NotInterested => {
+                // TODO: update peer state
+                tmh.sender.send(TransmitMsg::PeerUninterested(addr));
+            }
+            Message::Have(i) => {
+                tmh.sender.send(TransmitMsg::PeerHave(addr, i));
+            }
+            Message::BitField(bf) => {
+                info!("bf");
+                // TODO: handle error
+                tmh.sender.send(TransmitMsg::PeerBitField(addr, bf));
+            }
+            Message::Request(request) => {
+                // TODO:
+                // if in cache, mark cache in use
+                // add to send queue, wake sending task
+                // if not in cache, send to background fetch task
+                // when block fetched, wake sending task
+            }
+            Message::Piece(piece) => {
+                self.bw.add(piece.len as usize);
+                self.n_recv_req.fetch_add(1, Ordering::Relaxed);
+                tmh.sender.send(TransmitMsg::PeerRecvPiece(addr, piece));
+            }
+            Message::Cancel(request) => {
+                // TODO: cancel pending request/fetch task
+                // todo!();
+            }
+            Message::Port(port) => {
+                tmh.sender.send(TransmitMsg::PeerDhtPort(addr, port));
+            }
+            Message::Extended(extend) => {
+                handle_extended_msg(&addr, tmh, extend).await;
+            }
         }
     }
 }
@@ -403,6 +457,7 @@ where
                 let piece_size = reqs.piece_size;
                 for rg in reqs.range.iter() {
                     for r in rg.iter(piece_size) {
+                        self.n_sent_req.fetch_add(1, Ordering::Relaxed);
                         self.write_stream
                             .send_request(r.index, r.begin, r.len)
                             .await;

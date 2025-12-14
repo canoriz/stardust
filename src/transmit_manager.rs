@@ -57,7 +57,12 @@ pub(crate) enum Msg {
 
     FlushError(FlushErr),
 
-    BlockReceived(PeerAddr, u32),
+    BlockReceived {
+        peer: PeerAddr,
+        // estimated bandwidth, bytes per period
+        estimated_bw: usize,
+        n_req_in_flight: usize,
+    },
 
     ExtendMetadata(PeerAddr, ExtendedMetadata),
 }
@@ -342,19 +347,23 @@ impl TransmitWorker {
         let piece_size = m.regular_piece_size() as u32;
         let total_length = m.len();
         let piece_picker = Box::new(RarestPicker::new(total_length, piece_size as usize));
-        let piece_picker = BlockPicker::new(
+        let mut block_picker = BlockPicker::new(
             total_length,
             piece_size as usize,
             piece_picker,
             time::Duration::from_secs(10),
         );
 
+        for i in 0..block_picker.n_pieces() {
+            block_picker.select(i as u32, true);
+        }
+
         let back_file = BackFile::new::<NormalFile>().metadata(m.clone()).build();
         let buf_storage = BufStorage::new(total_length, m.regular_piece_size(), back_file);
 
         Downloading {
             metadata: m,
-            block_picker: piece_picker,
+            block_picker,
             storage: buf_storage,
         }
     }
@@ -378,7 +387,6 @@ impl TransmitWorker {
             }
         };
 
-        let now = std::time::Instant::now();
         for (addr, h) in &mut self.connected_peers {
             info!("peer status {addr}: {:?}", h.state);
             if h.state.peer_choke_status == ChokeStatus::Unchoked {
@@ -390,7 +398,8 @@ impl TransmitWorker {
 
     // fn pick_blocks_for_peer(&mut self, addr: &SocketAddr, n_blocks: usize) {
     // Fn: n_blk_received, n_blk_in_flight -> n_this_time_pick
-    fn pick_blocks_for_peer(&mut self, addr: &SocketAddr, n_received: u32) {
+    fn pick_blocks_for_peer(&mut self, addr: &SocketAddr, pick_n: usize) {
+        warn!("pick {pick_n} blocks from {addr:?}");
         let block_picker = match &mut self.torrent_state {
             TorrentState::Metadata(d) => &mut d.block_picker,
             TorrentState::Fetching(_) => {
@@ -398,50 +407,9 @@ impl TransmitWorker {
             }
         };
 
-        // n_block_in_flight = estimated_bandwidth * response_time
-        // response_time = RTT + process_time
-        // estimated_bandwidth = ALPHA * n_received_per_second
-        let now = std::time::Instant::now();
         if let Some(h) = self.connected_peers.get_mut(addr) {
             if h.state.peer_choke_status == ChokeStatus::Unchoked {
-                // h.n_block_in_flight = block_picker
-                //     .get_status(addr)
-                //     .map(|s| s.n_in_flight as u32)
-                //     .unwrap_or(0);
-                // dbg!(h.n_block_in_flight);
-
-                // let mut n_blk = 1;
-                // if n_received > 0 {
-                //     let period_duration = h.last_pick_time.elapsed();
-                //     h.last_pick_time = time::Instant::now();
-                //     let estm_bw_bps = if let Some(status) = block_picker.get_status(addr) {
-                //         (status.bandwidth.count(period_duration) as f32)
-                //             / period_duration.div_duration_f32(time::Duration::from_secs(1))
-                //     } else {
-                //         0.0
-                //     };
-
-                //     // TODO: now send 10 senconds in batch
-                //     // maybe calculate this with response time
-                //     let batch_seconds = 10.0;
-                //     let mut optimal_n_in_flight = (estm_bw_bps * batch_seconds / 16384.0) as u32;
-                //     optimal_n_in_flight = optimal_n_in_flight.min(1500).max(16);
-
-                //     dbg!(n_received, estm_bw_bps, optimal_n_in_flight);
-
-                //     dbg!(h.n_block_in_flight);
-                //     // let n_blk = pick_fn(n_received, h.n_block_in_flight);
-                //     n_blk = if optimal_n_in_flight > h.n_block_in_flight {
-                //         optimal_n_in_flight - h.n_block_in_flight
-                //     } else {
-                //         0
-                //     };
-                // }
-                // warn!(
-                //     "peer {addr} picking {n_blk} block in next period, {} in flight",
-                //     h.n_block_in_flight
-                // );
-                let (reqs, n) = block_picker.pick_blocks(addr, 2 as usize);
+                let (reqs, _n) = block_picker.pick_blocks(addr, pick_n);
                 h.conn.send_stream_cmd(ConnMsg::RequestBlocks(reqs));
             }
         }
@@ -601,33 +569,24 @@ impl TransmitWorker {
                 });
                 Ok(())
             }
-            Msg::BlockReceived(peer, n) => {
-                // optimally
-                // n_packet_in_flight = (bandwidth * response_time) / packet_size
-                // response_time can be measured
-                // packet_size is known
-                // bandwitdh is unknown and ?difficult to measure
+            Msg::BlockReceived {
+                peer,
+                estimated_bw,
+                n_req_in_flight,
+            } => {
+                // TODO: OPTIMIZE: return connection handle to reduce map search
                 let conn_stat = self.connected_peers.get_mut(&peer).expect("should exist");
-                debug!(
-                    "peer {peer} received {n} block in prev period, in flight {}",
-                    conn_stat.n_block_in_flight
-                );
+                warn!("peer {peer} estimated bandwidth {estimated_bw}, req in flight: {n_req_in_flight}");
 
-                // TODO: peer may take longer than period to process,
-                // we need to estimate bandwidth
-                //
-                // n_block_in_flight = estimated_bandwidth * response_time
-                // response_time = RTT + process_time
-                // estimated_bandwidth = ALPHA * n_received_per_second
-                //
-                // so we can estimate response_time
+                let n_to_pick = ((10 * estimated_bw / 16384).max(n_req_in_flight)
+                    - n_req_in_flight)
+                    .max(10)
+                    .min(1500);
 
                 if conn_stat.state.peer_choke_status == ChokeStatus::Unchoked {
-                    self.pick_blocks_for_peer(&peer, 2);
+                    self.pick_blocks_for_peer(&peer, n_to_pick);
                 }
                 Ok(())
-
-                // TODO: if peer is choking us?
             }
             Msg::PeerRecvPiece(addr, piece) => self.handle_piece_msg(&addr, piece),
             Msg::FlushError(_) => {

@@ -82,19 +82,17 @@ impl Picker {
     }
 
     fn update_rarity(&mut self, state: &PeerPieceDetail, join: bool) {
-        if !state.choke {
-            match &state.have {
-                PieceState::HaveAll => {
-                    for i in 0..self.n {
-                        self.update_one_piece_rarity(i as u32, join);
-                    }
+        match &state.have {
+            PieceState::HaveAll => {
+                for i in 0..self.n {
+                    self.update_one_piece_rarity(i as u32, join);
                 }
-                PieceState::HaveNone => {}
-                PieceState::Bitfield(b) => {
-                    for (i, have) in b.iter().enumerate().take(self.n) {
-                        if have {
-                            self.update_one_piece_rarity(i as u32, join);
-                        }
+            }
+            PieceState::HaveNone => {}
+            PieceState::Bitfield(b) => {
+                for (i, have) in b.iter().enumerate().take(self.n) {
+                    if have {
+                        self.update_one_piece_rarity(i as u32, join);
                     }
                 }
             }
@@ -114,6 +112,7 @@ impl From<PieceState> for PeerPieceDetail {
 impl PiecePicker for Picker {
     type T = PeerPieceDetail;
     fn peer_add(&mut self, addr: PeerAddr, state: PieceState) {
+        self.peer_leave(&addr);
         if !self.peers.contains_key(&addr) {
             let d = state.into();
             self.update_rarity(&d, true);
@@ -135,7 +134,7 @@ impl PiecePicker for Picker {
 
     fn peer_unchoke(&mut self, addr: &PeerAddr) {
         if let Some(state) = self.peers.get_mut(addr) {
-            state.choke = true;
+            state.choke = false;
         }
     }
 
@@ -214,18 +213,22 @@ impl PiecePicker for Picker {
     }
 
     fn pick_next(&mut self, peer: &PeerAddr) -> Option<u32> {
-        let peer_have = if let Some(h) = self.peers.get(peer) {
+        let peer_status = if let Some(h) = self.peers.get(peer) {
             h
         } else {
             return None;
         };
+
+        if peer_status.choke {
+            return None;
+        }
 
         let mut found = None;
 
         // find the first piece this peer have
         for (r, index) in self.want_rarity.iter() {
             assert_eq!(self.have.get(*index), false);
-            if peer_have.have(*index) {
+            if peer_status.have(*index) {
                 let selected = self.selected.get(*index);
                 assert!(selected);
                 found = Some((*r, *index));

@@ -9,9 +9,16 @@ pub(crate) struct Bandwidth<const SLOT_SIZE: usize> {
 
 #[derive(Debug, Copy, Clone)]
 struct Period {
+    /// packet number
     count: u32,
+
+    /// bytes number
     val: usize,
+
+    /// time since when
     time: Instant,
+
+    /// average response time
     resp_time: time::Duration,
 }
 
@@ -78,11 +85,11 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
             let now = Instant::now();
             let time_elapsed = slot.time.elapsed();
             if time_elapsed <= back_interval {
-                // quering range covers entire slot
+                // querying range covers entire slot
                 total += slot.val;
                 total_dur += slot.resp_time * slot.count;
             } else if now.duration_since(slot.time + self.interval) <= back_interval {
-                // quering range covers part of this slot's time range
+                // querying range covers part of this slot's time range
                 let ratio = 1.0
                     - (now - back_interval)
                         .duration_since(slot.time)
