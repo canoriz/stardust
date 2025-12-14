@@ -5,6 +5,7 @@ use tokio::time;
 use tracing::warn;
 
 use crate::backfile::BackFile;
+use crate::math_helper::piece_total_and_last_size;
 
 use super::{AllocErr, ArcCache, GetRefErr, MutexBackFile, PieceBuf, PieceBufPool, PieceKey, Ref};
 
@@ -171,15 +172,5 @@ impl BufStorage {
         } else {
             self.piece_size
         }
-    }
-}
-
-fn piece_total_and_last_size(total_length: usize, piece_size: usize) -> (usize, usize) {
-    let n_full_piece = total_length / piece_size;
-    let full_piece_total_size = n_full_piece * piece_size;
-    if full_piece_total_size == total_length {
-        (n_full_piece, piece_size)
-    } else {
-        (n_full_piece + 1, (total_length - full_piece_total_size))
     }
 }

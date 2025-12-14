@@ -4,9 +4,11 @@ use crate::cache::simple_buffer::{GetPieceErr, PieceBuf};
 use crate::connection_manager::{ConnectionManagerHandle, Msg as ConnMsg};
 use crate::dht::DHT;
 use crate::metadata::{self, Magnet, Metadata};
-use crate::picker::{start_receive_piece_block, HeapPiecePicker};
+use crate::picker::{
+    start_receive_piece_block, BlockPicker, HeapPiecePicker, PieceState, RarestPicker,
+};
 use crate::protocol::{
-    self, BitField, Conn, ExtendedMetadata, ExtendedMsg, FuncBits, HandshakeOption, Piece,
+    self, BitField, Conn, ExtendedMetadata, ExtendedMsg, FuncBits, HandshakeOption, Piece, Request,
 };
 
 use sha1::{Digest, Sha1};
@@ -252,7 +254,7 @@ impl MetadataBuffer {
 pub struct Downloading {
     pub metadata: Arc<Metadata>,
 
-    pub piece_picker: HeapPiecePicker,
+    pub block_picker: BlockPicker,
     pub storage: BufStorage,
 }
 
@@ -339,11 +341,12 @@ impl TransmitWorker {
         let m = Arc::new(m);
         let piece_size = m.regular_piece_size() as u32;
         let total_length = m.len();
-        let piece_picker = HeapPiecePicker::new(total_length, piece_size);
-
-        let (piece_total, last_piece_size) = (
-            m.total_pieces(),
-            m.piece_size_of(m.total_pieces() as u32 - 1),
+        let piece_picker = Box::new(RarestPicker::new(total_length, piece_size as usize));
+        let piece_picker = BlockPicker::new(
+            total_length,
+            piece_size as usize,
+            piece_picker,
+            time::Duration::from_secs(10),
         );
 
         let back_file = BackFile::new::<NormalFile>().metadata(m.clone()).build();
@@ -351,7 +354,7 @@ impl TransmitWorker {
 
         Downloading {
             metadata: m,
-            piece_picker,
+            block_picker: piece_picker,
             storage: buf_storage,
         }
     }
@@ -368,8 +371,8 @@ impl TransmitWorker {
     //     self
     // }
     fn pick_blocks_for_all_peers(&mut self, n_blocks: usize) {
-        let piece_picker = match &mut self.torrent_state {
-            TorrentState::Metadata(d) => &mut d.piece_picker,
+        let block_picker = match &mut self.torrent_state {
+            TorrentState::Metadata(d) => &mut d.block_picker,
             TorrentState::Fetching(_) => {
                 return;
             }
@@ -379,7 +382,7 @@ impl TransmitWorker {
         for (addr, h) in &mut self.connected_peers {
             info!("peer status {addr}: {:?}", h.state);
             if h.state.peer_choke_status == ChokeStatus::Unchoked {
-                let (reqs, n) = piece_picker.pick_blocks(addr, n_blocks, now);
+                let (reqs, n) = block_picker.pick_blocks(addr, n_blocks);
                 h.conn.send_stream_cmd(ConnMsg::RequestBlocks(reqs));
             }
         }
@@ -388,8 +391,8 @@ impl TransmitWorker {
     // fn pick_blocks_for_peer(&mut self, addr: &SocketAddr, n_blocks: usize) {
     // Fn: n_blk_received, n_blk_in_flight -> n_this_time_pick
     fn pick_blocks_for_peer(&mut self, addr: &SocketAddr, n_received: u32) {
-        let piece_picker = match &mut self.torrent_state {
-            TorrentState::Metadata(d) => &mut d.piece_picker,
+        let block_picker = match &mut self.torrent_state {
+            TorrentState::Metadata(d) => &mut d.block_picker,
             TorrentState::Fetching(_) => {
                 return;
             }
@@ -401,44 +404,44 @@ impl TransmitWorker {
         let now = std::time::Instant::now();
         if let Some(h) = self.connected_peers.get_mut(addr) {
             if h.state.peer_choke_status == ChokeStatus::Unchoked {
-                h.n_block_in_flight = piece_picker
-                    .get_status(addr)
-                    .map(|s| s.n_in_flight as u32)
-                    .unwrap_or(0);
-                dbg!(h.n_block_in_flight);
+                // h.n_block_in_flight = block_picker
+                //     .get_status(addr)
+                //     .map(|s| s.n_in_flight as u32)
+                //     .unwrap_or(0);
+                // dbg!(h.n_block_in_flight);
 
-                let mut n_blk = 1;
-                if n_received > 0 {
-                    let period_duration = h.last_pick_time.elapsed();
-                    h.last_pick_time = time::Instant::now();
-                    let estm_bw_bps = if let Some(status) = piece_picker.get_status(addr) {
-                        (status.bandwidth.count(period_duration) as f32)
-                            / period_duration.div_duration_f32(time::Duration::from_secs(1))
-                    } else {
-                        0.0
-                    };
+                // let mut n_blk = 1;
+                // if n_received > 0 {
+                //     let period_duration = h.last_pick_time.elapsed();
+                //     h.last_pick_time = time::Instant::now();
+                //     let estm_bw_bps = if let Some(status) = block_picker.get_status(addr) {
+                //         (status.bandwidth.count(period_duration) as f32)
+                //             / period_duration.div_duration_f32(time::Duration::from_secs(1))
+                //     } else {
+                //         0.0
+                //     };
 
-                    // TODO: now send 10 senconds in batch
-                    // maybe calculate this with response time
-                    let batch_seconds = 10.0;
-                    let mut optimal_n_in_flight = (estm_bw_bps * batch_seconds / 16384.0) as u32;
-                    optimal_n_in_flight = optimal_n_in_flight.min(1500).max(16);
+                //     // TODO: now send 10 senconds in batch
+                //     // maybe calculate this with response time
+                //     let batch_seconds = 10.0;
+                //     let mut optimal_n_in_flight = (estm_bw_bps * batch_seconds / 16384.0) as u32;
+                //     optimal_n_in_flight = optimal_n_in_flight.min(1500).max(16);
 
-                    dbg!(n_received, estm_bw_bps, optimal_n_in_flight);
+                //     dbg!(n_received, estm_bw_bps, optimal_n_in_flight);
 
-                    dbg!(h.n_block_in_flight);
-                    // let n_blk = pick_fn(n_received, h.n_block_in_flight);
-                    n_blk = if optimal_n_in_flight > h.n_block_in_flight {
-                        optimal_n_in_flight - h.n_block_in_flight
-                    } else {
-                        0
-                    };
-                }
-                warn!(
-                    "peer {addr} picking {n_blk} block in next period, {} in flight",
-                    h.n_block_in_flight
-                );
-                let (reqs, n) = piece_picker.pick_blocks(addr, n_blk as usize, now);
+                //     dbg!(h.n_block_in_flight);
+                //     // let n_blk = pick_fn(n_received, h.n_block_in_flight);
+                //     n_blk = if optimal_n_in_flight > h.n_block_in_flight {
+                //         optimal_n_in_flight - h.n_block_in_flight
+                //     } else {
+                //         0
+                //     };
+                // }
+                // warn!(
+                //     "peer {addr} picking {n_blk} block in next period, {} in flight",
+                //     h.n_block_in_flight
+                // );
+                let (reqs, n) = block_picker.pick_blocks(addr, 2 as usize);
                 h.conn.send_stream_cmd(ConnMsg::RequestBlocks(reqs));
             }
         }
@@ -521,8 +524,8 @@ impl TransmitWorker {
                 Ok(())
             }
             Msg::PeerBitField(addr, bitfield) => {
-                let piece_picker = match &mut self.torrent_state {
-                    TorrentState::Metadata(d) => &mut d.piece_picker,
+                let block_picker = match &mut self.torrent_state {
+                    TorrentState::Metadata(d) => &mut d.block_picker,
                     TorrentState::Fetching(_) => {
                         let pc = self
                             .connected_peers
@@ -532,30 +535,30 @@ impl TransmitWorker {
                         return Ok(());
                     }
                 };
-                piece_picker.peer_add(addr, bitfield);
+                block_picker.peer_add(addr, PieceState::Bitfield(bitfield));
                 Ok(())
             }
             Msg::PeerHave(peer, i) => {
                 info!("peer {peer} have piece {i}");
-                let piece_picker = match &mut self.torrent_state {
-                    TorrentState::Metadata(d) => &mut d.piece_picker,
+                let block_picker = match &mut self.torrent_state {
+                    TorrentState::Metadata(d) => &mut d.block_picker,
                     TorrentState::Fetching(_) => {
                         return Ok(());
                     }
                 };
 
-                piece_picker.peer_have(&peer, i);
+                block_picker.peer_new_have(&peer, i);
                 Ok(())
             }
             Msg::PeerChoke(peer) => {
                 warn!("{peer} choked us");
                 let piece_picker = match &mut self.torrent_state {
-                    TorrentState::Metadata(d) => &mut d.piece_picker,
+                    TorrentState::Metadata(d) => &mut d.block_picker,
                     TorrentState::Fetching(_) => {
                         return Ok(());
                     }
                 };
-                piece_picker.peer_mark_not_requested(&peer);
+                piece_picker.peer_choke(&peer);
                 self.connected_peers.entry(peer).and_modify(|st| {
                     st.state.peer_choke_status = ChokeStatus::Choked;
                 });
@@ -620,7 +623,7 @@ impl TransmitWorker {
                 // so we can estimate response_time
 
                 if conn_stat.state.peer_choke_status == ChokeStatus::Unchoked {
-                    self.pick_blocks_for_peer(&peer, n);
+                    self.pick_blocks_for_peer(&peer, 2);
                 }
                 Ok(())
 
@@ -668,17 +671,17 @@ impl TransmitWorker {
         p: &mut PieceBuf,
         metadata: &Metadata,
         connected_peers: &mut HashMap<PeerAddr, PeerConn>,
-        piece_picker: &mut HeapPiecePicker,
+        block_picker: &mut BlockPicker,
     ) {
         if Self::verify_piece(p, metadata) {
             p.flush(None);
             for (_, h) in connected_peers.iter() {
                 h.conn.send_stream_cmd(ConnMsg::Have(p.index() as u32));
             }
-            piece_picker.piece_checked(p.index() as u32);
+            block_picker.piece_verified(p.index() as u32, true);
         } else {
             info!("piece {} verify failed", p.index());
-            piece_picker.piece_revoke(p.index() as u32);
+            block_picker.piece_verified(p.index() as u32, false);
         }
     }
 
@@ -707,8 +710,8 @@ impl TransmitWorker {
             len: piece.len,
         };
 
-        let (piece_picker, metadata, storage) = match &mut self.torrent_state {
-            TorrentState::Metadata(d) => (&mut d.piece_picker, d.metadata.clone(), &mut d.storage),
+        let (block_picker, metadata, storage) = match &mut self.torrent_state {
+            TorrentState::Metadata(d) => (&mut d.block_picker, d.metadata.clone(), &mut d.storage),
             TorrentState::Fetching(_) => {
                 info!(
                     "receive PIECE msg {} {} {} block index {} before having metadata",
@@ -720,32 +723,24 @@ impl TransmitWorker {
                 return Ok(());
             }
         };
-        let piece_received = {
-            let mut receiving_guard =
-                if let Some(g) = start_receive_piece_block(piece_picker, peer, &blk) {
-                    g
-                } else {
-                    // TODO: why this happen (at testing)?
-                    // seems we are requesting twice for each piece
-                    warn!(
-                        "drain PIECE msg {} {} {} block index {}",
-                        piece.index,
-                        piece.begin,
-                        piece.len,
-                        piece.begin >> 14,
-                    );
-                    return Ok(());
-                };
 
-            debug!(
-                "receive PIECE msg {} {} {} block index {}",
+        let req = Request {
+            index: piece.index,
+            begin: piece.begin,
+            len: piece.len,
+        };
+        if !block_picker.want_block(req) {
+            warn!(
+                "discard PIECE msg {} {} {} block index {}",
                 piece.index,
                 piece.begin,
                 piece.len,
                 piece.begin >> 14,
             );
-            receiving_guard.piece_received()
-        };
+            return Ok(());
+        }
+
+        let piece_received = block_picker.receive_block(req);
 
         match Self::get_piecebuf(
             storage,
@@ -759,7 +754,7 @@ impl TransmitWorker {
                         piecebuf,
                         &metadata,
                         &mut self.connected_peers,
-                        piece_picker,
+                        block_picker,
                     );
                 }
             }
@@ -892,10 +887,10 @@ impl TransmitWorker {
                 TorrentState::Fetching(f) => {
                     if let Some(m) = f.receive_metadata_part(piece, data, total_size) {
                         let mut metadata = Self::metadata_into_downloading(m);
-                        let piece_picker = &mut metadata.piece_picker;
+                        let piece_picker = &mut metadata.block_picker;
                         for (addr, pc) in &mut self.connected_peers {
                             if let Some(map) = pc.bitmap.take() {
-                                piece_picker.peer_add(*addr, map);
+                                piece_picker.peer_add(*addr, PieceState::Bitfield(map));
                             }
                         }
                         self.torrent_state = TorrentState::Metadata(metadata);

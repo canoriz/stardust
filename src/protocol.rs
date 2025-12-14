@@ -7,6 +7,7 @@ use bt_bencode::ByteString;
 use bytes::BytesMut;
 use core::fmt;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use sha1::digest::typenum::bit;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Formatter;
@@ -1152,13 +1153,24 @@ impl std::fmt::Debug for Message {
 #[derive(Debug, Eq, PartialEq, Clone)]
 pub struct BitField {
     bitfield: Vec<u8>, // use array?
+
+    /// how many (1)s in there
+    count: u32,
 }
 
 impl BitField {
     const TYPE: u8 = 5;
 
     pub fn new(bitfield: Vec<u8>) -> Self {
-        Self { bitfield }
+        let mut count = 0;
+        for b in bitfield.iter() {
+            count += b.count_ones();
+        }
+        Self { bitfield, count }
+    }
+
+    pub fn with_bit_len(len: usize) -> Self {
+        Self::new(vec![0; (len + 7) / 8])
     }
 
     pub fn bitfield_bytes(&self) -> &[u8] {
@@ -1169,16 +1181,22 @@ impl BitField {
         self.bitfield.len() as u32
     }
 
-    pub fn set(&mut self, bit_index: u32) {
+    pub fn set(&mut self, bit_index: u32, set: bool) {
         let u8_index = bit_index >> 3;
         let bit_offset = 7 - (bit_index % 8);
-        self.bitfield[u8_index as usize] |= 1 << bit_offset;
+        let ptr = &mut self.bitfield[u8_index as usize];
+        let old = *ptr & (1 << bit_offset) > 0;
+        if set {
+            *ptr |= 1 << bit_offset;
+            self.count += (!old) as u32;
+        } else {
+            *ptr &= !(1 << bit_offset);
+            self.count -= (old) as u32;
+        }
     }
 
     pub fn unset(&mut self, bit_index: u32) {
-        let u8_index = bit_index >> 3;
-        let bit_offset = 7 - (bit_index % 8);
-        self.bitfield[u8_index as usize] &= !(1 << bit_offset);
+        self.set(bit_index, false)
     }
 
     pub fn get(&self, bit_index: u32) -> bool {
@@ -1187,7 +1205,11 @@ impl BitField {
         self.bitfield[u8_index as usize] & (1 << bit_offset) != 0
     }
 
-    pub fn iter(&self) -> BitFieldIter {
+    pub fn count_ones(&self) -> u32 {
+        self.count
+    }
+
+    pub fn iter<'a>(&'a self) -> BitFieldIter<'a> {
         let iter = self.bitfield.iter();
         BitFieldIter {
             u: 0,
@@ -1203,18 +1225,17 @@ where
 {
     fn from(v: T) -> Self {
         let s = v.as_ref();
-        Self {
-            bitfield: s
-                .chunks(8)
-                .map(|bs| {
-                    let mut ret = 0u8;
-                    for (i, b) in bs.iter().enumerate() {
-                        ret |= (*b as u8) << (7 - i);
-                    }
-                    ret
-                })
-                .collect(),
-        }
+        let bitfield = s
+            .chunks(8)
+            .map(|bs| {
+                let mut ret = 0u8;
+                for (i, b) in bs.iter().enumerate() {
+                    ret |= (*b as u8) << (7 - i);
+                }
+                ret
+            })
+            .collect();
+        Self::new(bitfield)
     }
 }
 
@@ -2381,11 +2402,21 @@ pub mod tests {
     #[test]
     fn test_bitfield() {
         let test_bits = [false, true, false, true, false, false, false, false, true];
-        let a = BitField::from(&test_bits);
+        let mut a = BitField::from(&test_bits);
+        assert_eq!(a.count, 3);
         assert_eq!(a.bitfield, [0b01010000, 0b10000000]);
         for (b1, b2) in a.iter().zip(test_bits.iter()) {
             assert_eq!(b1, *b2);
         }
+
+        a.set(5, true);
+        assert_eq!(a.count, 4);
+        a.set(5, true);
+        assert_eq!(a.count, 4);
+        a.set(5, false);
+        assert_eq!(a.count, 3);
+        a.set(5, false);
+        assert_eq!(a.count, 3);
     }
 
     pub async fn make_ends_tune(

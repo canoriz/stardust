@@ -1,16 +1,95 @@
-mod heap;
 use crate::bandwidth::Bandwidth;
 pub use crate::protocol::BitField;
 use crate::protocol::{self, Request};
 use heap::Heap;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
 use std::time;
 use tracing::{debug, info, warn};
 
+mod block_picker;
+mod heap;
+mod rarest_first;
+pub use block_picker::BlockPicker;
+pub use rarest_first::Picker as RarestPicker;
+
 const BLOCK_SIZE: u32 = 16384;
 pub(crate) const BW_SLOT_SIZE: usize = 10;
+
+impl PieceState {
+    pub fn have(&self, index: u32) -> bool {
+        match self {
+            PieceState::HaveAll => true,
+            PieceState::HaveNone => false,
+            PieceState::Bitfield(b) => b.get(index),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct PeerPieceDetail {
+    have: PieceState,
+    choke: bool,
+}
+
+#[derive(Debug)]
+pub enum PieceState {
+    HaveAll,
+    HaveNone,
+    Bitfield(BitField),
+}
+
+impl PeerPieceDetail {
+    pub fn have(&self, index: u32) -> bool {
+        match &self.have {
+            PieceState::HaveAll => true,
+            PieceState::HaveNone => false,
+            PieceState::Bitfield(b) => b.get(index),
+        }
+    }
+
+    pub fn choke(&self, index: u32) -> bool {
+        self.choke
+    }
+}
+
+pub type PeerAddr = SocketAddr;
+
+pub trait PiecePicker {
+    type T;
+
+    fn peer_add(&mut self, addr: PeerAddr, state: PieceState);
+    fn peer_leave(&mut self, addr: &PeerAddr);
+    fn peer_choke(&mut self, addr: &PeerAddr);
+    fn peer_unchoke(&mut self, addr: &PeerAddr);
+
+    /// called with peer send a HAVE to us
+    fn peer_new_have(&mut self, addr: &PeerAddr, index: u32);
+
+    /// show peer detail
+    fn peer_detail(&mut self, addr: &PeerAddr) -> Option<&Self::T>;
+
+    /// change selected piece set
+    fn select(&mut self, index: u32, want: bool);
+
+    /// returns this piece is selected or not
+    fn selected(&self, index: u32) -> bool;
+
+    /// set we have/not have this piece
+    fn set_have(&mut self, index: u32, have: bool);
+
+    /// returns if we have this piece
+    fn have(&self, index: u32) -> bool;
+
+    /// Pick next piece, returns id
+    /// and marks we have this piece
+    /// If later we don't receive this
+    /// call set_have(index, false) to reset it
+    fn pick_next(&mut self, addr: &PeerAddr) -> Option<u32>;
+
+    /// if we have all the piece we want
+    fn is_finished(&mut self) -> bool;
+}
 
 // TODO: maybe use peer_id instead of socketaddr?
 // pub trait Picker {
@@ -68,6 +147,7 @@ pub(crate) struct BlockRequests {
 //     }
 // }
 
+// Represents a continuous range of blocks
 // TODO: maybe change protocol::Request to use block-index
 // question: how to represent a part 16kib request?
 #[derive(Debug, Clone)]
@@ -116,24 +196,15 @@ pub struct BlockRangeIter {
 impl BlockRangeIter {
     fn one_request(&mut self, last_offset: u32) -> Option<<Self as Iterator>::Item> {
         if self.current_in_piece_offset < last_offset {
-            if self.current_in_piece_offset + BLOCK_SIZE > last_offset {
-                let step = last_offset - self.current_in_piece_offset;
-                let res = protocol::Request {
-                    index: self.current_piece,
-                    begin: self.current_in_piece_offset,
-                    len: step,
-                };
-                self.current_in_piece_offset += step;
-                Some(res)
-            } else {
-                let res = protocol::Request {
-                    index: self.current_piece,
-                    begin: self.current_in_piece_offset,
-                    len: BLOCK_SIZE,
-                };
-                self.current_in_piece_offset += BLOCK_SIZE;
-                Some(res)
-            }
+            let end = (self.current_in_piece_offset + BLOCK_SIZE).min(last_offset);
+            let step = end - self.current_in_piece_offset;
+            let res = protocol::Request {
+                index: self.current_piece,
+                begin: self.current_in_piece_offset,
+                len: step,
+            };
+            self.current_in_piece_offset += step;
+            Some(res)
         } else {
             None
         }
@@ -906,13 +977,13 @@ impl HeapPiecePicker {
 
     pub fn peer_have(&mut self, peer: &SocketAddr, piece: u32) {
         if let Some(s) = self.peer_status.get_mut(peer) {
-            s.bitfield.set(piece);
+            s.bitfield.set(piece, true);
             self.heap.increment_or(piece as usize, 1);
         } else {
             // if this peer is not stored, assume it is a new peer
             // TODO: maybe need a method for creating bitfield with given length?
             let mut b = BitField::from(vec![false; self.piece_total as usize]);
-            b.set(piece);
+            b.set(piece, true);
             self.peer_add(*peer, b);
             warn!("set have for a un-stored peer, socket addr: {peer}");
         }
