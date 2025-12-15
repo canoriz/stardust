@@ -346,6 +346,7 @@ pub type CapabilityMap = HashSet<Capability>;
 #[derive(Eq, Hash, PartialEq)]
 pub enum Capability {
     DHT,
+    Fast,
     Metadata,
     Pex,
 }
@@ -367,6 +368,9 @@ impl<T> BTStream<T> {
         let mut ret = CapabilityMap::new();
         if self.reserved.have_dht() {
             ret.insert(Capability::DHT);
+        }
+        if self.reserved.have_fast() {
+            ret.insert(Capability::Fast);
         }
         for id in self.extension_id.keys() {
             match id {
@@ -597,6 +601,7 @@ impl HandshakeOption {
         if self.dht_port.is_some() {
             func = func.set_dht();
         }
+        func = func.set_fast();
         let exth = ExtendedHandshake {
             m: map,
             p: self.port,
@@ -794,6 +799,26 @@ where
         send_port(&mut self.inner, port).await
     }
 
+    pub async fn send_reject(&mut self, index: u32, begin: u32, len: u32) -> io::Result<()> {
+        send_reject(&mut self.inner, index, begin, len).await
+    }
+
+    pub async fn send_allowed_fast(&mut self, index: u32) -> io::Result<()> {
+        send_allowed_fast(&mut self.inner, index).await
+    }
+
+    pub async fn send_suggest_piece(&mut self, index: u32) -> io::Result<()> {
+        send_suggest_piece(&mut self.inner, index).await
+    }
+
+    pub async fn send_have_all(&mut self) -> io::Result<()> {
+        send_have_all(&mut self.inner).await
+    }
+
+    pub async fn send_have_none(&mut self) -> io::Result<()> {
+        send_have_none(&mut self.inner).await
+    }
+
     pub async fn send_extend_pex(
         &mut self,
         now_connected: &HashMap<IpAddr, Option<PexFlag>>,
@@ -905,6 +930,26 @@ where
 
     pub async fn send_port(&mut self, port: u16) -> io::Result<()> {
         send_port(&mut self.inner, port).await
+    }
+
+    pub async fn send_reject(&mut self, index: u32, begin: u32, len: u32) -> io::Result<()> {
+        send_reject(&mut self.inner, index, begin, len).await
+    }
+
+    pub async fn send_allowed_fast(&mut self, index: u32) -> io::Result<()> {
+        send_allowed_fast(&mut self.inner, index).await
+    }
+
+    pub async fn send_suggest_piece(&mut self, index: u32) -> io::Result<()> {
+        send_suggest_piece(&mut self.inner, index).await
+    }
+
+    pub async fn send_have_all(&mut self) -> io::Result<()> {
+        send_have_all(&mut self.inner).await
+    }
+
+    pub async fn send_have_none(&mut self) -> io::Result<()> {
+        send_have_none(&mut self.inner).await
     }
 
     pub async fn send_extend_pex(
@@ -1052,6 +1097,11 @@ impl MsgTy {
     const CANCEL: u8 = 8;
     const PORT: u8 = 9;
     const EXTENDED: u8 = 20;
+    const HAVE_ALL: u8 = 0x0e;
+    const HAVE_NONE: u8 = 0x0f;
+    const SUGGEST_PIECE: u8 = 0x0d;
+    const REJECT: u8 = 0x10;
+    const ALLOWED_FAST: u8 = 0x11;
 
     const KEEPALIVE_LEN: u32 = 0;
     const CHOKE_LEN: u32 = 1;
@@ -1064,6 +1114,11 @@ impl MsgTy {
     // const  PIECE_LEN(_) : u32= unimplemented!();
     const CANCEL_LEN: u32 = 13;
     const PORT_LEN: u32 = 3;
+    const HAVE_ALL_LEN: u32 = 1;
+    const HAVE_NONE_LEN: u32 = 1;
+    const SUGGEST_PIECE_LEN: u32 = 5;
+    const REJECT_LEN: u32 = 13;
+    const ALLOWED_FAST_LEN: u32 = 5;
 }
 
 #[derive(Eq, PartialEq)]
@@ -1079,6 +1134,11 @@ pub enum Message {
     Piece(Piece),
     Cancel(Request),
     Port(u16),
+    SuggestPiece(u32),
+    AllowedFast(u32),
+    HaveAll,
+    HaveNone,
+    Reject(Request),
     Extended(ExtendedMsg),
 }
 
@@ -1095,6 +1155,11 @@ pub enum MessageHeader {
     Piece { index: u32, begin: u32, len: u32 },
     Cancel(Request),
     Port(u16),
+    SuggestPiece(u32),
+    AllowedFast(u32),
+    HaveAll,
+    HaveNone,
+    Reject(Request),
     Extended { id: u8, len: usize },
     Discard { len: usize },
 }
@@ -1102,50 +1167,32 @@ pub enum MessageHeader {
 impl std::fmt::Debug for Message {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Message::KeepAlive => {
-                f.write_str("KeepAlive")?;
-            }
-            Message::Choke => {
-                f.write_str("Choke")?;
-            }
-            Message::Unchoke => {
-                f.write_str("Unchoke")?;
-            }
-            Message::Interested => {
-                f.write_str("Interested")?;
-            }
-            Message::NotInterested => {
-                f.write_str("Notinterested")?;
-            }
-            Message::Have(h) => {
-                h.fmt(f)?;
-            }
-            Message::BitField(bit_field) => {
-                f.debug_struct("BitField")
-                    .field("byte length", &bit_field.u8_len())
-                    .finish()?;
-            }
-            Message::Request(request) => {
-                request.fmt(f)?;
-            }
-            Message::Piece(piece) => {
-                f.debug_struct("Piece")
-                    .field("index", &piece.index)
-                    .field("begin", &piece.begin)
-                    .field("len", &piece.len)
-                    .finish()?;
-            }
-            Message::Cancel(request) => {
-                request.fmt(f)?;
-            }
-            Message::Port(p) => {
-                f.write_str(&format!("Port: {}", *p))?;
-            }
-            Message::Extended(extend) => {
-                extend.fmt(f)?;
-            }
-        };
-        Ok(())
+            Message::KeepAlive => f.write_str("KeepAlive"),
+            Message::Choke => f.write_str("Choke"),
+            Message::Unchoke => f.write_str("Unchoke"),
+            Message::Interested => f.write_str("Interested"),
+            Message::NotInterested => f.write_str("NotInterested"),
+            Message::Have(h) => f.write_str(&format!("Have: {}", *h)),
+            Message::BitField(bit_field) => f
+                .debug_struct("BitField")
+                .field("byte length", &bit_field.u8_len())
+                .finish(),
+            Message::Request(request) => f.debug_struct("Request").field("inner", request).finish(),
+            Message::Piece(piece) => f
+                .debug_struct("Piece")
+                .field("index", &piece.index)
+                .field("begin", &piece.begin)
+                .field("len", &piece.len)
+                .finish(),
+            Message::Cancel(request) => f.debug_struct("Cancel").field("inner", request).finish(),
+            Message::Port(p) => f.write_str(&format!("Port: {}", *p)),
+            Message::Extended(extend) => extend.fmt(f),
+            Message::SuggestPiece(p) => f.write_str(&format!("SuggestPiece: {}", *p)),
+            Message::AllowedFast(p) => f.write_str(&format!("AllowedFast: {}", *p)),
+            Message::HaveAll => f.write_str("HaveAll"),
+            Message::HaveNone => f.write_str("HaveNone"),
+            Message::Reject(request) => f.debug_struct("Reject").field("inner", request).finish(),
+        }
     }
 }
 
@@ -1818,6 +1865,46 @@ async fn send_port<T: AsyncWrite + Unpin>(handle: &mut T, port: u16) -> io::Resu
     handle.flush().await
 }
 
+async fn send_have_all<T: AsyncWrite + Unpin>(handle: &mut T) -> io::Result<()> {
+    handle.write_u32(MsgTy::HAVE_ALL_LEN).await?;
+    handle.write_u8(MsgTy::HAVE_ALL).await?;
+    handle.flush().await
+}
+
+async fn send_have_none<T: AsyncWrite + Unpin>(handle: &mut T) -> io::Result<()> {
+    handle.write_u32(MsgTy::HAVE_NONE_LEN).await?;
+    handle.write_u8(MsgTy::HAVE_NONE).await?;
+    handle.flush().await
+}
+
+async fn send_reject<T: AsyncWrite + Unpin>(
+    handle: &mut T,
+    index: u32,
+    begin: u32,
+    len: u32,
+) -> io::Result<()> {
+    handle.write_u32(MsgTy::REJECT_LEN).await?;
+    handle.write_u8(MsgTy::REJECT).await?;
+    handle.write_u32(index).await?;
+    handle.write_u32(begin).await?;
+    handle.write_u32(len).await?;
+    handle.flush().await
+}
+
+async fn send_suggest_piece<T: AsyncWrite + Unpin>(handle: &mut T, index: u32) -> io::Result<()> {
+    handle.write_u32(MsgTy::SUGGEST_PIECE_LEN).await?;
+    handle.write_u8(MsgTy::SUGGEST_PIECE).await?;
+    handle.write_u32(index).await?;
+    handle.flush().await
+}
+
+async fn send_allowed_fast<T: AsyncWrite + Unpin>(handle: &mut T, index: u32) -> io::Result<()> {
+    handle.write_u32(MsgTy::ALLOWED_FAST_LEN).await?;
+    handle.write_u8(MsgTy::ALLOWED_FAST).await?;
+    handle.write_u32(index).await?;
+    handle.flush().await
+}
+
 async fn discard_remain<T>(reader: &mut T, state: &mut PartialExtend) -> io::Result<()>
 where
     T: AsyncRead + Unpin,
@@ -1890,6 +1977,11 @@ where
                     MessageHeader::Request(req) => return Ok(Message::Request(req)),
                     MessageHeader::Cancel(req) => return Ok(Message::Cancel(req)),
                     MessageHeader::Port(port) => return Ok(Message::Port(port)),
+                    MessageHeader::HaveAll => return Ok(Message::HaveAll),
+                    MessageHeader::HaveNone => return Ok(Message::HaveNone),
+                    MessageHeader::SuggestPiece(index) => return Ok(Message::SuggestPiece(index)),
+                    MessageHeader::AllowedFast(index) => return Ok(Message::AllowedFast(index)),
+                    MessageHeader::Reject(req) => return Ok(Message::Reject(req)),
                 }
             }
             PartialRead::BitField(p) => {
@@ -2004,7 +2096,15 @@ where
             state.filled = 0;
             Ok(MessageHeader::NotInterested)
         }
-        MsgTy::HAVE => {
+        MsgTy::HAVE_ALL => {
+            state.filled = 0;
+            Ok(MessageHeader::HaveAll)
+        }
+        MsgTy::HAVE_NONE => {
+            state.filled = 0;
+            Ok(MessageHeader::HaveNone)
+        }
+        m @ MsgTy::HAVE | m @ MsgTy::ALLOWED_FAST | m @ MsgTy::SUGGEST_PIECE => {
             // TODO: check length match, absorb remain length in case
             // unimplemented extension
             assert!(state.filled >= 5);
@@ -2020,14 +2120,21 @@ where
                 filled_len += n;
             }
             state.filled = 0;
-            Ok(MessageHeader::Have(u32::from_be_bytes(state.field1)))
+
+            let field1 = u32::from_be_bytes(state.field1);
+            match m {
+                MsgTy::HAVE => Ok(MessageHeader::Have(field1)),
+                MsgTy::ALLOWED_FAST => Ok(MessageHeader::AllowedFast(field1)),
+                MsgTy::SUGGEST_PIECE => Ok(MessageHeader::SuggestPiece(field1)),
+                _ => unreachable!(),
+            }
         }
         MsgTy::BITFIELD => {
             let capacity = (len - 1) as usize;
             state.filled = 0;
             Ok(MessageHeader::BitField { capacity })
         }
-        MsgTy::REQUEST => {
+        m @ MsgTy::REQUEST | m @ MsgTy::CANCEL | m @ MsgTy::REJECT => {
             // TODO: check length match
             assert!(state.filled >= 5);
             let mut filled_len = state.filled - 5;
@@ -2074,7 +2181,12 @@ where
             }
             let len = u32::from_be_bytes(state.field3);
             state.filled = 0;
-            Ok(MessageHeader::Request(Request { index, begin, len }))
+            match m {
+                MsgTy::REQUEST => Ok(MessageHeader::Request(Request { index, begin, len })),
+                MsgTy::CANCEL => Ok(MessageHeader::Cancel(Request { index, begin, len })),
+                MsgTy::REJECT => Ok(MessageHeader::Reject(Request { index, begin, len })),
+                _ => unreachable!(),
+            }
         }
         MsgTy::PIECE => {
             // TODO: check length match
@@ -2134,56 +2246,6 @@ where
             state.filled = 0;
             let port = u16::from_be_bytes([state.field1[0], state.field1[1]]);
             Ok(MessageHeader::Port(port))
-        }
-        MsgTy::CANCEL => {
-            // TODO: check length match
-            assert!(state.filled >= 5);
-            let mut filled_len = state.filled - 5;
-            while filled_len < 4 {
-                let n = reader.read(&mut state.field1[filled_len..4]).await?;
-                state.filled += n;
-                if n == 0 {
-                    // Go has ZeroReadIsEof, in TCP, this should be true
-                    // TODO: use custom error
-                    warn!("closed conn");
-                    return Err(io::Error::new(io::ErrorKind::BrokenPipe, "!"));
-                }
-                filled_len += n;
-            }
-            let index = u32::from_be_bytes(state.field1);
-
-            assert!(state.filled >= 9);
-            let mut filled_len = state.filled - 9;
-            while filled_len < 4 {
-                let n = reader.read(&mut state.field2[filled_len..4]).await?;
-                state.filled += n;
-                if n == 0 {
-                    // Go has ZeroReadIsEof, in TCP, this should be true
-                    // TODO: use custom error
-                    warn!("closed conn");
-                    return Err(io::Error::new(io::ErrorKind::BrokenPipe, "!"));
-                }
-                filled_len += n;
-            }
-            let begin = u32::from_be_bytes(state.field2);
-
-            assert!(state.filled >= 13);
-            let mut filled_len = state.filled - 13;
-            while filled_len < 4 {
-                let n = reader.read(&mut state.field3[filled_len..4]).await?;
-                state.filled += n;
-                if n == 0 {
-                    // Go has ZeroReadIsEof, in TCP, this should be true
-                    // TODO: use custom error
-                    warn!("closed conn");
-                    return Err(io::Error::new(io::ErrorKind::BrokenPipe, "!"));
-                }
-                filled_len += n;
-            }
-            let len = u32::from_be_bytes(state.field3);
-
-            state.filled = 0;
-            Ok(MessageHeader::Cancel(Request { index, begin, len }))
         }
         MsgTy::EXTENDED => {
             let capacity = (len - 2) as usize;
@@ -2788,6 +2850,99 @@ pub mod tests {
         let received = p2r.recv_msg().await.expect("should recv ok");
         let msg = extract_enum!(received, Message::Port);
         assert_eq!(msg, 4133);
+    }
+
+    #[tokio::test]
+    async fn reject() {
+        let (mut peer1, mut peer2) = make_ends().await;
+        peer1
+            .send_reject(1, 0, 16384)
+            .await
+            .expect("should send ok");
+        let received = peer2.recv_msg().await.expect("should recv ok");
+
+        let msg = extract_enum!(received, Message::Reject);
+        assert_eq!(
+            msg,
+            Request {
+                index: 1,
+                begin: 0,
+                len: 16384
+            }
+        );
+
+        let ((_, mut p1w), (mut p2r, _)) = make_ends_split().await;
+        p1w.send_reject(1, 0, 16384).await.expect("should send ok");
+        let received = p2r.recv_msg().await.expect("should recv ok");
+        let msg = extract_enum!(received, Message::Reject);
+        assert_eq!(
+            msg,
+            Request {
+                index: 1,
+                begin: 0,
+                len: 16384
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn suggest_piece() {
+        let (mut peer1, mut peer2) = make_ends().await;
+        peer1.send_suggest_piece(4).await.expect("should send ok");
+        let received = peer2.recv_msg().await.expect("should recv ok");
+
+        let msg = extract_enum!(received, Message::SuggestPiece);
+        assert_eq!(msg, 4);
+
+        let ((_, mut p1w), (mut p2r, _)) = make_ends_split().await;
+        p1w.send_suggest_piece(4).await.expect("should send ok");
+        let received = p2r.recv_msg().await.expect("should recv ok");
+        let msg = extract_enum!(received, Message::SuggestPiece);
+        assert_eq!(msg, 4);
+    }
+
+    #[tokio::test]
+    async fn allowed_fast() {
+        let (mut peer1, mut peer2) = make_ends().await;
+        peer1.send_allowed_fast(4).await.expect("should send ok");
+        let received = peer2.recv_msg().await.expect("should recv ok");
+
+        let msg = extract_enum!(received, Message::AllowedFast);
+        assert_eq!(msg, 4);
+
+        let ((_, mut p1w), (mut p2r, _)) = make_ends_split().await;
+        p1w.send_allowed_fast(4).await.expect("should send ok");
+        let received = p2r.recv_msg().await.expect("should recv ok");
+        let msg = extract_enum!(received, Message::AllowedFast);
+        assert_eq!(msg, 4);
+    }
+
+    #[tokio::test]
+    async fn have_all() {
+        let (mut peer1, mut peer2) = make_ends().await;
+        peer1.send_have_all().await.expect("should send ok");
+        let received = peer2.recv_msg().await.expect("should recv ok");
+
+        assert!(matches!(received, Message::HaveAll));
+
+        let ((_, mut p1w), (mut p2r, _)) = make_ends_split().await;
+        p1w.send_have_all().await.expect("should send ok");
+        let received = p2r.recv_msg().await.expect("should recv ok");
+        assert!(matches!(received, Message::HaveAll));
+    }
+
+    #[tokio::test]
+    async fn have_none() {
+        let (mut peer1, mut peer2) = make_ends().await;
+        peer1.send_have_none().await.expect("should send ok");
+        let received = peer2.recv_msg().await.expect("should recv ok");
+
+        assert!(matches!(received, Message::HaveNone));
+
+        let ((_, mut p1w), (mut p2r, _)) = make_ends_split().await;
+        p1w.send_have_none().await.expect("should send ok");
+        let received = p2r.recv_msg().await.expect("should recv ok");
+        assert!(matches!(received, Message::HaveNone));
     }
 
     #[tokio::test]

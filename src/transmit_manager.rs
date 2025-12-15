@@ -45,10 +45,15 @@ pub(crate) enum Msg {
     PeerUnchoke(PeerAddr),
     PeerInterested(PeerAddr),
     PeerUninterested(PeerAddr),
-    PeerBitField(PeerAddr, BitField),
+    PeerPieceState(PeerAddr, PieceState),
     PeerHave(PeerAddr, u32),
     PeerRecvPiece(PeerAddr, Piece),
     PeerDhtPort(PeerAddr, u16),
+    PeerSuggestPiece(PeerAddr, u32),
+    PeerAllowedFast(PeerAddr, u32),
+    PeerCancel(PeerAddr, Request),
+    PeerReject(PeerAddr, Request),
+    PeerRequest(PeerAddr, Request),
 
     PieceBufReady {
         index: usize,
@@ -491,7 +496,7 @@ impl TransmitWorker {
                 self.connected_peers.remove(&addr);
                 Ok(())
             }
-            Msg::PeerBitField(addr, bitfield) => {
+            Msg::PeerPieceState(addr, state) => {
                 let block_picker = match &mut self.torrent_state {
                     TorrentState::Metadata(d) => &mut d.block_picker,
                     TorrentState::Fetching(_) => {
@@ -499,11 +504,11 @@ impl TransmitWorker {
                             .connected_peers
                             .get_mut(&addr)
                             .expect("connection should in map");
-                        pc.bitmap = Some(PieceState::Bitfield(bitfield));
+                        pc.bitmap = Some(state);
                         return Ok(());
                     }
                 };
-                block_picker.peer_add(addr, PieceState::Bitfield(bitfield));
+                block_picker.peer_add(addr, state);
                 Ok(())
             }
             Msg::PeerHave(peer, i) => {
@@ -599,6 +604,31 @@ impl TransmitWorker {
             Msg::PieceBufReady { index, buf } => self.handle_piecebuf_ready(index, buf),
             Msg::ExtendMetadata(pa, m) => {
                 self.handle_extend_metadata(pa, m);
+                Ok(())
+            }
+            Msg::PeerSuggestPiece(addr, index) => {
+                info!("{addr} suggest piece {index}");
+                Ok(())
+            }
+            Msg::PeerAllowedFast(addr, index) => {
+                info!("{addr} allowed fast {index}");
+                Ok(())
+            }
+            Msg::PeerCancel(addr, req) => {
+                info!("{addr} cancel {req:?}");
+                Ok(())
+            }
+            Msg::PeerReject(addr, req) => {
+                self.handle_reject_msg(addr, req);
+                Ok(())
+            }
+            Msg::PeerRequest(addr, req) => {
+                // TODO: optimize: handle can be passed so avoid map search overhead
+                if let Some(conn) = self.connected_peers.get_mut(&addr) {
+                    if conn.conn.capability().contains(&protocol::Capability::Fast) {
+                        conn.conn.send_stream_cmd(ConnMsg::Reject(req));
+                    }
+                }
                 Ok(())
             }
         }
@@ -783,6 +813,16 @@ impl TransmitWorker {
                 return Err(e);
             }
         }
+    }
+
+    fn handle_reject_msg(&mut self, peer: SocketAddr, req: Request) {
+        debug!("{peer} rejects {req:?}");
+
+        let block_picker = match &mut self.torrent_state {
+            TorrentState::Metadata(d) => &mut d.block_picker,
+            TorrentState::Fetching(_) => return,
+        };
+        block_picker.peer_reject_block(&peer, req);
     }
 
     fn handle_dht_port_msg(&mut self, mut addr: PeerAddr, port: u16) -> io::Result<()> {

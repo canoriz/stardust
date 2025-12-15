@@ -14,10 +14,10 @@ use tracing::{info, warn};
 use crate::bandwidth::Bandwidth;
 use crate::cache::{AbortErr, ArcCache, BufStorage, GetRefErr, PieceBuf, PieceKey, Ref};
 use crate::metadata::{self, Metadata};
-use crate::picker::{start_receive_piece_block, BlockRequests, HeapPiecePicker};
+use crate::picker::{start_receive_piece_block, BlockRequests, HeapPiecePicker, PieceState};
 use crate::protocol::{
     self, BTStream, Capability, CapabilityMap, Conn, ExtendedMetadata, ExtendedMsg, Message, Piece,
-    ReadStream, Reader, Split, WriteStream, Writer,
+    ReadStream, Reader, Request, Split, WriteStream, Writer,
 };
 use crate::transmit_manager::{Downloading, TransmitManagerHandle};
 use crate::transmit_manager::{Msg as TransmitMsg, TorrentState};
@@ -35,6 +35,7 @@ pub(crate) enum Msg {
     RequestBlocks(BlockRequests),
     Have(u32),
     Extend(ExtendedMsg),
+    Reject(Request),
 
     // SendBlocks(BlockRange),
     SetWakeUp(WakeUpOption),
@@ -169,6 +170,10 @@ impl ConnectionManagerHandle {
         self.capability.contains(&Capability::Metadata)
     }
 
+    pub fn capability(&self) -> &CapabilityMap {
+        &self.capability
+    }
+
     pub fn metadata_size(&self) -> usize {
         self.metadata_size
     }
@@ -300,7 +305,7 @@ where
     T: AsyncRead + Unpin,
 {
     fn handle_report_tick(&mut self, interval: time::Duration) {
-        const TRACE_WINDOW: usize = 8;
+        const TRACE_WINDOW: usize = 30;
         if self.history_n_recv_req.len() < TRACE_WINDOW {
             self.history_n_recv_req
                 .push_back(self.n_recv_req.load(Ordering::Relaxed));
@@ -382,29 +387,43 @@ where
             Message::BitField(bf) => {
                 info!("bf");
                 // TODO: handle error
-                tmh.sender.send(TransmitMsg::PeerBitField(addr, bf));
+                tmh.sender
+                    .send(TransmitMsg::PeerPieceState(addr, PieceState::Bitfield(bf)));
             }
-            Message::Request(request) => {
-                // TODO:
-                // if in cache, mark cache in use
-                // add to send queue, wake sending task
-                // if not in cache, send to background fetch task
-                // when block fetched, wake sending task
+            Message::Request(req) => {
+                tmh.sender.send(TransmitMsg::PeerRequest(addr, req));
             }
             Message::Piece(piece) => {
                 self.bw.add(piece.len as usize);
                 self.n_recv_req.fetch_add(1, Ordering::Relaxed);
                 tmh.sender.send(TransmitMsg::PeerRecvPiece(addr, piece));
             }
-            Message::Cancel(request) => {
-                // TODO: cancel pending request/fetch task
-                // todo!();
+            Message::Cancel(req) => {
+                tmh.sender.send(TransmitMsg::PeerCancel(addr, req));
             }
             Message::Port(port) => {
                 tmh.sender.send(TransmitMsg::PeerDhtPort(addr, port));
             }
             Message::Extended(extend) => {
                 handle_extended_msg(&addr, tmh, extend).await;
+            }
+            Message::SuggestPiece(index) => {
+                tmh.sender.send(TransmitMsg::PeerSuggestPiece(addr, index));
+            }
+            Message::AllowedFast(index) => {
+                tmh.sender.send(TransmitMsg::PeerAllowedFast(addr, index));
+            }
+            Message::HaveAll => {
+                tmh.sender
+                    .send(TransmitMsg::PeerPieceState(addr, PieceState::HaveAll));
+            }
+            Message::HaveNone => {
+                tmh.sender
+                    .send(TransmitMsg::PeerPieceState(addr, PieceState::HaveNone));
+            }
+            Message::Reject(req) => {
+                self.n_recv_req.fetch_add(1, Ordering::Relaxed);
+                tmh.sender.send(TransmitMsg::PeerReject(addr, req));
             }
         }
     }

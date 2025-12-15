@@ -131,7 +131,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // let mut tm = TransmitManager::new(metadata).with_announce_list(announce_list);
-    let magnet: Magnet = "magnet:?xt=urn:btih:be195f263108ad2241c2ae1fb9e277f7731fbe5f".parse()?;
+    let magnet: Magnet = "magnet:?xt=urn:btih:08cf8043008576cbf88d94d5fb1aeb4232fdd747".parse()?;
     let trackers = magnet.tr.clone();
     let mut tm = TorrentManagerHandle::new(
         TorrentTask::Magnet(magnet),

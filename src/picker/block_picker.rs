@@ -125,19 +125,21 @@ impl PieceBlocks {
 
     /// inform some block request is rejected or no response, and
     /// should be send to other peers
-    fn revoke(&mut self, req: Request) {
+    fn revoke(&mut self, peer: &PeerAddr, req: Request) {
         let b_index = (req.begin as usize) / BLOCK_SIZE;
         let b = &mut self.block_map[b_index];
         #[cfg(test)]
         println!("{b:?}");
         match b {
-            BlockStatus::Requested { .. } => {
+            BlockStatus::Requested { addr, .. } if addr == peer => {
+                // A peer can only be revoked if it's requested before
                 *b = BlockStatus::NotRequested;
                 if self.all_request_or_received_before > b_index {
                     self.all_request_or_received_before = b_index;
                 }
                 self.requested_or_received_count -= 1;
             }
+            BlockStatus::Requested { .. } => {}
             BlockStatus::NotRequested => {}
             BlockStatus::Received => {}
         }
@@ -292,15 +294,15 @@ impl BlockPicker {
 
     /// Call then some block request is rejected, and request for that block
     /// should be send to other peers again.
-    pub fn revoke_block(&mut self, req: Request) {
+    pub fn peer_reject_block(&mut self, peer: &PeerAddr, req: Request) {
         if let Some(b) = self.receiving.get_mut(&req.index) {
-            b.revoke(req);
+            b.revoke(peer, req);
             if !b.is_all_received() {
                 self.requesting.insert(req.index, b.clone());
                 self.receiving.remove(&req.index);
             }
         } else if let Some(b) = self.requesting.get_mut(&req.index) {
-            b.revoke(req);
+            b.revoke(peer, req);
             if b.is_all_not_requested() {
                 self.piece_picker.set_have(req.index, false);
                 self.requesting.remove(&req.index);
@@ -602,11 +604,30 @@ mod test {
         }
         {
             // test revoke
-            b.revoke(Request {
-                index: 0,
-                begin: 17 * 16384,
-                len: 16384,
-            });
+            b.revoke(
+                &PEER1,
+                Request {
+                    index: 0,
+                    begin: 17 * 16384,
+                    len: 16384,
+                },
+            );
+            assert!(!b.is_all_requested_or_received());
+            assert!(!b.is_all_received());
+            assert_eq!(b.all_request_or_received_before, 17);
+            assert_eq!(b.received_count, 11);
+            assert_eq!(b.requested_or_received_count, 49);
+        }
+        {
+            // test revoke others should fail
+            b.revoke(
+                &PEER2,
+                Request {
+                    index: 0,
+                    begin: 32 * 16384,
+                    len: 16384,
+                },
+            );
             assert!(!b.is_all_requested_or_received());
             assert!(!b.is_all_received());
             assert_eq!(b.all_request_or_received_before, 17);
