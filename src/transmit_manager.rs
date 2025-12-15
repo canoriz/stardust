@@ -92,7 +92,7 @@ struct PeerStatus {
 struct PeerConn {
     conn: ConnectionManagerHandle,
     state: PeerStatus,
-    bitmap: Option<BitField>,
+    bitmap: Option<PieceState>,
 
     last_pick_time: time::Instant,
 
@@ -499,7 +499,7 @@ impl TransmitWorker {
                             .connected_peers
                             .get_mut(&addr)
                             .expect("connection should in map");
-                        pc.bitmap = Some(bitfield);
+                        pc.bitmap = Some(PieceState::Bitfield(bitfield));
                         return Ok(());
                     }
                 };
@@ -511,6 +511,9 @@ impl TransmitWorker {
                 let block_picker = match &mut self.torrent_state {
                     TorrentState::Metadata(d) => &mut d.block_picker,
                     TorrentState::Fetching(_) => {
+                        if let Some(pc) = self.connected_peers.get_mut(&peer) {
+                            pc.bitmap.as_mut().map(|bm| bm.set_have2(i));
+                        }
                         return Ok(());
                     }
                 };
@@ -845,14 +848,25 @@ impl TransmitWorker {
             } => match &mut self.torrent_state {
                 TorrentState::Fetching(f) => {
                     if let Some(m) = f.receive_metadata_part(piece, data, total_size) {
-                        let mut metadata = Self::metadata_into_downloading(m);
-                        let piece_picker = &mut metadata.block_picker;
+                        let mut downloading = Self::metadata_into_downloading(m);
+                        let piece_picker = &mut downloading.block_picker;
                         for (addr, pc) in &mut self.connected_peers {
-                            if let Some(map) = pc.bitmap.take() {
-                                piece_picker.peer_add(*addr, PieceState::Bitfield(map));
+                            if let Some(mut ps) = pc.bitmap.take() {
+                                // bit field map got in `Fetching` state may be the same length
+                                // as piece number.
+                                // Resize BitField map to the exact size of pieces
+                                match &mut ps {
+                                    PieceState::Bitfield(b) => {
+                                        b.resize(downloading.metadata.total_pieces() as u32)
+                                    }
+                                    _ => {}
+                                }
+                                piece_picker.peer_add(*addr, ps);
+                            } else {
+                                piece_picker.peer_add(*addr, PieceState::HaveNone);
                             }
                         }
-                        self.torrent_state = TorrentState::Metadata(metadata);
+                        self.torrent_state = TorrentState::Metadata(downloading);
                     } else {
                         // if we don't have metadata yet, fetch more from this peer
                         Self::fetching_metadata_from_peer_addr(

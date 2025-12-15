@@ -40,6 +40,22 @@ pub enum PieceState {
 }
 
 impl PieceState {
+    /// set index to 1
+    pub fn set_have2(&mut self, index: u32) {
+        match self {
+            PieceState::HaveAll => {}
+            PieceState::HaveNone => {
+                let mut b = BitField::with_bit_len(index as usize);
+                b.set(index, true);
+                *self = PieceState::Bitfield(b);
+            }
+            PieceState::Bitfield(b) => {
+                b.set(index, true);
+            }
+        }
+    }
+
+    /// set index to `have`. set or unset one index.
     pub fn set_have(&mut self, n_piece: usize, index: u32, have: bool) {
         match self {
             PieceState::HaveAll => {

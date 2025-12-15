@@ -41,13 +41,7 @@ impl Metadata {
     }
 
     pub fn total_pieces(&self) -> usize {
-        let n_full_piece = self.len() / self.regular_piece_size();
-        let full_piece_total_size = n_full_piece * self.regular_piece_size();
-        if full_piece_total_size == self.len() {
-            n_full_piece
-        } else {
-            n_full_piece + 1
-        }
+        (self.len() + self.regular_piece_size() - 1) / self.regular_piece_size()
     }
 
     pub fn piece_size_of(&self, index: u32) -> usize {

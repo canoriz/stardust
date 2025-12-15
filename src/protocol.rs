@@ -1181,6 +1181,9 @@ impl BitField {
     }
 
     pub fn set(&mut self, bit_index: u32, set: bool) {
+        if bit_index as usize > self.bitfield.len() * 8 {
+            self.resize(bit_index);
+        }
         let u8_index = bit_index >> 3;
         let bit_offset = 7 - (bit_index % 8);
         let ptr = &mut self.bitfield[u8_index as usize];
@@ -1191,6 +1194,20 @@ impl BitField {
         } else {
             *ptr &= !(1 << bit_offset);
             self.count -= (old) as u32;
+        }
+    }
+
+    /// expand or shrink BitField, expand with zero
+    /// shrink clears out bits in shrink section
+    pub fn resize(&mut self, new_size: u32) {
+        let new_u8_size = ((new_size + 7) / 8) as usize;
+        if new_size as usize > self.bitfield.len() * 8 {
+            self.bitfield.resize(new_u8_size, 0);
+        } else {
+            for i in new_size..((self.bitfield.len() * 8) as u32) {
+                self.set(i as u32, false);
+            }
+            self.bitfield.resize(new_u8_size, 0);
         }
     }
 
@@ -2384,6 +2401,21 @@ pub mod tests {
         assert_eq!(a.count, 3);
         a.set(5, false);
         assert_eq!(a.count, 3);
+    }
+
+    #[test]
+    fn test_bitfield_set_resize() {
+        let test_bits = [false, true, false, true, false, true, false, false];
+        let mut a = BitField::from(&test_bits);
+        assert_eq!(a.count, 3);
+        assert_eq!(a.bitfield, [0b01010100]);
+        a.resize(4);
+        assert_eq!(a.count, 2);
+        assert_eq!(a.bitfield, [0b01010000]);
+
+        a.set(9, true);
+        assert_eq!(a.count, 3);
+        assert_eq!(a.bitfield, [0b01010000, 0b01000000]);
     }
 
     pub async fn make_ends_tune(
