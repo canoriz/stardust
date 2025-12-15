@@ -7,7 +7,6 @@ use bt_bencode::ByteString;
 use bytes::BytesMut;
 use core::fmt;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use sha1::digest::typenum::bit;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Formatter;
@@ -1366,38 +1365,6 @@ pub struct ExtendedHandshake {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata_size: Option<u32>, // size of metadata
-}
-
-pub struct ExtendedHandshakeBuilder {
-    h: ExtendedHandshake,
-}
-
-impl ExtendedHandshakeBuilder {
-    pub fn build(self) -> ExtendedHandshake {
-        self.h
-    }
-
-    pub fn metadata_size(mut self, size: u32) -> Self {
-        self.h.metadata_size = Some(size);
-        self
-    }
-}
-
-impl ExtendedHandshake {
-    pub fn builder(port: u16, version: &str) -> ExtendedHandshakeBuilder {
-        ExtendedHandshakeBuilder {
-            h: ExtendedHandshake {
-                m: EXTENSION_IDS_MAP.clone(),
-                p: Some(port),
-                v: Some(version.into()),
-                yourip: None,
-                ipv6: None,
-                ipv4: None,
-                reqq: None,
-                metadata_size: None,
-            },
-        }
-    }
 }
 
 type MetadataMsgType = u8;

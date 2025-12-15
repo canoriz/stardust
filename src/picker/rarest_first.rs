@@ -144,21 +144,17 @@ impl PiecePicker for Picker {
         }
 
         if let Some(d) = self.peers.get_mut(addr) {
-            match &mut d.have {
-                PieceState::HaveAll => {}
-                PieceState::HaveNone => {
-                    let mut b = BitField::with_bit_len(self.n);
-                    b.set(index, true);
-                    d.have = PieceState::Bitfield(b);
-                    self.update_one_piece_rarity(index, true);
-                }
-                PieceState::Bitfield(b) => {
-                    b.set(index, true);
-                    if b.count_ones() == self.n as u32 {
-                        d.have = PieceState::HaveAll;
-                    }
-                }
-            }
+            d.have.set_have(self.n, index, true);
+        } else {
+            let mut have = PieceState::HaveNone;
+            have.set_have(self.n, index, true);
+            self.peers.insert(
+                *addr,
+                PeerPieceDetail {
+                    have,
+                    choke: false,
+                },
+            );
         }
     }
 

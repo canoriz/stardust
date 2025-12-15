@@ -1,4 +1,3 @@
-use sha1::digest::block_buffer::Block;
 use tracing::info;
 
 use super::{BlockRange, BlockRequests, PeerAddr, PeerPieceDetail, PiecePicker, PieceState};
@@ -24,10 +23,6 @@ struct PieceBlocks {
     /// piece index from 0 to all_requested_or_received_before(exclusive)
     /// are all requested
     all_request_or_received_before: usize,
-
-    /// piece index from 0 to all_received_before(exclusive)
-    /// are all requested
-    all_received_before: usize,
 
     /// number of blocks are requested plus received
     requested_or_received_count: usize,
@@ -95,9 +90,6 @@ impl PieceBlocks {
                     self.all_request_or_received_before = i + 1;
                 }
                 BlockStatus::Received => {
-                    if self.all_received_before == i {
-                        self.all_received_before += 1;
-                    }
                     self.all_request_or_received_before = i + 1;
                 }
             }
@@ -105,7 +97,7 @@ impl PieceBlocks {
 
         match (from, to) {
             (None, _) => {
-                assert_eq!(self.all_request_or_received_before, n_blocks);
+                assert!(self.all_request_or_received_before == n_blocks || count == n);
                 None
             }
             (Some(f), None) => Some((BlockRange { from: f, to: f }, count)),
@@ -136,12 +128,11 @@ impl PieceBlocks {
     fn revoke(&mut self, req: Request) {
         let b_index = (req.begin as usize) / BLOCK_SIZE;
         let b = &mut self.block_map[b_index];
+        #[cfg(test)]
+        println!("{b:?}");
         match b {
             BlockStatus::Requested { .. } => {
                 *b = BlockStatus::NotRequested;
-                if self.all_received_before > b_index {
-                    self.all_received_before = b_index;
-                }
                 if self.all_request_or_received_before > b_index {
                     self.all_request_or_received_before = b_index;
                 }
@@ -163,13 +154,10 @@ impl PieceBlocks {
                 BlockStatus::Requested { .. } => {
                     if cond(b) {
                         *b = BlockStatus::NotRequested;
-                        if self.all_received_before > i {
-                            self.all_received_before = i;
-                        }
+                        self.requested_or_received_count -= 1;
                         if self.all_request_or_received_before > i {
                             self.all_request_or_received_before = i;
                         }
-                        self.requested_or_received_count -= 1;
                     }
                 }
                 _ => {}
@@ -242,7 +230,6 @@ impl BlockPicker {
             piece_index: index,
             last_block_size,
             all_request_or_received_before: 0,
-            all_received_before: 0,
             block_map: vec![BlockStatus::NotRequested; n_blocks],
             requested_or_received_count: 0,
             received_count: 0,
@@ -256,7 +243,7 @@ impl BlockPicker {
             self.prev_time_check = time::Instant::now();
         }
 
-        let mut count = 0;
+        let mut remain = n;
         let peer_status = self
             .piece_picker
             .peer_detail(peer)
@@ -264,20 +251,20 @@ impl BlockPicker {
 
         let mut ret = Vec::new();
         for (index, blocks) in &mut self.requesting {
-            if count < n && peer_status.have(*index) {
-                while let Some((blks, n_picked)) = blocks.pick(*peer, n) {
-                    count += n_picked;
+            if remain > 0 && peer_status.have(*index) {
+                while let Some((blks, n_picked)) = blocks.pick(*peer, remain) {
+                    remain -= n_picked;
                     ret.push(blks);
                 }
             }
         }
 
-        while count < n {
+        while remain > 0 {
             if let Some(index) = self.piece_picker.pick_next(peer) {
                 let mut blocks = self.piece_block_of(index);
 
-                if let Some((blks, n_picked)) = blocks.pick(*peer, n) {
-                    count += n_picked;
+                if let Some((blks, n_picked)) = blocks.pick(*peer, remain) {
+                    remain -= n_picked;
                     ret.push(blks);
                 }
                 self.requesting.insert(index, blocks);
@@ -299,7 +286,7 @@ impl BlockPicker {
                 piece_size: self.piece_size as u32,
                 range: ret,
             },
-            count,
+            n - remain,
         )
     }
 
@@ -418,7 +405,11 @@ impl BlockPicker {
         }
 
         let index = req.index;
-        if !self.piece_picker.selected(index) {
+        if !self.selected(index) {
+            return false;
+        }
+
+        if self.have(index) {
             return false;
         }
 
@@ -520,16 +511,231 @@ impl BlockPicker {
 
     /// returns if we have this piece
     pub fn have(&self, index: u32) -> bool {
-        !self.receiving.contains_key(&index)
+        self.piece_picker.have(index)
+            && !self.receiving.contains_key(&index)
             && !self.requesting.contains_key(&index)
-            && !self.piece_picker.have(index)
     }
 }
 
 #[cfg(test)]
 mod test {
+    use crate::picker::BitField;
+
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    const PEER1: PeerAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 1);
+    const PEER2: PeerAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 2);
+    const PEER3: PeerAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 3);
+
     #[test]
     fn test_block_pieces() {
-        unimplemented!()
+        let mut b = PieceBlocks {
+            piece_index: 0,
+            last_block_size: 4133,
+            all_request_or_received_before: 0,
+            requested_or_received_count: 0,
+            received_count: 0,
+            block_map: vec![BlockStatus::NotRequested; 50],
+        };
+
+        {
+            let picked = b.pick(PEER1, 30);
+            let exp = Some((
+                BlockRange {
+                    from: Request {
+                        index: 0,
+                        begin: 0,
+                        len: 16384,
+                    },
+                    to: Request {
+                        index: 0,
+                        begin: 29 * 16384,
+                        len: 16384,
+                    },
+                },
+                30,
+            ));
+            assert_eq!(picked, exp);
+            assert_eq!(b.all_request_or_received_before, 30);
+            assert_eq!(b.requested_or_received_count, 30);
+        }
+        {
+            let picked = b.pick(PEER1, 30);
+            let exp = Some((
+                BlockRange {
+                    from: Request {
+                        index: 0,
+                        begin: 30 * 16384,
+                        len: 16384,
+                    },
+                    to: Request {
+                        index: 0,
+                        begin: 49 * 16384,
+                        len: 4133,
+                    },
+                },
+                20,
+            ));
+            assert_eq!(picked, exp);
+            assert_eq!(b.all_request_or_received_before, 50);
+            assert_eq!(b.requested_or_received_count, 50);
+            assert!(b.is_all_requested_or_received());
+            assert!(!b.is_all_received());
+        }
+        {
+            // test receive
+            for i in 0..10 {
+                b.receive(Request {
+                    index: 0,
+                    begin: i * 16384,
+                    len: 16384,
+                });
+            }
+            b.receive(Request {
+                index: 0,
+                begin: 15 * 16384,
+                len: 16384,
+            });
+            assert_eq!(b.received_count, 11);
+            assert_eq!(b.requested_or_received_count, 50);
+        }
+        {
+            // test revoke
+            b.revoke(Request {
+                index: 0,
+                begin: 17 * 16384,
+                len: 16384,
+            });
+            assert!(!b.is_all_requested_or_received());
+            assert!(!b.is_all_received());
+            assert_eq!(b.all_request_or_received_before, 17);
+            assert_eq!(b.received_count, 11);
+            assert_eq!(b.requested_or_received_count, 49);
+        }
+        {
+            b.revoke_all_requested_if(|b| match b {
+                BlockStatus::Requested { .. } => true,
+                _ => false,
+            });
+            assert!(!b.is_all_requested_or_received());
+            assert_eq!(b.all_request_or_received_before, 10);
+            assert_eq!(b.received_count, 11);
+            assert_eq!(b.requested_or_received_count, 11);
+        }
+    }
+
+    #[test]
+    fn test_block_picker_pick_select() {
+        use crate::picker::RarestPicker;
+        const PIECE_SIZE: usize = 16384 * 10;
+        const TOTAL_SIZE: usize = 16384 * 10 * 10 + 1500;
+        let p = Box::new(RarestPicker::new(TOTAL_SIZE, PIECE_SIZE));
+        let mut b = BlockPicker::new(TOTAL_SIZE, PIECE_SIZE, p, time::Duration::from_secs(10));
+        b.peer_add(PEER1, PieceState::HaveAll);
+        b.peer_add(
+            PEER2,
+            PieceState::Bitfield(BitField::from(vec![true, false, false, true, true, true])),
+        );
+        // b.peer_add(
+        //     PEER3,
+        //     PieceState::Bitfield(BitField::from(vec![false, false, false, true, true, true])),
+        // );
+        for i in 0..6 {
+            b.select(i, true);
+        }
+
+        {
+            let picked = b.pick_blocks(&PEER1, 15);
+            let exp = BlockRequests {
+                piece_size: PIECE_SIZE as u32,
+                range: vec![
+                    BlockRange {
+                        from: Request {
+                            index: 1,
+                            begin: 0,
+                            len: 16384,
+                        },
+                        to: Request {
+                            index: 1,
+                            begin: 9 * 16384,
+                            len: 16384,
+                        },
+                    },
+                    BlockRange {
+                        from: Request {
+                            index: 2,
+                            begin: 0,
+                            len: 16384,
+                        },
+                        to: Request {
+                            index: 2,
+                            begin: 4 * 16384,
+                            len: 16384,
+                        },
+                    },
+                ],
+            };
+            assert_eq!(picked.0, exp);
+            assert_eq!(picked.1, 15);
+        }
+
+        // test pick2
+        {
+            let picked = b.pick_blocks(&PEER2, 1);
+            let exp = BlockRequests {
+                piece_size: PIECE_SIZE as u32,
+                range: vec![BlockRange {
+                    from: Request {
+                        index: 0,
+                        begin: 0,
+                        len: 16384,
+                    },
+                    to: Request {
+                        index: 0,
+                        begin: 0,
+                        len: 16384,
+                    },
+                }],
+            };
+            assert_eq!(picked.0, exp);
+        }
+
+        // test un-select
+        {
+            b.select(2, false);
+            let picked = b.pick_blocks(&PEER1, 5);
+            let exp = BlockRequests {
+                piece_size: PIECE_SIZE as u32,
+                range: vec![BlockRange {
+                    from: Request {
+                        index: 0,
+                        begin: 16384,
+                        len: 16384,
+                    },
+                    to: Request {
+                        index: 0,
+                        begin: 5 * 16384,
+                        len: 16384,
+                    },
+                }],
+            };
+            assert_eq!(picked.0, exp);
+            assert!(!b.receiving.contains_key(&2));
+            assert!(!b.requesting.contains_key(&2));
+            assert!(!b.selected(2));
+        }
+    }
+
+    fn test_block_picker_choke_unchoke() {
+        // b.peer_leave(addr);
+        // b.peer_choke(addr);
+        // b.peer_unchoke(addr);
+        // b.peer_new_have(addr, index);
+        // b.piece_verified();
+        // b.piece_verified();
+        // b.check_block_validity(req)
+        // b.have(index);
+        // b.is_finished();
     }
 }

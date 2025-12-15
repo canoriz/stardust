@@ -39,6 +39,36 @@ pub enum PieceState {
     Bitfield(BitField),
 }
 
+impl PieceState {
+    pub fn set_have(&mut self, n_piece: usize, index: u32, have: bool) {
+        match self {
+            PieceState::HaveAll => {
+                if !have {
+                    let mut b = BitField::from(vec![true; n_piece]);
+                    b.set(index, have);
+                    *self = PieceState::Bitfield(b);
+                }
+            }
+            PieceState::HaveNone => {
+                if have {
+                    let mut b = BitField::with_bit_len(n_piece);
+                    b.set(index, have);
+                    *self = PieceState::Bitfield(b);
+                }
+            }
+            PieceState::Bitfield(b) => {
+                b.set(index, have);
+                let n_ones = b.count_ones();
+                if n_ones == n_piece as u32 {
+                    *self = PieceState::HaveAll;
+                } else if n_ones == 0 {
+                    *self = PieceState::HaveNone;
+                }
+            }
+        }
+    }
+}
+
 impl PeerPieceDetail {
     pub fn have(&self, index: u32) -> bool {
         match &self.have {
@@ -107,7 +137,7 @@ pub trait PiecePicker {
 // }
 
 // many consecutive block ranges
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct BlockRequests {
     pub piece_size: u32,
     pub range: Vec<BlockRange>,
@@ -150,7 +180,7 @@ pub(crate) struct BlockRequests {
 // Represents a continuous range of blocks
 // TODO: maybe change protocol::Request to use block-index
 // question: how to represent a part 16kib request?
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockRange {
     // from and to are inclusive
     // TODO: maybe use block index? this [begin, len) pattern is strange
