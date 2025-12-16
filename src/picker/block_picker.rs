@@ -323,7 +323,7 @@ impl BlockPicker {
             return false;
         }
         let (n_blocks, last_block_size) = self.n_blocks_and_last_block_size(index);
-        let expect_len = if req.begin / (BLOCK_SIZE as u32) == n_blocks as u32 {
+        let expect_len = if req.begin / (BLOCK_SIZE as u32) + 1 == n_blocks as u32 {
             last_block_size
         } else {
             BLOCK_SIZE

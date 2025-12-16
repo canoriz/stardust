@@ -1,15 +1,11 @@
 use crate::backfile::{BackFile, NormalFile};
-use crate::cache::simple_buffer::{BufStorage, ErrorCallback, FlushErr};
+use crate::cache::simple_buffer::{BufStorage, FlushErr};
 use crate::cache::simple_buffer::{GetPieceErr, PieceBuf};
 use crate::connection_manager::{ConnectionManagerHandle, Msg as ConnMsg};
 use crate::dht::DHT;
 use crate::metadata::{self, Magnet, Metadata};
-use crate::picker::{
-    start_receive_piece_block, BlockPicker, HeapPiecePicker, PieceState, RarestPicker,
-};
-use crate::protocol::{
-    self, BitField, Conn, ExtendedMetadata, ExtendedMsg, FuncBits, HandshakeOption, Piece, Request,
-};
+use crate::picker::{BlockPicker, PieceState, RarestPicker};
+use crate::protocol::{self, Conn, ExtendedMetadata, ExtendedMsg, HandshakeOption, Piece, Request};
 
 use sha1::{Digest, Sha1};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -356,7 +352,7 @@ impl TransmitWorker {
             total_length,
             piece_size as usize,
             piece_picker,
-            time::Duration::from_secs(10),
+            time::Duration::from_secs(120),
         );
 
         for i in 0..block_picker.n_pieces() {
@@ -703,7 +699,7 @@ impl TransmitWorker {
         };
 
         let (block_picker, metadata, storage) = match &mut self.torrent_state {
-            TorrentState::Metadata(d) => (&mut d.block_picker, d.metadata.clone(), &mut d.storage),
+            TorrentState::Metadata(d) => (&mut d.block_picker, &d.metadata, &mut d.storage),
             TorrentState::Fetching(_) => {
                 info!(
                     "receive PIECE msg {} {} {} block index {} before having metadata",
@@ -780,6 +776,12 @@ impl TransmitWorker {
     }
 
     fn handle_piecebuf_ready(&mut self, index: usize, buf: io::Result<PieceBuf>) -> io::Result<()> {
+        let (block_picker, metadata) = match &mut self.torrent_state {
+            TorrentState::Metadata(d) => (&mut d.block_picker, &d.metadata),
+            TorrentState::Fetching(_) => {
+                unreachable!();
+            }
+        };
         match buf {
             Ok(mut buf) => {
                 let pending = self.waiting_for_piecebuf.remove(&(index as u32));
@@ -791,8 +793,13 @@ impl TransmitWorker {
                         copy_to_piecebuf(&p.piece, &mut buf);
                         if p.full_received {
                             full_received = true;
-                            println!("flush new ready piecebuf {index}");
-                            buf.flush(None);
+                            info!("flush new ready piecebuf {index}");
+                            Self::handle_full_piece_received(
+                                &mut buf,
+                                &metadata,
+                                &mut self.connected_peers,
+                                block_picker,
+                            );
                         }
                     }
                 }
@@ -823,6 +830,14 @@ impl TransmitWorker {
             TorrentState::Fetching(_) => return,
         };
         block_picker.peer_reject_block(&peer, req);
+    }
+
+    fn is_downloaded(&mut self) -> bool {
+        let block_picker = match &mut self.torrent_state {
+            TorrentState::Metadata(d) => &mut d.block_picker,
+            TorrentState::Fetching(_) => return false,
+        };
+        block_picker.is_finished()
     }
 
     fn handle_dht_port_msg(&mut self, mut addr: PeerAddr, port: u16) -> io::Result<()> {
@@ -1020,6 +1035,9 @@ pub(crate) async fn run_transmit_worker(
             Some(msg) = transmit.receiver.recv() => {
                 debug!("transmit manager received msg {msg:?}");
                 transmit.handle_msg(msg); // TODO: handle result
+                if transmit.is_downloaded() {
+                    break;
+                }
             }
             _ = dht_ticker.tick() => {
                 info!("dht ticker tick");
