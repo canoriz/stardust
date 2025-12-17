@@ -82,6 +82,10 @@ impl ConnectionManagerHandle {
         let (recv_done_tx, recv_done_rx) = oneshot::channel();
         let recv_cancel = CancellationToken::new();
         let addr = read_stream.peer_addr();
+        let conn_break_guard = Arc::new(NotifyTransmitGuard {
+            addr,
+            transmit_handle: trh.clone(),
+        });
 
         let n_sent_req = Arc::new(AtomicU32::new(0));
         let n_recv_req = Arc::new(AtomicU32::new(0));
@@ -94,10 +98,7 @@ impl ConnectionManagerHandle {
             n_sent_req: n_sent_req.clone(),
             history_n_recv_req: VecDeque::new(),
             history_n_sent_req: VecDeque::new(),
-            _drop_guard: NotifyTransmitGuard {
-                addr,
-                transmit_handle: trh.clone(),
-            },
+            _drop_guard: conn_break_guard.clone(),
         };
 
         let (send_tx, send_rx) = mpsc::unbounded_channel();
@@ -107,10 +108,7 @@ impl ConnectionManagerHandle {
             receiver: send_rx,
             write_stream,
             n_sent_req,
-            _drop_guard: NotifyTransmitGuard {
-                addr,
-                transmit_handle: trh,
-            },
+            _drop_guard: conn_break_guard,
         };
 
         tokio::spawn(run_recv_stream(
@@ -215,7 +213,7 @@ struct RecvStream<T> {
     receiver: mpsc::UnboundedReceiver<Msg>,
     read_stream: ReadStream<T>,
     transmit_handle: TransmitManagerHandle,
-    _drop_guard: NotifyTransmitGuard,
+    _drop_guard: Arc<NotifyTransmitGuard>,
 
     /// number or received pieces in a period
     n_recv_req: Arc<AtomicU32>,
@@ -245,7 +243,7 @@ struct SendStream<T> {
     /// number or send requests in a period
     n_sent_req: Arc<AtomicU32>,
 
-    _drop_guard: NotifyTransmitGuard,
+    _drop_guard: Arc<NotifyTransmitGuard>,
 }
 
 async fn run_recv_stream<T>(
