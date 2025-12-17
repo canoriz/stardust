@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use crate::announce_manager::{self, AnnounceManagerHandle};
 use crate::dht::DHT;
-use crate::transmit_manager::{self, TorrentTask, TransmitManager};
-use tokio::sync::mpsc;
+use crate::transmit_manager::{self, TorrentTask, TransmitDump, TransmitManager};
+use tokio::sync::{mpsc, oneshot};
 
 pub struct TorrentManagerHandle {
     sender: mpsc::UnboundedSender<transmit_manager::Msg>,
@@ -39,5 +39,12 @@ impl TorrentManagerHandle {
 
     pub async fn stop_wait(self) {
         self.transmit_manager.stop_wait().await;
+    }
+
+    pub async fn dump_stop(mut self) {
+        let (tx, rx) = oneshot::channel();
+        self.send_msg(transmit_manager::Msg::DumpStatus(tx));
+        let s = serde_json::to_string(&rx.await.unwrap()).unwrap();
+        println!("{s}");
     }
 }

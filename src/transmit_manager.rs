@@ -5,16 +5,17 @@ use crate::cache::simple_buffer::{GetPieceErr, PieceBuf};
 use crate::connection_manager::{ConnectionManagerHandle, Msg as ConnMsg};
 use crate::dht::DHT;
 use crate::metadata::{self, Announce, Magnet, Metadata};
-use crate::picker::{BlockPicker, PieceState, RarestPicker};
+use crate::picker::{BlockPicker, BlockPickerDump, PieceState, RarestPicker};
 use crate::protocol::{self, Conn, ExtendedMetadata, ExtendedMsg, HandshakeOption, Piece, Request};
 
+use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::{clone, io};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time;
 use tokio_util::sync::{CancellationToken, DropGuard as CancelDropGuard};
 use tracing::{debug, info, warn};
@@ -52,6 +53,7 @@ pub(crate) enum Msg {
     PeerCancel(PeerAddr, Request),
     PeerReject(PeerAddr, Request),
     PeerRequest(PeerAddr, Request),
+    ExtendMetadata(PeerAddr, ExtendedMetadata),
 
     PieceBufReady {
         index: usize,
@@ -67,7 +69,7 @@ pub(crate) enum Msg {
         n_req_in_flight: usize,
     },
 
-    ExtendMetadata(PeerAddr, ExtendedMetadata),
+    DumpStatus(oneshot::Sender<TransmitDump>),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -98,8 +100,6 @@ struct PeerConn {
     bitmap: Option<PieceState>,
 
     last_pick_time: time::Instant,
-
-    n_block_in_flight: u32, // TODO: remove this
 }
 
 #[derive(Clone)]
@@ -107,7 +107,12 @@ pub(crate) struct TransmitManagerHandle {
     pub sender: mpsc::UnboundedSender<Msg>,
 }
 
+enum IsDownloaded {
+    Downloading,
+}
+
 pub(crate) struct TransmitManager {
+    is_downloaded: watch::Receiver<bool>,
     cancel: CancelDropGuard,
     worker_stop: oneshot::Receiver<()>,
 }
@@ -121,6 +126,7 @@ impl TransmitManager {
         dht_client: Option<Arc<DHT>>,
         announce_manager: AnnounceManagerHandle,
     ) -> Self {
+        let (downloaded_tx, downloaded_rx) = watch::channel(false);
         let worker = TransmitWorker::new(
             t,
             id,
@@ -128,6 +134,7 @@ impl TransmitManager {
             announce_manager,
             cmd_sender,
             cmd_receiver,
+            downloaded_tx,
         );
         let cancel_transmit = CancellationToken::new();
         let (done_transmit, done_transmit_rx) = oneshot::channel::<()>();
@@ -137,12 +144,14 @@ impl TransmitManager {
             done_transmit,
         ));
         Self {
+            is_downloaded: downloaded_rx,
             cancel: cancel_transmit.drop_guard(),
             worker_stop: done_transmit_rx,
         }
     }
 
-    pub async fn stop_wait(self) {
+    pub async fn stop_wait(mut self) {
+        self.is_downloaded.changed().await;
         self.cancel.disarm().cancel();
         _ = self.worker_stop.await;
     }
@@ -153,8 +162,15 @@ pub enum TorrentState {
     Fetching(FetchingMetadata),
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum TorrentStateDump {
+    Metadata(BlockPickerDump),
+    Fetching(FetchingMetadata),
+}
+
 /// The fetching information of a torrent
 /// still downloading metadata
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FetchingMetadata {
     meta_buf: MetadataBuffer,
     pub magnet: Magnet,
@@ -202,6 +218,7 @@ impl FetchingMetadata {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct MetadataBuffer {
     // stores total_piece map
     // any honest peers should sends same size
@@ -219,6 +236,7 @@ struct MetadataBuffer {
     not_requested: BTreeSet<u32>,
 
     // requests for parts of metadata sent, but no response yet
+    #[serde(skip)]
     requesting: BTreeMap<u32, time::Instant>,
 }
 
@@ -301,6 +319,8 @@ pub struct TransmitWorker {
     /// received blocks waiting writing to piece buf once
     /// piece buf is ready
     waiting_for_piecebuf: HashMap<u32, Vec<BlockWatingBuf>>,
+
+    downloaded: watch::Sender<bool>,
 }
 
 struct BlockWatingBuf {
@@ -308,6 +328,12 @@ struct BlockWatingBuf {
 
     /// if this piece is all_received
     full_received: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransmitDump {
+    pub state: TorrentStateDump,
+    pub peers: Vec<SocketAddr>,
 }
 
 impl TransmitWorker {
@@ -319,6 +345,7 @@ impl TransmitWorker {
         announce_manager: AnnounceManagerHandle,
         cmd_sender: mpsc::UnboundedSender<Msg>,
         cmd_receiver: mpsc::UnboundedReceiver<Msg>,
+        downloaded: watch::Sender<bool>,
     ) -> Self {
         let (info_hash, state) = match t {
             TorrentTask::Torrent(m) => {
@@ -354,6 +381,7 @@ impl TransmitWorker {
             connected_peers: HashMap::new(),
             connecting_peers: HashSet::new(),
             waiting_for_piecebuf: HashMap::new(),
+            downloaded,
         }
     }
 
@@ -492,7 +520,6 @@ impl TransmitWorker {
                         },
                         bitmap: None,
                         last_pick_time: time::Instant::now(),
-                        n_block_in_flight: 0,
                     },
                 );
                 self.connecting_peers.remove(&peer_addr);
@@ -570,10 +597,6 @@ impl TransmitWorker {
                     self.connected_peers[&peer].state.peer_choke_status,
                     ChokeStatus::Unchoked
                 );
-                warn!(
-                    "nblock in flight {}",
-                    self.connected_peers[&peer].n_block_in_flight
-                );
                 // TODO: are we interested in this peer?
                 // self.pick_blocks_for_peer(&peer, 0);
                 Ok(())
@@ -643,6 +666,10 @@ impl TransmitWorker {
                         conn.conn.send_stream_cmd(ConnMsg::Reject(req));
                     }
                 }
+                Ok(())
+            }
+            Msg::DumpStatus(sender) => {
+                self.handle_dump_status(sender);
                 Ok(())
             }
         }
@@ -850,6 +877,17 @@ impl TransmitWorker {
         block_picker.peer_reject_block(&peer, req);
     }
 
+    fn handle_dump_status(&mut self, sender: oneshot::Sender<TransmitDump>) {
+        // TODO: dump announce
+        let peers: Vec<_> = self.connected_peers.keys().cloned().collect();
+        let state = match &mut self.torrent_state {
+            TorrentState::Metadata(d) => TorrentStateDump::Metadata(d.block_picker.dump()),
+            TorrentState::Fetching(f) => TorrentStateDump::Fetching(f.clone()),
+        };
+        let dump = TransmitDump { peers, state };
+        sender.send(dump);
+    }
+
     fn is_downloaded(&mut self) -> bool {
         let block_picker = match &mut self.torrent_state {
             TorrentState::Metadata(d) => &mut d.block_picker,
@@ -1054,6 +1092,7 @@ pub(crate) async fn run_transmit_worker(
                 debug!("transmit manager received msg {msg:?}");
                 transmit.handle_msg(msg); // TODO: handle result
                 if transmit.is_downloaded() {
+                    transmit.downloaded.send(true);
                     break;
                 }
             }

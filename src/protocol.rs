@@ -1196,7 +1196,7 @@ impl std::fmt::Debug for Message {
     }
 }
 
-#[derive(Debug, Eq, PartialEq, Clone)]
+#[derive(Serialize, Deserialize, Debug, Eq, PartialEq, Clone)]
 pub struct BitField {
     bitfield: Vec<u8>, // use array?
 

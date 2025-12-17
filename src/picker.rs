@@ -2,6 +2,7 @@ use crate::bandwidth::Bandwidth;
 pub use crate::protocol::BitField;
 use crate::protocol::{self, Request};
 use heap::Heap;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::time;
@@ -10,7 +11,7 @@ use tracing::{debug, info, warn};
 mod block_picker;
 mod heap;
 mod rarest_first;
-pub use block_picker::BlockPicker;
+pub use block_picker::{BlockPicker, BlockPickerDump};
 pub use rarest_first::Picker as RarestPicker;
 
 const BLOCK_SIZE: u32 = 16384;
@@ -135,6 +136,16 @@ pub trait PiecePicker {
 
     /// if we have all the piece we want
     fn is_finished(&mut self) -> bool;
+
+    /// dump which piece we have
+    fn dump(&mut self) -> PieceMap;
+}
+
+/// Dumped piece map, must be size of N
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct PieceMap {
+    selected: BitField,
+    have: BitField,
 }
 
 // TODO: maybe use peer_id instead of socketaddr?

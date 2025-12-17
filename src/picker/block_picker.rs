@@ -1,19 +1,30 @@
+use serde::{Deserialize, Serialize};
 use tracing::info;
 
-use super::{BlockRange, BlockRequests, PeerAddr, PeerPieceDetail, PiecePicker, PieceState};
+use super::{
+    BlockRange, BlockRequests, PeerAddr, PeerPieceDetail, PieceMap, PiecePicker, PieceState,
+};
 use crate::{math_helper::piece_total_and_last_size, protocol::Request};
 use std::{collections::BTreeMap, time};
 
 const BLOCK_SIZE: usize = 16384;
 
-#[derive(Eq, PartialEq, Debug, Clone, Copy)]
+fn two_mins_ago() -> time::Instant {
+    time::Instant::now() - time::Duration::from_mins(2)
+}
+#[derive(Serialize, Deserialize, Eq, PartialEq, Debug, Clone, Copy)]
 enum BlockStatus {
     NotRequested,
-    Requested { addr: PeerAddr, at: time::Instant },
+    Requested {
+        addr: PeerAddr,
+        #[serde(skip)]
+        #[serde(default = "two_mins_ago")]
+        at: time::Instant,
+    },
     Received, // TODO: maybe record which peer sends us this block?
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq)]
 struct PieceBlocks {
     piece_index: u32,
 
@@ -449,6 +460,29 @@ impl BlockPicker {
     pub fn is_finished(&mut self) -> bool {
         self.receiving.is_empty() && self.requesting.is_empty() && self.piece_picker.is_finished()
     }
+
+    /// dump current status
+    pub fn dump(&mut self) -> BlockPickerDump {
+        BlockPickerDump {
+            receiving: self.receiving.clone(),
+            requesting: self.requesting.clone(),
+            piece_map: self.piece_picker.dump(),
+            no_response_timeout: self.no_response_timeout,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockPickerDump {
+    // pieces whose blocks are not all requested
+    pub requesting: BTreeMap<PieceIndex, PieceBlocks>,
+
+    // pieces whose blocks that all requested and waiting receiving
+    pub receiving: BTreeMap<PieceIndex, PieceBlocks>,
+
+    pub piece_map: PieceMap,
+
+    pub no_response_timeout: time::Duration,
 }
 
 impl BlockPicker {

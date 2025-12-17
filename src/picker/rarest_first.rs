@@ -1,4 +1,4 @@
-use super::{PeerAddr, PeerPieceDetail, PiecePicker, PieceState};
+use super::{PeerAddr, PeerPieceDetail, PieceMap, PiecePicker, PieceState};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::{math_helper::piece_total_and_last_size, picker::BitField};
@@ -148,13 +148,8 @@ impl PiecePicker for Picker {
         } else {
             let mut have = PieceState::HaveNone;
             have.set_have(self.n, index, true);
-            self.peers.insert(
-                *addr,
-                PeerPieceDetail {
-                    have,
-                    choke: false,
-                },
-            );
+            self.peers
+                .insert(*addr, PeerPieceDetail { have, choke: false });
         }
     }
 
@@ -251,6 +246,13 @@ impl PiecePicker for Picker {
 
     fn have(&self, index: u32) -> bool {
         self.have.get(index)
+    }
+
+    fn dump(&mut self) -> PieceMap {
+        PieceMap {
+            selected: self.selected.clone(),
+            have: self.have.clone(),
+        }
     }
 }
 
