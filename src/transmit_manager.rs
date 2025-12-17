@@ -1,9 +1,10 @@
+use crate::announce_manager::{self, AnnounceManagerHandle};
 use crate::backfile::{BackFile, NormalFile};
 use crate::cache::simple_buffer::{BufStorage, FlushErr};
 use crate::cache::simple_buffer::{GetPieceErr, PieceBuf};
 use crate::connection_manager::{ConnectionManagerHandle, Msg as ConnMsg};
 use crate::dht::DHT;
-use crate::metadata::{self, Magnet, Metadata};
+use crate::metadata::{self, Announce, Magnet, Metadata};
 use crate::picker::{BlockPicker, PieceState, RarestPicker};
 use crate::protocol::{self, Conn, ExtendedMetadata, ExtendedMsg, HandshakeOption, Piece, Request};
 
@@ -29,6 +30,7 @@ type PeerAddr = SocketAddr;
 #[non_exhaustive]
 pub(crate) enum Msg {
     AnnounceFinish(Result<metadata::AnnounceResp, metadata::AnnounceError>),
+    AnnounceMsg(announce_manager::Msg),
 
     NewPeer(Result<protocol::BTStream<Box<dyn Conn>>, SocketAddr>),
     NewIncomePeer(protocol::BTStream<Box<dyn Conn>>),
@@ -117,8 +119,16 @@ impl TransmitManager {
         cmd_sender: mpsc::UnboundedSender<Msg>,
         cmd_receiver: mpsc::UnboundedReceiver<Msg>,
         dht_client: Option<Arc<DHT>>,
+        announce_manager: AnnounceManagerHandle,
     ) -> Self {
-        let worker = TransmitWorker::new(t, id, dht_client, cmd_sender, cmd_receiver);
+        let worker = TransmitWorker::new(
+            t,
+            id,
+            dht_client,
+            announce_manager,
+            cmd_sender,
+            cmd_receiver,
+        );
         let cancel_transmit = CancellationToken::new();
         let (done_transmit, done_transmit_rx) = oneshot::channel::<()>();
         tokio::spawn(run_transmit_worker(
@@ -273,6 +283,8 @@ pub struct TransmitWorker {
 
     dht_client: Option<Arc<DHT>>,
 
+    announce_manager: AnnounceManagerHandle,
+
     /// The state of the torrent
     /// whether have metadata or not
     torrent_state: TorrentState,
@@ -304,6 +316,7 @@ impl TransmitWorker {
         t: TorrentTask,
         id: [u8; 20],
         dht_client: Option<Arc<DHT>>,
+        announce_manager: AnnounceManagerHandle,
         cmd_sender: mpsc::UnboundedSender<Msg>,
         cmd_receiver: mpsc::UnboundedReceiver<Msg>,
     ) -> Self {
@@ -332,6 +345,7 @@ impl TransmitWorker {
             info_hash,
             handshake_opt: opt,
             dht_client,
+            announce_manager,
             torrent_state: state,
             receiver: cmd_receiver,
             self_handle: TransmitManagerHandle { sender: cmd_sender },
@@ -418,6 +432,10 @@ impl TransmitWorker {
 
     fn handle_msg(&mut self, m: Msg) -> io::Result<()> {
         match m {
+            Msg::AnnounceMsg(m) => {
+                self.announce_manager.send(m);
+                Ok(())
+            }
             Msg::AnnounceFinish(Ok(a)) => {
                 // self.handle_announce(
                 //     a.peers
