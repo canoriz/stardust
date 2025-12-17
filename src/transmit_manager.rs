@@ -34,6 +34,7 @@ pub(crate) enum Msg {
     AnnounceMsg(announce_manager::Msg),
 
     NewPeer(Result<protocol::BTStream<Box<dyn Conn>>, SocketAddr>),
+    NewDiscoveredPeer(SocketAddr),
     NewIncomePeer(protocol::BTStream<Box<dyn Conn>>),
     PeerLeave(PeerAddr),
 
@@ -70,6 +71,7 @@ pub(crate) enum Msg {
     },
 
     DumpStatus(oneshot::Sender<TransmitDump>),
+    CheckFile(oneshot::Sender<()>),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -321,6 +323,8 @@ pub struct TransmitWorker {
     waiting_for_piecebuf: HashMap<u32, Vec<BlockWatingBuf>>,
 
     downloaded: watch::Sender<bool>,
+
+    running: bool,
 }
 
 struct BlockWatingBuf {
@@ -382,6 +386,7 @@ impl TransmitWorker {
             connecting_peers: HashSet::new(),
             waiting_for_piecebuf: HashMap::new(),
             downloaded,
+            running: false,
         }
     }
 
@@ -458,8 +463,12 @@ impl TransmitWorker {
         }
     }
 
-    fn handle_msg(&mut self, m: Msg) -> io::Result<()> {
+    async fn handle_msg(&mut self, m: Msg) -> io::Result<()> {
         match m {
+            Msg::NewDiscoveredPeer(addr) => {
+                self.handle_new_discovered_peer(addr);
+                Ok(())
+            }
             Msg::AnnounceMsg(m) => {
                 self.announce_manager.send(m);
                 Ok(())
@@ -488,14 +497,8 @@ impl TransmitWorker {
                         // TODO: if we already connected to a lot of active peers,
                         // maybe store available peers in a pool, connect to them when
                         // running out of peers
-                        let s = SocketAddr::new(ip, p.port);
-                        if !self.connected_peers.contains_key(&s)
-                            && !self.connecting_peers.contains(&s)
-                        {
-                            self.connecting_peers.insert(s);
-                            let dht_port = self.dht_client.as_ref().map(|c| c.port());
-                            tokio::spawn(connect_peer(h_clone, s, self.handshake_opt.clone()));
-                        }
+                        let addr = SocketAddr::new(ip, p.port);
+                        self.handle_new_discovered_peer(addr);
                     }
                 }
                 Ok(())
@@ -628,8 +631,10 @@ impl TransmitWorker {
                     .max(10)
                     .min(1500);
 
-                if conn_stat.state.peer_choke_status == ChokeStatus::Unchoked {
-                    self.pick_blocks_for_peer(&peer, n_to_pick);
+                if self.running {
+                    if conn_stat.state.peer_choke_status == ChokeStatus::Unchoked {
+                        self.pick_blocks_for_peer(&peer, n_to_pick);
+                    }
                 }
                 Ok(())
             }
@@ -670,6 +675,10 @@ impl TransmitWorker {
             }
             Msg::DumpStatus(sender) => {
                 self.handle_dump_status(sender);
+                Ok(())
+            }
+            Msg::CheckFile(sender) => {
+                self.handle_check_file(sender).await;
                 Ok(())
             }
         }
@@ -731,6 +740,34 @@ impl TransmitWorker {
             _ = err_sender.send(Msg::FlushError(e));
         };
         storage.get_piece(index, on_ready, Box::new(on_err))
+    }
+
+    /// NOTE: CRITICAL: if concurrently get same index, only one of them may return
+    /// others may block indefinitely
+    async fn get_piecebuf_now<'a>(
+        storage: &'a mut BufStorage,
+        index: usize,
+    ) -> io::Result<&'a mut PieceBuf> {
+        let (tx, rx) = oneshot::channel();
+        let on_ready = move |p| {
+            _ = tx.send(p);
+        };
+        let on_err = move |_| {};
+
+        match storage.get_piece(index, on_ready, Box::new(on_err)) {
+            Ok(p) => {
+                // return Ok(p);
+            }
+            Err(GetPieceErr::InvalidPiece) => panic!("wrong index {}", index),
+            Err(GetPieceErr::Returned) => panic!("already returned piece {}", index),
+            Err(GetPieceErr::Loading) => {
+                let p = rx.await.map_err(|_| {
+                    io::Error::new(io::ErrorKind::Other, "get piecebuf_now oneshot recv error")
+                })??;
+                storage.add_piece(p);
+            }
+        }
+        Ok(storage.get_piece(index, |_| {}, Box::new(|_| {})).unwrap())
     }
 
     /// handle PIECE message
@@ -906,6 +943,39 @@ impl TransmitWorker {
             });
         }
         Ok(())
+    }
+
+    fn handle_new_discovered_peer(&mut self, addr: SocketAddr) {
+        if !self.connected_peers.contains_key(&addr) && !self.connecting_peers.contains(&addr) {
+            self.connecting_peers.insert(addr);
+            let h_clone = self.self_handle.clone();
+            let opt = self.handshake_opt.clone();
+            tokio::spawn(connect_peer(h_clone, addr, opt));
+        }
+    }
+
+    async fn handle_check_file(&mut self, sender: oneshot::Sender<()>) {
+        let (block_picker, storage, metadata) = match &mut self.torrent_state {
+            TorrentState::Metadata(d) => (&mut d.block_picker, &mut d.storage, &d.metadata),
+            TorrentState::Fetching(_) => {
+                info!("check file when fetching metadata, maybe unreachable");
+                sender.send(());
+                return;
+            }
+        };
+        let total_pieces = block_picker.n_pieces();
+        for i in 0..total_pieces {
+            match Self::get_piecebuf_now(storage, i as usize).await {
+                Ok(piecebuf) => {
+                    if !Self::verify_piece(piecebuf, metadata) {
+                        println!("piece {} verify failed during file check", i);
+                    }
+                }
+                Err(e) => todo!(),
+            }
+        }
+        info!("file check complete");
+        let _ = sender.send(());
     }
 
     fn handle_extend_metadata(&mut self, addr: PeerAddr, m: ExtendedMetadata) {
@@ -1090,7 +1160,7 @@ pub(crate) async fn run_transmit_worker(
         tokio::select! {
             Some(msg) = transmit.receiver.recv() => {
                 debug!("transmit manager received msg {msg:?}");
-                transmit.handle_msg(msg); // TODO: handle result
+                transmit.handle_msg(msg).await; // TODO: handle result
                 if transmit.is_downloaded() {
                     transmit.downloaded.send(true);
                     break;
@@ -1145,7 +1215,7 @@ async fn dht_get_peers(
     for a in addrs {
         let t = tmh.clone();
         let opt = handshake_opt.clone();
-        tokio::spawn(connect_peer(t, a, opt));
+        tmh.sender.send(Msg::NewDiscoveredPeer(a));
     }
 }
 

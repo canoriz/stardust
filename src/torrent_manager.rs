@@ -41,6 +41,12 @@ impl TorrentManagerHandle {
         self.transmit_manager.stop_wait().await;
     }
 
+    pub async fn check(&mut self) {
+        let (tx, rx) = oneshot::channel();
+        self.sender.send(transmit_manager::Msg::CheckFile(tx));
+        rx.await;
+    }
+
     pub async fn dump_stop(mut self) {
         let (tx, rx) = oneshot::channel();
         self.send_msg(transmit_manager::Msg::DumpStatus(tx));
