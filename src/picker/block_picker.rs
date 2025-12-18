@@ -2,7 +2,8 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use super::{
-    BlockRange, BlockRequests, PeerAddr, PeerPieceDetail, PieceMap, PiecePicker, PieceState,
+    BitField, BlockRange, BlockRequests, PeerAddr, PeerPieceDetail, PieceMap, PiecePicker,
+    PieceState,
 };
 use crate::{math_helper::piece_total_and_last_size, protocol::Request};
 use std::{collections::BTreeMap, time};
@@ -414,15 +415,18 @@ impl BlockPicker {
     /// check if we want this block
     pub fn want_block(&mut self, req: Request) -> bool {
         if !self.check_block_validity(&req) {
+            println!("unwant because invalid {req:?}");
             return false;
         }
 
         let index = req.index;
         if !self.selected(index) {
+            println!("unwant because {index} not selected");
             return false;
         }
 
         if self.have(index) {
+            println!("unwant because have {index}");
             return false;
         }
 
@@ -433,6 +437,7 @@ impl BlockPicker {
                     return true;
                 }
                 BlockStatus::Received => {
+                    println!("unwant because received");
                     return false;
                 }
             }
@@ -445,6 +450,7 @@ impl BlockPicker {
                     return true;
                 }
                 BlockStatus::Received => {
+                    println!("unwant because received2");
                     return false;
                 }
                 _ => unreachable!(),
@@ -545,11 +551,25 @@ impl BlockPicker {
         self.piece_picker.selected(index)
     }
 
+    /// returns all selected pieces
+    pub fn selected_pieces(&self) -> &BitField {
+        self.piece_picker.selected_pieces()
+    }
+
     /// returns if we have this piece
     pub fn have(&self, index: u32) -> bool {
         self.piece_picker.have(index)
             && !self.receiving.contains_key(&index)
             && !self.requesting.contains_key(&index)
+    }
+
+    /// set we have this piece
+    pub fn set_have(&mut self, index: u32, have: bool) {
+        self.piece_picker.set_have(index, have);
+        if have {
+            self.receiving.remove(&index);
+            self.requesting.remove(&index);
+        }
     }
 }
 

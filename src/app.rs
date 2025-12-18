@@ -183,7 +183,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //     conn.recv_handshake().await?;
     //     tm.send_msg(transmit_manager::Msg::NewPeer(conn));
     // }
-    time::sleep(Duration::from_secs(100000)).await;
+    // time::sleep(Duration::from_secs(100000)).await;
     // tm.send_announce_msg(announce_manager::Msg::RemoveUrl(
     //     announce_list[0][0].clone(),
     // ));

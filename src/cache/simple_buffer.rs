@@ -292,6 +292,17 @@ impl BufStorage {
         }
     }
 
+    /// get piecebuf from local buffer, if piecebuf in buffer, return it.
+    /// If not in buffer, returns None
+    pub fn get_buffered_piece(&mut self, piece_idx: usize) -> Option<&mut PieceBuf> {
+        self.pieces.get_mut(&piece_idx)
+    }
+
+    /// returns all buffered pieces
+    pub fn iter_buffered(&mut self) -> impl Iterator<Item = (&usize, &mut PieceBuf)> {
+        self.pieces.iter_mut()
+    }
+
     /// If piece is in storage, the piece is returned.
     /// If piece is not in storage, Err will return and
     /// `on_ready` callback will be called then piece is ready

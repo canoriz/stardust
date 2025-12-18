@@ -240,8 +240,8 @@ impl PiecePicker for Picker {
         self.selected_not_have.count_ones() == 0
     }
 
-    fn selected(&self, index: u32) -> bool {
-        self.selected.get(index)
+    fn selected_pieces(&self) -> &BitField {
+        &self.selected
     }
 
     fn have(&self, index: u32) -> bool {

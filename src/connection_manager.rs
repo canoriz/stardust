@@ -197,6 +197,7 @@ struct NotifyTransmitGuard {
 
 impl Drop for NotifyTransmitGuard {
     fn drop(&mut self) {
+        println!("both send and recv end of {} stopped", self.addr);
         self.transmit_handle
             .sender
             .send(TransmitMsg::PeerLeave(self.addr));

@@ -120,7 +120,11 @@ pub trait PiecePicker {
     fn select(&mut self, index: u32, want: bool);
 
     /// returns this piece is selected or not
-    fn selected(&self, index: u32) -> bool;
+    fn selected(&self, index: u32) -> bool {
+        self.selected_pieces().get(index)
+    }
+
+    fn selected_pieces(&self) -> &BitField;
 
     /// set we have/not have this piece
     fn set_have(&mut self, index: u32, have: bool);

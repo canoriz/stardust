@@ -6,7 +6,9 @@ use crate::connection_manager::{ConnectionManagerHandle, Msg as ConnMsg};
 use crate::dht::DHT;
 use crate::metadata::{self, Announce, Magnet, Metadata};
 use crate::picker::{BlockPicker, BlockPickerDump, PieceState, RarestPicker};
-use crate::protocol::{self, Conn, ExtendedMetadata, ExtendedMsg, HandshakeOption, Piece, Request};
+use crate::protocol::{
+    self, BitField, Conn, ExtendedMetadata, ExtendedMsg, HandshakeOption, Piece, Request,
+};
 
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
@@ -71,7 +73,7 @@ pub(crate) enum Msg {
     },
 
     DumpStatus(oneshot::Sender<TransmitDump>),
-    CheckFile(oneshot::Sender<()>),
+    CheckFile(oneshot::Sender<bool>),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -162,6 +164,60 @@ impl TransmitManager {
 pub enum TorrentState {
     Metadata(Downloading),
     Fetching(FetchingMetadata),
+}
+
+type CheckResult = u8;
+
+#[derive(Serialize, Deserialize)]
+struct CheckState {
+    state: Vec<CheckResult>,
+    known: usize,
+}
+impl CheckState {
+    const UNKNOWN: CheckResult = 0;
+    const VERIFIED: CheckResult = 1;
+    const CORRUPT: CheckResult = 2;
+
+    fn new(n: usize) -> Self {
+        Self {
+            state: vec![Self::UNKNOWN; n],
+            known: 0,
+        }
+    }
+
+    fn get(&self, i: usize) -> CheckResult {
+        self.state[i]
+    }
+
+    fn check(&mut self, index: usize, ok: bool) {
+        let s = &mut self.state[index];
+        match *s {
+            Self::UNKNOWN => {
+                *s = if ok { Self::VERIFIED } else { Self::CORRUPT };
+                self.known += 1;
+            }
+            _ => {}
+        }
+    }
+
+    fn known(&self) -> usize {
+        self.known
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+pub enum RunningState {
+    Downloading,
+    Paused,  // maintains connection but do not download
+    Stopped, // all stopped
+    Seeding,
+    Checking {
+        total: usize,
+        selected: BitField,
+        checked: CheckState,
+        #[serde(skip)]
+        waiter: Vec<oneshot::Sender<bool>>,
+    }, // checking local file
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -309,6 +365,9 @@ pub struct TransmitWorker {
     /// whether have metadata or not
     torrent_state: TorrentState,
 
+    /// The running state
+    running_state: RunningState,
+
     /// receives various events
     receiver: mpsc::UnboundedReceiver<Msg>,
 
@@ -323,8 +382,6 @@ pub struct TransmitWorker {
     waiting_for_piecebuf: HashMap<u32, Vec<BlockWatingBuf>>,
 
     downloaded: watch::Sender<bool>,
-
-    running: bool,
 }
 
 struct BlockWatingBuf {
@@ -386,7 +443,7 @@ impl TransmitWorker {
             connecting_peers: HashSet::new(),
             waiting_for_piecebuf: HashMap::new(),
             downloaded,
-            running: false,
+            running_state: RunningState::Stopped,
         }
     }
 
@@ -463,7 +520,7 @@ impl TransmitWorker {
         }
     }
 
-    async fn handle_msg(&mut self, m: Msg) -> io::Result<()> {
+    fn handle_msg(&mut self, m: Msg) -> io::Result<()> {
         match m {
             Msg::NewDiscoveredPeer(addr) => {
                 self.handle_new_discovered_peer(addr);
@@ -631,7 +688,7 @@ impl TransmitWorker {
                     .max(10)
                     .min(1500);
 
-                if self.running {
+                if matches!(self.running_state, RunningState::Downloading) {
                     if conn_stat.state.peer_choke_status == ChokeStatus::Unchoked {
                         self.pick_blocks_for_peer(&peer, n_to_pick);
                     }
@@ -678,7 +735,7 @@ impl TransmitWorker {
                 Ok(())
             }
             Msg::CheckFile(sender) => {
-                self.handle_check_file(sender).await;
+                self.handle_check_file(sender);
                 Ok(())
             }
         }
@@ -772,7 +829,11 @@ impl TransmitWorker {
 
     /// handle PIECE message
     // TODO: fix the return type
-    fn handle_piece_msg(&mut self, peer: &SocketAddr, piece: protocol::Piece) -> io::Result<()> {
+    fn handle_piece_msg(
+        &mut self,
+        peer: &SocketAddr,
+        mut piece: protocol::Piece,
+    ) -> io::Result<()> {
         debug!("recv {piece:?} from {peer:?}");
         let blk = protocol::Request {
             index: piece.index,
@@ -818,6 +879,7 @@ impl TransmitWorker {
             piece.index as usize,
         ) {
             Ok(piecebuf) => {
+                info!("piecebuf {} already in", piece.index);
                 copy_to_piecebuf(&piece, piecebuf);
                 if let Some(_) = piece_received {
                     Self::handle_full_piece_received(
@@ -869,6 +931,10 @@ impl TransmitWorker {
                 let pending = self.waiting_for_piecebuf.remove(&(index as u32));
                 if let Some(ps) = pending {
                     let mut full_received = false;
+                    info!(
+                        "piecebuf {index} now ready, flushing {} blocks into it",
+                        ps.len()
+                    );
                     for p in ps {
                         // full_received should be set at most once
                         assert!(!full_received);
@@ -885,6 +951,39 @@ impl TransmitWorker {
                         }
                     }
                 }
+
+                match &mut self.running_state {
+                    RunningState::Checking {
+                        total,
+                        selected,
+                        checked,
+                        waiter,
+                    } => {
+                        let mut notify_waiter = |r: bool| {
+                            for w in waiter.drain(0..) {
+                                w.send(r);
+                            }
+                        };
+                        let index = buf.index() as u32;
+                        if selected.get(index) && checked.get(index as usize) == CheckState::UNKNOWN
+                        {
+                            let r = Self::verify_piece(&buf, metadata);
+                            checked.check(index as usize, r);
+                            block_picker.set_have(index, r);
+
+                            assert!(checked.get(index as usize) != CheckState::UNKNOWN);
+                            if selected.count_ones() as usize == checked.known() {
+                                let r = checked.state.iter().all(|s| *s != CheckState::CORRUPT);
+                                notify_waiter(r);
+                                // TODO: set to previous state, or new state changed because of
+                                // check
+                                self.running_state = RunningState::Paused;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+
                 match &mut self.torrent_state {
                     TorrentState::Metadata(d) => {
                         d.storage.add_piece(buf);
@@ -954,28 +1053,54 @@ impl TransmitWorker {
         }
     }
 
-    async fn handle_check_file(&mut self, sender: oneshot::Sender<()>) {
+    fn handle_check_file(&mut self, sender: oneshot::Sender<bool>) {
         let (block_picker, storage, metadata) = match &mut self.torrent_state {
             TorrentState::Metadata(d) => (&mut d.block_picker, &mut d.storage, &d.metadata),
             TorrentState::Fetching(_) => {
                 info!("check file when fetching metadata, maybe unreachable");
-                sender.send(());
+                sender.send(false);
                 return;
             }
         };
+        let selected = block_picker.selected_pieces().clone();
+        let mut checked = CheckState::new(block_picker.n_pieces());
         let total_pieces = block_picker.n_pieces();
-        for i in 0..total_pieces {
-            match Self::get_piecebuf_now(storage, i as usize).await {
-                Ok(piecebuf) => {
-                    if !Self::verify_piece(piecebuf, metadata) {
-                        println!("piece {} verify failed during file check", i);
-                    }
-                }
-                Err(e) => todo!(),
+
+        // check pieces in buffer
+        for (i, piecebuf) in storage.iter_buffered() {
+            if selected.get(*i as u32) {
+                let r = Self::verify_piece(piecebuf, metadata);
+                checked.check(*i, r);
             }
         }
-        info!("file check complete");
-        let _ = sender.send(());
+
+        // arrange for loading pieces not in buffer
+        for i in 0..total_pieces {
+            if selected.get(i as u32) && checked.get(i) == CheckState::UNKNOWN {
+                let res = Self::get_piecebuf(storage, self.self_handle.sender.clone(), i);
+                assert!(!res.is_ok())
+            }
+        }
+
+        if checked.known() == selected.count_ones() as usize {
+            info!("file check complete");
+            let _ = sender.send(true);
+        } else {
+            match &mut self.running_state {
+                RunningState::Checking { waiter, .. } => {
+                    waiter.push(sender);
+                }
+                _ => {
+                    let waiter = vec![sender];
+                    self.running_state = RunningState::Checking {
+                        total: total_pieces,
+                        checked,
+                        selected,
+                        waiter,
+                    };
+                }
+            }
+        }
     }
 
     fn handle_extend_metadata(&mut self, addr: PeerAddr, m: ExtendedMetadata) {
@@ -1160,7 +1285,7 @@ pub(crate) async fn run_transmit_worker(
         tokio::select! {
             Some(msg) = transmit.receiver.recv() => {
                 debug!("transmit manager received msg {msg:?}");
-                transmit.handle_msg(msg).await; // TODO: handle result
+                transmit.handle_msg(msg); // TODO: handle result
                 if transmit.is_downloaded() {
                     transmit.downloaded.send(true);
                     break;

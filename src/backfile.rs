@@ -95,7 +95,7 @@ impl Access for NormalFile {
     }
 
     fn write_all_at(&mut self, buf: &[u8], offset: usize) -> Result<()> {
-        info!("write_all at offset {offset} len {}", buf.len());
+        warn!("write_all at offset {offset} len {}", buf.len());
         self.file.write_all_at(buf, offset as u64)
         // Ok(())
     }
@@ -245,7 +245,7 @@ impl BackFile {
         let opener = self.opener;
         let rops = self.find_files(offset, buf);
         for r in rops {
-            warn!(
+            info!(
                 "read path {} offset {} len {}",
                 r.file.path, r.offset, r.buf_len
             );
