@@ -73,7 +73,9 @@ pub(crate) enum Msg {
     },
 
     DumpStatus(oneshot::Sender<TransmitDump>),
+    LoadProgress(TransmitDump, oneshot::Sender<()>),
     CheckFile(oneshot::Sender<bool>),
+    ChangeState(RunningCmd),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -218,6 +220,13 @@ pub enum RunningState {
         #[serde(skip)]
         waiter: Vec<oneshot::Sender<bool>>,
     }, // checking local file
+}
+
+#[derive(Debug, Clone)]
+pub enum RunningCmd {
+    Resume,
+    Pause,
+    Stop,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -734,8 +743,27 @@ impl TransmitWorker {
                 self.handle_dump_status(sender);
                 Ok(())
             }
+            Msg::LoadProgress(dump, sender) => {
+                self.handle_load_progress(dump, sender);
+                Ok(())
+            }
             Msg::CheckFile(sender) => {
                 self.handle_check_file(sender);
+                Ok(())
+            }
+            Msg::ChangeState(cmd) => {
+                match cmd {
+                    RunningCmd::Resume => {
+                        self.running_state = RunningState::Downloading;
+                        self.pick_blocks_for_all_peers(10);
+                    }
+                    RunningCmd::Pause => {
+                        self.running_state = RunningState::Paused;
+                    }
+                    RunningCmd::Stop => {
+                        self.running_state = RunningState::Stopped;
+                    }
+                }
                 Ok(())
             }
         }
@@ -1022,6 +1050,28 @@ impl TransmitWorker {
         };
         let dump = TransmitDump { peers, state };
         sender.send(dump);
+    }
+
+    fn handle_load_progress(&mut self, progress: TransmitDump, sender: oneshot::Sender<()>) {
+        // TODO: dump announce
+        match progress.state {
+            TorrentStateDump::Metadata(block_picker_dump) => match &mut self.torrent_state {
+                TorrentState::Metadata(d) => {
+                    d.block_picker.load_progress(block_picker_dump);
+                }
+                TorrentState::Fetching(_) => {
+                    info!("load progress when fetching metadata, maybe unreachable");
+                }
+            },
+            TorrentStateDump::Fetching(fetching_metadata) => todo!(),
+        }
+        let peers: Vec<_> = self.connected_peers.keys().cloned().collect();
+        let state = match &mut self.torrent_state {
+            TorrentState::Metadata(d) => TorrentStateDump::Metadata(d.block_picker.dump()),
+            TorrentState::Fetching(f) => TorrentStateDump::Fetching(f.clone()),
+        };
+        let dump = TransmitDump { peers, state };
+        sender.send(());
     }
 
     fn is_downloaded(&mut self) -> bool {

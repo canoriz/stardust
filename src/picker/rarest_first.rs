@@ -244,15 +244,12 @@ impl PiecePicker for Picker {
         &self.selected
     }
 
-    fn have(&self, index: u32) -> bool {
-        self.have.get(index)
+    fn have_pieces(&self) -> &BitField {
+        &self.have
     }
 
-    fn dump(&mut self) -> PieceMap {
-        PieceMap {
-            selected: self.selected.clone(),
-            have: self.have.clone(),
-        }
+    fn have(&self, index: u32) -> bool {
+        self.have.get(index)
     }
 }
 

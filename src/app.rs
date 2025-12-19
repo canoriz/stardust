@@ -12,7 +12,7 @@ use crate::dht::{self, DHT};
 use crate::metadata::Magnet;
 use crate::protocol::{self, BTStream, HandshakeOption, Message, Reunite, Split};
 use crate::torrent_manager::TorrentManagerHandle;
-use crate::transmit_manager::TorrentTask;
+use crate::transmit_manager::{self, TorrentTask, TransmitDump};
 use crate::{announce_manager, metadata};
 
 pub async fn main() -> Result<(), Box<dyn std::error::Error>> {

@@ -476,6 +476,14 @@ impl BlockPicker {
             no_response_timeout: self.no_response_timeout,
         }
     }
+
+    /// load progress
+    pub fn load_progress(&mut self, dump: BlockPickerDump) {
+        self.receiving = dump.receiving;
+        self.requesting = dump.requesting;
+        self.piece_picker.load(dump.piece_map);
+        self.no_response_timeout = dump.no_response_timeout;
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

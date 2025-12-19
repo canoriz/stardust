@@ -1,3 +1,4 @@
+use std::io;
 use std::sync::Arc;
 
 use crate::announce_manager::{self, AnnounceManagerHandle};
@@ -41,16 +42,35 @@ impl TorrentManagerHandle {
         self.transmit_manager.stop_wait().await;
     }
 
-    pub async fn check(&mut self) {
-        let (tx, rx) = oneshot::channel();
-        self.sender.send(transmit_manager::Msg::CheckFile(tx));
-        rx.await;
+    pub async fn change_state(&mut self, s: transmit_manager::RunningCmd) {
+        // TODO: add a receiver to confirm the state change is done
+        self.sender.send(transmit_manager::Msg::ChangeState(s));
     }
 
-    pub async fn dump_stop(mut self) {
+    pub async fn check(&mut self) -> io::Result<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.sender.send(transmit_manager::Msg::CheckFile(tx));
+        match rx.await {
+            Ok(r) => Ok(r),
+            Err(e) => Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("check oneshot recv error: {}", e),
+            )),
+        }
+    }
+
+    pub async fn dump_stop(&mut self) -> TransmitDump {
+        let (tx, rx) = oneshot::channel();
+        self.send_msg(transmit_manager::Msg::DumpStatus(tx));
+        let d = rx.await.unwrap();
+        let s = serde_json::to_string(&d).unwrap();
+        println!("{s}");
+        d
+    }
+
+    pub async fn load_progress(&mut self, progress: TransmitDump) {
         let (tx, rx) = oneshot::channel();
         self.send_msg(transmit_manager::Msg::DumpStatus(tx));
         let s = serde_json::to_string(&rx.await.unwrap()).unwrap();
-        println!("{s}");
     }
 }

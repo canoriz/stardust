@@ -132,6 +132,9 @@ pub trait PiecePicker {
     /// returns if we have this piece
     fn have(&self, index: u32) -> bool;
 
+    /// returns have piece bitfield
+    fn have_pieces(&self) -> &BitField;
+
     /// Pick next piece, returns id
     /// and marks we have this piece
     /// If later we don't receive this
@@ -142,7 +145,22 @@ pub trait PiecePicker {
     fn is_finished(&mut self) -> bool;
 
     /// dump which piece we have
-    fn dump(&mut self) -> PieceMap;
+    fn dump(&mut self) -> PieceMap {
+        PieceMap {
+            selected: self.selected_pieces().clone(),
+            have: self.have_pieces().clone(),
+        }
+    }
+
+    /// load progress from dumped piece map
+    fn load(&mut self, piece_map: PieceMap) {
+        for (i, s) in piece_map.selected.iter().enumerate() {
+            self.select(i as u32, s);
+        }
+        for (i, h) in piece_map.have.iter().enumerate() {
+            self.set_have(i as u32, h);
+        }
+    }
 }
 
 /// Dumped piece map, must be size of N
