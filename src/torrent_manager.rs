@@ -30,8 +30,13 @@ impl TorrentManagerHandle {
         }
     }
 
-    pub fn send_msg(&mut self, m: transmit_manager::Msg) {
-        self.sender.send(m); // TODO: preserve result type?
+    pub fn send_msg(&mut self, m: transmit_manager::Msg) -> io::Result<()> {
+        self.sender.send(m).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("send msg to transmit manager error: {}", e),
+            )
+        })
     }
 
     pub fn send_announce_msg(&mut self, m: announce_manager::Msg) {
@@ -42,35 +47,81 @@ impl TorrentManagerHandle {
         self.transmit_manager.stop_wait().await;
     }
 
-    pub async fn change_state(&mut self, s: transmit_manager::RunningCmd) {
+    pub async fn wait_downloaded(&mut self) -> io::Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.sender
+            .send(transmit_manager::Msg::WaitDownloaded(tx))
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("change state send msg error: {}", e),
+                )
+            })?;
+        let mut has_downloaded = rx.await.map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("wait downloaded oneshot recv error: {}", e),
+            )
+        })?;
+
+        has_downloaded.wait_for(|d| *d).await.map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("wait downloaded watch recv error: {}", e),
+            )
+        })?;
+        Ok(())
+    }
+
+    pub async fn change_state(&mut self, s: transmit_manager::RunningCmd) -> io::Result<()> {
         // TODO: add a receiver to confirm the state change is done
-        self.sender.send(transmit_manager::Msg::ChangeState(s));
+        let (tx, rx) = oneshot::channel();
+        self.sender
+            .send(transmit_manager::Msg::ChangeState(s, tx))
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("change state send msg error: {}", e),
+                )
+            })?;
+        rx.await.map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("change_state oneshot recv error: {}", e),
+            )
+        })
     }
 
     pub async fn check(&mut self) -> io::Result<bool> {
         let (tx, rx) = oneshot::channel();
-        self.sender.send(transmit_manager::Msg::CheckFile(tx));
-        match rx.await {
-            Ok(r) => Ok(r),
-            Err(e) => Err(io::Error::new(
+        self.send_msg(transmit_manager::Msg::CheckFile(tx))?;
+        rx.await.map_err(|e| {
+            io::Error::new(
                 io::ErrorKind::Other,
                 format!("check oneshot recv error: {}", e),
-            )),
-        }
+            )
+        })
     }
 
-    pub async fn dump_stop(&mut self) -> TransmitDump {
+    pub async fn dump_progress(&mut self) -> io::Result<TransmitDump> {
         let (tx, rx) = oneshot::channel();
-        self.send_msg(transmit_manager::Msg::DumpStatus(tx));
-        let d = rx.await.unwrap();
-        let s = serde_json::to_string(&d).unwrap();
-        println!("{s}");
-        d
+        self.send_msg(transmit_manager::Msg::DumpStatus(tx))?;
+        rx.await.map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("dump status oneshot recv error: {}", e),
+            )
+        })
     }
 
-    pub async fn load_progress(&mut self, progress: TransmitDump) {
+    pub async fn load_progress(&mut self, progress: TransmitDump) -> io::Result<()> {
         let (tx, rx) = oneshot::channel();
-        self.send_msg(transmit_manager::Msg::DumpStatus(tx));
-        let s = serde_json::to_string(&rx.await.unwrap()).unwrap();
+        self.send_msg(transmit_manager::Msg::LoadProgress(progress, tx))?;
+        rx.await.map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("load progress oneshot recv error: {}", e),
+            )
+        })
     }
 }

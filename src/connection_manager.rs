@@ -19,7 +19,7 @@ use crate::protocol::{
     self, BTStream, Capability, CapabilityMap, Conn, ExtendedMetadata, ExtendedMsg, Message, Piece,
     ReadStream, Reader, Request, Split, WriteStream, Writer,
 };
-use crate::transmit_manager::{Downloading, TransmitManagerHandle};
+use crate::transmit_manager::{Downloading, PeerMsg, TransmitManagerHandle};
 use crate::transmit_manager::{Msg as TransmitMsg, TorrentState};
 
 const BANDWIDTH_TIME_SLICE: time::Duration = time::Duration::from_millis(250);
@@ -339,11 +339,11 @@ where
 
         self.transmit_handle
             .sender
-            .send(TransmitMsg::BlockReceived {
+            .send(TransmitMsg::PeerMsg(PeerMsg::BlockReceived {
                 peer: self.read_stream.peer_addr(),
                 estimated_bw: self.bw.count(interval),
                 n_req_in_flight: n_req_in_flight.max(0) as usize,
-            });
+            }));
     }
 
     async fn handle_peer_msg(&mut self, addr: SocketAddr, m: Message) {
@@ -363,66 +363,83 @@ where
                 info!("ck");
                 // TODO: drop all pending requests
                 // stop sending all requests
-                let r = tmh.sender.send(TransmitMsg::PeerChoke(addr));
+                let r = tmh.sender.send(TransmitMsg::PeerMsg(PeerMsg::Choke(addr)));
                 if let Err(e) = r {
                     warn!("error send unchoke to transmit manager {e}")
                 }
             }
             Message::Unchoke => {
                 info!("uck");
-                tmh.sender.send(TransmitMsg::PeerUnchoke(addr));
+                tmh.sender
+                    .send(TransmitMsg::PeerMsg(PeerMsg::Unchoke(addr)));
             }
             Message::Interested => {
                 // TODO: update peer state
-                tmh.sender.send(TransmitMsg::PeerInterested(addr));
+                tmh.sender
+                    .send(TransmitMsg::PeerMsg(PeerMsg::Interested(addr)));
             }
             Message::NotInterested => {
                 // TODO: update peer state
-                tmh.sender.send(TransmitMsg::PeerUninterested(addr));
+                tmh.sender
+                    .send(TransmitMsg::PeerMsg(PeerMsg::Uninterested(addr)));
             }
             Message::Have(i) => {
-                tmh.sender.send(TransmitMsg::PeerHave(addr, i));
+                tmh.sender
+                    .send(TransmitMsg::PeerMsg(PeerMsg::Have(addr, i)));
             }
             Message::BitField(bf) => {
                 info!("bf");
                 // TODO: handle error
-                tmh.sender
-                    .send(TransmitMsg::PeerPieceState(addr, PieceState::Bitfield(bf)));
+                tmh.sender.send(TransmitMsg::PeerMsg(PeerMsg::PieceState(
+                    addr,
+                    PieceState::Bitfield(bf),
+                )));
             }
             Message::Request(req) => {
-                tmh.sender.send(TransmitMsg::PeerRequest(addr, req));
+                tmh.sender
+                    .send(TransmitMsg::PeerMsg(PeerMsg::Request(addr, req)));
             }
             Message::Piece(piece) => {
                 self.bw.add(piece.len as usize);
                 self.n_recv_req.fetch_add(1, Ordering::Relaxed);
-                tmh.sender.send(TransmitMsg::PeerRecvPiece(addr, piece));
+                tmh.sender
+                    .send(TransmitMsg::PeerMsg(PeerMsg::Piece(addr, piece)));
             }
             Message::Cancel(req) => {
-                tmh.sender.send(TransmitMsg::PeerCancel(addr, req));
+                tmh.sender
+                    .send(TransmitMsg::PeerMsg(PeerMsg::Cancel(addr, req)));
             }
             Message::Port(port) => {
-                tmh.sender.send(TransmitMsg::PeerDhtPort(addr, port));
+                tmh.sender
+                    .send(TransmitMsg::PeerMsg(PeerMsg::DhtPort(addr, port)));
             }
             Message::Extended(extend) => {
                 handle_extended_msg(&addr, tmh, extend).await;
             }
             Message::SuggestPiece(index) => {
-                tmh.sender.send(TransmitMsg::PeerSuggestPiece(addr, index));
+                tmh.sender
+                    .send(TransmitMsg::PeerMsg(PeerMsg::SuggestPiece(addr, index)));
             }
             Message::AllowedFast(index) => {
-                tmh.sender.send(TransmitMsg::PeerAllowedFast(addr, index));
+                tmh.sender
+                    .send(TransmitMsg::PeerMsg(PeerMsg::AllowedFast(addr, index)));
             }
             Message::HaveAll => {
-                tmh.sender
-                    .send(TransmitMsg::PeerPieceState(addr, PieceState::HaveAll));
+                tmh.sender.send(TransmitMsg::PeerMsg(PeerMsg::PieceState(
+                    addr,
+                    PieceState::HaveAll,
+                )));
             }
             Message::HaveNone => {
-                tmh.sender
-                    .send(TransmitMsg::PeerPieceState(addr, PieceState::HaveNone));
+                tmh.sender.send(TransmitMsg::PeerMsg(PeerMsg::PieceState(
+                    addr,
+                    PieceState::HaveNone,
+                )));
             }
             Message::Reject(req) => {
                 self.n_recv_req.fetch_add(1, Ordering::Relaxed);
-                tmh.sender.send(TransmitMsg::PeerReject(addr, req));
+                tmh.sender
+                    .send(TransmitMsg::PeerMsg(PeerMsg::Reject(addr, req)));
             }
         }
     }
@@ -542,7 +559,9 @@ async fn handle_extended_msg(
             Ok(())
         }
         ExtendedMsg::Metadata(m) => {
-            _ = tmh.sender.send(TransmitMsg::ExtendMetadata(*peer, m));
+            _ = tmh
+                .sender
+                .send(TransmitMsg::PeerMsg(PeerMsg::ExtendMetadata(*peer, m)));
             Ok(())
         }
         ExtendedMsg::Unknown(id) => {
@@ -579,11 +598,11 @@ mod test {
         let first1 = rx1.recv().await.unwrap();
         let first2 = rx2.recv().await.unwrap();
         let inner1 = match first1 {
-            Msg::PeerDhtPort(sa, p) => (sa, p),
+            Msg::PeerMsg(PeerMsg::DhtPort(sa, p)) => (sa, p),
             _ => unreachable!(),
         };
         let inner2 = match first2 {
-            Msg::PeerDhtPort(sa, p) => (sa, p),
+            Msg::PeerMsg(PeerMsg::DhtPort(sa, p)) => (sa, p),
             _ => unreachable!(),
         };
         assert_eq!(inner1, inner2);

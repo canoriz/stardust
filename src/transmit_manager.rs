@@ -31,6 +31,34 @@ type PeerAddr = SocketAddr;
 
 #[derive(Debug)]
 #[non_exhaustive]
+pub enum PeerMsg {
+    // TODO: use a structure ptr to connection_peer struct
+    // to replace SocketAddr
+    // which removes the HashMap cost
+    Choke(PeerAddr),
+    Unchoke(PeerAddr),
+    Interested(PeerAddr),
+    Uninterested(PeerAddr),
+    PieceState(PeerAddr, PieceState),
+    Have(PeerAddr, u32),
+    Piece(PeerAddr, Piece),
+    DhtPort(PeerAddr, u16),
+    SuggestPiece(PeerAddr, u32),
+    AllowedFast(PeerAddr, u32),
+    Cancel(PeerAddr, Request),
+    Reject(PeerAddr, Request),
+    Request(PeerAddr, Request),
+    ExtendMetadata(PeerAddr, ExtendedMetadata),
+    BlockReceived {
+        peer: PeerAddr,
+        // estimated bandwidth, bytes per period
+        estimated_bw: usize,
+        n_req_in_flight: usize,
+    },
+}
+
+#[derive(Debug)]
+#[non_exhaustive]
 pub(crate) enum Msg {
     AnnounceFinish(Result<metadata::AnnounceResp, metadata::AnnounceError>),
     AnnounceMsg(announce_manager::Msg),
@@ -40,42 +68,19 @@ pub(crate) enum Msg {
     NewIncomePeer(protocol::BTStream<Box<dyn Conn>>),
     PeerLeave(PeerAddr),
 
-    // TODO: use a structure ptr to connection_peer struct
-    // to replace SocketAddr
-    // which removes the HashMap cost
-    PeerChoke(PeerAddr),
-    PeerUnchoke(PeerAddr),
-    PeerInterested(PeerAddr),
-    PeerUninterested(PeerAddr),
-    PeerPieceState(PeerAddr, PieceState),
-    PeerHave(PeerAddr, u32),
-    PeerRecvPiece(PeerAddr, Piece),
-    PeerDhtPort(PeerAddr, u16),
-    PeerSuggestPiece(PeerAddr, u32),
-    PeerAllowedFast(PeerAddr, u32),
-    PeerCancel(PeerAddr, Request),
-    PeerReject(PeerAddr, Request),
-    PeerRequest(PeerAddr, Request),
-    ExtendMetadata(PeerAddr, ExtendedMetadata),
-
     PieceBufReady {
         index: usize,
         buf: io::Result<PieceBuf>,
     },
 
+    PeerMsg(PeerMsg),
     FlushError(FlushErr),
-
-    BlockReceived {
-        peer: PeerAddr,
-        // estimated bandwidth, bytes per period
-        estimated_bw: usize,
-        n_req_in_flight: usize,
-    },
 
     DumpStatus(oneshot::Sender<TransmitDump>),
     LoadProgress(TransmitDump, oneshot::Sender<()>),
     CheckFile(oneshot::Sender<bool>),
-    ChangeState(RunningCmd),
+    ChangeState(RunningCmd, oneshot::Sender<()>),
+    WaitDownloaded(oneshot::Sender<watch::Receiver<bool>>),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -118,7 +123,6 @@ enum IsDownloaded {
 }
 
 pub(crate) struct TransmitManager {
-    is_downloaded: watch::Receiver<bool>,
     cancel: CancelDropGuard,
     worker_stop: oneshot::Receiver<()>,
 }
@@ -132,7 +136,6 @@ impl TransmitManager {
         dht_client: Option<Arc<DHT>>,
         announce_manager: AnnounceManagerHandle,
     ) -> Self {
-        let (downloaded_tx, downloaded_rx) = watch::channel(false);
         let worker = TransmitWorker::new(
             t,
             id,
@@ -140,7 +143,6 @@ impl TransmitManager {
             announce_manager,
             cmd_sender,
             cmd_receiver,
-            downloaded_tx,
         );
         let cancel_transmit = CancellationToken::new();
         let (done_transmit, done_transmit_rx) = oneshot::channel::<()>();
@@ -150,14 +152,13 @@ impl TransmitManager {
             done_transmit,
         ));
         Self {
-            is_downloaded: downloaded_rx,
             cancel: cancel_transmit.drop_guard(),
             worker_stop: done_transmit_rx,
         }
     }
 
     pub async fn stop_wait(mut self) {
-        self.is_downloaded.changed().await;
+        // TODO: dump status
         self.cancel.disarm().cancel();
         _ = self.worker_stop.await;
     }
@@ -415,7 +416,6 @@ impl TransmitWorker {
         announce_manager: AnnounceManagerHandle,
         cmd_sender: mpsc::UnboundedSender<Msg>,
         cmd_receiver: mpsc::UnboundedReceiver<Msg>,
-        downloaded: watch::Sender<bool>,
     ) -> Self {
         let (info_hash, state) = match t {
             TorrentTask::Torrent(m) => {
@@ -437,6 +437,7 @@ impl TransmitWorker {
             .info_hash(info_hash)
             .dht_port(dht_client.as_ref().map(|c| c.port()))
             .build();
+        let downloaded = watch::channel(false).0;
         Self {
             id,
             info_hash,
@@ -606,7 +607,50 @@ impl TransmitWorker {
                 self.connected_peers.remove(&addr);
                 Ok(())
             }
-            Msg::PeerPieceState(addr, state) => {
+            Msg::PeerMsg(pm) => self.handle_peer_msg(pm),
+            Msg::NewIncomePeer(btstream) => todo!(),
+            Msg::FlushError(_) => {
+                todo!()
+            }
+            Msg::PieceBufReady { index, buf } => self.handle_piecebuf_ready(index, buf),
+            Msg::DumpStatus(sender) => {
+                self.handle_dump_status(sender);
+                Ok(())
+            }
+            Msg::LoadProgress(dump, sender) => {
+                self.handle_load_progress(dump, sender);
+                Ok(())
+            }
+            Msg::CheckFile(sender) => {
+                self.handle_check_file(sender);
+                Ok(())
+            }
+            Msg::ChangeState(cmd, sender) => {
+                match cmd {
+                    RunningCmd::Resume => {
+                        self.running_state = RunningState::Downloading;
+                        self.pick_blocks_for_all_peers(10);
+                    }
+                    RunningCmd::Pause => {
+                        self.running_state = RunningState::Paused;
+                    }
+                    RunningCmd::Stop => {
+                        self.running_state = RunningState::Stopped;
+                    }
+                }
+                _ = sender.send(());
+                Ok(())
+            }
+            Msg::WaitDownloaded(sender) => {
+                _ = sender.send(self.downloaded.subscribe());
+                Ok(())
+            }
+        }
+    }
+
+    pub fn handle_peer_msg(&mut self, m: PeerMsg) -> io::Result<()> {
+        match m {
+            PeerMsg::PieceState(addr, state) => {
                 let block_picker = match &mut self.torrent_state {
                     TorrentState::Metadata(d) => &mut d.block_picker,
                     TorrentState::Fetching(_) => {
@@ -621,7 +665,7 @@ impl TransmitWorker {
                 block_picker.peer_add(addr, state);
                 Ok(())
             }
-            Msg::PeerHave(peer, i) => {
+            PeerMsg::Have(peer, i) => {
                 info!("peer {peer} have piece {i}");
                 let block_picker = match &mut self.torrent_state {
                     TorrentState::Metadata(d) => &mut d.block_picker,
@@ -636,7 +680,7 @@ impl TransmitWorker {
                 block_picker.peer_new_have(&peer, i);
                 Ok(())
             }
-            Msg::PeerChoke(peer) => {
+            PeerMsg::Choke(peer) => {
                 warn!("{peer} choked us");
                 let piece_picker = match &mut self.torrent_state {
                     TorrentState::Metadata(d) => &mut d.block_picker,
@@ -656,7 +700,7 @@ impl TransmitWorker {
                 // so we can recover to max speed (hopefully) once they unchoked us
                 Ok(())
             }
-            Msg::PeerUnchoke(peer) => {
+            PeerMsg::Unchoke(peer) => {
                 let n_first_pick = 3;
                 warn!("{peer} unchoked us");
                 self.connected_peers.entry(peer).and_modify(|st| {
@@ -670,20 +714,19 @@ impl TransmitWorker {
                 // self.pick_blocks_for_peer(&peer, 0);
                 Ok(())
             }
-            Msg::NewIncomePeer(btstream) => todo!(),
-            Msg::PeerInterested(peer) => {
+            PeerMsg::Interested(peer) => {
                 self.connected_peers.entry(peer).and_modify(|st| {
                     st.state.peer_interest_status = InterestStatus::Interested;
                 });
                 Ok(())
             }
-            Msg::PeerUninterested(peer) => {
+            PeerMsg::Uninterested(peer) => {
                 self.connected_peers.entry(peer).and_modify(|st| {
                     st.state.peer_interest_status = InterestStatus::Uninterested;
                 });
                 Ok(())
             }
-            Msg::BlockReceived {
+            PeerMsg::BlockReceived {
                 peer,
                 estimated_bw,
                 n_req_in_flight,
@@ -704,33 +747,29 @@ impl TransmitWorker {
                 }
                 Ok(())
             }
-            Msg::PeerRecvPiece(addr, piece) => self.handle_piece_msg(&addr, piece),
-            Msg::FlushError(_) => {
-                todo!()
-            }
-            Msg::PeerDhtPort(addr, port) => self.handle_dht_port_msg(addr, port),
-            Msg::PieceBufReady { index, buf } => self.handle_piecebuf_ready(index, buf),
-            Msg::ExtendMetadata(pa, m) => {
+            PeerMsg::Piece(addr, piece) => self.handle_piece_msg(&addr, piece),
+            PeerMsg::DhtPort(addr, port) => self.handle_dht_port_msg(addr, port),
+            PeerMsg::ExtendMetadata(pa, m) => {
                 self.handle_extend_metadata(pa, m);
                 Ok(())
             }
-            Msg::PeerSuggestPiece(addr, index) => {
+            PeerMsg::SuggestPiece(addr, index) => {
                 info!("{addr} suggest piece {index}");
                 Ok(())
             }
-            Msg::PeerAllowedFast(addr, index) => {
+            PeerMsg::AllowedFast(addr, index) => {
                 info!("{addr} allowed fast {index}");
                 Ok(())
             }
-            Msg::PeerCancel(addr, req) => {
+            PeerMsg::Cancel(addr, req) => {
                 info!("{addr} cancel {req:?}");
                 Ok(())
             }
-            Msg::PeerReject(addr, req) => {
+            PeerMsg::Reject(addr, req) => {
                 self.handle_reject_msg(addr, req);
                 Ok(())
             }
-            Msg::PeerRequest(addr, req) => {
+            PeerMsg::Request(addr, req) => {
                 // TODO: optimize: handle can be passed so avoid map search overhead
                 if let Some(conn) = self.connected_peers.get_mut(&addr) {
                     if conn.conn.capability().contains(&protocol::Capability::Fast) {
@@ -739,38 +778,7 @@ impl TransmitWorker {
                 }
                 Ok(())
             }
-            Msg::DumpStatus(sender) => {
-                self.handle_dump_status(sender);
-                Ok(())
-            }
-            Msg::LoadProgress(dump, sender) => {
-                self.handle_load_progress(dump, sender);
-                Ok(())
-            }
-            Msg::CheckFile(sender) => {
-                self.handle_check_file(sender);
-                Ok(())
-            }
-            Msg::ChangeState(cmd) => {
-                match cmd {
-                    RunningCmd::Resume => {
-                        self.running_state = RunningState::Downloading;
-                        self.pick_blocks_for_all_peers(10);
-                    }
-                    RunningCmd::Pause => {
-                        self.running_state = RunningState::Paused;
-                    }
-                    RunningCmd::Stop => {
-                        self.running_state = RunningState::Stopped;
-                    }
-                }
-                Ok(())
-            }
         }
-    }
-
-    pub fn start_find_peers_task(&self) {
-        todo!()
     }
 
     fn handle_announce(&mut self, addrs: Vec<SocketAddr>) {
@@ -1049,7 +1057,7 @@ impl TransmitWorker {
             TorrentState::Fetching(f) => TorrentStateDump::Fetching(f.clone()),
         };
         let dump = TransmitDump { peers, state };
-        sender.send(dump);
+        _ = sender.send(dump);
     }
 
     fn handle_load_progress(&mut self, progress: TransmitDump, sender: oneshot::Sender<()>) {
@@ -1061,17 +1069,18 @@ impl TransmitWorker {
                 }
                 TorrentState::Fetching(_) => {
                     info!("load progress when fetching metadata, maybe unreachable");
+                    todo!()
                 }
             },
-            TorrentStateDump::Fetching(fetching_metadata) => todo!(),
+            TorrentStateDump::Fetching(f) => {
+                self.torrent_state = TorrentState::Fetching(f);
+            }
         }
-        let peers: Vec<_> = self.connected_peers.keys().cloned().collect();
-        let state = match &mut self.torrent_state {
-            TorrentState::Metadata(d) => TorrentStateDump::Metadata(d.block_picker.dump()),
-            TorrentState::Fetching(f) => TorrentStateDump::Fetching(f.clone()),
-        };
-        let dump = TransmitDump { peers, state };
-        sender.send(());
+
+        for p in progress.peers {
+            self.handle_new_discovered_peer(p);
+        }
+        _ = sender.send(());
     }
 
     fn is_downloaded(&mut self) -> bool {
@@ -1412,6 +1421,48 @@ async fn connect_peer(
             info!("tcp handshake {addr} error {e}");
             _ = main_tx.sender.send(Msg::NewPeer(Err(addr)));
             Err(e)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    #[test]
+    fn test_dump_and_load_fetching() {
+        // construct a simple TransmitDump with Fetching state
+        let mb = MetadataBuffer::new();
+        let magnet = Magnet {
+            info_hash: [1; 20],
+            dn: None,
+            pe: None,
+            tr: None,
+        };
+        let fetching = FetchingMetadata {
+            meta_buf: mb,
+            magnet,
+        };
+        let dump = TransmitDump {
+            state: TorrentStateDump::Fetching(fetching),
+            peers: vec![SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                6881,
+            )],
+        };
+
+        let ser = serde_json::to_string(&dump).expect("serialize dump");
+        let de: TransmitDump = serde_json::from_str(&ser).expect("deserialize dump");
+        assert_eq!(dump.peers, de.peers);
+
+        // ensure state variant matches
+        match de.state {
+            TorrentStateDump::Fetching(f) => {
+                assert_eq!(f.magnet.info_hash, [1; 20]);
+            }
+            _ => panic!("expected Fetching state"),
         }
     }
 }
