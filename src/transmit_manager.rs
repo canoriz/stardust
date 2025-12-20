@@ -4,7 +4,7 @@ use crate::cache::simple_buffer::{BufStorage, FlushErr};
 use crate::cache::simple_buffer::{GetPieceErr, PieceBuf};
 use crate::connection_manager::{ConnectionManagerHandle, Msg as ConnMsg};
 use crate::dht::DHT;
-use crate::metadata::{self, Announce, Magnet, Metadata};
+use crate::metadata::{self, Magnet, Metadata};
 use crate::picker::{BlockPicker, BlockPickerDump, PieceState, RarestPicker};
 use crate::protocol::{
     self, BitField, Conn, ExtendedMetadata, ExtendedMsg, HandshakeOption, Piece, Request,
@@ -13,9 +13,9 @@ use crate::protocol::{
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::{clone, io};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time;
@@ -109,17 +109,11 @@ struct PeerConn {
     conn: ConnectionManagerHandle,
     state: PeerStatus,
     bitmap: Option<PieceState>,
-
-    last_pick_time: time::Instant,
 }
 
 #[derive(Clone)]
 pub(crate) struct TransmitManagerHandle {
     pub sender: mpsc::UnboundedSender<Msg>,
-}
-
-enum IsDownloaded {
-    Downloading,
 }
 
 pub(crate) struct TransmitManager {
@@ -209,13 +203,13 @@ impl CheckState {
 }
 
 #[derive(Serialize, Deserialize)]
-pub enum RunningState {
+enum RunningState {
     Downloading,
     Paused,  // maintains connection but do not download
     Stopped, // all stopped
     Seeding,
     Checking {
-        total: usize,
+        prev_state: RunningCmd,
         selected: BitField,
         checked: CheckState,
         #[serde(skip)]
@@ -223,7 +217,7 @@ pub enum RunningState {
     }, // checking local file
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RunningCmd {
     Resume,
     Pause,
@@ -589,7 +583,6 @@ impl TransmitWorker {
                             peer_interest_status: InterestStatus::Unknown,
                         },
                         bitmap: None,
-                        last_pick_time: time::Instant::now(),
                     },
                 );
                 self.connecting_peers.remove(&peer_addr);
@@ -990,7 +983,7 @@ impl TransmitWorker {
 
                 match &mut self.running_state {
                     RunningState::Checking {
-                        total,
+                        prev_state,
                         selected,
                         checked,
                         waiter,
@@ -1011,9 +1004,17 @@ impl TransmitWorker {
                             if selected.count_ones() as usize == checked.known() {
                                 let r = checked.state.iter().all(|s| *s != CheckState::CORRUPT);
                                 notify_waiter(r);
-                                // TODO: set to previous state, or new state changed because of
-                                // check
-                                self.running_state = RunningState::Paused;
+                                match prev_state {
+                                    RunningCmd::Resume => {
+                                        if block_picker.is_finished() {
+                                            self.running_state = RunningState::Seeding
+                                        } else {
+                                            self.running_state = RunningState::Downloading
+                                        }
+                                    }
+                                    RunningCmd::Pause => self.running_state = RunningState::Paused,
+                                    RunningCmd::Stop => self.running_state = RunningState::Stopped,
+                                }
                             }
                         }
                     }
@@ -1149,10 +1150,17 @@ impl TransmitWorker {
                 RunningState::Checking { waiter, .. } => {
                     waiter.push(sender);
                 }
-                _ => {
+                s => {
+                    let prev_state = match s {
+                        RunningState::Downloading => RunningCmd::Resume,
+                        RunningState::Paused => RunningCmd::Pause,
+                        RunningState::Stopped => RunningCmd::Stop,
+                        RunningState::Seeding => RunningCmd::Resume,
+                        _ => unreachable!(),
+                    };
                     let waiter = vec![sender];
                     self.running_state = RunningState::Checking {
-                        total: total_pieces,
+                        prev_state,
                         checked,
                         selected,
                         waiter,
