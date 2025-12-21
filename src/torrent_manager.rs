@@ -13,7 +13,7 @@ pub struct TorrentManagerHandle {
 }
 
 impl TorrentManagerHandle {
-    pub fn new(t: TorrentTask, id: [u8; 20], port: u16, dht_client: Option<Arc<DHT>>) -> Self {
+    pub fn new(t: TorrentTask, self_id: [u8; 20], port: u16, dht_client: Option<Arc<DHT>>) -> Self {
         let (tx, rx) = mpsc::unbounded_channel::<transmit_manager::Msg>();
 
         let info_hash = match &t {
@@ -21,8 +21,8 @@ impl TorrentManagerHandle {
             TorrentTask::Magnet(m) => m.info_hash,
         };
 
-        let am = AnnounceManagerHandle::new(id, port, info_hash, tx.clone());
-        let tm = TransmitManager::new(t, id, tx.clone(), rx, dht_client, am);
+        let am = AnnounceManagerHandle::new(self_id, port, info_hash, tx.clone());
+        let tm = TransmitManager::new(t, self_id, tx.clone(), rx, dht_client, am);
 
         Self {
             sender: tx,

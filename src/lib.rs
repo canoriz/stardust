@@ -10,6 +10,7 @@ pub(crate) mod math_helper;
 pub(crate) mod metadata;
 pub(crate) mod picker;
 pub(crate) mod protocol;
+pub(crate) mod session;
 pub(crate) mod torrent_manager;
 pub(crate) mod transmit_manager;
 

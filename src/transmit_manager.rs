@@ -27,6 +27,15 @@ pub enum TorrentTask {
     Magnet(Magnet),
 }
 
+impl TorrentTask {
+    pub fn info_hash(&self) -> [u8; 20] {
+        match self {
+            TorrentTask::Torrent(m) => m.info_hash,
+            TorrentTask::Magnet(m) => m.info_hash,
+        }
+    }
+}
+
 type PeerAddr = SocketAddr;
 
 #[derive(Debug)]
@@ -76,6 +85,7 @@ pub(crate) enum Msg {
     PeerMsg(PeerMsg),
     FlushError(FlushErr),
 
+    RequestMetadata(oneshot::Sender<Option<Arc<Metadata>>>),
     DumpStatus(oneshot::Sender<TransmitDump>),
     LoadProgress(TransmitDump, oneshot::Sender<()>),
     CheckFile(oneshot::Sender<bool>),
@@ -610,6 +620,10 @@ impl TransmitWorker {
                 self.handle_dump_status(sender);
                 Ok(())
             }
+            Msg::RequestMetadata(sender) => {
+                self.handle_request_metadata(sender);
+                Ok(())
+            }
             Msg::LoadProgress(dump, sender) => {
                 self.handle_load_progress(dump, sender);
                 Ok(())
@@ -1059,6 +1073,14 @@ impl TransmitWorker {
         };
         let dump = TransmitDump { peers, state };
         _ = sender.send(dump);
+    }
+
+    fn handle_request_metadata(&mut self, sender: oneshot::Sender<Option<Arc<Metadata>>>) {
+        let metadata = match &mut self.torrent_state {
+            TorrentState::Metadata(d) => Some(d.metadata.clone()),
+            TorrentState::Fetching(_) => None,
+        };
+        _ = sender.send(metadata);
     }
 
     fn handle_load_progress(&mut self, progress: TransmitDump, sender: oneshot::Sender<()>) {

@@ -21,6 +21,7 @@ use crate::protocol::{
 };
 use crate::transmit_manager::{Downloading, PeerMsg, TransmitManagerHandle};
 use crate::transmit_manager::{Msg as TransmitMsg, TorrentState};
+use crate::Reunite;
 
 const BANDWIDTH_TIME_SLICE: time::Duration = time::Duration::from_millis(250);
 

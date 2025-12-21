@@ -1,5 +1,6 @@
 use crate::cache::{AbortErr, AsyncAbortRead, Ref};
 use crate::dht;
+use crate::metadata::Metadata;
 use bon::Builder;
 use bt_bencode::ByteIpAddr;
 use bt_bencode::ByteString;
@@ -10,10 +11,9 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Formatter;
-use std::mem::MaybeUninit;
+use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::Arc;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net;
 use tokio::net::tcp;
@@ -57,6 +57,12 @@ impl fmt::Debug for dyn Conn {
             .field("protocol", &self.protocol())
             .finish()
     }
+}
+
+pub enum AcceptOpt {
+    HaveMetadata(Arc<Metadata>),
+    NoMetadata,
+    Reject,
 }
 
 impl<T> Conn for T
@@ -696,14 +702,41 @@ where
         Ok(s)
     }
 
-    pub async fn accept(mut t: T, opt: HandshakeOption) -> io::Result<Self>
+    pub async fn accept<F>(mut t: T, accept: F, opt: HandshakeOption) -> io::Result<Self>
     where
         <T as Split>::R: Reunite<W = <T as Split>::W, U = T>,
+        F: AsyncFnOnce(&Handshake) -> AcceptOpt,
     {
         let dht_port = opt.dht_port;
-        let (h, eh) = opt.handshake();
+        let (h, mut eh) = opt.handshake();
         let peer_handshake = recv_handshake(&mut t).await?;
-        // TODO: check the id, if no same id, close connection
+
+        // TODO: let accept return metadata size and send to peer
+        match accept(&peer_handshake).await {
+            AcceptOpt::HaveMetadata(m) => {
+                let b = match bt_bencode::to_vec(&m.info) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        // TODO: optimize, don't encode every time
+                        return Err(io::Error::new(
+                            io::ErrorKind::Other,
+                            "handshake metadata bencode failed",
+                        ));
+                    }
+                };
+                if let Some(eh) = &mut eh {
+                    eh.metadata_size = Some(b.len() as u32);
+                }
+            }
+            AcceptOpt::NoMetadata => {}
+            AcceptOpt::Reject => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "handshake rejected by accept function",
+                ));
+            }
+        }
+
         send_handshake(&mut t, &h).await?;
 
         let reserved = peer_handshake.reserved.common(&h.reserved);
@@ -2486,7 +2519,11 @@ pub mod tests {
     ) -> (BTStream<DuplexStream>, BTStream<DuplexStream>) {
         let (peer1, peer2) = duplex(1024 * 1024);
         let p1 = tokio::spawn(async move { BTStream::connect(peer1, opt).await.unwrap() });
-        let p2 = tokio::spawn(async move { BTStream::accept(peer2, opt2).await.unwrap() });
+        let p2 = tokio::spawn(async move {
+            BTStream::accept(peer2, async |_| AcceptOpt::NoMetadata, opt2)
+                .await
+                .unwrap()
+        });
 
         (p1.await.unwrap(), p2.await.unwrap())
     }
