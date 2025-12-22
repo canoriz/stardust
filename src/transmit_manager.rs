@@ -639,6 +639,7 @@ impl TransmitWorker {
                 Ok(())
             }
             Msg::ChangeState(cmd, sender) => {
+                // TODO: FIXME: should pause announce task as well
                 match cmd {
                     RunningCmd::Resume => {
                         self.running_state = RunningState::Downloading;
@@ -933,7 +934,6 @@ impl TransmitWorker {
             piece.index as usize,
         ) {
             Ok(piecebuf) => {
-                info!("piecebuf {} already in", piece.index);
                 copy_to_piecebuf(&piece, piecebuf);
                 if let Some(_) = piece_received {
                     Self::handle_full_piece_received(
@@ -1302,6 +1302,7 @@ impl TransmitWorker {
     }
 
     fn handle_extend_pex(&mut self, addr: PeerAddr, pex: ExtendedPex) {
+        info!("receive pex from {addr:?}: {:?}", pex);
         for (addr, flags) in pex.added {
             self.handle_new_discovered_peer(addr);
         }

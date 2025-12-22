@@ -27,7 +27,7 @@ pub trait Writer: AsyncWrite + Send + Unpin + 'static {}
 impl<T> Reader for T where T: AsyncRead + Send + Unpin + 'static {}
 impl<T> Writer for T where T: AsyncWrite + Send + Unpin + 'static {}
 
-pub trait Split {
+pub trait Split: AsyncRead + AsyncWrite + Send + Unpin + 'static {
     type R: Reader;
     type W: Writer;
 
@@ -44,7 +44,7 @@ pub trait Split {
 /// Dynamic connection
 /// BTStream can operate with any connection implemented this.
 // prepared for utp/tcp/proxy support
-pub trait Conn: Send {
+pub trait Conn: AsyncRead + AsyncWrite + Send + Unpin + 'static {
     fn split(self: Box<Self>) -> (Box<dyn Reader>, Box<dyn Writer>);
     fn remote_addr(&self) -> SocketAddr;
     fn protocol(&self) -> &'static str;
@@ -191,7 +191,7 @@ pub struct BTStream<T> {
     // torrent_hash: [u8; 20],
 
     // what this peer knows about our connected peers
-    pex_peers: HashMap<IpAddr, Option<PexFlag>>,
+    pex_peers: HashMap<SocketAddr, Option<PexFlag>>,
 
     // buffer for incoming piece
     // this might be transferred to other place for further
@@ -231,6 +231,95 @@ where
 impl BTStream<Box<dyn Conn>> {
     pub fn peer_addr(&self) -> SocketAddr {
         self.inner.remote_addr()
+    }
+
+    pub async fn send_keepalive(&mut self) -> io::Result<()> {
+        send_keepalive(&mut self.inner).await
+    }
+
+    pub async fn send_choke(&mut self) -> io::Result<()> {
+        send_choke(&mut self.inner).await
+    }
+
+    pub async fn send_unchoke(&mut self) -> io::Result<()> {
+        send_unchoke(&mut self.inner).await
+    }
+
+    pub async fn send_interested(&mut self) -> io::Result<()> {
+        send_interested(&mut self.inner).await
+    }
+
+    pub async fn send_notinterested(&mut self) -> io::Result<()> {
+        send_notinterested(&mut self.inner).await
+    }
+
+    pub async fn send_have(&mut self, index: u32) -> io::Result<()> {
+        send_have(&mut self.inner, index).await
+    }
+
+    pub async fn send_bitfield(&mut self, b: &BitField) -> io::Result<()> {
+        send_bitfield(&mut self.inner, b).await
+    }
+
+    pub async fn send_request(&mut self, index: u32, begin: u32, len: u32) -> io::Result<()> {
+        send_request(&mut self.inner, index, begin, len).await
+    }
+
+    pub async fn send_piece(&mut self, index: u32, begin: u32, piece: &[u8]) -> io::Result<()> {
+        send_piece(&mut self.inner, index, begin, piece).await
+    }
+
+    pub async fn send_cancel(&mut self, index: u32, begin: u32, len: u32) -> io::Result<()> {
+        send_cancel(&mut self.inner, index, begin, len).await
+    }
+
+    pub async fn send_port(&mut self, port: u16) -> io::Result<()> {
+        send_port(&mut self.inner, port).await
+    }
+
+    pub async fn send_reject(&mut self, index: u32, begin: u32, len: u32) -> io::Result<()> {
+        send_reject(&mut self.inner, index, begin, len).await
+    }
+
+    pub async fn send_allowed_fast(&mut self, index: u32) -> io::Result<()> {
+        send_allowed_fast(&mut self.inner, index).await
+    }
+
+    pub async fn send_suggest_piece(&mut self, index: u32) -> io::Result<()> {
+        send_suggest_piece(&mut self.inner, index).await
+    }
+
+    pub async fn send_have_all(&mut self) -> io::Result<()> {
+        send_have_all(&mut self.inner).await
+    }
+
+    pub async fn send_have_none(&mut self) -> io::Result<()> {
+        send_have_none(&mut self.inner).await
+    }
+
+    pub async fn send_extend_pex(
+        &mut self,
+        now_connected: &HashMap<SocketAddr, Option<PexFlag>>,
+    ) -> io::Result<()> {
+        let (added, dropped) = make_added_and_dropped(now_connected, &self.pex_peers);
+        match send_extend_pex(
+            &mut self.inner,
+            added.iter(),
+            dropped.iter(),
+            &self.extension_id,
+        )
+        .await
+        {
+            Ok(_) => {
+                update_pex_map(&mut self.pex_peers, &added, &dropped);
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    pub async fn send_extend_metadata(&mut self, meta: ExtendedMetadata) -> io::Result<()> {
+        send_extend_metadata(&mut self.inner, meta, &self.extension_id).await
     }
 }
 
@@ -314,7 +403,7 @@ pub struct WriteStream<T> {
     metadata_size: usize,
 
     // what this peer knows about our connected peers
-    pex_peers: HashMap<IpAddr, Option<PexFlag>>,
+    pex_peers: HashMap<SocketAddr, Option<PexFlag>>,
 
     peer_id: [u8; 20],
     info_hash: [u8; 20],
@@ -876,7 +965,7 @@ where
 
     pub async fn send_extend_pex(
         &mut self,
-        now_connected: &HashMap<IpAddr, Option<PexFlag>>,
+        now_connected: &HashMap<SocketAddr, Option<PexFlag>>,
     ) -> io::Result<()> {
         let (added, dropped) = make_added_and_dropped(now_connected, &self.pex_peers);
         match send_extend_pex(
@@ -901,9 +990,9 @@ where
 }
 
 fn make_added_and_dropped(
-    now_connected: &HashMap<IpAddr, Option<PexFlag>>,
-    old_connected: &HashMap<IpAddr, Option<PexFlag>>,
-) -> (Vec<(IpAddr, Option<PexFlag>)>, Vec<IpAddr>) {
+    now_connected: &HashMap<SocketAddr, Option<PexFlag>>,
+    old_connected: &HashMap<SocketAddr, Option<PexFlag>>,
+) -> (Vec<(SocketAddr, Option<PexFlag>)>, Vec<SocketAddr>) {
     // to send added and dropped
     // what we now have, but peer don't know comes to added
     // what we don't have, but peer thinks we have, come to dropped
@@ -926,9 +1015,9 @@ fn make_added_and_dropped(
 }
 
 fn update_pex_map(
-    pex_map: &mut HashMap<IpAddr, Option<PexFlag>>,
-    added: &Vec<(IpAddr, Option<PexFlag>)>,
-    dropped: &Vec<IpAddr>,
+    pex_map: &mut HashMap<SocketAddr, Option<PexFlag>>,
+    added: &Vec<(SocketAddr, Option<PexFlag>)>,
+    dropped: &Vec<SocketAddr>,
 ) {
     for (ip, pex) in added {
         pex_map.insert(*ip, *pex);
@@ -1009,7 +1098,7 @@ where
 
     pub async fn send_extend_pex(
         &mut self,
-        now_connected: &HashMap<IpAddr, Option<PexFlag>>,
+        now_connected: &HashMap<SocketAddr, Option<PexFlag>>,
     ) -> io::Result<()> {
         let (added, dropped) = make_added_and_dropped(now_connected, &self.pex_peers);
         match send_extend_pex(
@@ -1582,18 +1671,19 @@ impl From<u8> for PexFlag {
 
 #[derive(Debug, Eq, PartialEq, Default)]
 pub struct ExtendedPex {
-    pub added: Vec<(IpAddr, Option<PexFlag>)>,
-    pub added6: Vec<(IpAddr, Option<PexFlag>)>,
-    pub dropped: Vec<IpAddr>,
-    pub dropped6: Vec<IpAddr>,
+    pub added: Vec<(SocketAddr, Option<PexFlag>)>,
+    pub added6: Vec<(SocketAddr, Option<PexFlag>)>,
+    pub dropped: Vec<SocketAddr>,
+    pub dropped6: Vec<SocketAddr>,
 }
 
 impl From<ExtendedPexWire> for ExtendedPex {
     // Required method
     fn from(v: ExtendedPexWire) -> Self {
         let mut r = Self::default();
-        for (i, bip) in v.added.chunks_exact(4).enumerate() {
+        for (i, bip) in v.added.chunks_exact(6).enumerate() {
             let ip = IpAddr::from(Ipv4Addr::from([bip[0], bip[1], bip[2], bip[3]]));
+            let port = u16::from_be_bytes([bip[4], bip[5]]);
             let f = if let Some(ref fs) = v.addedf {
                 if fs.len() > i {
                     let f = PexFlag::from(fs[i]);
@@ -1604,14 +1694,15 @@ impl From<ExtendedPexWire> for ExtendedPex {
             } else {
                 None
             };
-            r.added.push((ip, f))
+            r.added.push((SocketAddr::new(ip, port), f))
         }
 
-        for (i, bip) in v.added6.chunks_exact(16).enumerate() {
+        for (i, bip) in v.added6.chunks_exact(18).enumerate() {
             let ip = IpAddr::from(Ipv6Addr::from([
                 bip[0], bip[1], bip[2], bip[3], bip[4], bip[5], bip[6], bip[7], bip[8], bip[9],
                 bip[10], bip[11], bip[12], bip[13], bip[14], bip[15],
             ]));
+            let port = u16::from_be_bytes([bip[16], bip[17]]);
             let f = if let Some(ref fs) = v.added6f {
                 if fs.len() > i {
                     let f = PexFlag::from(fs[i]);
@@ -1622,27 +1713,29 @@ impl From<ExtendedPexWire> for ExtendedPex {
             } else {
                 None
             };
-            r.added6.push((ip, f))
+            r.added6.push((SocketAddr::new(ip, port), f))
         }
 
         r.dropped = v
             .dropped
-            .chunks_exact(4)
+            .chunks_exact(6)
             .map(|bip| {
                 let ip = IpAddr::from(Ipv4Addr::from([bip[0], bip[1], bip[2], bip[3]]));
-                ip
+                let port = u16::from_be_bytes([bip[4], bip[5]]);
+                SocketAddr::new(ip, port)
             })
             .collect();
 
         r.dropped6 = v
             .dropped6
-            .chunks_exact(16)
+            .chunks_exact(18)
             .map(|bip| {
                 let ip = IpAddr::from(Ipv6Addr::from([
                     bip[0], bip[1], bip[2], bip[3], bip[4], bip[5], bip[6], bip[7], bip[8], bip[9],
                     bip[10], bip[11], bip[12], bip[13], bip[14], bip[15],
                 ]));
-                ip
+                let port = u16::from_be_bytes([bip[16], bip[17]]);
+                SocketAddr::new(ip, port)
             })
             .collect();
         r
@@ -1841,8 +1934,8 @@ async fn send_extend_metadata<T: AsyncWrite + Unpin>(
 
 async fn send_extend_pex<T: AsyncWrite + Unpin>(
     handle: &mut T,
-    added: impl Iterator<Item = &(IpAddr, Option<PexFlag>)>,
-    dropped: impl Iterator<Item = &IpAddr>,
+    added: impl Iterator<Item = &(SocketAddr, Option<PexFlag>)>,
+    dropped: impl Iterator<Item = &SocketAddr>,
     extend_idmap: &HashMap<ExtensionType, u8>,
 ) -> io::Result<()> {
     let extension_id = if let Some(id) = extend_idmap.get(&ExtensionType::Pex) {
@@ -1863,12 +1956,20 @@ async fn send_extend_pex<T: AsyncWrite + Unpin>(
     let mut dropped6_bin = empty_bytestring();
     for (a, f) in added {
         match a {
-            IpAddr::V4(v4) => {
-                added_bin.extend_from_slice(&v4.octets());
+            SocketAddr::V4(v4) => {
+                added_bin.extend_from_slice(&v4.ip().octets());
+                added_bin.extend_from_slice(&[
+                    ((v4.port() >> 8) as u8) & 0xff,
+                    (v4.port() as u8) & 0xff,
+                ]);
                 addedf_bin.push(f.unwrap_or(PexFlag::from(0)).0);
             }
-            IpAddr::V6(v6) => {
-                added6_bin.extend_from_slice(&v6.octets());
+            SocketAddr::V6(v6) => {
+                added6_bin.extend_from_slice(&v6.ip().octets());
+                added6_bin.extend_from_slice(&[
+                    ((v6.port() >> 8) as u8) & 0xff,
+                    (v6.port() as u8) & 0xff,
+                ]);
                 added6f_bin.push(f.unwrap_or(PexFlag::from(0)).0);
             }
         }
@@ -1876,8 +1977,20 @@ async fn send_extend_pex<T: AsyncWrite + Unpin>(
 
     for a in dropped {
         match a {
-            IpAddr::V4(v4) => dropped_bin.extend_from_slice(&v4.octets()),
-            IpAddr::V6(v6) => dropped6_bin.extend_from_slice(&v6.octets()),
+            SocketAddr::V4(v4) => {
+                dropped_bin.extend_from_slice(&v4.ip().octets());
+                dropped_bin.extend_from_slice(&[
+                    ((v4.port() >> 8) as u8) & 0xff,
+                    (v4.port() as u8) & 0xff,
+                ]);
+            }
+            SocketAddr::V6(v6) => {
+                dropped6_bin.extend_from_slice(&v6.ip().octets());
+                dropped6_bin.extend_from_slice(&[
+                    ((v6.port() >> 8) as u8) & 0xff,
+                    (v6.port() as u8) & 0xff,
+                ]);
+            }
         }
     }
 
@@ -3100,8 +3213,8 @@ pub mod tests {
     async fn extend_pex() {
         let (mut peer1, mut peer2) = make_ends().await;
         let initial: Vec<_> = vec![
-            ("1.2.3.4".parse().unwrap(), Some(PexFlag(1))),
-            ("::9".parse().unwrap(), Some(PexFlag(2))),
+            ("1.2.3.4:1234".parse().unwrap(), Some(PexFlag(1))),
+            ("[::9]:1234".parse().unwrap(), Some(PexFlag(2))),
         ];
 
         peer1
@@ -3114,16 +3227,16 @@ pub mod tests {
         assert_eq!(
             pex_msg,
             ExtendedPex {
-                added: vec![("1.2.3.4".parse().unwrap(), Some(PexFlag(1))),],
-                added6: vec![("::9".parse().unwrap(), Some(PexFlag(2)))],
+                added: vec![("1.2.3.4:1234".parse().unwrap(), Some(PexFlag(1))),],
+                added6: vec![("[::9]:1234".parse().unwrap(), Some(PexFlag(2)))],
                 dropped: vec![],
                 dropped6: vec![],
             }
         );
 
         let then: Vec<_> = vec![
-            ("4.3.2.1".parse().unwrap(), Some(PexFlag(1))),
-            ("::9".parse().unwrap(), Some(PexFlag(2))),
+            ("4.3.2.1:1234".parse().unwrap(), Some(PexFlag(1))),
+            ("[::9]:1234".parse().unwrap(), Some(PexFlag(2))),
         ];
 
         peer1
@@ -3136,9 +3249,9 @@ pub mod tests {
         assert_eq!(
             pex_msg,
             ExtendedPex {
-                added: vec![("4.3.2.1".parse().unwrap(), Some(PexFlag(1))),],
+                added: vec![("4.3.2.1:1234".parse().unwrap(), Some(PexFlag(1))),],
                 added6: vec![],
-                dropped: vec!["1.2.3.4".parse().unwrap()],
+                dropped: vec!["1.2.3.4:1234".parse().unwrap()],
                 dropped6: vec![],
             }
         );
@@ -3153,8 +3266,8 @@ pub mod tests {
         assert_eq!(
             pex_msg,
             ExtendedPex {
-                added: vec![("1.2.3.4".parse().unwrap(), Some(PexFlag(1))),],
-                added6: vec![("::9".parse().unwrap(), Some(PexFlag(2)))],
+                added: vec![("1.2.3.4:1234".parse().unwrap(), Some(PexFlag(1))),],
+                added6: vec![("[::9]:1234".parse().unwrap(), Some(PexFlag(2)))],
                 dropped: vec![],
                 dropped6: vec![],
             }

@@ -10,9 +10,10 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::info;
 
 use crate::dht::{self, DHT};
+use crate::metadata::Magnet;
 use crate::protocol::{AcceptOpt, BTStream, HandshakeOption, InfoHash};
 use crate::torrent_manager::TorrentManagerHandle;
-use crate::transmit_manager::{TorrentTask, TransmitManagerHandle};
+use crate::transmit_manager::{RunningCmd, TorrentTask, TransmitManagerHandle};
 use crate::{announce_manager, Reunite, Split};
 
 pub struct Session {
@@ -70,23 +71,49 @@ impl Session {
     }
 
     /// add new torrent
-    pub fn add_torrent(&mut self, job: TorrentTask, announce_list: Vec<Vec<String>>) {
+    pub async fn add_torrent(&mut self, job: TorrentTask, announce_list: Vec<Vec<String>>) {
         let info_hash = job.info_hash();
+        let trackers = if let TorrentTask::Magnet(Magnet { tr, .. }) = &job {
+            tr.clone()
+        } else {
+            None
+        };
+
         let mut tm =
             TorrentManagerHandle::new(job, self.self_id, self.port, Some(self.dht_client.clone()));
 
         for addr in announce_list {
             tm.send_announce_msg(announce_manager::Msg::AddUrl(addr));
         }
+        if let Some(addr) = trackers {
+            tm.send_announce_msg(announce_manager::Msg::AddUrl(addr));
+        }
+        _ = tm.change_state(RunningCmd::Resume).await;
         self.tasks.lock().unwrap().insert(info_hash, tm);
     }
 
     /// remove torrent by info_hash
     pub async fn remove_torrent(&mut self, info_hash: &InfoHash) {
-        match self.tasks.lock().unwrap().remove(info_hash) {
-            Some(tm) => tm.stop_wait().await,
-            None => {}
+        let tm = match self.tasks.lock().unwrap().remove(info_hash) {
+            Some(tm) => tm,
+            None => return,
+        };
+        tm.stop_wait().await;
+    }
+
+    pub async fn do_work<F>(&mut self, info_hash: &InfoHash, work: F)
+    where
+        F: AsyncFnOnce(&mut TorrentManagerHandle),
+    {
+        let mut guard = self.tasks.lock().unwrap();
+        let w = async || {
+            futures::future::ready(1).await;
+        };
+        w().await;
+        if let Some(tm) = guard.get_mut(info_hash) {
+            work(tm).await;
         }
+        drop(guard);
     }
 }
 

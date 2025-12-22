@@ -334,7 +334,6 @@ where
         let n_req_in_flight = {
             let sent = self.n_sent_req.load(Ordering::Relaxed) as i32;
             let recv = self.n_recv_req.load(Ordering::Relaxed) as i32;
-            warn!("sent: {sent}, recv: {recv}");
             sent - recv
         };
 
@@ -455,8 +454,10 @@ where
     T: AsyncWrite + Unpin,
 {
     let mut interval = tokio::time::interval(time::Duration::from_secs(120));
-    // conn.write_stream.send_interested().await;
     conn.write_stream.maybe_send_pending_msg().await?;
+
+    // TODO: shall we send interested by default?
+    conn.write_stream.send_interested().await?;
 
     loop {
         tokio::select! {
