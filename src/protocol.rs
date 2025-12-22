@@ -1,5 +1,4 @@
 use crate::cache::{AbortErr, AsyncAbortRead, Ref};
-use crate::dht;
 use crate::metadata::Metadata;
 use bon::Builder;
 use bt_bencode::ByteIpAddr;
@@ -11,7 +10,6 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Formatter;
-use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, LazyLock};
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
@@ -21,6 +19,8 @@ use tokio::sync::oneshot;
 use tracing::{info, warn};
 
 const DEFAULT_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0);
+
+pub type InfoHash = [u8; 20];
 
 pub trait Reader: AsyncRead + Send + Unpin + 'static {}
 pub trait Writer: AsyncWrite + Send + Unpin + 'static {}
@@ -186,6 +186,7 @@ pub struct BTStream<T> {
 
     reserved: FuncBits,
     peer_id: [u8; 20],
+    info_hash: [u8; 20],
     // TODO: maybe add a torrent hash Arc<>
     // torrent_hash: [u8; 20],
 
@@ -218,6 +219,7 @@ where
             extension_id: self.extension_id,
             reserved: self.reserved,
             peer_id: self.peer_id,
+            info_hash: self.info_hash,
             pex_peers: self.pex_peers,
             metadata_size: self.metadata_size,
             piece_buf: Some(BytesMut::new()),
@@ -256,6 +258,7 @@ pub struct ReadStream<T> {
     metadata_size: usize,
 
     peer_id: [u8; 20],
+    info_hash: [u8; 20],
     reserved: FuncBits,
 
     // buffer for incoming piece
@@ -314,6 +317,7 @@ pub struct WriteStream<T> {
     pex_peers: HashMap<IpAddr, Option<PexFlag>>,
 
     peer_id: [u8; 20],
+    info_hash: [u8; 20],
     reserved: FuncBits,
 
     pending_dht_port: Option<u16>,
@@ -358,8 +362,9 @@ pub enum Capability {
 }
 
 pub struct ConnInfo<'a> {
-    func_bits: &'a FuncBits,
-    peer_id: &'a [u8; 20],
+    pub func_bits: &'a FuncBits,
+    pub peer_id: &'a [u8; 20],
+    pub info_hash: &'a InfoHash,
 }
 
 impl<T> BTStream<T> {
@@ -367,6 +372,7 @@ impl<T> BTStream<T> {
         ConnInfo {
             func_bits: &self.reserved,
             peer_id: &self.peer_id,
+            info_hash: &self.info_hash,
         }
     }
 
@@ -405,6 +411,7 @@ where
                 peer_addr,
                 partial_read: self.partial_read,
                 peer_id: self.peer_id,
+                info_hash: self.info_hash,
                 reserved: self.reserved,
                 metadata_size: self.metadata_size,
                 piece_buf: self.piece_buf,
@@ -415,6 +422,7 @@ where
                 extension_id: self.extension_id,
                 pex_peers: self.pex_peers,
                 peer_id: self.peer_id,
+                info_hash: self.info_hash,
                 reserved: self.reserved,
                 metadata_size: self.metadata_size,
                 pending_dht_port: self.pending_dht_port,
@@ -438,6 +446,7 @@ where
             extension_id: w.extension_id,
             reserved: r.reserved,
             peer_id: r.peer_id,
+            info_hash: r.info_hash,
             pex_peers: w.pex_peers,
             metadata_size: r.metadata_size,
             piece_buf: r.piece_buf,
@@ -459,6 +468,7 @@ where
                 peer_addr,
                 partial_read: self.partial_read,
                 peer_id: self.peer_id,
+                info_hash: self.info_hash,
                 reserved: self.reserved,
                 metadata_size: self.metadata_size,
                 piece_buf: self.piece_buf,
@@ -469,6 +479,7 @@ where
                 extension_id: self.extension_id,
                 pex_peers: self.pex_peers,
                 peer_id: self.peer_id,
+                info_hash: self.info_hash,
                 reserved: self.reserved,
                 metadata_size: self.metadata_size,
                 pending_dht_port: self.pending_dht_port,
@@ -487,6 +498,7 @@ impl BTStream<Box<dyn Conn>> {
                 peer_addr,
                 partial_read: self.partial_read,
                 peer_id: self.peer_id,
+                info_hash: self.info_hash,
                 reserved: self.reserved,
                 metadata_size: self.metadata_size,
                 piece_buf: self.piece_buf,
@@ -497,6 +509,7 @@ impl BTStream<Box<dyn Conn>> {
                 extension_id: self.extension_id,
                 pex_peers: self.pex_peers,
                 peer_id: self.peer_id,
+                info_hash: self.info_hash,
                 reserved: self.reserved,
                 metadata_size: self.metadata_size,
                 pending_dht_port: self.pending_dht_port,
@@ -518,6 +531,7 @@ impl BTStream<Box<dyn Conn>> {
                 peer_addr,
                 partial_read: self.partial_read,
                 peer_id: self.peer_id,
+                info_hash: self.info_hash,
                 reserved: self.reserved,
                 metadata_size: self.metadata_size,
                 piece_buf: self.piece_buf,
@@ -528,6 +542,7 @@ impl BTStream<Box<dyn Conn>> {
                 extension_id: self.extension_id,
                 pex_peers: self.pex_peers,
                 peer_id: self.peer_id,
+                info_hash: self.info_hash,
                 reserved: self.reserved,
                 metadata_size: self.metadata_size,
                 pending_dht_port: self.pending_dht_port,
@@ -588,7 +603,6 @@ pub struct HandshakeOption {
     dht_port: Option<u16>, // dht port
     // fast: bool,       // fast extension
     client_id: [u8; 20],
-    info_hash: [u8; 20],
     client_version: Option<String>, // used in extension
 }
 
@@ -620,7 +634,6 @@ impl HandshakeOption {
         };
         let h = Handshake {
             reserved: func,
-            torrent_hash: self.info_hash,
             client_id: self.client_id,
         };
         (
@@ -638,14 +651,20 @@ impl<T> BTStream<T>
 where
     T: AsyncRead + AsyncWrite + Split + Unpin,
 {
-    pub async fn connect(mut t: T, opt: HandshakeOption) -> io::Result<Self>
+    pub async fn connect(mut t: T, opt: HandshakeOption, info_hash: InfoHash) -> io::Result<Self>
     where
         <T as Split>::R: Reunite<W = <T as Split>::W, U = T>,
     {
         let dht_port = opt.dht_port;
         let (h, eh) = opt.handshake();
-        send_handshake(&mut t, &h).await?;
-        let peer_handshake = recv_handshake(&mut t).await?;
+        send_handshake(&mut t, &h, &info_hash).await?;
+        let (peer_info_hash, peer_handshake) = recv_handshake(&mut t).await?;
+        if peer_info_hash != info_hash {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "peer's info_hash differs from ours",
+            ));
+        }
 
         let reserved = peer_handshake.reserved.common(&h.reserved);
         // TODO: check peer_handshake's client id
@@ -654,6 +673,7 @@ where
             partial_read: INITIAL_PARTIAL_READ,
             extension_id: HashMap::new(),
             peer_id: peer_handshake.client_id,
+            info_hash,
             reserved,
             pex_peers: HashMap::new(),
             metadata_size: 0,
@@ -705,14 +725,14 @@ where
     pub async fn accept<F>(mut t: T, accept: F, opt: HandshakeOption) -> io::Result<Self>
     where
         <T as Split>::R: Reunite<W = <T as Split>::W, U = T>,
-        F: AsyncFnOnce(&Handshake) -> AcceptOpt,
+        F: AsyncFnOnce(&InfoHash) -> AcceptOpt,
     {
         let dht_port = opt.dht_port;
         let (h, mut eh) = opt.handshake();
-        let peer_handshake = recv_handshake(&mut t).await?;
+        let (peer_info_hash, peer_handshake) = recv_handshake(&mut t).await?;
 
         // TODO: let accept return metadata size and send to peer
-        match accept(&peer_handshake).await {
+        match accept(&peer_info_hash).await {
             AcceptOpt::HaveMetadata(m) => {
                 let b = match bt_bencode::to_vec(&m.info) {
                     Ok(b) => b,
@@ -737,7 +757,7 @@ where
             }
         }
 
-        send_handshake(&mut t, &h).await?;
+        send_handshake(&mut t, &h, &peer_info_hash).await?;
 
         let reserved = peer_handshake.reserved.common(&h.reserved);
         let support_dht = reserved.have_dht();
@@ -746,6 +766,7 @@ where
             partial_read: INITIAL_PARTIAL_READ,
             extension_id: HashMap::new(),
             peer_id: peer_handshake.client_id,
+            info_hash: peer_info_hash,
             reserved,
             pex_peers: HashMap::new(),
             metadata_size: 0,
@@ -783,6 +804,7 @@ where
                 .filter_map(|(s, id)| extension_type(s).map(|ss| (ss, *id)))
                 .filter(|(_, id)| *id != 0)
                 .collect();
+            s.metadata_size = extend_received.metadata_size.unwrap_or(0) as usize;
             return Ok(s);
         }
         Ok(s)
@@ -1113,7 +1135,6 @@ impl Default for FuncBits {
 #[derive(Debug, Eq, PartialEq)]
 pub struct Handshake {
     pub reserved: FuncBits,
-    pub torrent_hash: [u8; 20],
     pub client_id: [u8; 20],
 }
 
@@ -1643,11 +1664,15 @@ pub enum ExtendedMetadata {
     },
 }
 
-async fn send_handshake<T: AsyncWrite + Unpin>(handle: &mut T, h: &Handshake) -> io::Result<()> {
+async fn send_handshake<T: AsyncWrite + Unpin>(
+    handle: &mut T,
+    h: &Handshake,
+    info_hash: &InfoHash,
+) -> io::Result<()> {
     handle.write_u8(19).await?;
     handle.write_all(b"BitTorrent protocol").await?;
     handle.write_all(&h.reserved.0).await?;
-    handle.write_all(&h.torrent_hash).await?;
+    handle.write_all(info_hash).await?;
     handle.write_all(&h.client_id).await?;
     handle.flush().await
 }
@@ -2406,7 +2431,7 @@ where
     }
 }
 
-async fn recv_handshake<T: AsyncRead + Unpin>(handle: &mut T) -> io::Result<Handshake> {
+async fn recv_handshake<T: AsyncRead + Unpin>(handle: &mut T) -> io::Result<(InfoHash, Handshake)> {
     let first = handle.read_u8().await?;
     if first != 19 {
         todo!();
@@ -2417,17 +2442,19 @@ async fn recv_handshake<T: AsyncRead + Unpin>(handle: &mut T) -> io::Result<Hand
         todo!();
     }
     let mut reserved = FuncBits::default();
-    let mut torrent_hash = [0u8; 20];
+    let mut info_hash = [0u8; 20];
     let mut client_id = [0u8; 20];
     handle.read_exact(&mut reserved.0).await?;
-    handle.read_exact(&mut torrent_hash).await?;
+    handle.read_exact(&mut info_hash).await?;
     handle.read_exact(&mut client_id).await?;
 
-    Ok(Handshake {
-        reserved,
-        torrent_hash,
-        client_id,
-    })
+    Ok((
+        info_hash,
+        Handshake {
+            reserved,
+            client_id,
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -2518,7 +2545,7 @@ pub mod tests {
         opt2: HandshakeOption,
     ) -> (BTStream<DuplexStream>, BTStream<DuplexStream>) {
         let (peer1, peer2) = duplex(1024 * 1024);
-        let p1 = tokio::spawn(async move { BTStream::connect(peer1, opt).await.unwrap() });
+        let p1 = tokio::spawn(async move { BTStream::connect(peer1, opt, [0; 20]).await.unwrap() });
         let p2 = tokio::spawn(async move {
             BTStream::accept(peer2, async |_| AcceptOpt::NoMetadata, opt2)
                 .await
@@ -2534,7 +2561,6 @@ pub mod tests {
             .client_version("1".into())
             .pex(true)
             .metadata(true)
-            .info_hash([0; 20])
             .dht_port(None)
             .build();
         make_ends_tune(opt.clone(), opt).await
@@ -2554,6 +2580,7 @@ pub mod tests {
                     peer_addr: DEFAULT_ADDR,
                     partial_read: INITIAL_PARTIAL_READ,
                     peer_id: [0; 20],
+                    info_hash: [0; 20],
                     reserved: [0; 8].into(),
                     metadata_size: 0,
                     piece_buf: Some(BytesMut::new()),
@@ -2564,6 +2591,7 @@ pub mod tests {
                     extension_id: self.extension_id,
                     pex_peers: HashMap::new(),
                     peer_id: [0; 20],
+                    info_hash: [0; 20],
                     reserved: [0; 8].into(),
                     metadata_size: 0,
                     pending_dht_port: None,
@@ -2596,7 +2624,6 @@ pub mod tests {
             .client_version("1".into())
             .pex(false)
             .metadata(false)
-            .info_hash([0; 20])
             .dht_port(None)
             .build();
         // opt2 supports extension
@@ -2605,11 +2632,88 @@ pub mod tests {
             .client_version("1".into())
             .pex(true)
             .metadata(true)
-            .info_hash([0; 20])
             .dht_port(None)
             .build();
         make_ends_tune(opt1, opt2).await;
         // TODO: test info
+    }
+
+    #[tokio::test]
+    async fn test_handshake_accept_ok() {
+        let opt1 = HandshakeOption::builder()
+            .client_id([0; 20])
+            .client_version("1".into())
+            .pex(false)
+            .metadata(false)
+            .dht_port(None)
+            .build();
+        let opt2 = HandshakeOption::builder()
+            .client_id([0; 20])
+            .client_version("1".into())
+            .pex(true)
+            .metadata(true)
+            .dht_port(None)
+            .build();
+        let (peer1, peer2) = duplex(1024 * 1024);
+        let p1 =
+            tokio::spawn(async move { BTStream::connect(peer1, opt1, [1; 20]).await.unwrap() });
+        let p2 = tokio::spawn(async move {
+            BTStream::accept(
+                peer2,
+                async |h| {
+                    if *h == [1; 20] {
+                        AcceptOpt::NoMetadata
+                    } else {
+                        AcceptOpt::Reject
+                    }
+                },
+                opt2,
+            )
+            .await
+            .unwrap()
+        });
+        p1.await.unwrap();
+        p2.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_handshake_accept_reject() {
+        let opt1 = HandshakeOption::builder()
+            .client_id([0; 20])
+            .client_version("1".into())
+            .pex(false)
+            .metadata(false)
+            .dht_port(None)
+            .build();
+        let opt2 = HandshakeOption::builder()
+            .client_id([0; 20])
+            .client_version("1".into())
+            .pex(true)
+            .metadata(true)
+            .dht_port(None)
+            .build();
+        let (peer1, peer2) = duplex(1024 * 1024);
+
+        // because accept end rejects, connect end will also error
+        let p1 =
+            tokio::spawn(async move { BTStream::connect(peer1, opt1, [1; 20]).await.unwrap_err() });
+        let p2 = tokio::spawn(async move {
+            BTStream::accept(
+                peer2,
+                async |h| {
+                    if *h == [0; 20] {
+                        AcceptOpt::NoMetadata
+                    } else {
+                        AcceptOpt::Reject
+                    }
+                },
+                opt2,
+            )
+            .await
+            .unwrap_err() // should fail because info hash not match
+        });
+        p1.await.unwrap();
+        p2.await.unwrap();
     }
 
     #[tokio::test]
@@ -2620,7 +2724,6 @@ pub mod tests {
             .client_version("1".into())
             .pex(true)
             .metadata(true)
-            .info_hash([0; 20])
             .dht_port(None)
             .build();
         make_ends_tune(opt.clone(), opt.clone()).await;

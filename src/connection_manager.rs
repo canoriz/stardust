@@ -584,7 +584,6 @@ mod test {
         let opt = HandshakeOption::builder()
             .client_id([0; 20])
             .client_version("1".into())
-            .info_hash([0; 20])
             .dht_port(Some(1))
             .build();
         let (end1, end2) = make_ends_tune(opt.clone(), opt).await;
@@ -616,7 +615,6 @@ mod test {
         let opt = HandshakeOption::builder()
             .client_id([0; 20])
             .client_version("1".into())
-            .info_hash([0; 20])
             .dht_port(None)
             .build();
         let (end1, end2) = make_ends_tune(opt.clone(), opt).await;

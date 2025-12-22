@@ -7,7 +7,8 @@ use crate::dht::DHT;
 use crate::metadata::{self, Magnet, Metadata};
 use crate::picker::{BlockPicker, BlockPickerDump, PieceState, RarestPicker};
 use crate::protocol::{
-    self, BitField, Conn, ExtendedMetadata, ExtendedMsg, HandshakeOption, Piece, Request,
+    self, BTStream, BitField, Conn, ExtendedMetadata, ExtendedMsg, HandshakeOption, InfoHash,
+    Piece, Request,
 };
 
 use serde::{Deserialize, Serialize};
@@ -66,15 +67,17 @@ pub enum PeerMsg {
     },
 }
 
+/// (conn, is_income)
+pub type NewPeerConn = (protocol::BTStream<Box<dyn Conn>>, bool);
+
 #[derive(Debug)]
 #[non_exhaustive]
 pub(crate) enum Msg {
     AnnounceFinish(Result<metadata::AnnounceResp, metadata::AnnounceError>),
     AnnounceMsg(announce_manager::Msg),
 
-    NewPeer(Result<protocol::BTStream<Box<dyn Conn>>, SocketAddr>),
+    NewPeer(Result<NewPeerConn, SocketAddr>),
     NewDiscoveredPeer(SocketAddr),
-    NewIncomePeer(protocol::BTStream<Box<dyn Conn>>),
     PeerLeave(PeerAddr),
 
     PieceBufReady {
@@ -367,7 +370,7 @@ pub struct Downloading {
 pub struct TransmitWorker {
     // our peer ID
     id: [u8; 20],
-    info_hash: [u8; 20],
+    info_hash: InfoHash,
 
     handshake_opt: HandshakeOption,
 
@@ -438,7 +441,6 @@ impl TransmitWorker {
         };
         let opt = HandshakeOption::builder()
             .client_id(id)
-            .info_hash(info_hash)
             .dht_port(dht_client.as_ref().map(|c| c.port()))
             .build();
         let downloaded = watch::channel(false).0;
@@ -578,8 +580,12 @@ impl TransmitWorker {
                 info!("announce error {}", e);
                 Ok(())
             }
-            Msg::NewPeer(Ok(bt_conn)) => {
-                info!("new outward connection {:?}", bt_conn);
+            Msg::NewPeer(Ok((bt_conn, is_income))) => {
+                info!(
+                    "new {} connection {:?}",
+                    if is_income { "income" } else { "outward" },
+                    bt_conn
+                );
                 let peer_addr = bt_conn.peer_addr();
                 let cm = ConnectionManagerHandle::new_dyn(bt_conn, self.self_handle.clone());
                 self.connected_peers.insert(
@@ -611,7 +617,6 @@ impl TransmitWorker {
                 Ok(())
             }
             Msg::PeerMsg(pm) => self.handle_peer_msg(pm),
-            Msg::NewIncomePeer(btstream) => todo!(),
             Msg::FlushError(_) => {
                 todo!()
             }
@@ -655,9 +660,10 @@ impl TransmitWorker {
         }
     }
 
-    pub fn handle_peer_msg(&mut self, m: PeerMsg) -> io::Result<()> {
+    fn handle_peer_msg(&mut self, m: PeerMsg) -> io::Result<()> {
         match m {
             PeerMsg::PieceState(addr, state) => {
+                info!("peer {addr} sends state {state:?}");
                 let block_picker = match &mut self.torrent_state {
                     TorrentState::Metadata(d) => &mut d.block_picker,
                     TorrentState::Fetching(_) => {
@@ -1131,7 +1137,7 @@ impl TransmitWorker {
             self.connecting_peers.insert(addr);
             let h_clone = self.self_handle.clone();
             let opt = self.handshake_opt.clone();
-            tokio::spawn(connect_peer(h_clone, addr, opt));
+            tokio::spawn(connect_peer(h_clone, addr, opt, self.info_hash));
         }
     }
 
@@ -1437,12 +1443,13 @@ async fn connect_peer(
     main_tx: TransmitManagerHandle,
     addr: SocketAddr,
     opt: HandshakeOption,
+    info_hash: InfoHash,
 ) -> Result<(), std::io::Error> {
     let tcp_stream = TcpStream::connect(addr).await?;
-    let conn = protocol::BTStream::connect(tcp_stream, opt).await;
+    let conn = protocol::BTStream::connect(tcp_stream, opt, info_hash).await;
     match conn {
         Ok(c) => {
-            if let Err(e) = main_tx.sender.send(Msg::NewPeer(Ok(c.to_dyn()))) {
+            if let Err(e) = main_tx.sender.send(Msg::NewPeer(Ok((c.to_dyn(), false)))) {
                 info!("send new peer to main {e}");
             }
             Ok(())
