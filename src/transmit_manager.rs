@@ -397,12 +397,12 @@ pub struct TransmitWorker {
 
     /// received blocks waiting writing to piece buf once
     /// piece buf is ready
-    waiting_for_piecebuf: HashMap<u32, Vec<BlockWatingBuf>>,
+    waiting_for_piecebuf: HashMap<u32, Vec<BlockWaitingBuf>>,
 
     downloaded: watch::Sender<bool>,
 }
 
-struct BlockWatingBuf {
+struct BlockWaitingBuf {
     piece: Piece,
 
     /// if this piece is all_received
@@ -953,14 +953,14 @@ impl TransmitWorker {
                 let index = piece.index;
                 let full_received = piece_received.is_some();
                 match self.waiting_for_piecebuf.get_mut(&index) {
-                    Some(v) => v.push(BlockWatingBuf {
+                    Some(v) => v.push(BlockWaitingBuf {
                         piece,
                         full_received,
                     }),
                     None => {
                         self.waiting_for_piecebuf.insert(
                             index,
-                            vec![BlockWatingBuf {
+                            vec![BlockWaitingBuf {
                                 piece,
                                 full_received,
                             }],
