@@ -7,8 +7,8 @@ use crate::dht::DHT;
 use crate::metadata::{self, Magnet, Metadata};
 use crate::picker::{BlockPicker, BlockPickerDump, PieceState, RarestPicker};
 use crate::protocol::{
-    self, BTStream, BitField, Conn, ExtendedMetadata, ExtendedMsg, HandshakeOption, InfoHash,
-    Piece, Request,
+    self, BTStream, BitField, Conn, ExtendedMetadata, ExtendedMsg, ExtendedPex, HandshakeOption,
+    InfoHash, Piece, Request,
 };
 
 use serde::{Deserialize, Serialize};
@@ -59,6 +59,7 @@ pub enum PeerMsg {
     Reject(PeerAddr, Request),
     Request(PeerAddr, Request),
     ExtendMetadata(PeerAddr, ExtendedMetadata),
+    ExtendPex(PeerAddr, ExtendedPex),
     BlockReceived {
         peer: PeerAddr,
         // estimated bandwidth, bytes per period
@@ -766,6 +767,10 @@ impl TransmitWorker {
                 self.handle_extend_metadata(pa, m);
                 Ok(())
             }
+            PeerMsg::ExtendPex(pa, pex) => {
+                self.handle_extend_pex(pa, pex);
+                Ok(())
+            }
             PeerMsg::SuggestPiece(addr, index) => {
                 info!("{addr} suggest piece {index}");
                 Ok(())
@@ -1293,6 +1298,15 @@ impl TransmitWorker {
                     // already have metadata, simply ignore them
                 }
             },
+        }
+    }
+
+    fn handle_extend_pex(&mut self, addr: PeerAddr, pex: ExtendedPex) {
+        for (addr, flags) in pex.added {
+            self.handle_new_discovered_peer(addr);
+        }
+        for (addr, flags) in pex.added6 {
+            self.handle_new_discovered_peer(addr);
         }
     }
 

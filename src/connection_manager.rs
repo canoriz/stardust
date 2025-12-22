@@ -557,6 +557,9 @@ async fn handle_extended_msg(
         ExtendedMsg::Handshake(hs) => todo!(),
         ExtendedMsg::Pex(pex) => {
             info!("received pex from {peer}, {pex:?}");
+            _ = tmh
+                .sender
+                .send(TransmitMsg::PeerMsg(PeerMsg::ExtendPex(*peer, pex)));
             Ok(())
         }
         ExtendedMsg::Metadata(m) => {
