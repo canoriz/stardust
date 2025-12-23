@@ -1,3 +1,4 @@
+use bon::Builder;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -21,50 +22,64 @@ pub struct Session {
 
     tasks: Arc<Mutex<HashMap<InfoHash, TorrentManagerHandle>>>,
     port: u16,
-    dht_client: Arc<DHT>,
+    dht_client: Option<Arc<DHT>>,
 
     _cancel: DropGuard,
 }
 
+#[derive(Builder, Clone)]
+pub struct SessionOpt {
+    self_id: [u8; 20],
+    port: u16,
+
+    // TODO: support uTP and dht in same port
+    dht_port: Option<u16>,
+}
+
 impl Session {
-    pub fn new(self_id: [u8; 20], port: u16, dht_port: u16) -> Self {
+    pub fn new(opt: SessionOpt) -> Self {
         let tasks = Arc::new(Mutex::new(HashMap::new()));
         let cancel = CancellationToken::new();
 
         let l = Listener {
-            self_id,
+            self_id: opt.self_id,
             tasks: tasks.clone(),
             cancel: cancel.clone(),
-            dht_port, // TODO: what if dht client init failed?
+            dht_port: opt.dht_port, // TODO: what if dht client init failed?
         };
-        tokio::spawn(run_listener(l, port));
+        tokio::spawn(run_listener(l, opt.port));
 
         // TODO: clients connect to us who prefers uTP will be rejected by our DHT handler
         // and not trying to connect with TCP
         // support dual protocol on DHT port, or choose a different dht/tcp port
-        let dht_client = Arc::new(DHT::new(self_id, dht_port, "ST01".into()));
-        let c = dht_client.clone();
+        let dht_client = if let Some(dht_port) = opt.dht_port {
+            let dht_client = Arc::new(DHT::new(opt.self_id, dht_port, "ST01".into()));
+            let c = dht_client.clone();
 
-        // TODO: optimize: maybe wait dht bootstrap done then return session
-        // TODO: share dht network between sessions?
-        tokio::spawn(async move {
-            _ = c
-                .ping_rpc(
-                    dht::RpcAddr::NoID(
-                        "[240e:b8f:5c68:8400:4c07:3e69:7b5a:741]:54032"
-                            .parse()
-                            .unwrap(),
-                    ),
-                    time::Duration::from_secs(5),
-                )
-                .await;
-            c.find_closest_node_to(self_id, true).await;
-        });
+            // TODO: optimize: maybe wait dht bootstrap done then return session
+            // TODO: share dht network between sessions?
+            tokio::spawn(async move {
+                _ = c
+                    .ping_rpc(
+                        dht::RpcAddr::NoID(
+                            "[240e:b8f:5c68:8400:4c07:3e69:7b5a:741]:54032"
+                                .parse()
+                                .unwrap(),
+                        ),
+                        time::Duration::from_secs(5),
+                    )
+                    .await;
+                c.find_closest_node_to(opt.self_id, true).await;
+            });
+            Some(dht_client)
+        } else {
+            None
+        };
 
         Self {
-            self_id,
+            self_id: opt.self_id,
             tasks,
-            port,
+            port: opt.port,
             dht_client,
             _cancel: cancel.drop_guard(),
         }
@@ -80,7 +95,7 @@ impl Session {
         };
 
         let mut tm =
-            TorrentManagerHandle::new(job, self.self_id, self.port, Some(self.dht_client.clone()));
+            TorrentManagerHandle::new(job, self.self_id, self.port, self.dht_client.clone());
 
         for addr in announce_list {
             tm.send_announce_msg(announce_manager::Msg::AddUrl(addr));
@@ -121,7 +136,7 @@ struct Listener {
     tasks: Arc<Mutex<HashMap<InfoHash, TorrentManagerHandle>>>,
     cancel: CancellationToken,
     self_id: [u8; 20],
-    dht_port: u16,
+    dht_port: Option<u16>,
 }
 
 async fn run_listener(l: Listener, port: u16) -> std::io::Result<()> {
@@ -150,7 +165,7 @@ async fn run_listener(l: Listener, port: u16) -> std::io::Result<()> {
 
 struct IncomeConn<T> {
     conn: T,
-    dht_port: u16,
+    dht_port: Option<u16>,
     addr: SocketAddr,
     self_id: [u8; 20],
     tasks: Arc<Mutex<HashMap<InfoHash, TorrentManagerHandle>>>,
@@ -164,7 +179,7 @@ where
     let opt = HandshakeOption::builder()
         .client_id(conn.self_id)
         .client_version("ST01".into())
-        .dht_port(Some(conn.dht_port))
+        .dht_port(conn.dht_port)
         .build();
 
     let map = conn.tasks.clone();
