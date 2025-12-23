@@ -1,20 +1,9 @@
-use std::net::SocketAddr;
-// use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use anyhow::Result;
-use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::TcpStream;
-use tokio::time::Duration;
-use tokio::{net, time};
-use tracing::{error, info, warn};
+use tokio::time::{self, Duration};
 
-use crate::dht::{self, DHT};
 use crate::metadata::Magnet;
-use crate::protocol::{self, BTStream, HandshakeOption, Message, Reunite, Split};
 use crate::session::Session;
-use crate::torrent_manager::TorrentManagerHandle;
-use crate::transmit_manager::{self, RunningCmd, TorrentTask, TransmitDump};
-use crate::{announce_manager, metadata};
+use crate::transmit_manager::{RunningCmd, TorrentTask};
 
 pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
     const SELF_ID: [u8; 20] = *b"-TR0300-fjbo402nczk3";
@@ -51,6 +40,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await;
     session
         .do_work(&info_hash, async |tm| {
+            // TODO: this is ugly though, only sender can clone
             tm.change_state(RunningCmd::Resume).await;
         })
         .await;

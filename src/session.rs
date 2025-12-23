@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::{io, time};
 
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::info;
@@ -12,8 +12,8 @@ use tracing::info;
 use crate::dht::{self, DHT};
 use crate::metadata::Magnet;
 use crate::protocol::{AcceptOpt, BTStream, HandshakeOption, InfoHash};
-use crate::torrent_manager::TorrentManagerHandle;
-use crate::transmit_manager::{RunningCmd, TorrentTask, TransmitManagerHandle};
+use crate::torrent_manager::{TorrentManagerHandle, TransmitManagerSender};
+use crate::transmit_manager::{RunningCmd, TorrentTask};
 use crate::{announce_manager, Reunite, Split};
 
 pub struct Session {
@@ -23,7 +23,7 @@ pub struct Session {
     port: u16,
     dht_client: Arc<DHT>,
 
-    cancel: DropGuard,
+    _cancel: DropGuard,
 }
 
 impl Session {
@@ -66,7 +66,7 @@ impl Session {
             tasks,
             port,
             dht_client,
-            cancel: cancel.drop_guard(),
+            _cancel: cancel.drop_guard(),
         }
     }
 
@@ -88,7 +88,7 @@ impl Session {
         if let Some(addr) = trackers {
             tm.send_announce_msg(announce_manager::Msg::AddUrl(addr));
         }
-        _ = tm.change_state(RunningCmd::Resume).await;
+        _ = tm.sender.change_state(RunningCmd::Resume).await;
         self.tasks.lock().unwrap().insert(info_hash, tm);
     }
 
@@ -103,17 +103,17 @@ impl Session {
 
     pub async fn do_work<F>(&mut self, info_hash: &InfoHash, work: F)
     where
-        F: AsyncFnOnce(&mut TorrentManagerHandle),
+        F: AsyncFnOnce(&mut TransmitManagerSender),
     {
-        let mut guard = self.tasks.lock().unwrap();
-        let w = async || {
-            futures::future::ready(1).await;
+        let mut sender = {
+            let mut guard = self.tasks.lock().unwrap();
+            if let Some(tm) = guard.get_mut(info_hash) {
+                tm.sender.clone()
+            } else {
+                return;
+            }
         };
-        w().await;
-        if let Some(tm) = guard.get_mut(info_hash) {
-            work(tm).await;
-        }
-        drop(guard);
+        work(&mut sender).await
     }
 }
 

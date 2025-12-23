@@ -6,8 +6,11 @@ use crate::dht::DHT;
 use crate::transmit_manager::{self, TorrentTask, TransmitDump, TransmitManager};
 use tokio::sync::{mpsc, oneshot};
 
+#[derive(Clone)]
+pub struct TransmitManagerSender(mpsc::UnboundedSender<transmit_manager::Msg>);
+
 pub struct TorrentManagerHandle {
-    sender: mpsc::UnboundedSender<transmit_manager::Msg>,
+    pub sender: TransmitManagerSender,
 
     transmit_manager: TransmitManager,
 }
@@ -25,13 +28,13 @@ impl TorrentManagerHandle {
         let tm = TransmitManager::new(t, self_id, tx.clone(), rx, dht_client, am);
 
         Self {
-            sender: tx,
+            sender: TransmitManagerSender(tx),
             transmit_manager: tm,
         }
     }
 
     pub fn send_msg(&mut self, m: transmit_manager::Msg) -> io::Result<()> {
-        self.sender.send(m).map_err(|e| {
+        self.sender.0.send(m).map_err(|e| {
             io::Error::new(
                 io::ErrorKind::Other,
                 format!("send msg to transmit manager error: {}", e),
@@ -40,16 +43,18 @@ impl TorrentManagerHandle {
     }
 
     pub fn send_announce_msg(&mut self, m: announce_manager::Msg) {
-        self.sender.send(transmit_manager::Msg::AnnounceMsg(m)); // TODO: preserve result type?
+        self.sender.0.send(transmit_manager::Msg::AnnounceMsg(m)); // TODO: preserve result type?
     }
 
     pub async fn stop_wait(self) {
         self.transmit_manager.stop_wait().await;
     }
+}
 
+impl TransmitManagerSender {
     pub async fn wait_downloaded(&mut self) -> io::Result<()> {
         let (tx, rx) = oneshot::channel();
-        self.sender
+        self.0
             .send(transmit_manager::Msg::WaitDownloaded(tx))
             .map_err(|e| {
                 io::Error::new(
@@ -74,9 +79,8 @@ impl TorrentManagerHandle {
     }
 
     pub async fn change_state(&mut self, s: transmit_manager::RunningCmd) -> io::Result<()> {
-        // TODO: add a receiver to confirm the state change is done
         let (tx, rx) = oneshot::channel();
-        self.sender
+        self.0
             .send(transmit_manager::Msg::ChangeState(s, tx))
             .map_err(|e| {
                 io::Error::new(
@@ -94,7 +98,11 @@ impl TorrentManagerHandle {
 
     pub async fn check(&mut self) -> io::Result<bool> {
         let (tx, rx) = oneshot::channel();
-        self.send_msg(transmit_manager::Msg::CheckFile(tx))?;
+        self.0
+            .send(transmit_manager::Msg::CheckFile(tx))
+            .map_err(|e| {
+                io::Error::new(io::ErrorKind::Other, format!("check send msg error: {}", e))
+            })?;
         rx.await.map_err(|e| {
             io::Error::new(
                 io::ErrorKind::Other,
@@ -105,7 +113,14 @@ impl TorrentManagerHandle {
 
     pub async fn dump_progress(&mut self) -> io::Result<TransmitDump> {
         let (tx, rx) = oneshot::channel();
-        self.send_msg(transmit_manager::Msg::DumpStatus(tx))?;
+        self.0
+            .send(transmit_manager::Msg::DumpStatus(tx))
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("dump status send msg error: {}", e),
+                )
+            })?;
         rx.await.map_err(|e| {
             io::Error::new(
                 io::ErrorKind::Other,
@@ -116,7 +131,14 @@ impl TorrentManagerHandle {
 
     pub async fn load_progress(&mut self, progress: TransmitDump) -> io::Result<()> {
         let (tx, rx) = oneshot::channel();
-        self.send_msg(transmit_manager::Msg::LoadProgress(progress, tx))?;
+        self.0
+            .send(transmit_manager::Msg::LoadProgress(progress, tx))
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("load status send msg error: {}", e),
+                )
+            })?;
         rx.await.map_err(|e| {
             io::Error::new(
                 io::ErrorKind::Other,

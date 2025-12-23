@@ -1781,7 +1781,7 @@ async fn send_extension_handshake<T: AsyncWrite + Unpin>(
     handle.write_u8(MsgTy::EXTENDED).await?;
     handle.write_u8(0).await?;
 
-    handle.write_all(&mut buf).await?;
+    handle.write_all(&buf).await?;
 
     handle.flush().await
 }
