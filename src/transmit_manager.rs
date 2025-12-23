@@ -5,7 +5,7 @@ use crate::cache::simple_buffer::{GetPieceErr, PieceBuf};
 use crate::connection_manager::{ConnectionManagerHandle, Msg as ConnMsg};
 use crate::dht::DHT;
 use crate::metadata::{self, Magnet, Metadata};
-use crate::picker::{BlockPicker, BlockPickerDump, PieceState, RarestPicker};
+use crate::picker::{BlockPicker, BlockPickerDump, BlockStatus, PieceState, RarestPicker};
 use crate::protocol::{
     self, BTStream, BitField, Conn, ExtendedMetadata, ExtendedMsg, ExtendedPex, HandshakeOption,
     InfoHash, Piece, Request,
@@ -915,7 +915,18 @@ impl TransmitWorker {
             begin: piece.begin,
             len: piece.len,
         };
-        if !block_picker.want_block(req) {
+        if let Some(s) = block_picker.want_block(req) {
+            match s {
+                BlockStatus::Requested { addr, .. } if addr != *peer => {
+                    // if this block come from peer we did not request, cancel old request
+                    // TODO: remove pending requests if not sent
+                    if let Some(conn) = self.connected_peers.get(&addr) {
+                        conn.conn.send_stream_cmd(ConnMsg::Cancel(req));
+                    }
+                }
+                _ => {}
+            }
+        } else {
             warn!(
                 "discard PIECE msg {} {} {} block index {}",
                 piece.index,

@@ -13,8 +13,9 @@ const BLOCK_SIZE: usize = 16384;
 fn two_mins_ago() -> time::Instant {
     time::Instant::now() - time::Duration::from_mins(2)
 }
+
 #[derive(Serialize, Deserialize, Eq, PartialEq, Debug, Clone, Copy)]
-enum BlockStatus {
+pub enum BlockStatus {
     NotRequested,
     Requested {
         addr: PeerAddr,
@@ -412,33 +413,34 @@ impl BlockPicker {
         self.requesting.retain(|_, b| !b.is_all_not_requested());
     }
 
-    /// check if we want this block
-    pub fn want_block(&mut self, req: Request) -> bool {
+    /// check if we want this block, if want, returns previous
+    /// state of this block
+    pub fn want_block(&mut self, req: Request) -> Option<BlockStatus> {
         if !self.check_block_validity(&req) {
             println!("unwant because invalid {req:?}");
-            return false;
+            return None;
         }
 
         let index = req.index;
         if !self.selected(index) {
             println!("unwant because {index} not selected");
-            return false;
+            return None;
         }
 
         if self.have(index) {
             println!("unwant because have {index}");
-            return false;
+            return None;
         }
 
         if let Some(b) = self.requesting.get(&index) {
             let s = &b.block_map[req.begin as usize / BLOCK_SIZE];
             match s {
                 BlockStatus::NotRequested | BlockStatus::Requested { .. } => {
-                    return true;
+                    return Some(*s);
                 }
                 BlockStatus::Received => {
                     println!("unwant because received");
-                    return false;
+                    return None;
                 }
             }
         }
@@ -447,11 +449,11 @@ impl BlockPicker {
             let s = &b.block_map[req.begin as usize / BLOCK_SIZE];
             match s {
                 BlockStatus::Requested { .. } => {
-                    return true;
+                    return Some(*s);
                 }
                 BlockStatus::Received => {
                     println!("unwant because received2");
-                    return false;
+                    return None;
                 }
                 _ => unreachable!(),
             }
@@ -459,7 +461,7 @@ impl BlockPicker {
 
         // we selected, but we did not request it, or we mark this block as
         // not requested because of timeout
-        return true;
+        return Some(BlockStatus::NotRequested);
     }
 
     /// Are all selected pieces downloaded and verified?

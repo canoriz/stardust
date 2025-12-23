@@ -37,6 +37,7 @@ pub(crate) enum Msg {
     Have(u32),
     Extend(ExtendedMsg),
     Reject(Request),
+    Cancel(Request),
 
     // SendBlocks(BlockRange),
     SetWakeUp(WakeUpOption),
