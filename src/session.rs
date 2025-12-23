@@ -108,12 +108,8 @@ impl Session {
     }
 
     /// remove torrent by info_hash
-    pub async fn remove_torrent(&mut self, info_hash: &InfoHash) {
-        let tm = match self.tasks.lock().unwrap().remove(info_hash) {
-            Some(tm) => tm,
-            None => return,
-        };
-        tm.stop_wait().await;
+    pub async fn remove_torrent(&mut self, info_hash: &InfoHash) -> Option<TorrentManagerHandle> {
+        self.tasks.lock().unwrap().remove(info_hash)
     }
 
     pub async fn do_work<F>(&mut self, info_hash: &InfoHash, work: F)
@@ -146,7 +142,7 @@ async fn run_listener(l: Listener, port: u16) -> std::io::Result<()> {
         tokio::select! {
             _ = l.cancel.cancelled() => {
                 info!("session listener cancelled");
-                break;
+                break Ok(());
             }
             Ok((conn, addr)) = listener.accept() => {
                 let ic = IncomeConn {
@@ -156,11 +152,12 @@ async fn run_listener(l: Listener, port: u16) -> std::io::Result<()> {
                     self_id: l.self_id,
                     tasks: l.tasks.clone(),
                 };
-                handle_income_connection(ic).await;
+                if let Err(e) = handle_income_connection(ic).await {
+                    info!("handle income connection error {e}");
+                }
             }
         }
     }
-    todo!()
 }
 
 struct IncomeConn<T> {

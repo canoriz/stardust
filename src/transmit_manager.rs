@@ -165,7 +165,7 @@ impl TransmitManager {
         }
     }
 
-    pub async fn stop_wait(mut self) {
+    pub async fn stop_wait(self) {
         // TODO: dump status
         self.cancel.disarm().cancel();
         _ = self.worker_stop.await;

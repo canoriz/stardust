@@ -1,5 +1,6 @@
 use anyhow::Result;
 use tokio::time::{self, Duration};
+use tracing::info;
 
 use crate::metadata::{self, Magnet};
 use crate::session::{Session, SessionOpt};
@@ -21,7 +22,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut session = Session::new(
         SessionOpt::builder()
-            .dht_port(DHT_PORT)
+            .maybe_dht_port(None)
             .port(SELF_PORT)
             .self_id(SELF_ID)
             .build(),
@@ -52,7 +53,10 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tm.change_state(RunningCmd::Resume).await;
         })
         .await;
-
-    time::sleep(Duration::from_secs(2000)).await;
+    if let Some(mut tm) = session.remove_torrent(&info_hash).await {
+        tm.wait_downloaded().await;
+        info!("stopped");
+    }
+    info!("after");
     Ok(())
 }

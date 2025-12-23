@@ -46,6 +46,10 @@ impl TorrentManagerHandle {
         self.sender.0.send(transmit_manager::Msg::AnnounceMsg(m)); // TODO: preserve result type?
     }
 
+    pub async fn wait_downloaded(&mut self) -> io::Result<()> {
+        self.sender.wait_downloaded().await
+    }
+
     pub async fn stop_wait(self) {
         self.transmit_manager.stop_wait().await;
     }
