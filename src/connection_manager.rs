@@ -12,16 +12,13 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{info, warn};
 
 use crate::bandwidth::Bandwidth;
-use crate::cache::{AbortErr, ArcCache, BufStorage, GetRefErr, PieceBuf, PieceKey, Ref};
-use crate::metadata::{self, Metadata};
-use crate::picker::{start_receive_piece_block, BlockRequests, HeapPiecePicker, PieceState};
+use crate::picker::{BlockRequests, PieceState};
 use crate::protocol::{
-    self, BTStream, Capability, CapabilityMap, Conn, ExtendedMetadata, ExtendedMsg, Message, Piece,
-    ReadStream, Reader, Request, Split, WriteStream, Writer,
+    self, BTStream, Capability, CapabilityMap, Conn, ExtendedMsg, Message, ReadStream, Request,
+    Split, WriteStream,
 };
-use crate::transmit_manager::{Downloading, PeerMsg, TransmitManagerHandle};
-use crate::transmit_manager::{Msg as TransmitMsg, TorrentState};
-use crate::Reunite;
+use crate::transmit_manager::Msg as TransmitMsg;
+use crate::transmit_manager::{PeerMsg, TransmitManagerHandle};
 
 const BANDWIDTH_TIME_SLICE: time::Duration = time::Duration::from_millis(250);
 

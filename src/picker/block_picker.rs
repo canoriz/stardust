@@ -6,7 +6,10 @@ use super::{
     PieceState,
 };
 use crate::{math_helper::piece_total_and_last_size, protocol::Request};
-use std::{collections::BTreeMap, time};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    time,
+};
 
 const BLOCK_SIZE: usize = 16384;
 
@@ -14,14 +17,14 @@ fn two_mins_ago() -> time::Instant {
     time::Instant::now() - time::Duration::from_mins(2)
 }
 
-#[derive(Serialize, Deserialize, Eq, PartialEq, Debug, Clone, Copy)]
+#[derive(Serialize, Deserialize, Eq, PartialEq, Debug, Clone)]
 pub enum BlockStatus {
     NotRequested,
     Requested {
-        addr: PeerAddr,
+        // TODO: when serializing, make all requested state to NotRequested
+        // avoid canceling not requested blocks
         #[serde(skip)]
-        #[serde(default = "two_mins_ago")]
-        at: time::Instant,
+        addr: HashMap<PeerAddr, time::Instant>,
     },
     Received, // TODO: maybe record which peer sends us this block?
 }
@@ -60,50 +63,116 @@ impl PieceBlocks {
     }
 
     /// try to pick n blocks, return blocks and how many blocks picked
-    fn pick(&mut self, peer: PeerAddr, n: usize) -> Option<(BlockRange, usize)> {
+    fn pick(&mut self, peer: PeerAddr, n: usize, endgame: bool) -> Option<(BlockRange, usize)> {
         let mut from = None;
         let mut to = None;
         let mut count = 0;
         let n_blocks = self.block_map.len();
 
-        for (i, b) in self
-            .block_map
-            .iter_mut()
-            .enumerate()
-            .skip(self.all_request_or_received_before)
-        {
-            if count >= n {
-                break;
-            }
-            match b {
-                BlockStatus::NotRequested => {
-                    *b = BlockStatus::Requested {
-                        addr: peer,
-                        at: time::Instant::now(),
-                    };
-                    self.all_request_or_received_before = i + 1;
-                    let req = Some(Request {
-                        index: self.piece_index,
-                        begin: (i * BLOCK_SIZE) as u32,
-                        len: if i + 1 == n_blocks {
-                            self.last_block_size as u32
-                        } else {
-                            BLOCK_SIZE as u32
-                        },
-                    });
-                    if from.is_none() {
-                        from = req;
+        if !endgame {
+            for (i, b) in self
+                .block_map
+                .iter_mut()
+                .enumerate()
+                .skip(self.all_request_or_received_before)
+            {
+                if count >= n {
+                    break;
+                }
+                let req = Some(Request {
+                    index: self.piece_index,
+                    begin: (i * BLOCK_SIZE) as u32,
+                    len: if i + 1 == n_blocks {
+                        self.last_block_size as u32
                     } else {
-                        to = req;
+                        BLOCK_SIZE as u32
+                    },
+                });
+                match b {
+                    BlockStatus::NotRequested => {
+                        *b = BlockStatus::Requested {
+                            addr: HashMap::from([(peer, time::Instant::now())]),
+                        };
+                        if from.is_none() {
+                            from = req;
+                        } else {
+                            to = req;
+                        }
+                        count += 1;
+                        self.requested_or_received_count += 1;
+                        self.all_request_or_received_before = i + 1;
                     }
-                    count += 1;
-                    self.requested_or_received_count += 1;
+                    BlockStatus::Requested { .. } => {
+                        self.all_request_or_received_before = i + 1;
+                        if from.is_some() {
+                            // not continuous, should break
+                            break;
+                        }
+                    }
+                    BlockStatus::Received => {
+                        self.all_request_or_received_before = i + 1;
+                        if from.is_some() {
+                            // not continuous, should break
+                            break;
+                        }
+                    }
                 }
-                BlockStatus::Requested { .. } => {
-                    self.all_request_or_received_before = i + 1;
+            }
+        } else {
+            for (i, b) in self.block_map.iter_mut().enumerate() {
+                if count >= n {
+                    break;
                 }
-                BlockStatus::Received => {
-                    self.all_request_or_received_before = i + 1;
+                let req = Some(Request {
+                    index: self.piece_index,
+                    begin: (i * BLOCK_SIZE) as u32,
+                    len: if i + 1 == n_blocks {
+                        self.last_block_size as u32
+                    } else {
+                        BLOCK_SIZE as u32
+                    },
+                });
+                match b {
+                    BlockStatus::NotRequested => {
+                        // TODO: todo!("does this really happen in endgame mode?");
+                        *b = BlockStatus::Requested {
+                            addr: HashMap::from([(peer, time::Instant::now())]),
+                        };
+                        self.all_request_or_received_before = i + 1;
+                        if from.is_none() {
+                            from = req;
+                        } else {
+                            to = req;
+                        }
+                        count += 1;
+                        self.requested_or_received_count += 1;
+                    }
+                    BlockStatus::Requested { addr } => {
+                        if self.all_request_or_received_before <= i {
+                            self.all_request_or_received_before = i + 1;
+                        }
+                        if !addr.contains_key(&peer) {
+                            count += 1;
+                            addr.insert(peer, time::Instant::now());
+                            if from.is_none() {
+                                from = req;
+                            } else {
+                                to = req;
+                            }
+                        } else if from.is_some() {
+                            // not continuous, should break
+                            break;
+                        }
+                    }
+                    BlockStatus::Received => {
+                        if self.all_request_or_received_before <= i {
+                            self.all_request_or_received_before = i + 1;
+                        }
+                        if from.is_some() {
+                            // not continuous, should break
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -118,8 +187,9 @@ impl PieceBlocks {
         }
     }
 
-    /// inform some block is received, returns
-    fn receive(&mut self, req: Request) {
+    /// inform some block is received, returns requested all peers
+    /// requested for that block
+    fn receive(&mut self, req: Request) -> Vec<PeerAddr> {
         // input req must be valid
         let b_index = (req.begin as usize) / BLOCK_SIZE;
         let b = &mut self.block_map[b_index];
@@ -127,13 +197,17 @@ impl PieceBlocks {
             BlockStatus::NotRequested => {
                 self.received_count += 1;
                 self.requested_or_received_count += 1;
+                *b = BlockStatus::Received;
+                vec![]
             }
-            BlockStatus::Requested { .. } => {
+            BlockStatus::Requested { addr } => {
                 self.received_count += 1;
+                let ret = addr.keys().map(|x| *x).collect();
+                *b = BlockStatus::Received;
+                ret
             }
-            BlockStatus::Received => {}
+            BlockStatus::Received => vec![],
         }
-        *b = BlockStatus::Received;
     }
 
     /// inform some block request is rejected or no response, and
@@ -144,30 +218,50 @@ impl PieceBlocks {
         #[cfg(test)]
         println!("{b:?}");
         match b {
-            BlockStatus::Requested { addr, .. } if addr == peer => {
+            BlockStatus::Requested { addr, .. } => {
                 // A peer can only be revoked if it's requested before
-                *b = BlockStatus::NotRequested;
-                if self.all_request_or_received_before > b_index {
-                    self.all_request_or_received_before = b_index;
+                addr.remove(peer);
+                if addr.is_empty() {
+                    *b = BlockStatus::NotRequested;
+                    if self.all_request_or_received_before > b_index {
+                        self.all_request_or_received_before = b_index;
+                    }
+                    self.requested_or_received_count -= 1;
                 }
-                self.requested_or_received_count -= 1;
             }
-            BlockStatus::Requested { .. } => {}
             BlockStatus::NotRequested => {}
             BlockStatus::Received => {}
         }
     }
 
-    /// change state of `Requested` blocks to `NotRequested` if
-    /// condition fulfils
-    fn revoke_all_requested_if<F>(&mut self, cond: F)
+    /// revoke request of one peer for all `Requested` which fulfils condition
+    fn revoke_all_requested_if<F>(&mut self, remove: F) -> Vec<(PeerAddr, Request)>
     where
-        F: Fn(&BlockStatus) -> bool,
+        F: Fn(&PeerAddr, &time::Instant) -> bool,
     {
+        let mut ret = vec![];
+        let n_blocks = self.block_map.len();
         for (i, b) in self.block_map.iter_mut().enumerate().rev() {
+            let req = Request {
+                index: self.piece_index,
+                begin: (i * BLOCK_SIZE) as u32,
+                len: if i + 1 == n_blocks {
+                    self.last_block_size
+                } else {
+                    BLOCK_SIZE
+                } as u32,
+            };
             match b {
-                BlockStatus::Requested { .. } => {
-                    if cond(b) {
+                BlockStatus::Requested { addr, .. } => {
+                    addr.retain(|p, t| {
+                        if remove(p, t) {
+                            ret.push((*p, req));
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                    if addr.is_empty() {
                         *b = BlockStatus::NotRequested;
                         self.requested_or_received_count -= 1;
                         if self.all_request_or_received_before > i {
@@ -178,6 +272,7 @@ impl PieceBlocks {
                 _ => {}
             }
         }
+        ret
     }
 }
 
@@ -204,6 +299,8 @@ pub struct BlockPicker {
     prev_time_check: time::Instant,
 
     no_response_timeout: time::Duration,
+
+    endgame: bool,
 }
 
 impl BlockPicker {
@@ -223,6 +320,7 @@ impl BlockPicker {
             receiving: BTreeMap::new(),
             prev_time_check: time::Instant::now(),
             no_response_timeout,
+            endgame: false,
         }
     }
 
@@ -251,12 +349,24 @@ impl BlockPicker {
         }
     }
 
-    /// Pick n blocks from peer, returns picked blocks and number of picked blocks
-    pub fn pick_blocks(&mut self, peer: &PeerAddr, n: usize) -> (BlockRequests, usize) {
+    /// Pick n blocks from peer, returns
+    /// (
+    ///  picked blocks,
+    ///  number of picked blocks,
+    ///  revoked blocks,
+    /// )
+    pub fn pick_blocks(
+        &mut self,
+        peer: &PeerAddr,
+        n: usize,
+    ) -> (BlockRequests, usize, Vec<(PeerAddr, Request)>) {
+        let mut revoked = Vec::with_capacity(8);
         if self.prev_time_check.elapsed() > self.no_response_timeout {
-            self.revoke_unrespond(self.no_response_timeout);
+            revoked.extend(self.revoke_unrespond(self.no_response_timeout));
             self.prev_time_check = time::Instant::now();
         }
+
+        let endgame = self.update_endgame();
 
         let mut remain = n;
         let peer_status = self
@@ -267,7 +377,7 @@ impl BlockPicker {
         let mut ret = Vec::new();
         for (index, blocks) in &mut self.requesting {
             if remain > 0 && peer_status.have(*index) {
-                while let Some((blks, n_picked)) = blocks.pick(*peer, remain) {
+                while let Some((blks, n_picked)) = blocks.pick(*peer, remain, endgame) {
                     remain -= n_picked;
                     ret.push(blks);
                 }
@@ -278,7 +388,7 @@ impl BlockPicker {
             if let Some(index) = self.piece_picker.pick_next(peer) {
                 let mut blocks = self.piece_block_of(index);
 
-                if let Some((blks, n_picked)) = blocks.pick(*peer, remain) {
+                if let Some((blks, n_picked)) = blocks.pick(*peer, remain, endgame) {
                     remain -= n_picked;
                     ret.push(blks);
                 }
@@ -296,16 +406,34 @@ impl BlockPicker {
         self.requesting
             .retain(|_, b| !b.is_all_requested_or_received());
 
+        let endgame = self.update_endgame();
+        let peer_status = self
+            .piece_picker
+            .peer_detail(peer)
+            .expect("the peer to pick block from should exist in piece_picker");
+        if endgame {
+            // if in endgame mode, we re-requesting requested blocks
+            for (index, blocks) in &mut self.receiving {
+                if remain > 0 && peer_status.have(*index) {
+                    while let Some((blks, n_picked)) = blocks.pick(*peer, remain, self.endgame) {
+                        remain -= n_picked;
+                        ret.push(blks);
+                    }
+                }
+            }
+        }
+
         (
             BlockRequests {
                 piece_size: self.piece_size as u32,
                 range: ret,
             },
             n - remain,
+            revoked,
         )
     }
 
-    /// Call then some block request is rejected, and request for that block
+    /// Call when some block request is rejected, and request for that block
     /// should be send to other peers again.
     pub fn peer_reject_block(&mut self, peer: &PeerAddr, req: Request) {
         if let Some(b) = self.receiving.get_mut(&req.index) {
@@ -347,37 +475,41 @@ impl BlockPicker {
         }
         true
     }
-    /// Called when a piece is received, returns if a piece is fully received
-    pub fn receive_block(&mut self, req: Request) -> Option<u32> {
+    /// Called when a piece is received, returns
+    /// (
+    /// if a piece is fully received,
+    /// revoked requests,
+    /// )
+    pub fn receive_block(&mut self, req: Request) -> (Option<u32>, Vec<PeerAddr>) {
         if !self.check_block_validity(&req) {
-            return None;
+            return (None, vec![]);
         }
 
         let index = req.index;
         if let Some(b) = self.receiving.get_mut(&index) {
-            b.receive(req);
-            b.is_all_received().then(|| index)
+            let r = b.receive(req);
+            (b.is_all_received().then(|| index), r)
         } else if let Some(b) = self.requesting.get_mut(&index) {
-            b.receive(req);
+            let r = b.receive(req);
             if b.is_all_received() {
                 self.requesting.remove(&index);
-                Some(index)
+                (Some(index), r)
             } else {
                 if b.is_all_requested_or_received() {
                     self.receiving.insert(index, b.clone());
                     self.requesting.remove(&index);
                 }
-                None
+                (None, r)
             }
         } else if self.piece_picker.selected(index) && !self.piece_picker.have(index) {
             let mut b = self.piece_block_of(index);
-            b.receive(req);
+            let r = b.receive(req);
             // only receive one block must be partial requested
             self.requesting.insert(index, b);
-            None
+            (None, r)
         } else {
             // blocks we didn't select or already have
-            None
+            (None, vec![])
         }
     }
 
@@ -390,13 +522,12 @@ impl BlockPicker {
 
     /// Mark blocks as `NotRequested` if they are `Requested` and did not respond
     /// longer than timeout
-    fn revoke_unrespond(&mut self, timeout: time::Duration) {
-        let no_response = |b: &BlockStatus| match b {
-            BlockStatus::Requested { at, .. } => at.elapsed() > timeout,
-            _ => false,
-        };
+    fn revoke_unrespond(&mut self, timeout: time::Duration) -> Vec<(PeerAddr, Request)> {
+        let mut revoked = Vec::with_capacity(8);
+        let no_response = |_: &PeerAddr, at: &time::Instant| at.elapsed() > timeout;
         for (index, blocks) in self.receiving.iter_mut() {
-            blocks.revoke_all_requested_if(no_response);
+            let r = blocks.revoke_all_requested_if(no_response);
+            revoked.extend(r);
             if !blocks.is_all_requested_or_received() {
                 self.requesting.insert(*index, blocks.clone());
             }
@@ -405,42 +536,52 @@ impl BlockPicker {
             .retain(|_, b| b.is_all_requested_or_received());
 
         for (index, blocks) in self.requesting.iter_mut() {
-            blocks.revoke_all_requested_if(no_response);
+            let r = blocks.revoke_all_requested_if(no_response);
+            revoked.extend(r);
             if blocks.is_all_not_requested() {
                 self.piece_picker.set_have(*index, false);
             }
         }
         self.requesting.retain(|_, b| !b.is_all_not_requested());
+        revoked
     }
 
-    /// check if we want this block, if want, returns previous
-    /// state of this block
-    pub fn want_block(&mut self, req: Request) -> Option<BlockStatus> {
+    fn update_endgame(&mut self) -> bool {
+        let old = self.endgame;
+        self.endgame = self.requesting.is_empty() && self.piece_picker.is_finished();
+        if old != self.endgame {
+            info!("switch endgame from {old} to {}", self.endgame);
+        }
+        self.endgame
+    }
+
+    /// check if we want this block
+    pub fn want_block(&mut self, req: Request) -> bool {
         if !self.check_block_validity(&req) {
             println!("unwant because invalid {req:?}");
-            return None;
+            return false;
         }
 
         let index = req.index;
         if !self.selected(index) {
             println!("unwant because {index} not selected");
-            return None;
+            return false;
         }
 
         if self.have(index) {
             println!("unwant because have {index}");
-            return None;
+            return false;
         }
 
         if let Some(b) = self.requesting.get(&index) {
             let s = &b.block_map[req.begin as usize / BLOCK_SIZE];
             match s {
                 BlockStatus::NotRequested | BlockStatus::Requested { .. } => {
-                    return Some(*s);
+                    return true;
                 }
                 BlockStatus::Received => {
                     println!("unwant because received");
-                    return None;
+                    return false;
                 }
             }
         }
@@ -449,11 +590,11 @@ impl BlockPicker {
             let s = &b.block_map[req.begin as usize / BLOCK_SIZE];
             match s {
                 BlockStatus::Requested { .. } => {
-                    return Some(*s);
+                    return true;
                 }
                 BlockStatus::Received => {
                     println!("unwant because received2");
-                    return None;
+                    return false;
                 }
                 _ => unreachable!(),
             }
@@ -461,7 +602,7 @@ impl BlockPicker {
 
         // we selected, but we did not request it, or we mark this block as
         // not requested because of timeout
-        return Some(BlockStatus::NotRequested);
+        return true;
     }
 
     /// Are all selected pieces downloaded and verified?
@@ -514,11 +655,8 @@ impl BlockPicker {
         self.piece_picker.peer_leave(addr);
     }
 
-    pub fn peer_choke(&mut self, addr: &PeerAddr) {
-        let requested_peer = |b: &BlockStatus| match b {
-            BlockStatus::Requested { addr: peer, .. } => addr == peer,
-            _ => false,
-        };
+    pub fn peer_choke(&mut self, peer: &PeerAddr) {
+        let requested_peer = |p: &PeerAddr, _: &time::Instant| p == peer;
 
         for (i, b) in self.receiving.iter_mut() {
             b.revoke_all_requested_if(requested_peer);
@@ -606,7 +744,7 @@ mod test {
         };
 
         {
-            let picked = b.pick(PEER1, 30);
+            let picked = b.pick(PEER1, 30, false);
             let exp = Some((
                 BlockRange {
                     from: Request {
@@ -627,7 +765,7 @@ mod test {
             assert_eq!(b.requested_or_received_count, 30);
         }
         {
-            let picked = b.pick(PEER1, 30);
+            let picked = b.pick(PEER1, 30, false);
             let exp = Some((
                 BlockRange {
                     from: Request {
@@ -699,14 +837,91 @@ mod test {
             assert_eq!(b.requested_or_received_count, 49);
         }
         {
-            b.revoke_all_requested_if(|b| match b {
-                BlockStatus::Requested { .. } => true,
-                _ => false,
-            });
+            b.revoke_all_requested_if(|_, _| true);
             assert!(!b.is_all_requested_or_received());
             assert_eq!(b.all_request_or_received_before, 10);
             assert_eq!(b.received_count, 11);
             assert_eq!(b.requested_or_received_count, 11);
+        }
+    }
+
+    #[test]
+    fn test_block_pieces_non_consecutive() {
+        let mut b = PieceBlocks {
+            piece_index: 0,
+            last_block_size: 4133,
+            all_request_or_received_before: 0,
+            requested_or_received_count: 1,
+            received_count: 0,
+            block_map: vec![
+                BlockStatus::NotRequested,
+                BlockStatus::Requested {
+                    addr: HashMap::from([(PEER1, time::Instant::now())]),
+                },
+                BlockStatus::NotRequested,
+            ],
+        };
+        {
+            let picked = b.pick(PEER1, 30, false);
+            let exp = Some((
+                BlockRange {
+                    from: Request {
+                        index: 0,
+                        begin: 0,
+                        len: 16384,
+                    },
+                    to: Request {
+                        index: 0,
+                        begin: 0,
+                        len: 16384,
+                    },
+                },
+                1,
+            ));
+            assert_eq!(picked, exp);
+            assert_eq!(b.all_request_or_received_before, 2);
+            assert_eq!(b.requested_or_received_count, 2);
+        }
+    }
+
+    #[test]
+    fn test_block_pieces_endgame() {
+        let mut b = PieceBlocks {
+            piece_index: 0,
+            last_block_size: 4133,
+            all_request_or_received_before: 0,
+            requested_or_received_count: 2,
+            received_count: 0,
+            block_map: vec![
+                BlockStatus::NotRequested,
+                BlockStatus::Requested {
+                    addr: HashMap::from([(PEER1, time::Instant::now())]),
+                },
+                BlockStatus::NotRequested,
+                BlockStatus::Received,
+                BlockStatus::NotRequested,
+            ],
+        };
+        {
+            let picked = b.pick(PEER2, 30, true);
+            let exp = Some((
+                BlockRange {
+                    from: Request {
+                        index: 0,
+                        begin: 0,
+                        len: 16384,
+                    },
+                    to: Request {
+                        index: 0,
+                        begin: 2 * 16384,
+                        len: 16384,
+                    },
+                },
+                3,
+            ));
+            assert_eq!(picked, exp);
+            assert_eq!(b.all_request_or_received_before, 4);
+            assert_eq!(b.requested_or_received_count, 4);
         }
     }
 

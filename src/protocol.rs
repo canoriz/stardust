@@ -668,6 +668,12 @@ where
     }
 }
 
+impl<T> WriteStream<T> {
+    pub fn peer_addr(&self) -> SocketAddr {
+        self.peer_addr
+    }
+}
+
 impl<T> WriteStream<T>
 where
     T: AsyncRead + AsyncWrite + Unpin,

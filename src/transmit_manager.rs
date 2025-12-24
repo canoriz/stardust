@@ -509,11 +509,20 @@ impl TransmitWorker {
             }
         };
 
+        let mut revoked = vec![];
         for (addr, h) in &mut self.connected_peers {
             info!("peer status {addr}: {:?}", h.state);
             if h.state.peer_choke_status == ChokeStatus::Unchoked {
-                let (reqs, n) = block_picker.pick_blocks(addr, n_blocks);
+                let (reqs, n, ri) = block_picker.pick_blocks(addr, n_blocks);
+                revoked.extend(ri);
                 h.conn.send_stream_cmd(ConnMsg::RequestBlocks(reqs));
+            }
+        }
+        for (peer, r) in revoked {
+            if let Some(c) = self.connected_peers.get_mut(&peer) {
+                if c.conn.capability().contains(&protocol::Capability::Fast) {
+                    c.conn.send_stream_cmd(ConnMsg::Cancel(r));
+                }
             }
         }
     }
@@ -529,10 +538,19 @@ impl TransmitWorker {
             }
         };
 
+        let mut revoked = vec![];
         if let Some(h) = self.connected_peers.get_mut(addr) {
             if h.state.peer_choke_status == ChokeStatus::Unchoked {
-                let (reqs, _n) = block_picker.pick_blocks(addr, pick_n);
+                let (reqs, _n, ri) = block_picker.pick_blocks(addr, pick_n);
                 h.conn.send_stream_cmd(ConnMsg::RequestBlocks(reqs));
+                revoked.extend(ri);
+            }
+        }
+        for (peer, r) in revoked {
+            if let Some(c) = self.connected_peers.get_mut(&peer) {
+                if c.conn.capability().contains(&protocol::Capability::Fast) {
+                    c.conn.send_stream_cmd(ConnMsg::Cancel(r));
+                }
             }
         }
     }
@@ -915,18 +933,7 @@ impl TransmitWorker {
             begin: piece.begin,
             len: piece.len,
         };
-        if let Some(s) = block_picker.want_block(req) {
-            match s {
-                BlockStatus::Requested { addr, .. } if addr != *peer => {
-                    // if this block come from peer we did not request, cancel old request
-                    // TODO: remove pending requests if not sent
-                    if let Some(conn) = self.connected_peers.get(&addr) {
-                        conn.conn.send_stream_cmd(ConnMsg::Cancel(req));
-                    }
-                }
-                _ => {}
-            }
-        } else {
+        if !block_picker.want_block(req) {
             warn!(
                 "discard PIECE msg {} {} {} block index {}",
                 piece.index,
@@ -937,7 +944,18 @@ impl TransmitWorker {
             return Ok(());
         }
 
-        let piece_received = block_picker.receive_block(req);
+        let (piece_received, peers_requested) = block_picker.receive_block(req);
+        for addr in peers_requested {
+            if addr != *peer {
+                // if this block come from peer we did not request, cancel old request
+                // TODO: remove pending requests if not sent
+                if let Some(conn) = self.connected_peers.get(&addr) {
+                    if conn.conn.capability().contains(&protocol::Capability::Fast) {
+                        conn.conn.send_stream_cmd(ConnMsg::Cancel(req));
+                    }
+                }
+            }
+        }
 
         match Self::get_piecebuf(
             storage,
@@ -1405,7 +1423,7 @@ pub(crate) async fn run_transmit_worker(
         // TODO: lets use notify?
         tokio::select! {
             Some(msg) = transmit.receiver.recv() => {
-                debug!("transmit manager received msg {msg:?}");
+                // debug!("transmit manager received msg {msg:?}");
                 transmit.handle_msg(msg); // TODO: handle result
                 if transmit.is_downloaded() {
                     transmit.downloaded.send(true);
