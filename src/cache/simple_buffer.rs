@@ -9,7 +9,8 @@ use std::{
 
 use super::{BackFile, MutexBackFile};
 use bytes::BytesMut;
-use tokio::time;
+use tokio::{sync::mpsc, time};
+use tracing::warn;
 
 const FLUSHING: u32 = 0b1;
 const DIRTY: u32 = 0b10;
@@ -59,6 +60,8 @@ pub struct PieceBuf {
     dropping: Arc<AtomicBool>,
     file: MutexBackFile,
     pool: Arc<Mutex<Pool<BytesMut>>>,
+
+    /// always Some, except drop takes this
     on_error: Option<Box<dyn ErrorCallback>>,
 }
 
@@ -108,8 +111,13 @@ impl Drop for PieceBuf {
         let old_state = s.fetch_or(FLUSHING, Ordering::Acquire);
         if old_state & FLUSHING > 0 || old_state & DIRTY > 0 {
             // buffer may be dirty while DIRTY bit is 0 if other is FLUSHING
+            let index = self.index;
             tokio::task::spawn_blocking(move || {
-                Self::force_flush(buf, f, pool, offset, s, dropping, true, on_err)
+                let r = Self::force_flush(buf, f, pool, offset, s, dropping, true);
+                if let Err(e) = r {
+                    warn!("PieceBuf::Drop flush error index {index} {e:?}, data lost");
+                    on_err.unwrap()(e)
+                }
             });
         }
     }
@@ -120,7 +128,10 @@ impl PieceBuf {
         self.index
     }
 
-    pub fn flush(&mut self, on_err: Option<Box<dyn ErrorCallback>>) {
+    pub fn flush<F>(&mut self, result_callback: F)
+    where
+        F: FnOnce(Result<(), FlushErr>) + Send + 'static,
+    {
         // set flushing bit and clear dirty bit
         // dirty flushing
         // 00 -> 00 and return
@@ -156,7 +167,8 @@ impl PieceBuf {
                     self.buf.clone().unwrap()
                 };
                 tokio::task::spawn_blocking(move || {
-                    Self::force_flush(buf, f, pool, offset, s, dropping, false, on_err)
+                    let r = Self::force_flush(buf, f, pool, offset, s, dropping, false);
+                    result_callback(r);
                 });
             }
             0b11 => {}
@@ -172,20 +184,10 @@ impl PieceBuf {
         state: Arc<AtomicU32>,
         dropping: Arc<AtomicBool>,
         from_drop: bool,
-        on_err: Option<Box<dyn ErrorCallback>>,
-    ) {
-        flush_buf_to_file(
-            buf,
-            offset,
-            state,
-            file,
-            dropping,
-            from_drop,
-            move |b| {
-                pool.lock().unwrap().put(b);
-            },
-            on_err,
-        );
+    ) -> Result<(), FlushErr> {
+        flush_buf_to_file(buf, offset, state, file, dropping, from_drop, move |b| {
+            pool.lock().unwrap().put(b);
+        })
     }
 }
 
@@ -201,8 +203,8 @@ fn flush_buf_to_file<F>(
     dropping: Arc<AtomicBool>,
     from_drop: bool,
     recycle_buf: F,
-    on_err: Option<Box<dyn ErrorCallback>>,
-) where
+) -> Result<(), FlushErr>
+where
     F: FnOnce(BytesMut) + Send + 'static,
 {
     let r = {
@@ -218,25 +220,24 @@ fn flush_buf_to_file<F>(
     let len = buf.len();
     recycle_buf(buf);
     if let Err(e) = r {
-        if let Some(cb) = on_err {
-            cb(FlushErr {
-                offset,
-                len,
-                err: e,
-            })
-        }
         // dirty flush bits
         // 01 -> 10 no new write after flushing begins
         // 11 -> 10 new write after flushing begins, the dirty bit is set by others
         // in all cases, should set dirty=1, flush=0
         let _old_state = state.swap(DIRTY, Ordering::Release);
         // assert!(old_state & FLUSHING > 0);
+        Err(FlushErr {
+            offset,
+            len,
+            err: e,
+        })
     } else {
         // dirty flush bits
         // 01 -> 00 no new write after flushing begins
         // 11 -> 10 new write after flushing begins, the dirty bit is set by others
         let _old_state = state.fetch_and(!FLUSHING, Ordering::Release);
         // assert!(old_state & FLUSHING > 0);
+        Ok(())
     }
 }
 
@@ -290,6 +291,27 @@ impl BufStorage {
             loading: Arc::new(Mutex::new(HashMap::new())),
             pool: Arc::new(Mutex::new(Pool::new(16))),
         }
+    }
+
+    pub async fn shutdown(mut self) {
+        let n = self.pieces.len();
+        let (tx, mut rx) = mpsc::channel(n);
+        for (_, piece) in self.pieces.iter_mut() {
+            let ti = tx.clone();
+            piece.flush(move |r| {
+                ti.try_send(r)
+                    .expect("allocated exact n slots, should not send fail")
+            });
+        }
+
+        let mut c = 0;
+        while let Some(r) = rx.recv().await {
+            c += 1;
+            if let Err(e) = r {
+                warn!("shutdown flush error {e:?}, data lost");
+            }
+        }
+        assert_eq!(c, n);
     }
 
     /// get piecebuf from local buffer, if piecebuf in buffer, return it.
@@ -376,6 +398,8 @@ impl BufStorage {
                     on_ready(Ok(p));
                 }
                 Err(e) => {
+                    let mut guard = loading_map.lock().unwrap();
+                    guard.remove(&piece_idx);
                     on_ready(Err(e));
                 }
             });
@@ -401,14 +425,23 @@ impl BufStorage {
     }
 
     pub fn purge_by_size(&mut self, keep: usize) {
-        if self.pieces.len() > keep {
-            let mut ps: Vec<_> = self.pieces.drain().collect();
-            ps.sort_by_key(|(_, p)| p.touch);
-            ps.reverse();
-            while ps.len() > keep {
-                ps.pop();
+        // TODO: OPTIMIZE
+        while self.pieces.len() > keep {
+            if let Some(&idx) = self
+                .pieces
+                .iter()
+                .min_by_key(|(_, p)| p.touch)
+                .map(|(k, _)| k)
+            {
+                self.pieces.remove(&idx);
             }
-            self.pieces = HashMap::from_iter(ps.into_iter());
+            // let mut ps: Vec<_> = self.pieces.drain().collect();
+            // ps.sort_by_key(|(_, p)| p.touch);
+            // ps.reverse();
+            // while ps.len() > keep {
+            //     ps.pop();
+            // }
+            // self.pieces = HashMap::from_iter(ps.into_iter());
         }
     }
 }

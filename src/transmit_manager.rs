@@ -846,7 +846,9 @@ impl TransmitWorker {
         block_picker: &mut BlockPicker,
     ) {
         if Self::verify_piece(p, metadata) {
-            p.flush(None);
+            // flush error is not fatal
+            // we always catch drop error
+            p.flush(|_| {});
             for (_, h) in connected_peers.iter() {
                 h.conn.send_stream_cmd(ConnMsg::Have(p.index() as u32));
             }
