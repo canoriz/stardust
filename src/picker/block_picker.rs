@@ -62,14 +62,82 @@ impl PieceBlocks {
         self.requested_or_received_count == self.block_map.len()
     }
 
-    /// try to pick n blocks, return blocks and how many blocks picked
-    fn pick(&mut self, peer: PeerAddr, n: usize, endgame: bool) -> Option<(BlockRange, usize)> {
+    /// Try to pick n blocks, return blocks and how many blocks picked.
+    /// If in endgame mode, take a duplicate request limit, we want blocks
+    /// requested count is evenly distributed, e.g. A and B block are both
+    /// requested from 3 peers, not A block requested 5 peers
+    /// while B from only 1 peer.
+    /// TODO: optimize: if we really can not pick any block (all sent requests
+    /// to this peer), then notify caller to fail soon
+    fn pick(
+        &mut self,
+        peer: PeerAddr,
+        n: usize,
+        endgame: Option<usize>,
+    ) -> Option<(BlockRange, usize)> {
         let mut from = None;
         let mut to = None;
         let mut count = 0;
         let n_blocks = self.block_map.len();
 
-        if !endgame {
+        if let Some(limit) = endgame {
+            for (i, b) in self.block_map.iter_mut().enumerate() {
+                if count >= n {
+                    break;
+                }
+                let req = Some(Request {
+                    index: self.piece_index,
+                    begin: (i * BLOCK_SIZE) as u32,
+                    len: if i + 1 == n_blocks {
+                        self.last_block_size as u32
+                    } else {
+                        BLOCK_SIZE as u32
+                    },
+                });
+                match b {
+                    BlockStatus::NotRequested => {
+                        // TODO: todo!("does this really happen in endgame mode?");
+                        *b = BlockStatus::Requested {
+                            addr: HashMap::from([(peer, time::Instant::now())]),
+                        };
+                        self.all_request_or_received_before = i + 1;
+                        if from.is_none() {
+                            from = req;
+                        } else {
+                            to = req;
+                        }
+                        count += 1;
+                        self.requested_or_received_count += 1;
+                    }
+                    BlockStatus::Requested { addr } => {
+                        if self.all_request_or_received_before <= i {
+                            self.all_request_or_received_before = i + 1;
+                        }
+                        if !addr.contains_key(&peer) && addr.len() < limit {
+                            count += 1;
+                            addr.insert(peer, time::Instant::now());
+                            if from.is_none() {
+                                from = req;
+                            } else {
+                                to = req;
+                            }
+                        } else if from.is_some() {
+                            // not continuous, should break
+                            break;
+                        }
+                    }
+                    BlockStatus::Received => {
+                        if self.all_request_or_received_before <= i {
+                            self.all_request_or_received_before = i + 1;
+                        }
+                        if from.is_some() {
+                            // not continuous, should break
+                            break;
+                        }
+                    }
+                }
+            }
+        } else {
             for (i, b) in self
                 .block_map
                 .iter_mut()
@@ -111,63 +179,6 @@ impl PieceBlocks {
                     }
                     BlockStatus::Received => {
                         self.all_request_or_received_before = i + 1;
-                        if from.is_some() {
-                            // not continuous, should break
-                            break;
-                        }
-                    }
-                }
-            }
-        } else {
-            for (i, b) in self.block_map.iter_mut().enumerate() {
-                if count >= n {
-                    break;
-                }
-                let req = Some(Request {
-                    index: self.piece_index,
-                    begin: (i * BLOCK_SIZE) as u32,
-                    len: if i + 1 == n_blocks {
-                        self.last_block_size as u32
-                    } else {
-                        BLOCK_SIZE as u32
-                    },
-                });
-                match b {
-                    BlockStatus::NotRequested => {
-                        // TODO: todo!("does this really happen in endgame mode?");
-                        *b = BlockStatus::Requested {
-                            addr: HashMap::from([(peer, time::Instant::now())]),
-                        };
-                        self.all_request_or_received_before = i + 1;
-                        if from.is_none() {
-                            from = req;
-                        } else {
-                            to = req;
-                        }
-                        count += 1;
-                        self.requested_or_received_count += 1;
-                    }
-                    BlockStatus::Requested { addr } => {
-                        if self.all_request_or_received_before <= i {
-                            self.all_request_or_received_before = i + 1;
-                        }
-                        if !addr.contains_key(&peer) {
-                            count += 1;
-                            addr.insert(peer, time::Instant::now());
-                            if from.is_none() {
-                                from = req;
-                            } else {
-                                to = req;
-                            }
-                        } else if from.is_some() {
-                            // not continuous, should break
-                            break;
-                        }
-                    }
-                    BlockStatus::Received => {
-                        if self.all_request_or_received_before <= i {
-                            self.all_request_or_received_before = i + 1;
-                        }
                         if from.is_some() {
                             // not continuous, should break
                             break;
@@ -376,8 +387,9 @@ impl BlockPicker {
 
         let mut ret = Vec::new();
         for (index, blocks) in &mut self.requesting {
+            assert!(!endgame);
             if remain > 0 && peer_status.have(*index) {
-                while let Some((blks, n_picked)) = blocks.pick(*peer, remain, endgame) {
+                while let Some((blks, n_picked)) = blocks.pick(*peer, remain, None) {
                     remain -= n_picked;
                     ret.push(blks);
                 }
@@ -386,9 +398,10 @@ impl BlockPicker {
 
         while remain > 0 {
             if let Some(index) = self.piece_picker.pick_next(peer) {
+                assert!(!endgame);
                 let mut blocks = self.piece_block_of(index);
 
-                if let Some((blks, n_picked)) = blocks.pick(*peer, remain, endgame) {
+                if let Some((blks, n_picked)) = blocks.pick(*peer, remain, None) {
                     remain -= n_picked;
                     ret.push(blks);
                 }
@@ -411,13 +424,40 @@ impl BlockPicker {
             .piece_picker
             .peer_detail(peer)
             .expect("the peer to pick block from should exist in piece_picker");
+
         if endgame {
             // if in endgame mode, we re-requesting requested blocks
-            for (index, blocks) in &mut self.receiving {
-                if remain > 0 && peer_status.have(*index) {
-                    while let Some((blks, n_picked)) = blocks.pick(*peer, remain, self.endgame) {
-                        remain -= n_picked;
-                        ret.push(blks);
+            // in endgame mode, duplicate requested count of every block should be put evenly
+            // since in endgame mode, remaining candidates should be few(TODO: fact check)
+            // use a simple approach
+            // TODO: set dynamic upper limit, optimize impossible pick(if all blocks requested before
+            // simply add limit does not work
+            // maybe add a BTreeSet to maintain this
+            let from = self
+                .receiving
+                .iter()
+                .map(|(_, p)| {
+                    p.block_map
+                        .iter()
+                        .map(|b| match b {
+                            BlockStatus::NotRequested => 0,
+                            BlockStatus::Requested { addr } => addr.len(),
+                            BlockStatus::Received => usize::MAX,
+                        })
+                        .min()
+                        .unwrap_or(usize::MAX)
+                })
+                .min()
+                .unwrap_or(2);
+            'outer: for limit in from..=from + 1 {
+                for (index, blocks) in &mut self.receiving {
+                    if remain > 0 && peer_status.have(*index) {
+                        while let Some((blks, n_picked)) = blocks.pick(*peer, remain, Some(limit)) {
+                            remain -= n_picked;
+                            ret.push(blks);
+                        }
+                    } else {
+                        break 'outer;
                     }
                 }
             }
@@ -744,7 +784,7 @@ mod test {
         };
 
         {
-            let picked = b.pick(PEER1, 30, false);
+            let picked = b.pick(PEER1, 30, None);
             let exp = Some((
                 BlockRange {
                     from: Request {
@@ -765,7 +805,7 @@ mod test {
             assert_eq!(b.requested_or_received_count, 30);
         }
         {
-            let picked = b.pick(PEER1, 30, false);
+            let picked = b.pick(PEER1, 30, None);
             let exp = Some((
                 BlockRange {
                     from: Request {
@@ -862,7 +902,7 @@ mod test {
             ],
         };
         {
-            let picked = b.pick(PEER1, 30, false);
+            let picked = b.pick(PEER1, 30, None);
             let exp = Some((
                 BlockRange {
                     from: Request {
@@ -903,7 +943,7 @@ mod test {
             ],
         };
         {
-            let picked = b.pick(PEER2, 30, true);
+            let picked = b.pick(PEER2, 30, Some(2));
             let exp = Some((
                 BlockRange {
                     from: Request {
@@ -922,6 +962,70 @@ mod test {
             assert_eq!(picked, exp);
             assert_eq!(b.all_request_or_received_before, 4);
             assert_eq!(b.requested_or_received_count, 4);
+        }
+        {
+            let picked = b.pick(PEER2, 30, Some(2));
+            let exp = Some((
+                BlockRange {
+                    from: Request {
+                        index: 0,
+                        begin: 4 * 16384,
+                        len: 4133,
+                    },
+                    to: Request {
+                        index: 0,
+                        begin: 4 * 16384,
+                        len: 4133,
+                    },
+                },
+                1,
+            ));
+            assert_eq!(picked, exp);
+            assert_eq!(b.all_request_or_received_before, 5);
+            assert_eq!(b.requested_or_received_count, 5);
+        }
+        {
+            let picked = b.pick(PEER1, 30, Some(2));
+            let exp = Some((
+                BlockRange {
+                    from: Request {
+                        index: 0,
+                        begin: 0,
+                        len: 16384,
+                    },
+                    to: Request {
+                        index: 0,
+                        begin: 0,
+                        len: 16384,
+                    },
+                },
+                1,
+            ));
+            assert_eq!(picked, exp);
+            assert_eq!(b.all_request_or_received_before, 5);
+            assert_eq!(b.requested_or_received_count, 5);
+        }
+        {
+            let picked = b.pick(PEER3, 30, Some(2));
+            // PEER 3 should skip block 0, 1 because they are already requested to PEER 1 and 2
+            let exp = Some((
+                BlockRange {
+                    from: Request {
+                        index: 0,
+                        begin: 2 * 16384,
+                        len: 16384,
+                    },
+                    to: Request {
+                        index: 0,
+                        begin: 2 * 16384,
+                        len: 16384,
+                    },
+                },
+                1,
+            ));
+            assert_eq!(picked, exp);
+            assert_eq!(b.all_request_or_received_before, 5);
+            assert_eq!(b.requested_or_received_count, 5);
         }
     }
 
