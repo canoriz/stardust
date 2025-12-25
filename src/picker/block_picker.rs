@@ -478,9 +478,9 @@ impl BlockPicker {
     pub fn peer_reject_block(&mut self, peer: &PeerAddr, req: Request) {
         if let Some(b) = self.receiving.get_mut(&req.index) {
             b.revoke(peer, req);
-            if !b.is_all_received() {
-                self.requesting.insert(req.index, b.clone());
-                self.receiving.remove(&req.index);
+            if !b.is_all_requested_or_received() {
+                let b = self.receiving.remove(&req.index).unwrap();
+                self.requesting.insert(req.index, b);
             }
         } else if let Some(b) = self.requesting.get_mut(&req.index) {
             b.revoke(peer, req);
@@ -536,8 +536,8 @@ impl BlockPicker {
                 (Some(index), r)
             } else {
                 if b.is_all_requested_or_received() {
-                    self.receiving.insert(index, b.clone());
-                    self.requesting.remove(&index);
+                    let b = self.requesting.remove(&index).unwrap();
+                    self.receiving.insert(index, b);
                 }
                 (None, r)
             }
