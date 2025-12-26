@@ -546,6 +546,7 @@ impl BlockPicker {
             let r = b.receive(req);
             // only receive one block must be partial requested
             self.requesting.insert(index, b);
+            info!("123");
             (None, r)
         } else {
             // blocks we didn't select or already have
@@ -570,6 +571,7 @@ impl BlockPicker {
             revoked.extend(r);
             if !blocks.is_all_requested_or_received() {
                 self.requesting.insert(*index, blocks.clone());
+                info!("234");
             }
         }
         self.receiving
@@ -702,6 +704,7 @@ impl BlockPicker {
             b.revoke_all_requested_if(requested_peer);
             if !b.is_all_requested_or_received() {
                 self.requesting.insert(*i, b.clone());
+                info!("345");
             }
         }
         self.receiving

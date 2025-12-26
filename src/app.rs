@@ -45,7 +45,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // let info_hash = magnet.info_hash;
     session
         // .add_torrent(TorrentTask::Magnet(magnet), vec![])
-        .add_torrent(TorrentTask::Torrent(metadata), announce_list)
+        .add_torrent(TorrentTask::Torrent(metadata), vec![vec!["1".into()]])
         .await;
     session
         .do_work(&info_hash, async |tm| {

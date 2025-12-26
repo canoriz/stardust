@@ -590,6 +590,7 @@ impl TransmitWorker {
                         // maybe store available peers in a pool, connect to them when
                         // running out of peers
                         let addr = SocketAddr::new(ip, p.port);
+                        let addr = to_canonical_addr(addr);
                         self.handle_new_discovered_peer(addr);
                     }
                 }
@@ -605,21 +606,23 @@ impl TransmitWorker {
                     if is_income { "income" } else { "outward" },
                     bt_conn
                 );
-                let peer_addr = bt_conn.peer_addr();
-                let cm = ConnectionManagerHandle::new_dyn(bt_conn, self.self_handle.clone());
-                self.connected_peers.insert(
-                    peer_addr,
-                    PeerConn {
-                        conn: cm,
-                        state: PeerStatus {
-                            our_choke_status: ChokeStatus::Unknown,
-                            our_interest_status: InterestStatus::Unknown,
-                            peer_choke_status: ChokeStatus::Unknown,
-                            peer_interest_status: InterestStatus::Unknown,
+                let peer_addr = to_canonical_addr(bt_conn.peer_addr());
+                if !self.connected_peers.contains_key(&peer_addr) {
+                    let cm = ConnectionManagerHandle::new_dyn(bt_conn, self.self_handle.clone());
+                    self.connected_peers.insert(
+                        peer_addr,
+                        PeerConn {
+                            conn: cm,
+                            state: PeerStatus {
+                                our_choke_status: ChokeStatus::Unknown,
+                                our_interest_status: InterestStatus::Unknown,
+                                peer_choke_status: ChokeStatus::Unknown,
+                                peer_interest_status: InterestStatus::Unknown,
+                            },
+                            bitmap: None,
                         },
-                        bitmap: None,
-                    },
-                );
+                    );
+                }
                 self.connecting_peers.remove(&peer_addr);
                 Ok(())
             }
@@ -629,10 +632,8 @@ impl TransmitWorker {
                 Ok(())
             }
             Msg::PeerLeave(addr) => {
-                // receive twice from send end and recv end
-                // TODO: test this
                 info!("peer leave {addr}");
-                self.connected_peers.remove(&addr);
+                self.connected_peers.remove(&to_canonical_addr(addr));
                 Ok(())
             }
             Msg::PeerMsg(pm) => self.handle_peer_msg(pm),
@@ -771,7 +772,7 @@ impl TransmitWorker {
                 let n_to_pick = ((10 * estimated_bw / 16384).max(n_req_in_flight)
                     - n_req_in_flight)
                     .max(10)
-                    .min(1500);
+                    .min(150);
 
                 if matches!(self.running_state, RunningState::Downloading) {
                     if conn_stat.state.peer_choke_status == ChokeStatus::Unchoked {
@@ -1143,7 +1144,7 @@ impl TransmitWorker {
         }
 
         for p in progress.peers {
-            self.handle_new_discovered_peer(p);
+            self.handle_new_discovered_peer(to_canonical_addr(p));
         }
         _ = sender.send(());
     }
@@ -1506,6 +1507,10 @@ async fn connect_peer(
             Err(e)
         }
     }
+}
+
+fn to_canonical_addr(s: SocketAddr) -> SocketAddr {
+    SocketAddr::new(s.ip().to_canonical(), s.port())
 }
 
 #[cfg(test)]
