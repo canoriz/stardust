@@ -2553,6 +2553,10 @@ where
 async fn recv_handshake<T: AsyncRead + Unpin>(handle: &mut T) -> io::Result<(InfoHash, Handshake)> {
     let first = handle.read_u8().await?;
     if first != 19 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid handshake pstrlen",
+        ));
         todo!();
     }
     let mut header = [0u8; 19];

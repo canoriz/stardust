@@ -846,6 +846,7 @@ impl TransmitWorker {
         connected_peers: &mut HashMap<PeerAddr, PeerConn>,
         block_picker: &mut BlockPicker,
     ) {
+        info!("piece {} full received, verifying...", p.index());
         if Self::verify_piece(p, metadata) {
             // flush error is not fatal
             // we always catch drop error

@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{debug, info};
 
 use super::{
     BitField, BlockRange, BlockRequests, PeerAddr, PeerPieceDetail, PieceMap, PiecePicker,
@@ -198,7 +198,7 @@ impl PieceBlocks {
         }
     }
 
-    /// inform some block is received, returns requested all peers
+    /// inform some block is received, returns all being requested peers
     /// requested for that block
     fn receive(&mut self, req: Request) -> Vec<PeerAddr> {
         // input req must be valid
@@ -391,6 +391,9 @@ impl BlockPicker {
             if remain > 0 && peer_status.have(*index) {
                 while let Some((blks, n_picked)) = blocks.pick(*peer, remain, None) {
                     remain -= n_picked;
+                    debug!(
+                        "pick piece {index} from peer {peer} (requesting), picked blks: {blks:?}"
+                    );
                     ret.push(blks);
                 }
             }
@@ -403,8 +406,12 @@ impl BlockPicker {
 
                 if let Some((blks, n_picked)) = blocks.pick(*peer, remain, None) {
                     remain -= n_picked;
+                    debug!(
+                        "pick piece {index} from peer {peer} (pick_next), picked blks: {blks:?}"
+                    );
                     ret.push(blks);
                 }
+                assert!(!self.requesting.contains_key(&index));
                 self.requesting.insert(index, blocks);
             } else {
                 break;
@@ -454,6 +461,9 @@ impl BlockPicker {
                     if remain > 0 && peer_status.have(*index) {
                         while let Some((blks, n_picked)) = blocks.pick(*peer, remain, Some(limit)) {
                             remain -= n_picked;
+                            debug!(
+                                "pick piece {index} from peer {peer} (requested), picked blks: {blks:?}"
+                            );
                             ret.push(blks);
                         }
                     } else {
@@ -477,12 +487,20 @@ impl BlockPicker {
     /// should be send to other peers again.
     pub fn peer_reject_block(&mut self, peer: &PeerAddr, req: Request) {
         if let Some(b) = self.receiving.get_mut(&req.index) {
+            assert!(b.is_all_requested_or_received());
+            assert!(!self.requesting.contains_key(&req.index));
+            assert!(!self.piece_picker.have(req.index));
             b.revoke(peer, req);
             if !b.is_all_requested_or_received() {
                 let b = self.receiving.remove(&req.index).unwrap();
                 self.requesting.insert(req.index, b);
+            } else if b.is_all_not_requested() {
+                self.piece_picker.set_have(req.index, false);
+                self.receiving.remove(&req.index);
             }
         } else if let Some(b) = self.requesting.get_mut(&req.index) {
+            assert!(!self.receiving.contains_key(&req.index));
+            assert!(!self.piece_picker.have(req.index));
             b.revoke(peer, req);
             if b.is_all_not_requested() {
                 self.piece_picker.set_have(req.index, false);
@@ -532,7 +550,8 @@ impl BlockPicker {
         } else if let Some(b) = self.requesting.get_mut(&index) {
             let r = b.receive(req);
             if b.is_all_received() {
-                self.requesting.remove(&index);
+                let b = self.requesting.remove(&index).unwrap();
+                self.receiving.insert(index, b);
                 (Some(index), r)
             } else {
                 if b.is_all_requested_or_received() {
@@ -546,6 +565,8 @@ impl BlockPicker {
             let r = b.receive(req);
             // only receive one block must be partial requested
             self.requesting.insert(index, b);
+            // notify piece_picker this piece is downloading
+            self.piece_picker.set_have(index, true);
             info!("123");
             (None, r)
         } else {

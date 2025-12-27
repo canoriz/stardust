@@ -472,7 +472,7 @@ where
             }
             Some(msg) = conn.receiver.recv() => {
                 // TODO: maybe use buffer and Notify?
-                info!("send stream received {msg:?}");
+                info!("send stream {} received {msg:?}", conn.write_stream.peer_addr());
                 conn.handle_cmd(msg).await;
             }
         };
