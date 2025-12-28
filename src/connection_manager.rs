@@ -303,7 +303,17 @@ where
     T: AsyncRead + Unpin,
 {
     fn handle_report_tick(&mut self, interval: time::Duration) {
-        const TRACE_WINDOW: usize = 30;
+        const TRACE_WINDOW: usize = 16;
+        let prev_n_recv = self
+            .history_n_recv_req
+            .iter()
+            .last()
+            .map(|x| *x)
+            .unwrap_or(0);
+        let n_recv_in_period = self
+            .n_recv_req
+            .load(Ordering::Relaxed)
+            .saturating_sub(prev_n_recv) as usize;
         if self.history_n_recv_req.len() < TRACE_WINDOW {
             self.history_n_recv_req
                 .push_back(self.n_recv_req.load(Ordering::Relaxed));
@@ -341,6 +351,7 @@ where
                 peer: self.read_stream.peer_addr(),
                 estimated_bw: self.bw.count(interval),
                 n_req_in_flight: n_req_in_flight.max(0) as usize,
+                n_recv_in_period,
             }));
     }
 

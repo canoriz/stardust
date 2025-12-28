@@ -487,9 +487,9 @@ impl BlockPicker {
     /// should be send to other peers again.
     pub fn peer_reject_block(&mut self, peer: &PeerAddr, req: Request) {
         if let Some(b) = self.receiving.get_mut(&req.index) {
-            assert!(b.is_all_requested_or_received());
-            assert!(!self.requesting.contains_key(&req.index));
-            assert!(!self.piece_picker.have(req.index));
+            assert!(b.is_all_requested_or_received(), "{}", req.index);
+            assert!(!self.requesting.contains_key(&req.index), "{}", req.index);
+            assert!(self.piece_picker.have(req.index), "{}", req.index);
             b.revoke(peer, req);
             if !b.is_all_requested_or_received() {
                 let b = self.receiving.remove(&req.index).unwrap();
@@ -499,8 +499,8 @@ impl BlockPicker {
                 self.receiving.remove(&req.index);
             }
         } else if let Some(b) = self.requesting.get_mut(&req.index) {
-            assert!(!self.receiving.contains_key(&req.index));
-            assert!(!self.piece_picker.have(req.index));
+            assert!(!self.receiving.contains_key(&req.index), "{}", req.index);
+            assert!(self.piece_picker.have(req.index), "{}", req.index);
             b.revoke(peer, req);
             if b.is_all_not_requested() {
                 self.piece_picker.set_have(req.index, false);
@@ -614,6 +614,8 @@ impl BlockPicker {
         self.endgame = self.requesting.is_empty() && self.piece_picker.is_finished();
         if old != self.endgame {
             info!("switch endgame from {old} to {}", self.endgame);
+            info!("requesting pieces?: {:?}", self.requesting.keys());
+            info!("picker finished?: {}", self.piece_picker.is_finished());
         }
         self.endgame
     }

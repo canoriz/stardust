@@ -1,3 +1,5 @@
+use tracing::debug;
+
 use super::{PeerAddr, PeerPieceDetail, PieceMap, PiecePicker, PieceState};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -228,7 +230,12 @@ impl PiecePicker for Picker {
         }
 
         if let Some((_rarity, index)) = found {
+            debug!(
+                "pick piece {index} with rarity {} from peer {peer}",
+                self.rarity.get(&index).unwrap()
+            );
             self.set_have(index, true);
+            debug!("self.have: {:?}", self.have);
             Some(index)
         } else {
             None

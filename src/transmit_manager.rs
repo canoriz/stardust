@@ -65,6 +65,9 @@ pub enum PeerMsg {
         // estimated bandwidth, bytes per period
         estimated_bw: usize,
         n_req_in_flight: usize,
+
+        // how many blocks we received in this period
+        n_recv_in_period: usize,
     },
 }
 
@@ -764,15 +767,23 @@ impl TransmitWorker {
                 peer,
                 estimated_bw,
                 n_req_in_flight,
+                n_recv_in_period,
             } => {
                 // TODO: OPTIMIZE: return connection handle to reduce map search
                 let conn_stat = self.connected_peers.get_mut(&peer).expect("should exist");
                 warn!("peer {peer} estimated bandwidth {estimated_bw}, req in flight: {n_req_in_flight}");
 
-                let n_to_pick = ((10 * estimated_bw / 16384).max(n_req_in_flight)
-                    - n_req_in_flight)
-                    .max(10)
-                    .min(150);
+                // Only can pick more blocks if we received some or no requests in flight.
+                // For peers with small bandwidth, we don't request too much from them
+                // to avoid mark these blocks as in-flight and not requesting from other peers.
+                // preventing accumulating too much partial downloaded pieces.
+                let n_to_pick = if n_recv_in_period > 0 || n_req_in_flight == 0 {
+                    ((10 * estimated_bw / 16384).max(n_req_in_flight) - n_req_in_flight)
+                        .max(10)
+                        .min(150)
+                } else {
+                    0
+                };
 
                 if matches!(self.running_state, RunningState::Downloading) {
                     if conn_stat.state.peer_choke_status == ChokeStatus::Unchoked {
