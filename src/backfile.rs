@@ -215,6 +215,7 @@ impl BackFile {
 
 impl BackFile {
     pub fn write_all_at(&mut self, offset: usize, buf: &[u8]) -> Result<()> {
+        debug!("backfile write at {offset} len {}", buf.len());
         let opener = self.opener;
         let wops = self.find_files(offset, buf);
         for w in wops {

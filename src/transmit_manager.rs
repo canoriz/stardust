@@ -627,6 +627,7 @@ impl TransmitWorker {
                     );
                 }
                 self.connecting_peers.remove(&peer_addr);
+                // TODO: if is income, send bitfield
                 Ok(())
             }
             Msg::NewPeer(Err(addr)) => {

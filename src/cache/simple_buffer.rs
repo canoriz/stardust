@@ -1,5 +1,6 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    cmp,
+    collections::{BinaryHeap, HashMap, VecDeque},
     fmt, io,
     sync::{
         atomic::{AtomicBool, AtomicU32, Ordering},
@@ -10,7 +11,7 @@ use std::{
 use super::{BackFile, MutexBackFile};
 use bytes::BytesMut;
 use tokio::{sync::mpsc, time};
-use tracing::warn;
+use tracing::{info, warn};
 
 const FLUSHING: u32 = 0b1;
 const DIRTY: u32 = 0b10;
@@ -126,6 +127,11 @@ impl Drop for PieceBuf {
 impl PieceBuf {
     pub fn index(&self) -> usize {
         self.index
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        let s = self.state.load(Ordering::Relaxed);
+        (s & (DIRTY | FLUSHING)) > 0
     }
 
     pub fn flush<F>(&mut self, result_callback: F)
@@ -415,6 +421,7 @@ impl BufStorage {
             // inserted piece should be from get_piece's on_ready
             // and by that way, loading[piece_idx] should be PieceState::Returned
             matches!(guard.remove(&p.index), Some(PieceState::Returned));
+            info!("insert piece buffer {}", p.index());
             self.pieces.insert(p.index, p);
         }
         self.purge_by_size(16);
@@ -425,23 +432,44 @@ impl BufStorage {
     }
 
     pub fn purge_by_size(&mut self, keep: usize) {
+        if self.pieces.len() <= keep {
+            return;
+        }
+
         // TODO: OPTIMIZE
-        while self.pieces.len() > keep {
-            if let Some(&idx) = self
-                .pieces
-                .iter()
-                .min_by_key(|(_, p)| p.touch)
-                .map(|(k, _)| k)
-            {
-                self.pieces.remove(&idx);
+        let mut n_purge = self.pieces.len() - keep;
+
+        let mut remove_pieces = BinaryHeap::new();
+
+        for (k, v) in self.pieces.iter().filter(|(_, v)| !v.is_dirty()) {
+            remove_pieces.push(cmp::Reverse((v.touch, *k)));
+            if remove_pieces.len() > n_purge {
+                remove_pieces.pop();
             }
-            // let mut ps: Vec<_> = self.pieces.drain().collect();
-            // ps.sort_by_key(|(_, p)| p.touch);
-            // ps.reverse();
-            // while ps.len() > keep {
-            //     ps.pop();
-            // }
-            // self.pieces = HashMap::from_iter(ps.into_iter());
+        }
+        while n_purge > 0 {
+            if let Some(cmp::Reverse((_, i))) = remove_pieces.pop() {
+                self.pieces.remove(&i);
+                info!("purge clear piece {i}");
+                n_purge -= 1;
+            }
+        }
+
+        if n_purge > 0 {
+            // now we remove dirty pieces
+            for (k, v) in self.pieces.iter() {
+                remove_pieces.push(cmp::Reverse((v.touch, *k)));
+                if remove_pieces.len() > n_purge {
+                    remove_pieces.pop();
+                }
+            }
+            while n_purge > 0 {
+                if let Some(cmp::Reverse((_, i))) = remove_pieces.pop() {
+                    info!("purge dirty piece {i}");
+                    self.pieces.remove(&i);
+                    n_purge -= 1;
+                }
+            }
         }
     }
 }

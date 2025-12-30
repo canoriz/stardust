@@ -73,14 +73,16 @@ impl PieceBlocks {
         &mut self,
         peer: PeerAddr,
         n: usize,
-        endgame: Option<usize>,
+        repick_option: RepickOption,
+        // endgame: Option<usize>,
     ) -> Option<(BlockRange, usize)> {
         let mut from = None;
         let mut to = None;
         let mut count = 0;
         let n_blocks = self.block_map.len();
 
-        if let Some(limit) = endgame {
+        let repick_limit = repick_option.repick_limit;
+        if repick_limit > 1 {
             for (i, b) in self.block_map.iter_mut().enumerate() {
                 if count >= n {
                     break;
@@ -113,13 +115,24 @@ impl PieceBlocks {
                         if self.all_request_or_received_before <= i {
                             self.all_request_or_received_before = i + 1;
                         }
-                        if !addr.contains_key(&peer) && addr.len() < limit {
-                            count += 1;
-                            addr.insert(peer, time::Instant::now());
-                            if from.is_none() {
-                                from = req;
-                            } else {
-                                to = req;
+                        if !addr.contains_key(&peer) {
+                            let mut request = addr.len() < repick_limit;
+                            if let Some(t) = repick_option.alt_timeout {
+                                for (_, requested_time) in addr.iter() {
+                                    if requested_time.elapsed() > t {
+                                        request = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if request {
+                                count += 1;
+                                addr.insert(peer, time::Instant::now());
+                                if from.is_none() {
+                                    from = req;
+                                } else {
+                                    to = req;
+                                }
                             }
                         } else if from.is_some() {
                             // not continuous, should break
@@ -287,6 +300,19 @@ impl PieceBlocks {
     }
 }
 
+#[derive(Copy, Clone)]
+struct RepickOption {
+    // The upper limit of how many times a block may be requested from
+    // different peers
+    repick_limit: usize,
+
+    // The alternative timeout duration.
+    // Once a peer did not response Piece or Reject
+    // in this period, we conclude they will not respond forever
+    // forget that request, and request other peers for this block again
+    alt_timeout: Option<time::Duration>,
+}
+
 type Picker = dyn PiecePicker<T = PeerPieceDetail> + Send;
 type PieceIndex = u32;
 pub struct BlockPicker {
@@ -360,6 +386,13 @@ impl BlockPicker {
         }
     }
 
+    fn rush_mode(&self) -> bool {
+        let working_set_size = self.receiving.len() + self.requesting.len();
+        // swap IO is too frequent
+        const WORKING_SET_LIMIT: usize = 10;
+        working_set_size > WORKING_SET_LIMIT
+    }
+
     /// Pick n blocks from peer, returns
     /// (
     ///  picked blocks,
@@ -378,6 +411,18 @@ impl BlockPicker {
         }
 
         let endgame = self.update_endgame();
+        let repick_option = if self.rush_mode() {
+            revoked.extend(self.revoke_unrespond(time::Duration::from_secs(15)));
+            RepickOption {
+                repick_limit: 2,
+                alt_timeout: None,
+            }
+        } else {
+            RepickOption {
+                repick_limit: 1,
+                alt_timeout: None,
+            }
+        };
 
         let mut remain = n;
         let peer_status = self
@@ -389,32 +434,12 @@ impl BlockPicker {
         for (index, blocks) in &mut self.requesting {
             assert!(!endgame);
             if remain > 0 && peer_status.have(*index) {
-                while let Some((blks, n_picked)) = blocks.pick(*peer, remain, None) {
+                while let Some((blks, n_picked)) = blocks.pick(*peer, remain, repick_option) {
                     remain -= n_picked;
-                    debug!(
-                        "pick piece {index} from peer {peer} (requesting), picked blks: {blks:?}"
-                    );
+                    let pb: Vec<_> = blks.iter(self.piece_size as u32).collect();
+                    debug!("pick piece {index} from peer {peer} (requesting), picked blks: {pb:?}");
                     ret.push(blks);
                 }
-            }
-        }
-
-        while remain > 0 {
-            if let Some(index) = self.piece_picker.pick_next(peer) {
-                assert!(!endgame);
-                let mut blocks = self.piece_block_of(index);
-
-                if let Some((blks, n_picked)) = blocks.pick(*peer, remain, None) {
-                    remain -= n_picked;
-                    debug!(
-                        "pick piece {index} from peer {peer} (pick_next), picked blks: {blks:?}"
-                    );
-                    ret.push(blks);
-                }
-                assert!(!self.requesting.contains_key(&index));
-                self.requesting.insert(index, blocks);
-            } else {
-                break;
             }
         }
 
@@ -432,14 +457,7 @@ impl BlockPicker {
             .peer_detail(peer)
             .expect("the peer to pick block from should exist in piece_picker");
 
-        if endgame {
-            // if in endgame mode, we re-requesting requested blocks
-            // in endgame mode, duplicate requested count of every block should be put evenly
-            // since in endgame mode, remaining candidates should be few(TODO: fact check)
-            // use a simple approach
-            // TODO: set dynamic upper limit, optimize impossible pick(if all blocks requested before
-            // simply add limit does not work
-            // maybe add a BTreeSet to maintain this
+        if remain > 0 && endgame {
             let from = self
                 .receiving
                 .iter()
@@ -456,20 +474,61 @@ impl BlockPicker {
                 })
                 .min()
                 .unwrap_or(2);
-            'outer: for limit in from..=from + 1 {
+
+            // If in endgame mode, we re-requesting requested blocks
+            // In endgame mode, duplicate requested count of every block should be put evenly,
+            // since in endgame mode, remaining candidates should be few(TODO: fact check)
+            // use a simple approach
+            // TODO: set dynamic upper limit, optimize impossible pick(if all blocks requested before
+            // simply add limit does not work
+            // maybe add a BTreeSet to maintain this
+            for limit in from..=from + 1 {
+                let repick_option = RepickOption {
+                    repick_limit: limit,
+                    alt_timeout: None,
+                };
                 for (index, blocks) in &mut self.receiving {
                     if remain > 0 && peer_status.have(*index) {
-                        while let Some((blks, n_picked)) = blocks.pick(*peer, remain, Some(limit)) {
+                        while let Some((blks, n_picked)) = blocks.pick(*peer, remain, repick_option)
+                        {
                             remain -= n_picked;
-                            debug!(
-                                "pick piece {index} from peer {peer} (requested), picked blks: {blks:?}"
-                            );
+                            let pb: Vec<_> = blks.iter(self.piece_size as u32).collect();
+                            debug!("pick piece {index} from peer {peer} (requested endgame), picked blks: {pb:?}");
                             ret.push(blks);
                         }
-                    } else {
-                        break 'outer;
                     }
                 }
+            }
+        } else if remain > 0 && repick_option.repick_limit > 1 {
+            for (index, blocks) in &mut self.receiving {
+                if remain > 0 && peer_status.have(*index) {
+                    while let Some((blks, n_picked)) = blocks.pick(*peer, remain, repick_option) {
+                        remain -= n_picked;
+                        let pb: Vec<_> = blks.iter(self.piece_size as u32).collect();
+                        debug!("pick piece {index} from peer {peer} (requested rush mode), picked blks: {pb:?}");
+                        ret.push(blks);
+                    }
+                }
+            }
+        }
+
+        let endgame = self.update_endgame();
+        while remain > 0 && !self.rush_mode() {
+            if let Some(index) = self.piece_picker.pick_next(peer) {
+                assert!(!endgame);
+                let mut blocks = self.piece_block_of(index);
+
+                if let Some((blks, n_picked)) = blocks.pick(*peer, remain, repick_option) {
+                    remain -= n_picked;
+                    debug!(
+                        "pick piece {index} from peer {peer} (pick_next), picked blks: {blks:?}"
+                    );
+                    ret.push(blks);
+                }
+                assert!(!self.requesting.contains_key(&index));
+                self.requesting.insert(index, blocks);
+            } else {
+                break;
             }
         }
 
@@ -567,7 +626,6 @@ impl BlockPicker {
             self.requesting.insert(index, b);
             // notify piece_picker this piece is downloading
             self.piece_picker.set_have(index, true);
-            info!("123");
             (None, r)
         } else {
             // blocks we didn't select or already have
@@ -810,7 +868,14 @@ mod test {
         };
 
         {
-            let picked = b.pick(PEER1, 30, None);
+            let picked = b.pick(
+                PEER1,
+                30,
+                RepickOption {
+                    repick_limit: 1,
+                    alt_timeout: None,
+                },
+            );
             let exp = Some((
                 BlockRange {
                     from: Request {
@@ -831,7 +896,14 @@ mod test {
             assert_eq!(b.requested_or_received_count, 30);
         }
         {
-            let picked = b.pick(PEER1, 30, None);
+            let picked = b.pick(
+                PEER1,
+                30,
+                RepickOption {
+                    repick_limit: 1,
+                    alt_timeout: None,
+                },
+            );
             let exp = Some((
                 BlockRange {
                     from: Request {
@@ -928,7 +1000,14 @@ mod test {
             ],
         };
         {
-            let picked = b.pick(PEER1, 30, None);
+            let picked = b.pick(
+                PEER1,
+                30,
+                RepickOption {
+                    repick_limit: 1,
+                    alt_timeout: None,
+                },
+            );
             let exp = Some((
                 BlockRange {
                     from: Request {
@@ -969,7 +1048,14 @@ mod test {
             ],
         };
         {
-            let picked = b.pick(PEER2, 30, Some(2));
+            let picked = b.pick(
+                PEER2,
+                30,
+                RepickOption {
+                    repick_limit: 2,
+                    alt_timeout: None,
+                },
+            );
             let exp = Some((
                 BlockRange {
                     from: Request {
@@ -990,7 +1076,14 @@ mod test {
             assert_eq!(b.requested_or_received_count, 4);
         }
         {
-            let picked = b.pick(PEER2, 30, Some(2));
+            let picked = b.pick(
+                PEER2,
+                30,
+                RepickOption {
+                    repick_limit: 2,
+                    alt_timeout: None,
+                },
+            );
             let exp = Some((
                 BlockRange {
                     from: Request {
@@ -1011,7 +1104,14 @@ mod test {
             assert_eq!(b.requested_or_received_count, 5);
         }
         {
-            let picked = b.pick(PEER1, 30, Some(2));
+            let picked = b.pick(
+                PEER1,
+                30,
+                RepickOption {
+                    repick_limit: 2,
+                    alt_timeout: None,
+                },
+            );
             let exp = Some((
                 BlockRange {
                     from: Request {
@@ -1032,7 +1132,14 @@ mod test {
             assert_eq!(b.requested_or_received_count, 5);
         }
         {
-            let picked = b.pick(PEER3, 30, Some(2));
+            let picked = b.pick(
+                PEER3,
+                30,
+                RepickOption {
+                    repick_limit: 2,
+                    alt_timeout: None,
+                },
+            );
             // PEER 3 should skip block 0, 1 because they are already requested to PEER 1 and 2
             let exp = Some((
                 BlockRange {
