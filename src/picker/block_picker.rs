@@ -5,7 +5,7 @@ use super::{
     BitField, BlockRange, BlockRequests, PeerAddr, PeerPieceDetail, PieceMap, PiecePicker,
     PieceState,
 };
-use crate::{math_helper::piece_total_and_last_size, protocol::Request};
+use crate::{bandwidth::RTT, math_helper::piece_total_and_last_size, protocol::Request};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     time,
@@ -279,6 +279,10 @@ impl PieceBlocks {
                 BlockStatus::Requested { addr, .. } => {
                     addr.retain(|p, t| {
                         if remove(p, t) {
+                            info!(
+                                "revoke block {req:?}, issued at {t:?}, now {:?}",
+                                time::Instant::now()
+                            );
                             ret.push((*p, req));
                             false
                         } else {
@@ -386,6 +390,38 @@ impl BlockPicker {
         }
     }
 
+    pub fn get_block_status(&self, req: &Request) -> Option<&BlockStatus> {
+        if !self.check_block_validity(&req) {
+            return None;
+        }
+
+        if let Some(b) = self.requesting.get(&req.index) {
+            Some(&b.block_map[req.begin as usize / BLOCK_SIZE])
+        } else if let Some(b) = self.receiving.get(&req.index) {
+            Some(&b.block_map[req.begin as usize / BLOCK_SIZE])
+        } else {
+            None
+        }
+    }
+
+    pub fn get_rtt(&self, peer: &PeerAddr, req: &Request) -> Option<time::Duration> {
+        if let Some(b) = self.get_block_status(req) {
+            match b {
+                BlockStatus::NotRequested => None,
+                BlockStatus::Requested { addr } => {
+                    if let Some(t) = addr.get(peer) {
+                        Some(t.elapsed())
+                    } else {
+                        None
+                    }
+                }
+                BlockStatus::Received => None,
+            }
+        } else {
+            None
+        }
+    }
+
     fn rush_mode(&self) -> bool {
         let working_set_size = self.receiving.len() + self.requesting.len();
         // swap IO is too frequent
@@ -402,17 +438,16 @@ impl BlockPicker {
     pub fn pick_blocks(
         &mut self,
         peer: &PeerAddr,
+        rtts: &HashMap<PeerAddr, RTT>,
         n: usize,
     ) -> (BlockRequests, usize, Vec<(PeerAddr, Request)>) {
         let mut revoked = Vec::with_capacity(8);
-        if self.prev_time_check.elapsed() > self.no_response_timeout {
-            revoked.extend(self.revoke_unrespond(self.no_response_timeout));
-            self.prev_time_check = time::Instant::now();
-        }
+        revoked.extend(self.revoke_unrespond(rtts));
+        self.prev_time_check = time::Instant::now();
 
         let endgame = self.update_endgame();
         let repick_option = if self.rush_mode() {
-            revoked.extend(self.revoke_unrespond(time::Duration::from_secs(15)));
+            revoked.extend(self.revoke_unrespond(rtts));
             RepickOption {
                 repick_limit: 2,
                 alt_timeout: None,
@@ -642,15 +677,22 @@ impl BlockPicker {
 
     /// Mark blocks as `NotRequested` if they are `Requested` and did not respond
     /// longer than timeout
-    fn revoke_unrespond(&mut self, timeout: time::Duration) -> Vec<(PeerAddr, Request)> {
+    fn revoke_unrespond(&mut self, rtts: &HashMap<PeerAddr, RTT>) -> Vec<(PeerAddr, Request)> {
         let mut revoked = Vec::with_capacity(8);
-        let no_response = |_: &PeerAddr, at: &time::Instant| at.elapsed() > timeout;
+        let no_response = |peer: &PeerAddr, at: &time::Instant| {
+            if let Some(rtt) = rtts.get(peer) {
+                let timeout = rtt.get_rtt() + 4 * rtt.get_variation();
+                at.elapsed() > timeout
+            } else {
+                // TODO: choose a good value
+                at.elapsed() > time::Duration::from_secs(15)
+            }
+        };
         for (index, blocks) in self.receiving.iter_mut() {
             let r = blocks.revoke_all_requested_if(no_response);
             revoked.extend(r);
             if !blocks.is_all_requested_or_received() {
                 self.requesting.insert(*index, blocks.clone());
-                info!("234");
             }
         }
         self.receiving
@@ -847,7 +889,10 @@ impl BlockPicker {
 
 #[cfg(test)]
 mod test {
-    use crate::picker::BitField;
+    use crate::{
+        bandwidth::{ALPHA, BETA},
+        picker::BitField,
+    };
 
     use super::*;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -1182,8 +1227,10 @@ mod test {
             b.select(i, true);
         }
 
+        let rtts = HashMap::new();
+
         {
-            let picked = b.pick_blocks(&PEER1, 15);
+            let picked = b.pick_blocks(&PEER1, &rtts, 15);
             let exp = BlockRequests {
                 piece_size: PIECE_SIZE as u32,
                 range: vec![
@@ -1219,7 +1266,7 @@ mod test {
 
         // test pick2
         {
-            let picked = b.pick_blocks(&PEER2, 1);
+            let picked = b.pick_blocks(&PEER2, &rtts, 1);
             let exp = BlockRequests {
                 piece_size: PIECE_SIZE as u32,
                 range: vec![BlockRange {
@@ -1241,7 +1288,7 @@ mod test {
         // test un-select
         {
             b.select(2, false);
-            let picked = b.pick_blocks(&PEER1, 5);
+            let picked = b.pick_blocks(&PEER1, &rtts, 5);
             let exp = BlockRequests {
                 piece_size: PIECE_SIZE as u32,
                 range: vec![BlockRange {

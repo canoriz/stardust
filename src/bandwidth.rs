@@ -1,5 +1,8 @@
 use std::time::{self, Duration, Instant};
 
+mod rtt;
+pub use rtt::{ALPHA, BETA, RTT};
+
 #[derive(Debug, Copy, Clone)]
 pub(crate) struct Bandwidth<const SLOT_SIZE: usize> {
     circular: [Period; SLOT_SIZE],
@@ -19,7 +22,7 @@ struct Period {
     time: Instant,
 
     /// average response time
-    resp_time: time::Duration,
+    avg_rtt: time::Duration,
 }
 
 impl Default for Period {
@@ -28,17 +31,17 @@ impl Default for Period {
             count: 0,
             val: 0,
             time: Instant::now(),
-            resp_time: time::Duration::from_secs(0),
+            avg_rtt: time::Duration::from_secs(0),
         }
     }
 }
 
 impl Period {
-    fn add(&mut self, size: usize, n_packet: u32, resp_time: Duration) {
+    fn add(&mut self, size: usize, n_packet: u32, rtt: Duration) {
         self.val += size;
-        let total_time = self.resp_time * self.count + resp_time * n_packet;
+        let total_time = self.avg_rtt * self.count + rtt * n_packet;
         self.count += n_packet;
-        self.resp_time = total_time / self.count;
+        self.avg_rtt = total_time / self.count;
     }
 }
 
@@ -54,11 +57,11 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
     /// updates bandwidth status
     /// how many new bytes received
     pub fn add(&mut self, size: usize) {
-        self.add_with_time(size, 1, Duration::from_secs(1));
+        self.add_with_rtt(size, 1, Duration::from_secs(1));
     }
 
-    /// how many new bytes received within a response time of resp_time
-    pub fn add_with_time(&mut self, size: usize, n: u32, resp_time: Duration) {
+    /// how many new bytes received within a round trip time of rtt
+    pub fn add_with_rtt(&mut self, size: usize, n: u32, rtt: Duration) {
         if self.circular[self.head].time.elapsed() > self.interval {
             if self.head + 1 >= SLOT_SIZE {
                 self.head = 0;
@@ -67,15 +70,15 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
             }
             self.circular[self.head] = Period::default();
         }
-        self.circular[self.head].add(size, n, resp_time);
+        self.circular[self.head].add(size, n, rtt);
     }
 
     pub fn count(&self, back_interval: Duration) -> usize {
-        self.count_with_time(back_interval).0
+        self.count_within_period(back_interval).0
     }
 
-    /// returns how many bytes received in back_interval, and average response latency
-    pub fn count_with_time(&self, back_interval: Duration) -> (usize, Duration) {
+    /// returns how many bytes received in back_interval, and average RTT
+    pub fn count_within_period(&self, back_interval: Duration) -> (usize, Duration) {
         let mut total = 0usize;
         let mut slot_id = self.head;
         let mut total_dur = Duration::from_secs(0);
@@ -87,7 +90,7 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
             if time_elapsed <= back_interval {
                 // querying range covers entire slot
                 total += slot.val;
-                total_dur += slot.resp_time * slot.count;
+                total_dur += slot.avg_rtt * slot.count;
             } else if now.duration_since(slot.time + self.interval) <= back_interval {
                 // querying range covers part of this slot's time range
                 let ratio = 1.0
@@ -97,7 +100,7 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
 
                 total += (ratio * (slot.val as f32)) as usize;
                 let slot_cnt = ratio * slot.count as f32;
-                total_dur += slot.resp_time.mul_f32(slot_cnt);
+                total_dur += slot.avg_rtt.mul_f32(slot_cnt);
                 break;
             }
 
@@ -113,12 +116,12 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
             }
         }
 
-        let resp_time = if total == 0 {
+        let avg_rtt = if total == 0 {
             Duration::from_secs(1)
         } else {
             total_dur / total as u32
         };
-        (total, resp_time)
+        (total, avg_rtt)
     }
 }
 

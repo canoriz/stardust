@@ -1,5 +1,6 @@
 use crate::announce_manager::{self, AnnounceManagerHandle};
 use crate::backfile::{BackFile, NormalFile};
+use crate::bandwidth::{self, Bandwidth, RTT};
 use crate::cache::simple_buffer::{BufStorage, FlushErr};
 use crate::cache::simple_buffer::{GetPieceErr, PieceBuf};
 use crate::connection_manager::{ConnectionManagerHandle, Msg as ConnMsg};
@@ -62,8 +63,6 @@ pub enum PeerMsg {
     ExtendPex(PeerAddr, ExtendedPex),
     BlockReceived {
         peer: PeerAddr,
-        // estimated bandwidth, bytes per period
-        estimated_bw: usize,
         n_req_in_flight: usize,
 
         // how many blocks we received in this period
@@ -126,6 +125,8 @@ struct PeerConn {
     conn: ConnectionManagerHandle,
     state: PeerStatus,
     bitmap: Option<PieceState>,
+    bw: Bandwidth<10>,
+    rtt: RTT,
 }
 
 #[derive(Clone)]
@@ -512,11 +513,18 @@ impl TransmitWorker {
             }
         };
 
+        // TODO: optimize this, do not clone every time
+        let rtts = self
+            .connected_peers
+            .iter()
+            .map(|(k, v)| (*k, v.rtt))
+            .collect();
+
         let mut revoked = vec![];
-        for (addr, h) in &mut self.connected_peers {
+        for (addr, h) in &self.connected_peers {
             info!("peer status {addr}: {:?}", h.state);
             if h.state.peer_choke_status == ChokeStatus::Unchoked {
-                let (reqs, n, ri) = block_picker.pick_blocks(addr, n_blocks);
+                let (reqs, n, ri) = block_picker.pick_blocks(addr, &rtts, n_blocks);
                 revoked.extend(ri);
                 h.conn.send_stream_cmd(ConnMsg::RequestBlocks(reqs));
             }
@@ -541,10 +549,17 @@ impl TransmitWorker {
             }
         };
 
+        // TODO: optimize this, do not clone every time
+        let rtts = self
+            .connected_peers
+            .iter()
+            .map(|(k, v)| (*k, v.rtt))
+            .collect();
+
         let mut revoked = vec![];
         if let Some(h) = self.connected_peers.get_mut(addr) {
             if h.state.peer_choke_status == ChokeStatus::Unchoked {
-                let (reqs, _n, ri) = block_picker.pick_blocks(addr, pick_n);
+                let (reqs, _n, ri) = block_picker.pick_blocks(addr, &rtts, pick_n);
                 h.conn.send_stream_cmd(ConnMsg::RequestBlocks(reqs));
                 revoked.extend(ri);
             }
@@ -622,6 +637,8 @@ impl TransmitWorker {
                                 peer_choke_status: ChokeStatus::Unknown,
                                 peer_interest_status: InterestStatus::Unknown,
                             },
+                            bw: Bandwidth::new(time::Duration::from_millis(250)),
+                            rtt: RTT::new(bandwidth::ALPHA, bandwidth::BETA),
                             bitmap: None,
                         },
                     );
@@ -766,10 +783,15 @@ impl TransmitWorker {
             }
             PeerMsg::BlockReceived {
                 peer,
-                estimated_bw,
                 n_req_in_flight,
                 n_recv_in_period,
             } => {
+                let estimated_bw = if let Some(pc) = self.connected_peers.get(&peer) {
+                    // TODO: this 30 is set randomly, choose a good value value instead
+                    pc.bw.count(time::Duration::from_secs(30))
+                } else {
+                    0
+                };
                 // TODO: OPTIMIZE: return connection handle to reduce map search
                 let conn_stat = self.connected_peers.get_mut(&peer).expect("should exist");
                 warn!("peer {peer} estimated bandwidth {estimated_bw}, req in flight: {n_req_in_flight}");
@@ -781,7 +803,7 @@ impl TransmitWorker {
                 let n_to_pick = if n_recv_in_period > 0 || n_req_in_flight == 0 {
                     ((10 * estimated_bw / 16384).max(n_req_in_flight) - n_req_in_flight)
                         .max(10)
-                        .min(150)
+                        .min(1500)
                 } else {
                     0
                 };
@@ -924,11 +946,6 @@ impl TransmitWorker {
         mut piece: protocol::Piece,
     ) -> io::Result<()> {
         debug!("recv {piece:?} from {peer:?}");
-        let blk = protocol::Request {
-            index: piece.index,
-            begin: piece.begin,
-            len: piece.len,
-        };
 
         let (block_picker, metadata, storage) = match &mut self.torrent_state {
             TorrentState::Metadata(d) => (&mut d.block_picker, &d.metadata, &mut d.storage),
@@ -949,6 +966,17 @@ impl TransmitWorker {
             begin: piece.begin,
             len: piece.len,
         };
+
+        if let Some(pc) = self.connected_peers.get_mut(peer) {
+            pc.bw.add(piece.len as usize); // TODO: add with rtt
+            if let Some(rtt) = block_picker.get_rtt(peer, &req) {
+                pc.rtt.add_rtt_sample(rtt);
+            } else {
+                // TODO: choose a good value
+                pc.rtt.add_rtt_sample(time::Duration::from_secs(3));
+            }
+        }
+
         if !block_picker.want_block(req) {
             warn!(
                 "discard PIECE msg {} {} {} block index {}",

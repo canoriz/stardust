@@ -273,7 +273,7 @@ async fn run_recv_stream<T>(
             _ = ticker.tick() => {
                 // TODO: many ticks may come together, unfair
                 // debug!("recv conn ticker tick {} block received in this epoch", conn.blk_recv_count);
-                conn.handle_report_tick(report_interval);
+                conn.handle_report_tick(ticker.period());
             }
             r = conn.read_stream.recv_msg() => {
                 // r = receive_peer_msg(&mut conn.read_stream, &mut conn.transmit_handle) => {
@@ -349,7 +349,6 @@ where
             .sender
             .send(TransmitMsg::PeerMsg(PeerMsg::BlockReceived {
                 peer: self.read_stream.peer_addr(),
-                estimated_bw: self.bw.count(interval),
                 n_req_in_flight: n_req_in_flight.max(0) as usize,
                 n_recv_in_period,
             }));
@@ -409,7 +408,6 @@ where
                     .send(TransmitMsg::PeerMsg(PeerMsg::Request(addr, req)));
             }
             Message::Piece(piece) => {
-                self.bw.add(piece.len as usize);
                 self.n_recv_req.fetch_add(1, Ordering::Relaxed);
                 tmh.sender
                     .send(TransmitMsg::PeerMsg(PeerMsg::Piece(addr, piece)));
