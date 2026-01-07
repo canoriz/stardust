@@ -3,7 +3,9 @@ use crate::backfile::{BackFile, NormalFile};
 use crate::bandwidth::{self, Bandwidth, RTT};
 use crate::cache::simple_buffer::{BufStorage, FlushErr};
 use crate::cache::simple_buffer::{GetPieceErr, PieceBuf};
-use crate::connection_manager::{ConnectionManagerHandle, Msg as ConnMsg};
+use crate::connection_manager::{
+    ConnectionManagerHandle, CtrlOfRecv, CtrlOfSend, CtrlOfSend as ConnMsg,
+};
 use crate::dht::DHT;
 use crate::metadata::{self, Magnet, Metadata};
 use crate::picker::{BlockPicker, BlockPickerDump, BlockStatus, PieceState, RarestPicker};
@@ -88,8 +90,13 @@ pub(crate) enum Msg {
         buf: io::Result<PieceBuf>,
     },
 
+    /// A message received from peer
     PeerMsg(PeerMsg),
     FlushError(FlushErr),
+
+    /// A peer reaches it's rtt limit, check if any
+    /// request are timeout
+    PeerTimeoutCheck(PeerAddr),
 
     RequestMetadata(oneshot::Sender<Option<Arc<Metadata>>>),
     DumpStatus(oneshot::Sender<TransmitDump>),
@@ -520,20 +527,11 @@ impl TransmitWorker {
             .map(|(k, v)| (*k, v.rtt))
             .collect();
 
-        let mut revoked = vec![];
         for (addr, h) in &self.connected_peers {
             info!("peer status {addr}: {:?}", h.state);
             if h.state.peer_choke_status == ChokeStatus::Unchoked {
-                let (reqs, n, ri) = block_picker.pick_blocks(addr, &rtts, n_blocks);
-                revoked.extend(ri);
+                let (reqs, n) = block_picker.pick_blocks(addr, &rtts, n_blocks);
                 h.conn.send_stream_cmd(ConnMsg::RequestBlocks(reqs));
-            }
-        }
-        for (peer, r) in revoked {
-            if let Some(c) = self.connected_peers.get_mut(&peer) {
-                if c.conn.capability().contains(&protocol::Capability::Fast) {
-                    c.conn.send_stream_cmd(ConnMsg::Cancel(r));
-                }
             }
         }
     }
@@ -556,19 +554,10 @@ impl TransmitWorker {
             .map(|(k, v)| (*k, v.rtt))
             .collect();
 
-        let mut revoked = vec![];
         if let Some(h) = self.connected_peers.get_mut(addr) {
             if h.state.peer_choke_status == ChokeStatus::Unchoked {
-                let (reqs, _n, ri) = block_picker.pick_blocks(addr, &rtts, pick_n);
+                let (reqs, _n) = block_picker.pick_blocks(addr, &rtts, pick_n);
                 h.conn.send_stream_cmd(ConnMsg::RequestBlocks(reqs));
-                revoked.extend(ri);
-            }
-        }
-        for (peer, r) in revoked {
-            if let Some(c) = self.connected_peers.get_mut(&peer) {
-                if c.conn.capability().contains(&protocol::Capability::Fast) {
-                    c.conn.send_stream_cmd(ConnMsg::Cancel(r));
-                }
             }
         }
     }
@@ -642,6 +631,9 @@ impl TransmitWorker {
                             bitmap: None,
                         },
                     );
+                    self.self_handle
+                        .sender
+                        .send(Msg::PeerTimeoutCheck(peer_addr));
                 }
                 self.connecting_peers.remove(&peer_addr);
                 // TODO: if is income, send bitfield
@@ -661,6 +653,7 @@ impl TransmitWorker {
             Msg::FlushError(_) => {
                 todo!()
             }
+            Msg::PeerTimeoutCheck(addr) => self.handle_peer_request_timeout(addr),
             Msg::PieceBufReady { index, buf } => self.handle_piecebuf_ready(index, buf),
             Msg::DumpStatus(sender) => {
                 self.handle_dump_status(sender);
@@ -851,6 +844,24 @@ impl TransmitWorker {
                 Ok(())
             }
         }
+    }
+
+    fn handle_peer_request_timeout(&mut self, peer: PeerAddr) -> io::Result<()> {
+        // call pick 0 to revoke timeout requests
+        self.pick_blocks_for_peer(&peer, 0);
+        if let Some(pc) = self.connected_peers.get(&peer) {
+            pc.conn.recv_stream_cmd(CtrlOfRecv::ReportStat);
+
+            // TODO: set a alarm at some clock instead of using tokio task?
+            let next_alarm_wait = (pc.rtt.get_rtt() * 2).max(time::Duration::from_millis(10));
+            let s = self.self_handle.sender.clone();
+            info!("check timeout for {peer:?}, next check after {next_alarm_wait:?}");
+            tokio::spawn(async move {
+                time::sleep(next_alarm_wait).await;
+                s.send(Msg::PeerTimeoutCheck(peer));
+            });
+        }
+        Ok(())
     }
 
     fn handle_announce(&mut self, addrs: Vec<SocketAddr>) {

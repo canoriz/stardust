@@ -29,7 +29,7 @@ pub(crate) enum WakeUpOption {
 }
 
 #[derive(Debug)]
-pub(crate) enum Msg {
+pub(crate) enum CtrlOfSend {
     RequestBlocks(BlockRequests),
     Have(u32),
     Extend(ExtendedMsg),
@@ -39,6 +39,12 @@ pub(crate) enum Msg {
     // SendBlocks(BlockRange),
     SetWakeUp(WakeUpOption),
     ResetWakeUp(WakeUpOption),
+}
+
+#[derive(Debug)]
+pub(crate) enum CtrlOfRecv {
+    /// force recv stream to report statistics
+    ReportStat,
 }
 
 pub(crate) struct ConnectionManagerHandle {
@@ -159,8 +165,12 @@ impl ConnectionManagerHandle {
     //     }
     // }
 
-    pub fn send_stream_cmd(&self, m: Msg) {
+    pub fn send_stream_cmd(&self, m: CtrlOfSend) {
         self.send_stream.sender.send(m);
+    }
+
+    pub fn recv_stream_cmd(&self, m: CtrlOfRecv) {
+        self.recv_stream.sender.send(m);
     }
 
     pub fn support_metadata_extension(&self) -> bool {
@@ -204,13 +214,13 @@ impl Drop for NotifyTransmitGuard {
 }
 
 struct RecvStreamHandle {
-    sender: mpsc::UnboundedSender<Msg>,
+    sender: mpsc::UnboundedSender<CtrlOfRecv>,
     cancel: DropGuard,
     done: oneshot::Receiver<()>,
 }
 
 struct RecvStream<T> {
-    receiver: mpsc::UnboundedReceiver<Msg>,
+    receiver: mpsc::UnboundedReceiver<CtrlOfRecv>,
     read_stream: ReadStream<T>,
     transmit_handle: TransmitManagerHandle,
     _drop_guard: Arc<NotifyTransmitGuard>,
@@ -231,13 +241,13 @@ struct RecvStream<T> {
 }
 
 struct SendStreamHandle {
-    sender: mpsc::UnboundedSender<Msg>,
+    sender: mpsc::UnboundedSender<CtrlOfSend>,
     cancel: DropGuard,
     done: oneshot::Receiver<()>,
 }
 
 struct SendStream<T> {
-    receiver: mpsc::UnboundedReceiver<Msg>,
+    receiver: mpsc::UnboundedReceiver<CtrlOfSend>,
     write_stream: WriteStream<T>,
 
     /// number or send requests in a period
@@ -269,11 +279,12 @@ async fn run_recv_stream<T>(
                 // TODO: need handle None case
                 // TODO: use buffer and tokio::Notify
                 // info!("connection manager recv stream of {} received msg {msg:?}", &manager.conn);
+                conn.handle_ctrl_cmd(msg);
             }
             _ = ticker.tick() => {
                 // TODO: many ticks may come together, unfair
                 // debug!("recv conn ticker tick {} block received in this epoch", conn.blk_recv_count);
-                conn.handle_report_tick(ticker.period());
+                conn.handle_report_tick();
             }
             r = conn.read_stream.recv_msg() => {
                 // r = receive_peer_msg(&mut conn.read_stream, &mut conn.transmit_handle) => {
@@ -302,7 +313,10 @@ impl<T> RecvStream<T>
 where
     T: AsyncRead + Unpin,
 {
-    fn handle_report_tick(&mut self, interval: time::Duration) {
+    /// update sent REQUEST msg count and received PIECE msg count
+    /// returns received count of received PIECE msg since previous
+    /// update
+    fn update_request_stat(&mut self) -> usize {
         const TRACE_WINDOW: usize = 16;
         let prev_n_recv = self
             .history_n_recv_req
@@ -338,20 +352,37 @@ where
             self.history_n_sent_req
                 .push_back(self.n_sent_req.load(Ordering::Relaxed));
         }
+        n_recv_in_period
+    }
 
-        let n_req_in_flight = {
-            let sent = self.n_sent_req.load(Ordering::Relaxed) as i32;
-            let recv = self.n_recv_req.load(Ordering::Relaxed) as i32;
-            sent - recv
-        };
+    /// return estimated number of requests in flight
+    fn n_request_in_flight(&self) -> usize {
+        let sent = self.n_sent_req.load(Ordering::Relaxed) as i32;
+        let recv = self.n_recv_req.load(Ordering::Relaxed) as i32;
+        (sent - recv).max(0) as usize
+    }
+
+    fn handle_report_tick(&mut self) {
+        // TODO: FIXME: update_request_stat(push and correct deque) every time
+        // or on a scheduled basis?
+        let n_recv_in_period = self.update_request_stat();
+        let n_req_in_flight = self.n_request_in_flight();
 
         self.transmit_handle
             .sender
             .send(TransmitMsg::PeerMsg(PeerMsg::BlockReceived {
                 peer: self.read_stream.peer_addr(),
-                n_req_in_flight: n_req_in_flight.max(0) as usize,
+                n_req_in_flight,
                 n_recv_in_period,
             }));
+    }
+
+    fn handle_ctrl_cmd(&mut self, cmd: CtrlOfRecv) {
+        match cmd {
+            CtrlOfRecv::ReportStat => {
+                self.handle_report_tick();
+            }
+        }
     }
 
     async fn handle_peer_msg(&mut self, addr: SocketAddr, m: Message) {
@@ -411,6 +442,11 @@ where
                 self.n_recv_req.fetch_add(1, Ordering::Relaxed);
                 tmh.sender
                     .send(TransmitMsg::PeerMsg(PeerMsg::Piece(addr, piece)));
+
+                // TODO: set a proper value
+                if self.n_request_in_flight() < 10 {
+                    self.handle_report_tick();
+                }
             }
             Message::Cancel(req) => {
                 tmh.sender
@@ -495,9 +531,9 @@ impl<T> SendStream<T>
 where
     T: AsyncWrite + Unpin,
 {
-    async fn handle_cmd(&mut self, msg: Msg) {
+    async fn handle_cmd(&mut self, msg: CtrlOfSend) {
         match msg {
-            Msg::RequestBlocks(reqs) => {
+            CtrlOfSend::RequestBlocks(reqs) => {
                 let piece_size = reqs.piece_size;
                 for rg in reqs.range.iter() {
                     for r in rg.iter(piece_size) {
@@ -508,10 +544,10 @@ where
                     }
                 }
             }
-            Msg::Have(i) => {
+            CtrlOfSend::Have(i) => {
                 self.write_stream.send_have(i).await;
             }
-            Msg::Extend(ExtendedMsg::Metadata(m)) => {
+            CtrlOfSend::Extend(ExtendedMsg::Metadata(m)) => {
                 self.write_stream.send_extend_metadata(m).await;
             }
             other => {}
