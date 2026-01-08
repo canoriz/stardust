@@ -779,12 +779,16 @@ impl TransmitWorker {
                 n_req_in_flight,
                 n_recv_in_period,
             } => {
-                let estimated_bw = if let Some(pc) = self.connected_peers.get(&peer) {
-                    // TODO: this 30 is set randomly, choose a good value value instead
-                    pc.bw.count(time::Duration::from_secs(30))
-                } else {
-                    0
-                };
+                let (estimated_bw, estimated_rtt) =
+                    if let Some(pc) = self.connected_peers.get(&peer) {
+                        // TODO: this 3 is set randomly, choose a good value value instead
+                        (
+                            pc.bw.count(time::Duration::from_secs(3)) / 3,
+                            pc.rtt.get_min_rtt(),
+                        )
+                    } else {
+                        (0, time::Duration::from_secs(1))
+                    };
                 // TODO: OPTIMIZE: return connection handle to reduce map search
                 let conn_stat = self.connected_peers.get_mut(&peer).expect("should exist");
                 warn!("peer {peer} estimated bandwidth {estimated_bw}, req in flight: {n_req_in_flight}");
@@ -794,9 +798,14 @@ impl TransmitWorker {
                 // to avoid mark these blocks as in-flight and not requesting from other peers.
                 // preventing accumulating too much partial downloaded pieces.
                 let n_to_pick = if n_recv_in_period > 0 || n_req_in_flight == 0 {
-                    ((10 * estimated_bw / 16384).max(n_req_in_flight) - n_req_in_flight)
-                        .max(10)
-                        .min(1500)
+                    let a = (10 * estimated_bw / 16384).max(n_req_in_flight).min(250)
+                        - n_req_in_flight.min(250);
+                    const MIN_IN_FLIGHT: usize = 8;
+                    if a + n_req_in_flight < MIN_IN_FLIGHT {
+                        MIN_IN_FLIGHT - n_req_in_flight
+                    } else {
+                        a
+                    }
                 } else {
                     0
                 };

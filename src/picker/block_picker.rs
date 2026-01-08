@@ -127,12 +127,13 @@ impl PieceBlocks {
                                             .get(p)
                                             .map(|x| *x)
                                             .unwrap_or(time::Duration::from_secs(5))
-                                            .max(time::Duration::from_millis(100))
+                                            .min(time::Duration::from_secs(5))
                                 })
                                 .count()
-                                < repick_limit
+                                == 0
                         {
                             count += 1;
+                            info!("{peer:?} repick {req:?}, addr {addr:?}");
                             addr.insert(peer, time::Instant::now());
                             if from.is_none() {
                                 from = req;
@@ -442,7 +443,17 @@ impl BlockPicker {
         rtts: &HashMap<PeerAddr, RTT>,
         n: usize,
     ) -> (BlockRequests, usize) {
-        self.revoke_unrespond(&rtts.iter().map(|(p, r)| (*p, 3 * r.get_rtt())).collect());
+        self.revoke_unrespond(
+            &rtts
+                .iter()
+                .map(|(p, r)| {
+                    (
+                        *p,
+                        r.get_rtt() + 4 * r.get_variation() + time::Duration::from_millis(500),
+                    )
+                })
+                .collect(),
+        );
         self.prev_time_check = time::Instant::now();
 
         let endgame = self.update_endgame();
@@ -454,8 +465,7 @@ impl BlockPicker {
                     .map(|(k, v)| {
                         (
                             *k,
-                            (v.get_rtt() + 4 * v.get_variation())
-                                .max(time::Duration::from_millis(100)),
+                            v.get_rtt() + 4 * v.get_variation() + time::Duration::from_millis(500),
                         )
                     })
                     .collect(),
@@ -689,7 +699,7 @@ impl BlockPicker {
                 > timeout
                     .get(peer)
                     .map(|x| *x)
-                    .unwrap_or(time::Duration::from_millis(100))
+                    .unwrap_or(time::Duration::from_millis(500))
                     .min(time::Duration::from_secs(90))
         };
         for (index, blocks) in self.receiving.iter_mut() {

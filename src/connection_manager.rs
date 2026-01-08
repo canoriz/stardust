@@ -11,7 +11,6 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{info, warn};
 
-use crate::bandwidth::Bandwidth;
 use crate::picker::{BlockRequests, PieceState};
 use crate::protocol::{
     self, BTStream, Capability, CapabilityMap, Conn, ExtendedMsg, Message, ReadStream, Request,
@@ -19,8 +18,6 @@ use crate::protocol::{
 };
 use crate::transmit_manager::Msg as TransmitMsg;
 use crate::transmit_manager::{PeerMsg, TransmitManagerHandle};
-
-const BANDWIDTH_TIME_SLICE: time::Duration = time::Duration::from_millis(250);
 
 #[derive(Debug)]
 pub(crate) enum WakeUpOption {
@@ -92,15 +89,17 @@ impl ConnectionManagerHandle {
             transmit_handle: trh.clone(),
         });
 
-        let n_sent_req = Arc::new(AtomicU32::new(0));
-        let n_recv_req = Arc::new(AtomicU32::new(0));
+        let bw_stat = Arc::new(BandwidthStat {
+            n_sent_req: AtomicU32::new(0),
+            n_recv_req: AtomicU32::new(0),
+            report_when: AtomicU32::new(0),
+        });
         let recv_stream = RecvStream::<BufReader<R>> {
             receiver: recv_rx,
             read_stream,
             transmit_handle: trh.clone(),
-            bw: Bandwidth::new(BANDWIDTH_TIME_SLICE),
-            n_recv_req,
-            n_sent_req: n_sent_req.clone(),
+            bw_stat: bw_stat.clone(),
+            prev_check_time: time::Instant::now(),
             history_n_recv_req: VecDeque::new(),
             history_n_sent_req: VecDeque::new(),
             _drop_guard: conn_break_guard.clone(),
@@ -112,7 +111,7 @@ impl ConnectionManagerHandle {
         let send_stream = SendStream::<BufWriter<W>> {
             receiver: send_rx,
             write_stream,
-            n_sent_req,
+            bw_stat: bw_stat,
             _drop_guard: conn_break_guard,
         };
 
@@ -225,19 +224,16 @@ struct RecvStream<T> {
     transmit_handle: TransmitManagerHandle,
     _drop_guard: Arc<NotifyTransmitGuard>,
 
-    /// number or received pieces in a period
-    n_recv_req: Arc<AtomicU32>,
+    bw_stat: Arc<BandwidthStat>,
 
-    /// number or sent pieces in a period
-    n_sent_req: Arc<AtomicU32>,
+    // previous check time of sent/received requests
+    prev_check_time: time::Instant,
 
     /// history of number of received requests in every tick
     history_n_recv_req: VecDeque<u32>,
 
     /// history of number of sent requests in every tick
     history_n_sent_req: VecDeque<u32>,
-
-    bw: Bandwidth<10>,
 }
 
 struct SendStreamHandle {
@@ -250,10 +246,20 @@ struct SendStream<T> {
     receiver: mpsc::UnboundedReceiver<CtrlOfSend>,
     write_stream: WriteStream<T>,
 
-    /// number or send requests in a period
-    n_sent_req: Arc<AtomicU32>,
+    bw_stat: Arc<BandwidthStat>,
 
     _drop_guard: Arc<NotifyTransmitGuard>,
+}
+
+struct BandwidthStat {
+    /// number or send requests in a period
+    n_sent_req: AtomicU32,
+
+    /// number or received pieces in a period
+    n_recv_req: AtomicU32,
+
+    /// report when in-flight requests are less then
+    report_when: AtomicU32,
 }
 
 async fn run_recv_stream<T>(
@@ -325,40 +331,52 @@ where
             .map(|x| *x)
             .unwrap_or(0);
         let n_recv_in_period = self
+            .bw_stat
             .n_recv_req
             .load(Ordering::Relaxed)
             .saturating_sub(prev_n_recv) as usize;
-        if self.history_n_recv_req.len() < TRACE_WINDOW {
-            self.history_n_recv_req
-                .push_back(self.n_recv_req.load(Ordering::Relaxed));
-            self.history_n_sent_req
-                .push_back(self.n_sent_req.load(Ordering::Relaxed));
-        } else {
-            let n_recv_ago = self.history_n_recv_req.pop_front().unwrap();
-            let n_sent_ago = self.history_n_sent_req.pop_front().unwrap();
+        // if self.prev_check_time.elapsed() > time::Duration::from_secs(2) {
+        if true {
+            self.prev_check_time = time::Instant::now();
+            if self.history_n_recv_req.len() < TRACE_WINDOW {
+                self.history_n_recv_req
+                    .push_back(self.bw_stat.n_recv_req.load(Ordering::Relaxed));
+                self.history_n_sent_req
+                    .push_back(self.bw_stat.n_sent_req.load(Ordering::Relaxed));
+            } else {
+                let n_recv_ago = self.history_n_recv_req.pop_front().unwrap();
+                let n_sent_ago = self.history_n_sent_req.pop_front().unwrap();
 
-            self.n_recv_req.fetch_sub(n_recv_ago, Ordering::Relaxed);
-            self.n_sent_req.fetch_sub(n_sent_ago, Ordering::Relaxed);
+                self.bw_stat
+                    .n_recv_req
+                    .fetch_sub(n_recv_ago, Ordering::Relaxed);
+                self.bw_stat
+                    .report_when
+                    .fetch_sub(n_recv_ago, Ordering::Relaxed);
+                self.bw_stat
+                    .n_sent_req
+                    .fetch_sub(n_sent_ago, Ordering::Relaxed);
 
-            for v in self.history_n_recv_req.iter_mut() {
-                *v = *v - n_recv_ago;
+                for v in self.history_n_recv_req.iter_mut() {
+                    *v = *v - n_recv_ago;
+                }
+                for v in self.history_n_sent_req.iter_mut() {
+                    *v = *v - n_sent_ago;
+                }
+
+                self.history_n_recv_req
+                    .push_back(self.bw_stat.n_recv_req.load(Ordering::Relaxed));
+                self.history_n_sent_req
+                    .push_back(self.bw_stat.n_sent_req.load(Ordering::Relaxed));
             }
-            for v in self.history_n_sent_req.iter_mut() {
-                *v = *v - n_sent_ago;
-            }
-
-            self.history_n_recv_req
-                .push_back(self.n_recv_req.load(Ordering::Relaxed));
-            self.history_n_sent_req
-                .push_back(self.n_sent_req.load(Ordering::Relaxed));
         }
         n_recv_in_period
     }
 
     /// return estimated number of requests in flight
     fn n_request_in_flight(&self) -> usize {
-        let sent = self.n_sent_req.load(Ordering::Relaxed) as i32;
-        let recv = self.n_recv_req.load(Ordering::Relaxed) as i32;
+        let sent = self.bw_stat.n_sent_req.load(Ordering::Relaxed) as i32;
+        let recv = self.bw_stat.n_recv_req.load(Ordering::Relaxed) as i32;
         (sent - recv).max(0) as usize
     }
 
@@ -439,12 +457,13 @@ where
                     .send(TransmitMsg::PeerMsg(PeerMsg::Request(addr, req)));
             }
             Message::Piece(piece) => {
-                self.n_recv_req.fetch_add(1, Ordering::Relaxed);
+                self.bw_stat.n_recv_req.fetch_add(1, Ordering::Relaxed);
                 tmh.sender
                     .send(TransmitMsg::PeerMsg(PeerMsg::Piece(addr, piece)));
 
-                // TODO: set a proper value
-                if self.n_request_in_flight() < 10 {
+                if self.bw_stat.n_recv_req.load(Ordering::Relaxed)
+                    > self.bw_stat.report_when.swap(u32::MAX, Ordering::Relaxed)
+                {
                     self.handle_report_tick();
                 }
             }
@@ -480,7 +499,7 @@ where
                 )));
             }
             Message::Reject(req) => {
-                self.n_recv_req.fetch_add(1, Ordering::Relaxed);
+                self.bw_stat.n_recv_req.fetch_add(1, Ordering::Relaxed);
                 tmh.sender
                     .send(TransmitMsg::PeerMsg(PeerMsg::Reject(addr, req)));
             }
@@ -535,14 +554,22 @@ where
         match msg {
             CtrlOfSend::RequestBlocks(reqs) => {
                 let piece_size = reqs.piece_size;
+                let mut count = 0;
                 for rg in reqs.range.iter() {
                     for r in rg.iter(piece_size) {
-                        self.n_sent_req.fetch_add(1, Ordering::Relaxed);
+                        self.bw_stat.n_sent_req.fetch_add(1, Ordering::Relaxed);
                         self.write_stream
                             .send_request(r.index, r.begin, r.len)
                             .await;
+                        count += 1;
                     }
                 }
+
+                // woke when half of in flight request is received
+                self.bw_stat.report_when.store(
+                    self.bw_stat.n_recv_req.load(Ordering::Relaxed) + count / 2,
+                    Ordering::Relaxed,
+                );
             }
             CtrlOfSend::Have(i) => {
                 self.write_stream.send_have(i).await;
