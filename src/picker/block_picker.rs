@@ -117,21 +117,21 @@ impl PieceBlocks {
 
                         // if number of requests that are in-flight and not timeout-ed are
                         // less than repick limit, request a new one
-                        if !addr.contains_key(&peer)
-                            && addr
-                                .iter()
-                                .filter(|(p, t)| {
-                                    t.elapsed()
-                                        < repick_option
-                                            .alt_timeout
-                                            .get(p)
-                                            .map(|x| *x)
-                                            .unwrap_or(time::Duration::from_secs(5))
-                                            .min(time::Duration::from_secs(5))
-                                })
-                                .count()
-                                == 0
-                        {
+                        let all_no_response_more_than_5 = addr
+                            .iter()
+                            .filter(|(p, t)| {
+                                t.elapsed()
+                                    < repick_option
+                                        .alt_timeout
+                                        .get(p)
+                                        .map(|d| *d)
+                                        .unwrap_or(time::Duration::from_secs(5))
+                                        .min(time::Duration::from_secs(5))
+                            })
+                            .count()
+                            == 0;
+
+                        if all_no_response_more_than_5 {
                             count += 1;
                             info!("{peer:?} repick {req:?}, addr {addr:?}");
                             addr.insert(peer, time::Instant::now());
@@ -440,35 +440,17 @@ impl BlockPicker {
     pub fn pick_blocks(
         &mut self,
         peer: &PeerAddr,
-        rtts: &HashMap<PeerAddr, RTT>,
+        rtts: &HashMap<PeerAddr, time::Duration>,
         n: usize,
     ) -> (BlockRequests, usize) {
-        self.revoke_unrespond(
-            &rtts
-                .iter()
-                .map(|(p, r)| {
-                    (
-                        *p,
-                        r.get_rtt() + 4 * r.get_variation() + time::Duration::from_millis(500),
-                    )
-                })
-                .collect(),
-        );
+        self.revoke_unrespond(time::Duration::from_secs(90));
         self.prev_time_check = time::Instant::now();
 
         let endgame = self.update_endgame();
         let repick_option = if self.rush_mode() {
             RepickOption {
                 repick_limit: 2, // TODO: set a proper repick limit
-                alt_timeout: &rtts
-                    .iter()
-                    .map(|(k, v)| {
-                        (
-                            *k,
-                            v.get_rtt() + 4 * v.get_variation() + time::Duration::from_millis(500),
-                        )
-                    })
-                    .collect(),
+                alt_timeout: rtts,
             }
         } else {
             RepickOption {
@@ -538,7 +520,7 @@ impl BlockPicker {
             for limit in from..=from + 1 {
                 let repick_option = RepickOption {
                     repick_limit: limit,
-                    alt_timeout: &HashMap::new(),
+                    alt_timeout: rtts,
                 };
                 for (index, blocks) in &mut self.receiving {
                     if remain > 0 && peer_status.have(*index) {
@@ -693,15 +675,8 @@ impl BlockPicker {
 
     /// Mark blocks as `NotRequested` if they are `Requested` and did not respond
     /// longer than timeout
-    fn revoke_unrespond(&mut self, timeout: &HashMap<PeerAddr, time::Duration>) {
-        let no_response = |peer: &PeerAddr, at: &time::Instant| {
-            at.elapsed()
-                > timeout
-                    .get(peer)
-                    .map(|x| *x)
-                    .unwrap_or(time::Duration::from_millis(500))
-                    .min(time::Duration::from_secs(90))
-        };
+    fn revoke_unrespond(&mut self, timeout: time::Duration) {
+        let no_response = |_: &PeerAddr, at: &time::Instant| at.elapsed() > timeout;
         for (index, blocks) in self.receiving.iter_mut() {
             blocks.revoke_all_requested_if(no_response);
             if !blocks.is_all_requested_or_received() {

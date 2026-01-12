@@ -20,6 +20,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time;
@@ -133,7 +134,6 @@ struct PeerConn {
     state: PeerStatus,
     bitmap: Option<PieceState>,
     bw: Bandwidth<10>,
-    rtt: RTT,
 }
 
 #[derive(Clone)]
@@ -524,7 +524,7 @@ impl TransmitWorker {
         let rtts = self
             .connected_peers
             .iter()
-            .map(|(k, v)| (*k, v.rtt))
+            .map(|(k, v)| (*k, v.bw.get_rtt_4var()))
             .collect();
 
         for (addr, h) in &self.connected_peers {
@@ -551,7 +551,7 @@ impl TransmitWorker {
         let rtts = self
             .connected_peers
             .iter()
-            .map(|(k, v)| (*k, v.rtt))
+            .map(|(k, v)| (*k, v.bw.get_rtt_4var()))
             .collect();
 
         if let Some(h) = self.connected_peers.get_mut(addr) {
@@ -626,8 +626,7 @@ impl TransmitWorker {
                                 peer_choke_status: ChokeStatus::Unknown,
                                 peer_interest_status: InterestStatus::Unknown,
                             },
-                            bw: Bandwidth::new(time::Duration::from_millis(250)),
-                            rtt: RTT::new(bandwidth::ALPHA, bandwidth::BETA),
+                            bw: Bandwidth::new(),
                             bitmap: None,
                         },
                     );
@@ -779,32 +778,32 @@ impl TransmitWorker {
                 n_req_in_flight,
                 n_recv_in_period,
             } => {
-                let (estimated_bw, estimated_rtt) =
-                    if let Some(pc) = self.connected_peers.get(&peer) {
-                        // TODO: this 3 is set randomly, choose a good value value instead
-                        (
-                            pc.bw.count(time::Duration::from_secs(3)) / 3,
-                            pc.rtt.get_min_rtt(),
-                        )
-                    } else {
-                        (0, time::Duration::from_secs(1))
-                    };
+                let (max_bw, min_rtt) = if let Some(pc) = self.connected_peers.get(&peer) {
+                    // TODO: this 3 is set randomly, choose a good value value instead
+                    pc.bw
+                        .count_max_bw_and_min_rtt(time::Duration::from_secs(10))
+                } else {
+                    (0.0, time::Duration::from_secs(1))
+                };
                 // TODO: OPTIMIZE: return connection handle to reduce map search
                 let conn_stat = self.connected_peers.get_mut(&peer).expect("should exist");
-                warn!("peer {peer} estimated bandwidth {estimated_bw}, req in flight: {n_req_in_flight}");
+                warn!("peer {peer} estimated max bandwidth {max_bw}, min rtt {min_rtt:?} req in flight: {n_req_in_flight}");
+
+                let optimum_req_in_flight =
+                    (2.0 * min_rtt.as_secs_f32() * max_bw / 16384.0) as usize;
+                const MIN_IN_FLIGHT: usize = 8;
 
                 // Only can pick more blocks if we received some or no requests in flight.
                 // For peers with small bandwidth, we don't request too much from them
                 // to avoid mark these blocks as in-flight and not requesting from other peers.
                 // preventing accumulating too much partial downloaded pieces.
-                let n_to_pick = if n_recv_in_period > 0 || n_req_in_flight == 0 {
-                    let a = (10 * estimated_bw / 16384).max(n_req_in_flight).min(250)
-                        - n_req_in_flight.min(250);
-                    const MIN_IN_FLIGHT: usize = 8;
-                    if a + n_req_in_flight < MIN_IN_FLIGHT {
+                let n_to_pick = if n_recv_in_period > 0 || n_req_in_flight < MIN_IN_FLIGHT {
+                    if n_req_in_flight < MIN_IN_FLIGHT {
                         MIN_IN_FLIGHT - n_req_in_flight
+                    } else if optimum_req_in_flight > n_req_in_flight {
+                        optimum_req_in_flight - n_req_in_flight
                     } else {
-                        a
+                        0
                     }
                 } else {
                     0
@@ -862,7 +861,7 @@ impl TransmitWorker {
             pc.conn.recv_stream_cmd(CtrlOfRecv::ReportStat);
 
             // TODO: set a alarm at some clock instead of using tokio task?
-            let next_alarm_wait = (pc.rtt.get_rtt() * 2).max(time::Duration::from_millis(10));
+            let next_alarm_wait = (pc.bw.get_rtt_4var() * 2).max(time::Duration::from_millis(10));
             let s = self.self_handle.sender.clone();
             info!("check timeout for {peer:?}, next check after {next_alarm_wait:?}");
             tokio::spawn(async move {
@@ -988,13 +987,8 @@ impl TransmitWorker {
         };
 
         if let Some(pc) = self.connected_peers.get_mut(peer) {
-            pc.bw.add(piece.len as usize); // TODO: add with rtt
-            if let Some(rtt) = block_picker.get_rtt(peer, &req) {
-                pc.rtt.add_rtt_sample(rtt);
-            } else {
-                // TODO: choose a good value
-                pc.rtt.add_rtt_sample(time::Duration::from_secs(3));
-            }
+            let rtt = block_picker.get_rtt(peer, &req);
+            pc.bw.add_sample(piece.len as usize, rtt);
         }
 
         if !block_picker.want_block(req) {
