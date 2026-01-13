@@ -335,8 +335,8 @@ where
             .n_recv_req
             .load(Ordering::Relaxed)
             .saturating_sub(prev_n_recv) as usize;
-        // if self.prev_check_time.elapsed() > time::Duration::from_secs(2) {
-        if true {
+        if self.prev_check_time.elapsed() > time::Duration::from_secs(1) {
+            // if true {
             self.prev_check_time = time::Instant::now();
             if self.history_n_recv_req.len() < TRACE_WINDOW {
                 self.history_n_recv_req

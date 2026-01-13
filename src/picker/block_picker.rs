@@ -285,7 +285,7 @@ impl PieceBlocks {
                     addr.retain(|p, t| {
                         if remove(p, t) {
                             info!(
-                                "revoke block {req:?}, issued at {t:?}, after {:?}",
+                                "revoke block {req:?} from {p}, issued at {t:?}, after {:?}",
                                 t.elapsed()
                             );
                             false
@@ -460,10 +460,18 @@ impl BlockPicker {
         };
 
         let mut remain = n;
-        let peer_status = self
-            .piece_picker
-            .peer_detail(peer)
-            .expect("the peer to pick block from should exist in piece_picker");
+        let peer_status = if let Some(h) = self.piece_picker.peer_detail(peer) {
+            h
+        } else {
+            info!("pick_blocks: peer {peer} not registered in piece_picker, skipping");
+            return (
+                BlockRequests {
+                    piece_size: self.piece_size as u32,
+                    range: Vec::new(),
+                },
+                0,
+            );
+        };
 
         let mut ret = Vec::new();
         for (index, blocks) in &mut self.requesting {
@@ -487,10 +495,18 @@ impl BlockPicker {
             .retain(|_, b| !b.is_all_requested_or_received());
 
         let endgame = self.update_endgame();
-        let peer_status = self
-            .piece_picker
-            .peer_detail(peer)
-            .expect("the peer to pick block from should exist in piece_picker");
+        let peer_status = if let Some(h) = self.piece_picker.peer_detail(peer) {
+            h
+        } else {
+            info!("pick_blocks: peer {peer} not registered in piece_picker after initial picks; returning {} picked", n - remain);
+            return (
+                BlockRequests {
+                    piece_size: self.piece_size as u32,
+                    range: ret,
+                },
+                n - remain,
+            );
+        };
 
         if remain > 0 && endgame {
             let from = self
@@ -625,6 +641,7 @@ impl BlockPicker {
         }
         true
     }
+
     /// Called when a piece is received, returns
     /// (
     /// if a piece is fully received,

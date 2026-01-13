@@ -630,6 +630,17 @@ impl TransmitWorker {
                             bitmap: None,
                         },
                     );
+
+                    // ensure piece picker has a record for this peer (assume HaveNone until
+                    // the peer sends its bitfield/have messages). This prevents
+                    // pick_blocks from panicking when called before we received a bitfield.
+                    match &mut self.torrent_state {
+                        TorrentState::Metadata(d) => {
+                            d.block_picker.peer_add(peer_addr, PieceState::HaveNone);
+                        }
+                        TorrentState::Fetching(_) => {}
+                    }
+
                     self.self_handle
                         .sender
                         .send(Msg::PeerTimeoutCheck(peer_addr));
@@ -645,6 +656,13 @@ impl TransmitWorker {
             }
             Msg::PeerLeave(addr) => {
                 info!("peer leave {addr}");
+                // notify piece picker this peer left so it can update rarity and internal state
+                match &mut self.torrent_state {
+                    TorrentState::Metadata(d) => {
+                        d.block_picker.peer_leave(&to_canonical_addr(addr))
+                    }
+                    TorrentState::Fetching(_) => {}
+                }
                 self.connected_peers.remove(&to_canonical_addr(addr));
                 Ok(())
             }
@@ -989,6 +1007,7 @@ impl TransmitWorker {
         if let Some(pc) = self.connected_peers.get_mut(peer) {
             let rtt = block_picker.get_rtt(peer, &req);
             pc.bw.add_sample(piece.len as usize, rtt);
+            info!("add rtt sample for {peer}, req: {req:?}, rtt {rtt:?}");
         }
 
         if !block_picker.want_block(req) {
