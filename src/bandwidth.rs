@@ -42,12 +42,12 @@ struct Period {
 
 impl Period {
     /// new a Period with initial rtt and variation
-    fn new(init_rtt: Duration, init_var: Duration) -> Self {
+    fn new() -> Self {
         Self {
             pkg_count: 0,
             bytes_count: 0,
             since: Instant::now(),
-            rtt: RTT::new(ALPHA, BETA, init_rtt, init_var),
+            rtt: RTT::new(ALPHA, BETA),
         }
     }
 
@@ -61,7 +61,7 @@ impl Period {
 impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
     pub fn new() -> Bandwidth<SLOT_SIZE> {
         Bandwidth {
-            circular: [Period::new(Duration::from_secs(1), Duration::from_secs(0)); SLOT_SIZE],
+            circular: [Period::new(); SLOT_SIZE],
             head: 0,
 
             count: 0.0,
@@ -80,7 +80,6 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
         n_in_flight: Option<usize>,
     ) {
         let before_rtt = self.circular[self.head].rtt.get_rtt();
-        let before_var = self.circular[self.head].rtt.get_variation();
         let split_rtt = before_rtt.max(Duration::from_millis(100));
 
         // alloc a new slot if time of rtt has passed
@@ -90,7 +89,7 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
             } else {
                 self.head += 1;
             }
-            self.circular[self.head] = Period::new(before_rtt, before_var);
+            self.circular[self.head] = Period::new();
         }
 
         let rtt = rtt.unwrap_or(before_rtt);
@@ -99,6 +98,7 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
         self.circular[self.head].add(n_bytes, 1, rtt);
         self.tendency
             .add(self.count, rtt.as_secs_f64(), n_in_flight);
+        self.count += 1.0;
     }
 
     pub fn get_rtt_slope_and_correlation(&self) -> (f64, f64) {
@@ -107,6 +107,10 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
 
     pub fn get_rtt_n_points(&self) -> usize {
         self.tendency.n_points()
+    }
+
+    pub fn get_prev_in_flight(&self) -> usize {
+        self.tendency.get_first_point_val().map(|x| *x).unwrap_or(2)
     }
 
     pub fn count_max_bw_and_min_rtt(&self, back_interval: Duration) -> (f32, Duration) {

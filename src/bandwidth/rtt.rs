@@ -5,6 +5,9 @@ pub const BETA: f32 = 0.25;
 
 #[derive(Copy, Clone, Debug)]
 pub struct RTT {
+    /// total sample count
+    count: usize,
+
     /// smoothed average RTT
     smooth_rtt: Duration,
 
@@ -22,11 +25,12 @@ pub struct RTT {
 }
 
 impl RTT {
-    pub fn new(alpha: f32, beta: f32, init_rtt: Duration, init_var: Duration) -> Self {
+    pub fn new(alpha: f32, beta: f32) -> Self {
         Self {
             // set start up rtt to 3 sec
-            smooth_rtt: init_rtt,
-            rtt_var: init_var,
+            count: 0,
+            smooth_rtt: Duration::from_secs(50),
+            rtt_var: Duration::from_secs(0),
             a: alpha,
             b: beta,
             min_rtt: Duration::from_secs(60),
@@ -50,10 +54,20 @@ impl RTT {
 
     /// add a new sample of RTT
     pub fn add_rtt_sample(&mut self, rtt: Duration) {
-        self.rtt_var =
-            self.rtt_var.mul_f32(1.0 - self.b) + self.smooth_rtt.abs_diff(rtt).mul_f32(self.b);
-        self.smooth_rtt = self.smooth_rtt.mul_f32(1.0 - self.a) + rtt.mul_f32(self.a);
-        self.min_rtt = self.min_rtt.min(rtt)
+        self.min_rtt = self.min_rtt.min(rtt);
+        if self.count as f32 * self.a >= 1.0 {
+            self.rtt_var =
+                self.rtt_var.mul_f32(1.0 - self.b) + self.smooth_rtt.abs_diff(rtt).mul_f32(self.b);
+            self.smooth_rtt = self.smooth_rtt.mul_f32(1.0 - self.a) + rtt.mul_f32(self.a);
+        } else {
+            self.smooth_rtt =
+                (self.smooth_rtt.mul_f32(self.count as f32) + rtt) / ((self.count + 1) as u32);
+            self.rtt_var = (self.rtt_var.mul_f32(self.count as f32)
+                + self.smooth_rtt.abs_diff(rtt))
+                / ((self.count + 1) as u32);
+            self.min_rtt = self.min_rtt.min(rtt);
+        }
+        self.count += 1;
     }
 }
 
@@ -63,7 +77,7 @@ mod test {
 
     #[test]
     fn test_rtt_estimator() {
-        let mut r = RTT::new(ALPHA, BETA, Duration::from_secs(1), Duration::from_secs(1));
+        let mut r = RTT::new(ALPHA, BETA);
         r.add_rtt_sample(Duration::from_secs(1));
         r.add_rtt_sample(Duration::from_secs(2));
         r.add_rtt_sample(Duration::from_secs(1));

@@ -559,7 +559,7 @@ impl TransmitWorker {
             if h.state.peer_choke_status == ChokeStatus::Unchoked {
                 let n_in_flight = h.conn.get_n_in_flight();
                 let (reqs, _n) =
-                    block_picker.pick_blocks(addr, &rtts, n_in_flight as usize, pick_n);
+                    block_picker.pick_blocks(addr, &rtts, pick_n, n_in_flight as usize);
                 h.conn.send_stream_cmd(ConnMsg::RequestBlocks(reqs));
             }
         }
@@ -810,14 +810,25 @@ impl TransmitWorker {
                 let conn_stat = self.connected_peers.get_mut(&peer).expect("should exist");
                 warn!("peer {peer} estimated max bandwidth {max_bw}, min rtt {min_rtt:?} req in flight: {n_req_in_flight}");
 
-                let optimum_req_in_flight =
-                    (2.0 * min_rtt.as_secs_f32() * max_bw / 16384.0) as usize;
-                const MIN_IN_FLIGHT: usize = 8;
+                let mut optimum_req_in_flight = 2.0 * min_rtt.as_secs_f32() * max_bw;
+                const MIN_IN_FLIGHT: usize = 1;
+
+                let (rtt_slope, rtt_correlation) = conn_stat.bw.get_rtt_slope_and_correlation();
+                info!(
+                    "peer {peer} rtt slope {rtt_slope} correlation {rtt_correlation} points {}",
+                    conn_stat.bw.get_rtt_n_points()
+                );
+                if rtt_slope > 0.1 && rtt_correlation > 0.7 && conn_stat.bw.get_rtt_n_points() >= 7
+                {
+                    optimum_req_in_flight = conn_stat.bw.get_prev_in_flight() as f32 * 0.5;
+                    info!("{peer} slow down");
+                }
 
                 // Only can pick more blocks if we received some or no requests in flight.
                 // For peers with small bandwidth, we don't request too much from them
                 // to avoid mark these blocks as in-flight and not requesting from other peers.
                 // preventing accumulating too much partial downloaded pieces.
+                let optimum_req_in_flight = optimum_req_in_flight as usize / 16384;
                 let n_to_pick = if n_recv_in_period > 0 || n_req_in_flight < MIN_IN_FLIGHT {
                     if n_req_in_flight < MIN_IN_FLIGHT {
                         MIN_IN_FLIGHT - n_req_in_flight
@@ -1012,7 +1023,6 @@ impl TransmitWorker {
             let inflight_when_sent = block_picker.get_inflight_when_sent(peer, &req);
             pc.bw
                 .add_sample(piece.len as usize, rtt, inflight_when_sent);
-            info!("add rtt sample for {peer}, req: {req:?}, rtt {rtt:?}");
         }
 
         if !block_picker.want_block(req) {

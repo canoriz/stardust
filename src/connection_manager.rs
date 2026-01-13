@@ -566,9 +566,7 @@ where
                 let mut count = 0;
                 for rg in reqs.range.iter() {
                     for r in rg.iter(piece_size) {
-                        let old_send = self.bw_stat.n_sent_req.fetch_add(1, Ordering::Relaxed);
-                        let old_recv = self.bw_stat.n_recv_req.load(Ordering::Relaxed);
-                        let n_in_flight = (old_send + 1).max(old_recv) - old_recv;
+                        time::sleep(time::Duration::from_secs(1)).await;
                         self.write_stream
                             .send_request(r.index, r.begin, r.len)
                             .await;
