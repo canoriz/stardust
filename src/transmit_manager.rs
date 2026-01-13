@@ -530,7 +530,8 @@ impl TransmitWorker {
         for (addr, h) in &self.connected_peers {
             info!("peer status {addr}: {:?}", h.state);
             if h.state.peer_choke_status == ChokeStatus::Unchoked {
-                let (reqs, n) = block_picker.pick_blocks(addr, &rtts, n_blocks);
+                let in_flight = h.conn.get_n_in_flight();
+                let (reqs, n) = block_picker.pick_blocks(addr, &rtts, in_flight as usize, n_blocks);
                 h.conn.send_stream_cmd(ConnMsg::RequestBlocks(reqs));
             }
         }
@@ -556,7 +557,9 @@ impl TransmitWorker {
 
         if let Some(h) = self.connected_peers.get_mut(addr) {
             if h.state.peer_choke_status == ChokeStatus::Unchoked {
-                let (reqs, _n) = block_picker.pick_blocks(addr, &rtts, pick_n);
+                let n_in_flight = h.conn.get_n_in_flight();
+                let (reqs, _n) =
+                    block_picker.pick_blocks(addr, &rtts, n_in_flight as usize, pick_n);
                 h.conn.send_stream_cmd(ConnMsg::RequestBlocks(reqs));
             }
         }
@@ -1006,7 +1009,9 @@ impl TransmitWorker {
 
         if let Some(pc) = self.connected_peers.get_mut(peer) {
             let rtt = block_picker.get_rtt(peer, &req);
-            pc.bw.add_sample(piece.len as usize, rtt);
+            let inflight_when_sent = block_picker.get_inflight_when_sent(peer, &req);
+            pc.bw
+                .add_sample(piece.len as usize, rtt, inflight_when_sent);
             info!("add rtt sample for {peer}, req: {req:?}, rtt {rtt:?}");
         }
 

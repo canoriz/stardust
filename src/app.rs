@@ -14,6 +14,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::registry();
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_ansi(false)
         .event_format(
             tracing_subscriber::fmt::format()
                 .with_file(true)

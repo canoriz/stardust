@@ -49,6 +49,8 @@ pub(crate) struct ConnectionManagerHandle {
     send_stream: SendStreamHandle,
     capability: CapabilityMap,
     metadata_size: usize,
+
+    bw_stat: Arc<BandwidthStat>,
 }
 
 impl ConnectionManagerHandle {
@@ -111,7 +113,7 @@ impl ConnectionManagerHandle {
         let send_stream = SendStream::<BufWriter<W>> {
             receiver: send_rx,
             write_stream,
-            bw_stat: bw_stat,
+            bw_stat: bw_stat.clone(),
             _drop_guard: conn_break_guard,
         };
 
@@ -141,6 +143,7 @@ impl ConnectionManagerHandle {
             send_stream: send_stream_handle,
             capability,
             metadata_size,
+            bw_stat,
         }
     }
 
@@ -163,6 +166,12 @@ impl ConnectionManagerHandle {
     //         }
     //     }
     // }
+
+    pub fn get_n_in_flight(&self) -> u32 {
+        let old_sent = self.bw_stat.n_sent_req.load(Ordering::Relaxed);
+        let old_recv = self.bw_stat.n_recv_req.load(Ordering::Relaxed);
+        old_sent.max(old_recv) - old_recv
+    }
 
     pub fn send_stream_cmd(&self, m: CtrlOfSend) {
         self.send_stream.sender.send(m);
@@ -323,7 +332,7 @@ where
     /// returns received count of received PIECE msg since previous
     /// update
     fn update_request_stat(&mut self) -> usize {
-        const TRACE_WINDOW: usize = 16;
+        const TRACE_WINDOW: usize = 30;
         let prev_n_recv = self
             .history_n_recv_req
             .iter()
@@ -557,7 +566,9 @@ where
                 let mut count = 0;
                 for rg in reqs.range.iter() {
                     for r in rg.iter(piece_size) {
-                        self.bw_stat.n_sent_req.fetch_add(1, Ordering::Relaxed);
+                        let old_send = self.bw_stat.n_sent_req.fetch_add(1, Ordering::Relaxed);
+                        let old_recv = self.bw_stat.n_recv_req.load(Ordering::Relaxed);
+                        let n_in_flight = (old_send + 1).max(old_recv) - old_recv;
                         self.write_stream
                             .send_request(r.index, r.begin, r.len)
                             .await;

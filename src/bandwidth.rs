@@ -1,13 +1,18 @@
 use tokio::time::{Duration, Instant};
 
+mod regression;
 mod rtt;
+pub use regression::SlidingWindowRegression;
 pub use rtt::{ALPHA, BETA, RTT};
 use tracing::info;
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Clone)]
 pub(crate) struct Bandwidth<const SLOT_SIZE: usize> {
     circular: [Period; SLOT_SIZE],
     head: usize,
+
+    count: f64,
+    tendency: SlidingWindowRegression<usize>,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -58,6 +63,9 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
         Bandwidth {
             circular: [Period::new(Duration::from_secs(1), Duration::from_secs(0)); SLOT_SIZE],
             head: 0,
+
+            count: 0.0,
+            tendency: SlidingWindowRegression::new(10),
         }
     }
 
@@ -65,7 +73,12 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
     /// how many new bytes received
     /// if given rtt, use this rtt
     /// if not given, will use an average rtt
-    pub fn add_sample(&mut self, n_bytes: usize, rtt: Option<Duration>) {
+    pub fn add_sample(
+        &mut self,
+        n_bytes: usize,
+        rtt: Option<Duration>,
+        n_in_flight: Option<usize>,
+    ) {
         let before_rtt = self.circular[self.head].rtt.get_rtt();
         let before_var = self.circular[self.head].rtt.get_variation();
         let split_rtt = before_rtt.max(Duration::from_millis(100));
@@ -80,14 +93,33 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
             self.circular[self.head] = Period::new(before_rtt, before_var);
         }
 
-        self.circular[self.head].add(n_bytes, 1, rtt.unwrap_or(before_rtt));
+        let rtt = rtt.unwrap_or(before_rtt);
+        let n_in_flight = n_in_flight.unwrap_or(2);
+
+        self.circular[self.head].add(n_bytes, 1, rtt);
+        self.tendency
+            .add(self.count, rtt.as_secs_f64(), n_in_flight);
+    }
+
+    pub fn get_rtt_slope_and_correlation(&self) -> (f64, f64) {
+        self.tendency.get_results()
+    }
+
+    pub fn get_rtt_n_points(&self) -> usize {
+        self.tendency.n_points()
     }
 
     pub fn count_max_bw_and_min_rtt(&self, back_interval: Duration) -> (f32, Duration) {
         let f = |acc: (f32, Duration), _begin: Instant, end: Instant, p: &Period| {
             let dt = end - p.since;
             let bw = (p.bytes_count as f32) / dt.as_secs_f32();
-            (acc.0.max(bw), acc.1.min(p.rtt.get_min_rtt()))
+            if dt > Duration::from_millis(100) {
+                // only count slots that dt are large enough slots to avoid division
+                // by near-zero duration and resulting large bandwidth
+                (acc.0.max(bw), acc.1.min(p.rtt.get_min_rtt()))
+            } else {
+                acc
+            }
         };
         self.fold_periods_within_interval(back_interval, (0.0, Duration::MAX), f)
     }
@@ -152,23 +184,24 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
     pub fn get_rtt_4var(&self) -> Duration {
         let f = |acc: (u32, Duration), _begin: Instant, _: Instant, p: &Period| {
             let n = acc.0;
-            info!(
-                "rtt: {:?} var: {:?}",
-                p.rtt.get_rtt(),
-                p.rtt.get_variation()
-            );
 
             if p.bytes_count > 0 {
+                info!(
+                    "rtt: {:?} var: {:?}",
+                    p.rtt.get_rtt(),
+                    p.rtt.get_variation()
+                );
                 (
                     n + 1,
-                    acc.1.mul_f32(((n - 1) as f32) / (n as f32))
-                        + (p.rtt.get_rtt() + 4 * p.rtt.get_variation()).mul_f32(1.0 / (n as f32)),
+                    acc.1.mul_f32((n as f32) / ((n + 1) as f32))
+                        + (p.rtt.get_rtt() + 4 * p.rtt.get_variation())
+                            .mul_f32(1.0 / ((n + 1) as f32)),
                 )
             } else {
                 acc
             }
         };
-        self.fold_periods_within_interval(Duration::from_secs(10), (1, Duration::from_secs(1)), f)
+        self.fold_periods_within_interval(Duration::from_secs(10), (0, Duration::from_secs(1)), f)
             .1
     }
 }
@@ -181,8 +214,8 @@ mod test {
     #[test]
     fn test_single_slots() {
         let mut bw = Bandwidth::<8>::new();
-        bw.add_sample(5, None);
-        bw.add_sample(9, None);
+        bw.add_sample(5, None, None);
+        bw.add_sample(9, None, None);
         assert_eq!(
             bw.count_bytes_within_period(Duration::from_millis(10)).0,
             14
@@ -192,10 +225,10 @@ mod test {
     #[tokio::test(start_paused = true)]
     async fn test_multi_slots() {
         let mut bw = Bandwidth::<8>::new();
-        bw.add_sample(10, Some(Duration::from_millis(40)));
-        bw.add_sample(5, Some(Duration::from_millis(40)));
+        bw.add_sample(10, Some(Duration::from_millis(40)), None);
+        bw.add_sample(5, Some(Duration::from_millis(40)), None);
         advance(Duration::from_millis(50)).await;
-        bw.add_sample(10, Some(Duration::from_millis(40)));
+        bw.add_sample(10, Some(Duration::from_millis(40)), None);
         advance(Duration::from_millis(30)).await;
         assert_eq!(
             bw.count_bytes_within_period(Duration::from_millis(1000)).0,
@@ -207,20 +240,20 @@ mod test {
     async fn test_circle() {
         let mut bw = Bandwidth::<4>::new();
         for _ in 0..100 {
-            bw.add_sample(10, Some(Duration::from_millis(40)));
+            bw.add_sample(10, Some(Duration::from_millis(40)), None);
         }
         advance(Duration::from_millis(5000)).await;
 
-        bw.add_sample(10, Some(Duration::from_millis(40))); // slot 0
-        bw.add_sample(5, Some(Duration::from_millis(40))); // slot 0
+        bw.add_sample(10, Some(Duration::from_millis(40)), None); // slot 0
+        bw.add_sample(5, Some(Duration::from_millis(40)), None); // slot 0
         advance(Duration::from_millis(500)).await;
-        bw.add_sample(10, Some(Duration::from_millis(40))); // slot 1
+        bw.add_sample(10, Some(Duration::from_millis(40)), None); // slot 1
         advance(Duration::from_millis(500)).await;
-        bw.add_sample(20, Some(Duration::from_millis(40))); // slot 2
+        bw.add_sample(20, Some(Duration::from_millis(40)), None); // slot 2
         advance(Duration::from_millis(500)).await;
-        bw.add_sample(30, Some(Duration::from_millis(40))); // slot 3
+        bw.add_sample(30, Some(Duration::from_millis(40)), None); // slot 3
         advance(Duration::from_millis(500)).await;
-        bw.add_sample(30, Some(Duration::from_millis(40))); // slot 0
+        bw.add_sample(30, Some(Duration::from_millis(40)), None); // slot 0
         assert_eq!(
             bw.count_bytes_within_period(Duration::from_millis(1250)).0,
             85

@@ -13,8 +13,10 @@ use std::{
 
 const BLOCK_SIZE: usize = 16384;
 
-fn two_mins_ago() -> time::Instant {
-    time::Instant::now() - time::Duration::from_mins(2)
+#[derive(Eq, PartialEq, Debug, Clone)]
+struct PickedDetail {
+    pick_time: time::Instant,
+    n_in_flight_when_picked: usize,
 }
 
 #[derive(Serialize, Deserialize, Eq, PartialEq, Debug, Clone)]
@@ -24,7 +26,7 @@ pub enum BlockStatus {
         // TODO: when serializing, make all requested state to NotRequested
         // avoid canceling not requested blocks
         #[serde(skip)]
-        addr: HashMap<PeerAddr, time::Instant>,
+        addr: HashMap<PeerAddr, PickedDetail>,
     },
     Received, // TODO: maybe record which peer sends us this block?
 }
@@ -73,6 +75,7 @@ impl PieceBlocks {
         &mut self,
         peer: PeerAddr,
         n: usize,
+        n_in_flight: &mut usize,
         repick_option: RepickOption,
     ) -> Option<(BlockRange, usize)> {
         let mut from = None;
@@ -99,8 +102,15 @@ impl PieceBlocks {
                     BlockStatus::NotRequested => {
                         // TODO: todo!("does this really happen in endgame mode?");
                         *b = BlockStatus::Requested {
-                            addr: HashMap::from([(peer, time::Instant::now())]),
+                            addr: HashMap::from([(
+                                peer,
+                                PickedDetail {
+                                    pick_time: time::Instant::now(),
+                                    n_in_flight_when_picked: *n_in_flight,
+                                },
+                            )]),
                         };
+                        *n_in_flight += 1;
                         self.all_request_or_received_before = i + 1;
                         if from.is_none() {
                             from = req;
@@ -120,7 +130,7 @@ impl PieceBlocks {
                         let all_no_response_more_than_5 = addr
                             .iter()
                             .filter(|(p, t)| {
-                                t.elapsed()
+                                t.pick_time.elapsed()
                                     < repick_option
                                         .alt_timeout
                                         .get(p)
@@ -134,7 +144,14 @@ impl PieceBlocks {
                         if all_no_response_more_than_5 {
                             count += 1;
                             info!("{peer:?} repick {req:?}, addr {addr:?}");
-                            addr.insert(peer, time::Instant::now());
+                            addr.insert(
+                                peer,
+                                PickedDetail {
+                                    pick_time: time::Instant::now(),
+                                    n_in_flight_when_picked: *n_in_flight,
+                                },
+                            );
+                            *n_in_flight += 1;
                             if from.is_none() {
                                 from = req;
                             } else {
@@ -178,8 +195,15 @@ impl PieceBlocks {
                 match b {
                     BlockStatus::NotRequested => {
                         *b = BlockStatus::Requested {
-                            addr: HashMap::from([(peer, time::Instant::now())]),
+                            addr: HashMap::from([(
+                                peer,
+                                PickedDetail {
+                                    pick_time: time::Instant::now(),
+                                    n_in_flight_when_picked: *n_in_flight,
+                                },
+                            )]),
                         };
+                        *n_in_flight += 1;
                         if from.is_none() {
                             from = req;
                         } else {
@@ -283,10 +307,10 @@ impl PieceBlocks {
             match b {
                 BlockStatus::Requested { addr, .. } => {
                     addr.retain(|p, t| {
-                        if remove(p, t) {
+                        if remove(p, &t.pick_time) {
                             info!(
                                 "revoke block {req:?} from {p}, issued at {t:?}, after {:?}",
-                                t.elapsed()
+                                t.pick_time.elapsed()
                             );
                             false
                         } else {
@@ -411,12 +435,20 @@ impl BlockPicker {
         if let Some(b) = self.get_block_status(req) {
             match b {
                 BlockStatus::NotRequested => None,
+                BlockStatus::Requested { addr } => addr.get(peer).map(|t| t.pick_time.elapsed()),
+                BlockStatus::Received => None,
+            }
+        } else {
+            None
+        }
+    }
+
+    pub fn get_inflight_when_sent(&self, peer: &PeerAddr, req: &Request) -> Option<usize> {
+        if let Some(b) = self.get_block_status(req) {
+            match b {
+                BlockStatus::NotRequested => None,
                 BlockStatus::Requested { addr } => {
-                    if let Some(t) = addr.get(peer) {
-                        Some(t.elapsed())
-                    } else {
-                        None
-                    }
+                    addr.get(peer).map(|t| t.n_in_flight_when_picked)
                 }
                 BlockStatus::Received => None,
             }
@@ -442,6 +474,7 @@ impl BlockPicker {
         peer: &PeerAddr,
         rtts: &HashMap<PeerAddr, time::Duration>,
         n: usize,
+        mut n_in_flight: usize,
     ) -> (BlockRequests, usize) {
         self.revoke_unrespond(time::Duration::from_secs(90));
         self.prev_time_check = time::Instant::now();
@@ -477,7 +510,9 @@ impl BlockPicker {
         for (index, blocks) in &mut self.requesting {
             assert!(!endgame);
             if remain > 0 && peer_status.have(*index) {
-                while let Some((blks, n_picked)) = blocks.pick(*peer, remain, repick_option) {
+                while let Some((blks, n_picked)) =
+                    blocks.pick(*peer, remain, &mut n_in_flight, repick_option)
+                {
                     remain -= n_picked;
                     let pb: Vec<_> = blks.iter(self.piece_size as u32).collect();
                     debug!("pick piece {index} from peer {peer} (requesting), picked blks: {pb:?}");
@@ -540,7 +575,8 @@ impl BlockPicker {
                 };
                 for (index, blocks) in &mut self.receiving {
                     if remain > 0 && peer_status.have(*index) {
-                        while let Some((blks, n_picked)) = blocks.pick(*peer, remain, repick_option)
+                        while let Some((blks, n_picked)) =
+                            blocks.pick(*peer, remain, &mut n_in_flight, repick_option)
                         {
                             remain -= n_picked;
                             let pb: Vec<_> = blks.iter(self.piece_size as u32).collect();
@@ -553,7 +589,9 @@ impl BlockPicker {
         } else if remain > 0 && repick_option.repick_limit > 1 {
             for (index, blocks) in &mut self.receiving {
                 if remain > 0 && peer_status.have(*index) {
-                    while let Some((blks, n_picked)) = blocks.pick(*peer, remain, repick_option) {
+                    while let Some((blks, n_picked)) =
+                        blocks.pick(*peer, remain, &mut n_in_flight, repick_option)
+                    {
                         remain -= n_picked;
                         let pb: Vec<_> = blks.iter(self.piece_size as u32).collect();
                         debug!("pick piece {index} from peer {peer} (requested rush mode), picked blks: {pb:?}, repick_option: {repick_option:?}");
@@ -569,7 +607,9 @@ impl BlockPicker {
                 assert!(!endgame);
                 let mut blocks = self.piece_block_of(index);
 
-                if let Some((blks, n_picked)) = blocks.pick(*peer, remain, repick_option) {
+                if let Some((blks, n_picked)) =
+                    blocks.pick(*peer, remain, &mut n_in_flight, repick_option)
+                {
                     remain -= n_picked;
                     let pb: Vec<_> = blks.iter(self.piece_size as u32).collect();
                     debug!("pick piece {index} from peer {peer} (pick_next), picked blks: {pb:?}, {:?}", blocks.block_map);
@@ -919,6 +959,7 @@ mod test {
             let picked = b.pick(
                 PEER1,
                 30,
+                &mut 0,
                 RepickOption {
                     repick_limit: 1,
                     alt_timeout: &HashMap::new(),
@@ -947,6 +988,7 @@ mod test {
             let picked = b.pick(
                 PEER1,
                 30,
+                &mut 0,
                 RepickOption {
                     repick_limit: 1,
                     alt_timeout: &HashMap::new(),
@@ -1042,7 +1084,13 @@ mod test {
             block_map: vec![
                 BlockStatus::NotRequested,
                 BlockStatus::Requested {
-                    addr: HashMap::from([(PEER1, time::Instant::now())]),
+                    addr: HashMap::from([(
+                        PEER1,
+                        PickedDetail {
+                            pick_time: time::Instant::now(),
+                            n_in_flight_when_picked: 0,
+                        },
+                    )]),
                 },
                 BlockStatus::NotRequested,
             ],
@@ -1051,6 +1099,7 @@ mod test {
             let picked = b.pick(
                 PEER1,
                 30,
+                &mut 0,
                 RepickOption {
                     repick_limit: 1,
                     alt_timeout: &HashMap::new(),
@@ -1077,6 +1126,10 @@ mod test {
         }
     }
 
+    fn two_mins_ago() -> time::Instant {
+        time::Instant::now() - time::Duration::from_mins(2)
+    }
+
     #[test]
     fn test_block_pieces_endgame() {
         let mut b = PieceBlocks {
@@ -1088,7 +1141,13 @@ mod test {
             block_map: vec![
                 BlockStatus::NotRequested,
                 BlockStatus::Requested {
-                    addr: HashMap::from([(PEER1, time::Instant::now())]),
+                    addr: HashMap::from([(
+                        PEER1,
+                        PickedDetail {
+                            pick_time: two_mins_ago(),
+                            n_in_flight_when_picked: 0,
+                        },
+                    )]),
                 },
                 BlockStatus::NotRequested,
                 BlockStatus::Received,
@@ -1099,6 +1158,7 @@ mod test {
             let picked = b.pick(
                 PEER2,
                 30,
+                &mut 0,
                 RepickOption {
                     repick_limit: 2,
                     alt_timeout: &HashMap::new(),
@@ -1127,6 +1187,7 @@ mod test {
             let picked = b.pick(
                 PEER2,
                 30,
+                &mut 0,
                 RepickOption {
                     repick_limit: 2,
                     alt_timeout: &HashMap::new(),
@@ -1155,6 +1216,7 @@ mod test {
             let picked = b.pick(
                 PEER1,
                 30,
+                &mut 0,
                 RepickOption {
                     repick_limit: 2,
                     alt_timeout: &HashMap::new(),
@@ -1183,6 +1245,7 @@ mod test {
             let picked = b.pick(
                 PEER3,
                 30,
+                &mut 0,
                 RepickOption {
                     repick_limit: 2,
                     alt_timeout: &HashMap::new(),
@@ -1233,7 +1296,7 @@ mod test {
         let rtts = HashMap::new();
 
         {
-            let picked = b.pick_blocks(&PEER1, &rtts, 15);
+            let picked = b.pick_blocks(&PEER1, &rtts, 0, 15);
             let exp = BlockRequests {
                 piece_size: PIECE_SIZE as u32,
                 range: vec![
@@ -1269,7 +1332,7 @@ mod test {
 
         // test pick2
         {
-            let picked = b.pick_blocks(&PEER2, &rtts, 1);
+            let picked = b.pick_blocks(&PEER2, &rtts, 0, 1);
             let exp = BlockRequests {
                 piece_size: PIECE_SIZE as u32,
                 range: vec![BlockRange {
@@ -1291,7 +1354,7 @@ mod test {
         // test un-select
         {
             b.select(2, false);
-            let picked = b.pick_blocks(&PEER1, &rtts, 5);
+            let picked = b.pick_blocks(&PEER1, &rtts, 0, 5);
             let exp = BlockRequests {
                 piece_size: PIECE_SIZE as u32,
                 range: vec![BlockRange {
