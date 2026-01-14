@@ -192,6 +192,12 @@ pub(crate) struct BlockRequests {
     pub range: Vec<BlockRange>,
 }
 
+impl BlockRequests {
+    pub fn len(&self) -> usize {
+        self.range.iter().map(|r| r.len(self.piece_size)).sum()
+    }
+}
+
 // struct BlockRequestsIter<'a, T>
 // where
 //     T: Iterator<Item = BlockRange>,
@@ -259,8 +265,17 @@ impl BlockRange {
         }
     }
 
-    pub fn n_blk(&self) -> usize {
-        todo!()
+    pub fn len(&self, piece_size: u32) -> usize {
+        if self.from.index == self.to.index {
+            (self.to.begin.saturating_sub(self.from.begin) / BLOCK_SIZE + 1) as usize
+        } else if self.to.index > self.from.index {
+            ((piece_size - self.from.begin) / BLOCK_SIZE
+                + (self.to.begin / BLOCK_SIZE + 1)
+                + (self.to.index - self.from.index - 1) * (piece_size / BLOCK_SIZE))
+                as usize
+        } else {
+            0
+        }
     }
 }
 
@@ -358,6 +373,7 @@ mod test {
                 begin: 147456,
                 len: BLOCK_SIZE
             }));
+        assert_eq!(br.len(16 * BLOCK_SIZE), 13 + 16 + 10);
     }
 
     #[test]
@@ -386,6 +402,7 @@ mod test {
                 begin: 3 * BLOCK_SIZE,
                 len: BLOCK_SIZE
             }));
+        assert_eq!(br.len(16 * BLOCK_SIZE), 7);
     }
 
     #[test]
@@ -408,6 +425,7 @@ mod test {
                 begin: 9 * BLOCK_SIZE,
                 len: 163,
             }));
+        assert_eq!(br.len(16 * BLOCK_SIZE), 1)
     }
 
     const fn generate_peer(ip: u32) -> SocketAddr {

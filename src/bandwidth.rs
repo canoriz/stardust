@@ -96,6 +96,7 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
         let n_in_flight = n_in_flight.unwrap_or(2);
 
         self.circular[self.head].add(n_bytes, 1, rtt);
+        // TODO: this is not count, should be n_inflight when this request was sent
         self.tendency
             .add(self.count, rtt.as_secs_f64(), n_in_flight);
         self.count += 1.0;
@@ -122,7 +123,7 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
                 // by near-zero duration and resulting large bandwidth
                 (acc.0.max(bw), acc.1.min(p.rtt.get_min_rtt()))
             } else {
-                acc
+                (acc.0, acc.1.min(p.rtt.get_min_rtt()))
             }
         };
         self.fold_periods_within_interval(back_interval, (0.0, Duration::MAX), f)
@@ -145,10 +146,14 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
             min_rtt = min_rtt.min(slot.rtt.get_min_rtt());
             if begin_time <= slot.since {
                 // querying range covers entire slot
-                t = f(t, slot.since, end_time, slot);
+                if slot.pkg_count > 0 {
+                    t = f(t, slot.since, end_time, slot);
+                }
             } else if begin_time < end_time {
                 // querying range covers part of this slot's time range
-                t = f(t, begin_time, end_time, slot);
+                if slot.pkg_count > 0 {
+                    t = f(t, begin_time, end_time, slot);
+                }
                 break;
             }
 
@@ -185,7 +190,7 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
         self.fold_periods_within_interval(back_interval, (0, Duration::MAX), f)
     }
 
-    pub fn get_rtt_4var(&self) -> Duration {
+    pub fn get_rtt_4var(&self, back_interval: Duration) -> Duration {
         let f = |acc: (u32, Duration), _begin: Instant, _: Instant, p: &Period| {
             let n = acc.0;
 
@@ -205,7 +210,25 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
                 acc
             }
         };
-        self.fold_periods_within_interval(Duration::from_secs(10), (0, Duration::from_secs(1)), f)
+        self.fold_periods_within_interval(back_interval, (0, Duration::from_secs(1)), f)
+            .1
+    }
+
+    pub fn get_rtt(&self, back_interval: Duration) -> Duration {
+        let f = |acc: (u32, Duration), _begin: Instant, _: Instant, p: &Period| {
+            let n = acc.0;
+
+            if p.bytes_count > 0 {
+                (
+                    n + 1,
+                    acc.1.mul_f32((n as f32) / ((n + 1) as f32))
+                        + (p.rtt.get_rtt()).mul_f32(1.0 / ((n + 1) as f32)),
+                )
+            } else {
+                acc
+            }
+        };
+        self.fold_periods_within_interval(back_interval, (0, Duration::from_secs(1)), f)
             .1
     }
 }

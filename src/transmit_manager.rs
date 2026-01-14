@@ -129,11 +129,46 @@ struct PeerStatus {
     peer_interest_status: InterestStatus,
 }
 
+/// modes for bandwidth control
+/// we want a balanced max-bandwidth and min rtt
+enum BandwidthMode {
+    /// adaptively increase requests
+    Auto {
+        since: time::Instant,
+        min_rtt: time::Duration,
+    },
+
+    /// slow down to this in-flight
+    SlowDown {
+        since_auto: time::Instant,
+        min_rtt: time::Duration,
+
+        // slow down to target inflight
+        inflight_target: usize,
+        expire: time::Instant,
+
+        rtt_before: time::Duration,
+
+        // if rtt is smaller
+        faster: bool,
+    },
+
+    /// probe rtt
+    ProbeRTT {
+        since_auto: time::Instant,
+        min_rtt: time::Duration,
+
+        expire: time::Instant,
+        n_to_receive: usize,
+    },
+}
+
 struct PeerConn {
     conn: ConnectionManagerHandle,
     state: PeerStatus,
     bitmap: Option<PieceState>,
-    bw: Bandwidth<10>,
+    bw: Bandwidth<16>,
+    bw_mode: BandwidthMode,
 }
 
 #[derive(Clone)]
@@ -524,7 +559,7 @@ impl TransmitWorker {
         let rtts = self
             .connected_peers
             .iter()
-            .map(|(k, v)| (*k, v.bw.get_rtt_4var()))
+            .map(|(k, v)| (*k, v.bw.get_rtt_4var(time::Duration::from_secs(10))))
             .collect();
 
         for (addr, h) in &self.connected_peers {
@@ -552,7 +587,7 @@ impl TransmitWorker {
         let rtts = self
             .connected_peers
             .iter()
-            .map(|(k, v)| (*k, v.bw.get_rtt_4var()))
+            .map(|(k, v)| (*k, v.bw.get_rtt_4var(time::Duration::from_secs(10))))
             .collect();
 
         if let Some(h) = self.connected_peers.get_mut(addr) {
@@ -629,8 +664,12 @@ impl TransmitWorker {
                                 peer_choke_status: ChokeStatus::Unknown,
                                 peer_interest_status: InterestStatus::Unknown,
                             },
-                            bw: Bandwidth::new(),
                             bitmap: None,
+                            bw: Bandwidth::new(),
+                            bw_mode: BandwidthMode::Auto {
+                                since: time::Instant::now(),
+                                min_rtt: time::Duration::MAX,
+                            },
                         },
                     );
 
@@ -799,50 +838,165 @@ impl TransmitWorker {
                 n_req_in_flight,
                 n_recv_in_period,
             } => {
-                let (max_bw, min_rtt) = if let Some(pc) = self.connected_peers.get(&peer) {
-                    // TODO: this 3 is set randomly, choose a good value value instead
-                    pc.bw
-                        .count_max_bw_and_min_rtt(time::Duration::from_secs(10))
-                } else {
-                    (0.0, time::Duration::from_secs(1))
-                };
                 // TODO: OPTIMIZE: return connection handle to reduce map search
-                let conn_stat = self.connected_peers.get_mut(&peer).expect("should exist");
+                let conn = self.connected_peers.get_mut(&peer).expect("should exist");
+
+                const TEN_SECS: time::Duration = time::Duration::from_secs(10);
+                // TODO: this 10 is set randomly, choose a good value value instead
+                let (max_bw, min_rtt) = conn.bw.count_max_bw_and_min_rtt(TEN_SECS);
+                let rtt = conn.bw.get_rtt(TEN_SECS);
                 warn!("peer {peer} estimated max bandwidth {max_bw}, min rtt {min_rtt:?} req in flight: {n_req_in_flight}");
 
-                let mut optimum_req_in_flight = 2.0 * min_rtt.as_secs_f32() * max_bw;
-                const MIN_IN_FLIGHT: usize = 1;
+                let optimum_bdp = 2.0 * min_rtt.as_secs_f32() * max_bw;
 
-                let (rtt_slope, rtt_correlation) = conn_stat.bw.get_rtt_slope_and_correlation();
-                info!(
-                    "peer {peer} rtt slope {rtt_slope} correlation {rtt_correlation} points {}",
-                    conn_stat.bw.get_rtt_n_points()
-                );
-                if rtt_slope > 0.1 && rtt_correlation > 0.7 && conn_stat.bw.get_rtt_n_points() >= 7
-                {
-                    optimum_req_in_flight = conn_stat.bw.get_prev_in_flight() as f32 * 0.5;
-                    info!("{peer} slow down");
-                }
+                let n_to_pick = match conn.bw_mode {
+                    BandwidthMode::Auto {
+                        ref mut since,
+                        ref mut min_rtt,
+                    } => {
+                        let since_auto = *since;
+                        let min_rtt2 = *min_rtt;
+                        let slow_down_to = |optimum_inflight: usize, mode: &mut BandwidthMode| {
+                            let expire = time::Instant::now()
+                                + rtt.mul_f32(
+                                    (n_req_in_flight.saturating_sub(optimum_inflight)) as f32 * 1.3,
+                                );
+                            *mode = BandwidthMode::SlowDown {
+                                since_auto,
+                                min_rtt: min_rtt2,
+                                inflight_target: optimum_inflight,
+                                expire,
+                                rtt_before: rtt,
+                                faster: false,
+                            };
+                        };
 
-                // Only can pick more blocks if we received some or no requests in flight.
-                // For peers with small bandwidth, we don't request too much from them
-                // to avoid mark these blocks as in-flight and not requesting from other peers.
-                // preventing accumulating too much partial downloaded pieces.
-                let optimum_req_in_flight = optimum_req_in_flight as usize / 16384;
-                let n_to_pick = if n_recv_in_period > 0 || n_req_in_flight < MIN_IN_FLIGHT {
-                    if n_req_in_flight < MIN_IN_FLIGHT {
-                        MIN_IN_FLIGHT - n_req_in_flight
-                    } else if optimum_req_in_flight > n_req_in_flight {
-                        optimum_req_in_flight - n_req_in_flight
-                    } else {
-                        0
+                        if since.elapsed() > TEN_SECS {
+                            info!("{peer} 10 sec no smaller rtt to SlowDown mode");
+                            slow_down_to(0, &mut conn.bw_mode);
+                            0
+                        } else {
+                            if rtt < *min_rtt {
+                                *since = time::Instant::now();
+                                *min_rtt = rtt;
+                            }
+                            let (rtt_slope, rtt_correlation) =
+                                conn.bw.get_rtt_slope_and_correlation();
+                            info!(
+                                "peer {peer} rtt slope {rtt_slope} correlation {rtt_correlation} points {}",
+                                conn.bw.get_rtt_n_points()
+                            );
+
+                            let mut optimum_inflight = optimum_bdp as usize / 16384;
+                            if conn.bw.get_rtt_n_points() >= 7 {
+                                if rtt_slope > 0.1 && rtt_correlation > 0.7 {
+                                    optimum_inflight = (conn.bw.get_prev_in_flight() as f32 * 0.5)
+                                        as usize
+                                        / 16384;
+                                    info!("{peer} slow down to {optimum_bdp}");
+                                    slow_down_to(optimum_inflight, &mut conn.bw_mode);
+                                } else if rtt_slope > 0.5 {
+                                    // non-linear rtt increase, maybe a new app level speed limit is
+                                    // applied on peer
+                                    info!(
+                                        "{peer} rtt non-linear drastically increase slow down to 2"
+                                    );
+                                    slow_down_to(2, &mut conn.bw_mode);
+                                }
+                            }
+
+                            // Only can pick more blocks if we received some or no requests in flight.
+                            // For peers with small bandwidth, we don't request too much from them
+                            // to avoid mark these blocks as in-flight and not requesting from other peers.
+                            // preventing accumulating too much partial downloaded pieces.
+                            const MIN_IN_FLIGHT: usize = 2;
+                            if n_recv_in_period > 0 || n_req_in_flight < MIN_IN_FLIGHT {
+                                if optimum_inflight > n_req_in_flight {
+                                    optimum_inflight - n_req_in_flight
+                                } else if n_req_in_flight < MIN_IN_FLIGHT {
+                                    MIN_IN_FLIGHT - n_req_in_flight
+                                } else {
+                                    0
+                                }
+                            } else {
+                                0
+                            }
+                        }
                     }
-                } else {
-                    0
+                    BandwidthMode::SlowDown {
+                        ref mut since_auto,
+                        ref mut min_rtt,
+                        expire,
+                        inflight_target,
+                        rtt_before,
+                        ref mut faster,
+                    } => {
+                        let (_, rtt) = conn.bw.count_max_bw_and_min_rtt(TEN_SECS);
+                        if rtt < *min_rtt {
+                            *since_auto = time::Instant::now();
+                            *min_rtt = rtt;
+                            *faster = true;
+                        }
+
+                        if n_req_in_flight <= inflight_target || time::Instant::now() > expire {
+                            const TEST_RTT_BURST: usize = 5;
+                            let now = time::Instant::now();
+                            let timeout = rtt_before.mul_f32(TEST_RTT_BURST as f32 * 1.2);
+                            if *faster {
+                                conn.bw_mode = BandwidthMode::Auto {
+                                    since: *since_auto,
+                                    min_rtt: *min_rtt,
+                                };
+                                TEST_RTT_BURST // some random value
+                            } else {
+                                info!("probe timeout {timeout:?}");
+                                conn.bw_mode = BandwidthMode::ProbeRTT {
+                                    since_auto: *since_auto,
+                                    min_rtt: *min_rtt,
+                                    expire: now + timeout,
+                                    n_to_receive: TEST_RTT_BURST,
+                                };
+                                TEST_RTT_BURST
+                            }
+                        } else {
+                            info!(
+                                "slow down mode {} to recv",
+                                n_req_in_flight.saturating_sub(inflight_target)
+                            );
+                            0
+                        }
+                    }
+                    BandwidthMode::ProbeRTT {
+                        ref mut since_auto,
+                        ref mut min_rtt,
+                        expire,
+                        ref mut n_to_receive,
+                    } => {
+                        if *n_to_receive > 0 {
+                            let (_, rtt) = conn.bw.count_max_bw_and_min_rtt(TEN_SECS);
+                            if rtt < *min_rtt {
+                                *since_auto = time::Instant::now();
+                                *min_rtt = rtt;
+                            }
+
+                            *n_to_receive = n_to_receive.saturating_sub(n_recv_in_period);
+                            info!(
+                                "received {}, {} to receive in probeRTT testing mode",
+                                n_recv_in_period, *n_to_receive,
+                            );
+                        }
+                        if *n_to_receive == 0 || time::Instant::now() > expire {
+                            conn.bw_mode = BandwidthMode::Auto {
+                                since: *since_auto,
+                                min_rtt: rtt,
+                            };
+                        }
+                        n_recv_in_period
+                    }
                 };
 
                 if matches!(self.running_state, RunningState::Downloading) {
-                    if conn_stat.state.peer_choke_status == ChokeStatus::Unchoked {
+                    if conn.state.peer_choke_status == ChokeStatus::Unchoked {
                         self.pick_blocks_for_peer(&peer, n_to_pick);
                     }
                 }
@@ -893,7 +1047,8 @@ impl TransmitWorker {
             pc.conn.recv_stream_cmd(CtrlOfRecv::ReportStat);
 
             // TODO: set a alarm at some clock instead of using tokio task?
-            let next_alarm_wait = (pc.bw.get_rtt_4var() * 2).max(time::Duration::from_millis(10));
+            let next_alarm_wait = (pc.bw.get_rtt_4var(time::Duration::from_secs(10)) * 2)
+                .max(time::Duration::from_millis(10));
             let s = self.self_handle.sender.clone();
             info!("check timeout for {peer:?}, next check after {next_alarm_wait:?}");
             tokio::spawn(async move {
