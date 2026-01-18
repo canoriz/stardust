@@ -11,8 +11,7 @@ pub(crate) struct Bandwidth<const SLOT_SIZE: usize> {
     circular: [Period; SLOT_SIZE],
     head: usize,
 
-    count: f64,
-    tendency: SlidingWindowRegression<usize>,
+    tendency: SlidingWindowRegression,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -64,7 +63,6 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
             circular: [Period::new(); SLOT_SIZE],
             head: 0,
 
-            count: 0.0,
             tendency: SlidingWindowRegression::new(10),
         }
     }
@@ -96,22 +94,40 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
         let n_in_flight = n_in_flight.unwrap_or(2);
 
         self.circular[self.head].add(n_bytes, 1, rtt);
-        // TODO: this is not count, should be n_inflight when this request was sent
-        self.tendency
-            .add(self.count, rtt.as_secs_f64(), n_in_flight);
-        self.count += 1.0;
+        self.tendency.add(n_in_flight as f64, rtt.as_secs_f64());
     }
 
     pub fn get_rtt_slope_and_correlation(&self) -> (f64, f64) {
         self.tendency.get_results()
     }
 
+    pub fn shrink_reset_slope(&mut self, n: usize) {
+        self.tendency.shrink_to(n);
+    }
+
     pub fn get_rtt_n_points(&self) -> usize {
         self.tendency.n_points()
     }
 
-    pub fn get_prev_in_flight(&self) -> usize {
-        self.tendency.get_first_point_val().map(|x| *x).unwrap_or(2)
+    pub fn get_optimum_in_flight(&self) -> usize {
+        // try to get the max in flight that
+        // rtt < 1.2 * min_rtt
+        let min_rtt = self
+            .tendency
+            .datapoints()
+            .iter()
+            .map(|(_, rtt)| *rtt)
+            .fold(f64::MAX / 2.0, |a, x| a.min(x));
+        self.tendency
+            .datapoints()
+            .iter()
+            .filter_map(|(n, rtt)| (*rtt < min_rtt * 1.2).then_some(*n))
+            .fold(0f64, |a, n| {
+                if n > a {
+                    dbg!(n);
+                }
+                n.max(a)
+            }) as usize
     }
 
     pub fn count_max_bw_and_min_rtt(&self, back_interval: Duration) -> (f32, Duration) {
