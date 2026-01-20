@@ -198,10 +198,16 @@ pub struct BTStream<T> {
     // processing and returns back when done
     piece_buf: Option<BytesMut>,
 
-    // pending PORT message to be sent later by splitted writer
+    // pending messages to send later by splitted writer,
+    // mainly PORT message
     // not sending it in connect(), because not sure if both ends
     // sends and no one receives.
-    pending_dht_port: Option<u16>,
+    pending_sends: Vec<Message>,
+
+    // Received messages during handshake phase(after handshake and before extend handshake).
+    // To be sent to upper layer.
+    // Some implementation may sent Port and BitField messaged between handshake and extend handshake
+    pending_recvs: Vec<Message>,
 }
 
 impl<T> BTStream<T>
@@ -223,7 +229,8 @@ where
             pex_peers: self.pex_peers,
             metadata_size: self.metadata_size,
             piece_buf: Some(BytesMut::new()),
-            pending_dht_port: self.pending_dht_port,
+            pending_sends: self.pending_sends,
+            pending_recvs: self.pending_recvs,
         }
     }
 }
@@ -352,6 +359,8 @@ pub struct ReadStream<T> {
 
     // buffer for incoming piece
     piece_buf: Option<BytesMut>,
+
+    pending_recvs: Vec<Message>,
 }
 
 #[derive(Debug)]
@@ -409,7 +418,7 @@ pub struct WriteStream<T> {
     info_hash: [u8; 20],
     reserved: FuncBits,
 
-    pending_dht_port: Option<u16>,
+    pending_sends: Vec<Message>,
 }
 
 impl BTStream<net::TcpStream> {
@@ -504,6 +513,7 @@ where
                 reserved: self.reserved,
                 metadata_size: self.metadata_size,
                 piece_buf: self.piece_buf,
+                pending_recvs: self.pending_recvs,
             },
             WriteStream {
                 inner: write_end,
@@ -514,7 +524,7 @@ where
                 info_hash: self.info_hash,
                 reserved: self.reserved,
                 metadata_size: self.metadata_size,
-                pending_dht_port: self.pending_dht_port,
+                pending_sends: self.pending_sends,
             },
         )
     }
@@ -539,7 +549,8 @@ where
             pex_peers: w.pex_peers,
             metadata_size: r.metadata_size,
             piece_buf: r.piece_buf,
-            pending_dht_port: w.pending_dht_port,
+            pending_sends: w.pending_sends,
+            pending_recvs: r.pending_recvs,
         })
     }
 
@@ -561,6 +572,7 @@ where
                 reserved: self.reserved,
                 metadata_size: self.metadata_size,
                 piece_buf: self.piece_buf,
+                pending_recvs: self.pending_recvs,
             },
             WriteStream {
                 inner: BufWriter::with_capacity(32768, write_end),
@@ -571,7 +583,7 @@ where
                 info_hash: self.info_hash,
                 reserved: self.reserved,
                 metadata_size: self.metadata_size,
-                pending_dht_port: self.pending_dht_port,
+                pending_sends: self.pending_sends,
             },
         )
     }
@@ -591,6 +603,7 @@ impl BTStream<Box<dyn Conn>> {
                 reserved: self.reserved,
                 metadata_size: self.metadata_size,
                 piece_buf: self.piece_buf,
+                pending_recvs: self.pending_recvs,
             },
             WriteStream {
                 inner: write_end,
@@ -601,7 +614,7 @@ impl BTStream<Box<dyn Conn>> {
                 info_hash: self.info_hash,
                 reserved: self.reserved,
                 metadata_size: self.metadata_size,
-                pending_dht_port: self.pending_dht_port,
+                pending_sends: self.pending_sends,
             },
         )
     }
@@ -624,6 +637,7 @@ impl BTStream<Box<dyn Conn>> {
                 reserved: self.reserved,
                 metadata_size: self.metadata_size,
                 piece_buf: self.piece_buf,
+                pending_recvs: self.pending_recvs,
             },
             WriteStream {
                 inner: BufWriter::with_capacity(32768, write_end),
@@ -634,7 +648,7 @@ impl BTStream<Box<dyn Conn>> {
                 info_hash: self.info_hash,
                 reserved: self.reserved,
                 metadata_size: self.metadata_size,
-                pending_dht_port: self.pending_dht_port,
+                pending_sends: self.pending_sends,
             },
         )
     }
@@ -773,7 +787,12 @@ where
             pex_peers: HashMap::new(),
             metadata_size: 0,
             piece_buf: Some(BytesMut::new()),
-            pending_dht_port: if reserved.have_dht() { dht_port } else { None },
+            pending_sends: if reserved.have_dht() && dht_port.is_some() {
+                vec![Message::Port(dht_port.unwrap())]
+            } else {
+                vec![]
+            },
+            pending_recvs: vec![],
         };
 
         if reserved.have_extension() {
@@ -798,9 +817,10 @@ where
                 &mut read_end.partial_read,
                 &mut read_end.piece_buf,
             );
-            let (write_end, exth) = {
-                let (w, exth) = tokio::join!(send_ext_handshake, recv_ext_handshake);
-                (w??, exth?)
+            let (write_end, exth, pending_recvs) = {
+                let (w, eh_res) = tokio::join!(send_ext_handshake, recv_ext_handshake);
+                let (exth, pending_recvs) = eh_res?;
+                (w??, exth, pending_recvs)
             };
 
             let mut s =
@@ -812,6 +832,7 @@ where
                 .filter(|(_, id)| *id != 0)
                 .collect();
             s.metadata_size = exth.metadata_size.unwrap_or(0) as usize;
+            s.pending_recvs = pending_recvs;
             return Ok(s);
         }
         Ok(s)
@@ -866,7 +887,12 @@ where
             pex_peers: HashMap::new(),
             metadata_size: 0,
             piece_buf: Some(BytesMut::new()),
-            pending_dht_port: if support_dht { dht_port } else { None },
+            pending_sends: if support_dht && dht_port.is_some() {
+                vec![Message::Port(dht_port.unwrap())]
+            } else {
+                vec![]
+            },
+            pending_recvs: vec![],
         };
 
         let support_extension = reserved.have_extension();
@@ -886,20 +912,22 @@ where
                 &mut read_end.partial_read,
                 &mut read_end.piece_buf,
             );
-            let (write_end, extend_received) = {
-                let (w, exth) = tokio::join!(send_ext_handshake, recv_ext_handshake);
-                (w??, exth?)
+            let (write_end, exth, pending_recvs) = {
+                let (w, eh_res) = tokio::join!(send_ext_handshake, recv_ext_handshake);
+                let (exth, pending_recvs) = eh_res?;
+                (w??, exth, pending_recvs)
             };
 
             let mut s =
                 BTStream::<T>::reunite(read_end, write_end).expect("reunite BTStream should OK");
-            s.extension_id = extend_received
+            s.extension_id = exth
                 .m
                 .iter()
                 .filter_map(|(s, id)| extension_type(s).map(|ss| (ss, *id)))
                 .filter(|(_, id)| *id != 0)
                 .collect();
-            s.metadata_size = extend_received.metadata_size.unwrap_or(0) as usize;
+            s.metadata_size = exth.metadata_size.unwrap_or(0) as usize;
+            s.pending_recvs = pending_recvs;
             return Ok(s);
         }
         Ok(s)
@@ -1130,9 +1158,14 @@ where
     /// called after split reader and writer
     /// the pending DHT PORT message can now be sent
     pub async fn maybe_send_pending_msg(&mut self) -> io::Result<()> {
-        if let Some(port) = self.pending_dht_port.take() {
-            send_port(&mut self.inner, port).await?;
+        for m in &self.pending_sends {
+            if let Message::Port(port) = m {
+                send_port(&mut self.inner, *port).await?;
+            } else {
+                todo!("non-dht in pending msg is not supported")
+            }
         }
+        self.pending_sends.clear();
         Ok(())
     }
 }
@@ -1161,6 +1194,12 @@ where
     /// this is cancel safe
     pub async fn recv_msg(&mut self) -> io::Result<Message> {
         recv_msg(&mut self.inner, &mut self.partial_read, &mut self.piece_buf).await
+    }
+
+    /// called after split reader and writer
+    /// the pending DHT PORT message can now be sent
+    pub async fn maybe_recv_pending_msg(&mut self) -> Vec<Message> {
+        self.pending_recvs.drain(0..).collect()
     }
 }
 
@@ -2532,21 +2571,23 @@ where
     Ok(BitField::new(new_buf.into()))
 }
 
+// waiting for extend handshake, returns extend handshake and message
+// before extend handshake
 async fn recv_extend_handshake<'a, T>(
     reader: &'a mut T,
     pr: &mut PartialRead,
     buf: &mut Option<BytesMut>, // not used here
-) -> io::Result<ExtendedHandshake>
+) -> io::Result<(ExtendedHandshake, Vec<Message>)>
 where
     T: AsyncRead + Unpin,
 {
-    let msg = recv_msg(reader, pr, buf).await?;
-    match msg {
-        Message::Extended(ExtendedMsg::Handshake(e)) => Ok(e),
-        other => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("expecting extension handshake, receive {other:?}"),
-        )),
+    let mut pending_recvs = vec![];
+    loop {
+        let msg = recv_msg(reader, pr, buf).await?;
+        match msg {
+            Message::Extended(ExtendedMsg::Handshake(e)) => break Ok((e, pending_recvs)),
+            m => pending_recvs.push(m),
+        }
     }
 }
 
@@ -2707,6 +2748,7 @@ pub mod tests {
                     reserved: [0; 8].into(),
                     metadata_size: 0,
                     piece_buf: Some(BytesMut::new()),
+                    pending_recvs: self.pending_recvs,
                 },
                 WriteStream {
                     inner: write_end,
@@ -2717,7 +2759,7 @@ pub mod tests {
                     info_hash: [0; 20],
                     reserved: [0; 8].into(),
                     metadata_size: 0,
-                    pending_dht_port: None,
+                    pending_sends: self.pending_sends,
                 },
             )
         }

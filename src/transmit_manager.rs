@@ -138,6 +138,8 @@ enum BandwidthMode {
         min_rtt: time::Duration,
     },
 
+    Choked,
+
     /// slow down to this in-flight
     SlowDown {
         since_auto: time::Instant,
@@ -161,6 +163,15 @@ enum BandwidthMode {
         expire: time::Instant,
         n_to_receive: usize,
     },
+}
+
+impl BandwidthMode {
+    pub fn new_auto() -> Self {
+        BandwidthMode::Auto {
+            since: time::Instant::now(),
+            min_rtt: time::Duration::MAX.mul_f32(0.5),
+        }
+    }
 }
 
 struct PeerConn {
@@ -666,10 +677,7 @@ impl TransmitWorker {
                             },
                             bitmap: None,
                             bw: Bandwidth::new(),
-                            bw_mode: BandwidthMode::Auto {
-                                since: time::Instant::now(),
-                                min_rtt: time::Duration::MAX.mul_f32(0.5),
-                            },
+                            bw_mode: BandwidthMode::new_auto(),
                         },
                     );
 
@@ -798,6 +806,7 @@ impl TransmitWorker {
                 piece_picker.peer_choke(&peer);
                 self.connected_peers.entry(peer).and_modify(|st| {
                     st.state.peer_choke_status = ChokeStatus::Choked;
+                    st.bw_mode = BandwidthMode::Choked;
                 });
                 assert_eq!(
                     self.connected_peers[&peer].state.peer_choke_status,
@@ -812,6 +821,7 @@ impl TransmitWorker {
                 warn!("{peer} unchoked us");
                 self.connected_peers.entry(peer).and_modify(|st| {
                     st.state.peer_choke_status = ChokeStatus::Unchoked;
+                    st.bw_mode = BandwidthMode::new_auto();
                 });
                 assert_eq!(
                     self.connected_peers[&peer].state.peer_choke_status,
@@ -997,6 +1007,7 @@ impl TransmitWorker {
                         }
                         n_recv_in_period
                     }
+                    BandwidthMode::Choked => 0,
                 };
                 conn.bw.shrink_reset_slope(10);
 
@@ -1742,9 +1753,12 @@ async fn connect_peer(
     opt: HandshakeOption,
     info_hash: InfoHash,
 ) -> Result<(), std::io::Error> {
-    let tcp_stream = TcpStream::connect(addr).await?;
-    let conn = protocol::BTStream::connect(tcp_stream, opt, info_hash).await;
-    match conn {
+    let do_connect = async || -> io::Result<_> {
+        let tcp_stream = TcpStream::connect(addr).await?;
+        protocol::BTStream::connect(tcp_stream, opt, info_hash).await
+    };
+
+    match do_connect().await {
         Ok(c) => {
             if let Err(e) = main_tx.sender.send(Msg::NewPeer(Ok((c.to_dyn(), false)))) {
                 info!("send new peer to main {e}");

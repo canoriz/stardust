@@ -301,6 +301,11 @@ async fn run_recv_stream<T>(
     let mut ticker = tokio::time::interval(report_interval);
     let addr = conn.read_stream.peer_addr();
 
+    let pending_recvs = conn.read_stream.maybe_recv_pending_msg().await;
+    for m in pending_recvs {
+        conn.handle_peer_msg(addr, m).await;
+    }
+
     loop {
         tokio::select! {
             biased;
