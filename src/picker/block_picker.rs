@@ -135,8 +135,8 @@ impl PieceBlocks {
                                         .alt_timeout
                                         .get(p)
                                         .map(|d| *d)
-                                        .unwrap_or(time::Duration::from_secs(5))
-                                        .min(time::Duration::from_secs(5))
+                                        .unwrap_or(time::Duration::from_secs(15))
+                                        .min(time::Duration::from_secs(15))
                             })
                             .count()
                             == 0;
@@ -491,6 +491,7 @@ impl BlockPicker {
                 alt_timeout: &HashMap::new(),
             }
         };
+        info!("endgame {endgame}, rush {}", self.rush_mode());
 
         let mut remain = n;
         let peer_status = if let Some(h) = self.piece_picker.peer_detail(peer) {
@@ -519,6 +520,7 @@ impl BlockPicker {
                     ret.push(blks);
                 }
             }
+            info!("remain 0 {remain}");
         }
 
         for (index, blocks) in self.requesting.iter_mut() {
@@ -586,6 +588,7 @@ impl BlockPicker {
                     }
                 }
             }
+            info!("remain 1 {remain}");
         } else if remain > 0 && repick_option.repick_limit > 1 {
             for (index, blocks) in &mut self.receiving {
                 if remain > 0 && peer_status.have(*index) {
@@ -599,10 +602,12 @@ impl BlockPicker {
                     }
                 }
             }
+            info!("remain 2 {remain}");
         }
 
         let endgame = self.update_endgame();
         while remain > 0 && !self.rush_mode() {
+            // while remain > 0 {
             if let Some(index) = self.piece_picker.pick_next(peer) {
                 assert!(!endgame);
                 let mut blocks = self.piece_block_of(index);
@@ -620,6 +625,7 @@ impl BlockPicker {
             } else {
                 break;
             }
+            info!("remain 3 {remain}");
         }
 
         (

@@ -39,7 +39,7 @@ impl RTT {
 
     /// get smoothed average RTT
     pub fn get_rtt(&self) -> Duration {
-        self.smooth_rtt.max(Duration::from_millis(10))
+        self.smooth_rtt
     }
 
     /// get historical min rtt

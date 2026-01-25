@@ -16,6 +16,7 @@ use crate::protocol::{
 
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
+use std::char::MAX;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io;
 use std::net::SocketAddr;
@@ -178,7 +179,7 @@ struct PeerConn {
     conn: ConnectionManagerHandle,
     state: PeerStatus,
     bitmap: Option<PieceState>,
-    bw: Bandwidth<16>,
+    bw: Bandwidth<50>,
     bw_mode: BandwidthMode,
 }
 
@@ -570,7 +571,13 @@ impl TransmitWorker {
         let rtts = self
             .connected_peers
             .iter()
-            .map(|(k, v)| (*k, v.bw.get_rtt_4var(time::Duration::from_secs(10))))
+            .map(|(k, v)| {
+                (
+                    *k,
+                    v.bw.get_rtt_4var(time::Duration::from_secs(10))
+                        + time::Duration::from_millis(500),
+                )
+            })
             .collect();
 
         for (addr, h) in &self.connected_peers {
@@ -586,7 +593,9 @@ impl TransmitWorker {
     // fn pick_blocks_for_peer(&mut self, addr: &SocketAddr, n_blocks: usize) {
     // Fn: n_blk_received, n_blk_in_flight -> n_this_time_pick
     fn pick_blocks_for_peer(&mut self, addr: &SocketAddr, pick_n: usize) {
-        warn!("pick {pick_n} blocks from {addr:?}");
+        if pick_n > 0 {
+            warn!("pick {pick_n} blocks from {addr:?}");
+        }
         let block_picker = match &mut self.torrent_state {
             TorrentState::Metadata(d) => &mut d.block_picker,
             TorrentState::Fetching(_) => {
@@ -598,7 +607,13 @@ impl TransmitWorker {
         let rtts = self
             .connected_peers
             .iter()
-            .map(|(k, v)| (*k, v.bw.get_rtt_4var(time::Duration::from_secs(10))))
+            .map(|(k, v)| {
+                (
+                    *k,
+                    v.bw.get_rtt_4var(time::Duration::from_secs(10))
+                        + time::Duration::from_millis(500),
+                )
+            })
             .collect();
 
         if let Some(h) = self.connected_peers.get_mut(addr) {
@@ -607,6 +622,9 @@ impl TransmitWorker {
                 let (reqs, _n) =
                     block_picker.pick_blocks(addr, &rtts, pick_n, n_in_flight as usize);
                 h.conn.send_stream_cmd(ConnMsg::RequestBlocks(reqs));
+                if pick_n > 0 {
+                    info!("really picked {_n} blocks");
+                }
             }
         }
     }
@@ -854,8 +872,16 @@ impl TransmitWorker {
                 const TEN_SECS: time::Duration = time::Duration::from_secs(10);
                 // TODO: this 10 is set randomly, choose a good value value instead
                 let (max_bw, min_rtt) = conn.bw.count_max_bw_and_min_rtt(TEN_SECS);
-                let rtt = conn.bw.get_rtt(TEN_SECS);
+                let avg_bw =
+                    conn.bw.count_bytes_within_period(TEN_SECS).0 as f32 / TEN_SECS.as_secs_f32();
+                let rtt = conn
+                    .bw
+                    .get_rtt(TEN_SECS)
+                    .max(time::Duration::from_millis(10));
                 warn!("peer {peer} estimated max bandwidth {max_bw}, min rtt {min_rtt:?} req in flight: {n_req_in_flight}");
+                let probe_rtt_interval = (min_rtt * 10)
+                    .max(TEN_SECS)
+                    .min(time::Duration::from_secs(30));
 
                 let optimum_bdp = 2.0 * min_rtt.as_secs_f32() * max_bw;
 
@@ -881,15 +907,18 @@ impl TransmitWorker {
                             };
                         };
 
-                        if since.elapsed() > TEN_SECS {
-                            info!("{peer} 10 sec no smaller rtt to SlowDown mode");
+                        // if false
+                        if since.elapsed() > probe_rtt_interval {
+                            info!("{peer} after {probe_rtt_interval:?} no smaller rtt to SlowDown mode");
                             slow_down_to(0, &mut conn.bw_mode);
                             0
                         } else {
                             if rtt < min_rtt.mul_f32(1.2) {
                                 *since = time::Instant::now();
+                                if rtt < *min_rtt {
+                                    info!("auto mode new min rtt = {:?}", rtt);
+                                }
                                 *min_rtt = (*min_rtt).min(rtt);
-                                info!("auto mode new min rtt = {:?}", *min_rtt);
                             }
                             let (rtt_slope, rtt_correlation) =
                                 conn.bw.get_rtt_slope_and_correlation();
@@ -900,12 +929,14 @@ impl TransmitWorker {
 
                             let mut optimum_inflight = optimum_bdp as usize / 16384;
                             if conn.bw.get_rtt_n_points() >= 7 {
-                                if rtt_correlation > 0.7 && rtt_slope as f32 > (16384f32 / max_bw) {
+                                if rtt_correlation > 0.7
+                                    && rtt_slope as f32 > (2.0 * 16384f32 / avg_bw)
+                                {
                                     optimum_inflight =
                                         (conn.bw.get_optimum_in_flight() as f32 * 0.9) as usize;
-                                    info!("{peer} slow down to {optimum_inflight} inflight");
+                                    info!("{peer} linear-increase threshold bw {avg_bw} slow down to {optimum_inflight} inflight");
                                     slow_down_to(optimum_inflight, &mut conn.bw_mode);
-                                } else if rtt_slope > 0.5 {
+                                } else if rtt_slope as f32 > (6.0 * 16384f32 / avg_bw) {
                                     // non-linear rtt increase, maybe a new app level speed limit is
                                     // applied on peer
                                     info!(
@@ -922,15 +953,23 @@ impl TransmitWorker {
                             // to avoid mark these blocks as in-flight and not requesting from other peers.
                             // preventing accumulating too much partial downloaded pieces.
                             const MIN_IN_FLIGHT: usize = 2;
-                            if n_recv_in_period > 0 || n_req_in_flight < MIN_IN_FLIGHT {
-                                if optimum_inflight > n_req_in_flight {
-                                    optimum_inflight - n_req_in_flight
-                                } else if n_req_in_flight < MIN_IN_FLIGHT {
-                                    MIN_IN_FLIGHT - n_req_in_flight
+                            const MAX_IN_FLIGHT: usize = 5000;
+                            // optimum_inflight = 1250;
+                            if n_req_in_flight > MAX_IN_FLIGHT {
+                                0
+                            } else if optimum_inflight > n_req_in_flight {
+                                info!("1111");
+                                let n_more = optimum_inflight - n_req_in_flight;
+                                if n_more + n_req_in_flight > MAX_IN_FLIGHT {
+                                    MAX_IN_FLIGHT - n_req_in_flight
                                 } else {
-                                    0
+                                    n_more
                                 }
+                            } else if n_req_in_flight < MIN_IN_FLIGHT {
+                                info!("2222");
+                                MIN_IN_FLIGHT - n_req_in_flight
                             } else {
+                                info!("3333");
                                 0
                             }
                         }
@@ -1063,8 +1102,8 @@ impl TransmitWorker {
             pc.conn.recv_stream_cmd(CtrlOfRecv::ReportStat);
 
             // TODO: set a alarm at some clock instead of using tokio task?
-            let next_alarm_wait = (pc.bw.get_rtt_4var(time::Duration::from_secs(10)) * 2)
-                .max(time::Duration::from_millis(10));
+            let next_alarm_wait = pc.bw.get_rtt_4var(time::Duration::from_secs(10)) * 2
+                + time::Duration::from_millis(10);
             let s = self.self_handle.sender.clone();
             info!("check timeout for {peer:?}, next check after {next_alarm_wait:?}");
             tokio::spawn(async move {

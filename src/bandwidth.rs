@@ -42,10 +42,11 @@ struct Period {
 impl Period {
     /// new a Period with initial rtt and variation
     fn new() -> Self {
+        let now = Instant::now();
         Self {
             pkg_count: 0,
             bytes_count: 0,
-            since: Instant::now(),
+            since: now,
             rtt: RTT::new(ALPHA, BETA),
         }
     }
@@ -58,6 +59,8 @@ impl Period {
 }
 
 impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
+    const SPLIT_DURATION: Duration = Duration::from_millis(100);
+
     pub fn new() -> Bandwidth<SLOT_SIZE> {
         Bandwidth {
             circular: [Period::new(); SLOT_SIZE],
@@ -78,10 +81,9 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
         n_in_flight: Option<usize>,
     ) {
         let before_rtt = self.circular[self.head].rtt.get_rtt();
-        let split_rtt = before_rtt.max(Duration::from_millis(100));
 
         // alloc a new slot if time of rtt has passed
-        if self.circular[self.head].since.elapsed() > split_rtt {
+        if self.circular[self.head].since.elapsed() > Self::SPLIT_DURATION {
             if self.head + 1 >= SLOT_SIZE {
                 self.head = 0;
             } else {
@@ -90,10 +92,16 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
             self.circular[self.head] = Period::new();
         }
 
+        info!("rtt: {rtt:?}");
         let rtt = rtt.unwrap_or(before_rtt);
         let n_in_flight = n_in_flight.unwrap_or(2);
 
         self.circular[self.head].add(n_bytes, 1, rtt);
+        info!(
+            "tendency add sample {rtt:?}, period: {:?}, elapsed {:?}",
+            self.circular[self.head],
+            self.circular[self.head].since.elapsed()
+        );
         self.tendency.add(n_in_flight as f64, rtt.as_secs_f64());
     }
 
@@ -132,9 +140,15 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
 
     pub fn count_max_bw_and_min_rtt(&self, back_interval: Duration) -> (f32, Duration) {
         let f = |acc: (f32, Duration), _begin: Instant, end: Instant, p: &Period| {
-            let dt = end - p.since;
+            let dt = (end - p.since).min(Self::SPLIT_DURATION);
             let bw = (p.bytes_count as f32) / dt.as_secs_f32();
-            if dt > Duration::from_millis(100) {
+            info!(
+                "bytes_count {} dt {dt:?} bw {bw}, since before {:?}",
+                p.bytes_count,
+                p.since.elapsed()
+            );
+            // if dt > Duration::from_millis(100) {
+            if dt > Duration::from_millis(40) {
                 // only count slots that dt are large enough slots to avoid division
                 // by near-zero duration and resulting large bandwidth
                 (acc.0.max(bw), acc.1.min(p.rtt.get_min_rtt()))
@@ -142,7 +156,7 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
                 (acc.0, acc.1.min(p.rtt.get_min_rtt()))
             }
         };
-        self.fold_periods_within_interval(back_interval, (0.0, Duration::MAX), f)
+        self.fold_periods_within_interval(back_interval, (0.0, Duration::MAX / 30), f)
     }
 
     fn fold_periods_within_interval<T, F>(&self, back_interval: Duration, init: T, mut f: F) -> T
@@ -211,11 +225,6 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
             let n = acc.0;
 
             if p.bytes_count > 0 {
-                info!(
-                    "rtt: {:?} var: {:?}",
-                    p.rtt.get_rtt(),
-                    p.rtt.get_variation()
-                );
                 (
                     n + 1,
                     acc.1.mul_f32((n as f32) / ((n + 1) as f32))

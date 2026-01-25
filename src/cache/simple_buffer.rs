@@ -13,6 +13,8 @@ use bytes::BytesMut;
 use tokio::{sync::mpsc, time};
 use tracing::{info, warn};
 
+const POOL_SIZE: usize = 16;
+
 const FLUSHING: u32 = 0b1;
 const DIRTY: u32 = 0b10;
 
@@ -295,7 +297,7 @@ impl BufStorage {
             piece_total,
 
             loading: Arc::new(Mutex::new(HashMap::new())),
-            pool: Arc::new(Mutex::new(Pool::new(16))),
+            pool: Arc::new(Mutex::new(Pool::new(POOL_SIZE))),
         }
     }
 
@@ -424,7 +426,7 @@ impl BufStorage {
             info!("insert piece buffer {}", p.index());
             self.pieces.insert(p.index, p);
         }
-        self.purge_by_size(16);
+        self.purge_by_size(POOL_SIZE);
     }
 
     pub fn purge_by_time(&mut self, timeout: time::Duration) {

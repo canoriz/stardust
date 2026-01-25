@@ -179,7 +179,6 @@ impl ConnectionManagerHandle {
             CtrlOfSend::RequestBlocks(reqs) => {
                 let n = reqs.len() as u32;
                 let p = self.bw_stat.n_sent_req.fetch_add(n, Ordering::Relaxed);
-                info!("add n sent to {p}");
 
                 // woke when half of in flight request is received
                 self.bw_stat.report_when.store(
@@ -190,8 +189,12 @@ impl ConnectionManagerHandle {
             _ => {}
         }
 
-        let c = &self.send_stream.sender;
+        let c = self.send_stream.sender.clone();
         c.send(m);
+        // tokio::spawn(async move {
+        //     time::sleep(time::Duration::from_secs(3)).await;
+        //     c.send(m);
+        // });
     }
 
     pub fn recv_stream_cmd(&self, m: CtrlOfRecv) {
@@ -278,6 +281,7 @@ struct SendStream<T> {
     _drop_guard: Arc<NotifyTransmitGuard>,
 }
 
+#[derive(Debug)]
 struct BandwidthStat {
     /// number or send requests in a period
     n_sent_req: AtomicU32,
@@ -297,7 +301,7 @@ async fn run_recv_stream<T>(
     T: AsyncRead + Unpin,
 {
     info!("in recv stream");
-    let report_interval = time::Duration::from_millis(1000);
+    let report_interval = time::Duration::from_millis(100);
     let mut ticker = tokio::time::interval(report_interval);
     let addr = conn.read_stream.peer_addr();
 
@@ -490,11 +494,17 @@ where
                 tmh.sender
                     .send(TransmitMsg::PeerMsg(PeerMsg::Piece(addr, piece)));
 
-                if self.bw_stat.n_recv_req.load(Ordering::Relaxed)
-                    > self.bw_stat.report_when.swap(u32::MAX, Ordering::Relaxed)
-                {
-                    self.handle_report_tick();
+                // self.handle_report_tick();
+                info!("{:?}", self.bw_stat);
+                let n_recv_req = self.bw_stat.n_recv_req.load(Ordering::Relaxed);
+                let report_when = self.bw_stat.report_when.swap(u32::MAX, Ordering::Relaxed);
+                if n_recv_req >= report_when {
+                    info!("report tick1");
+                    // self.handle_report_tick();
+                } else {
+                    info!("delay report n_recv_req {n_recv_req} report when {report_when}");
                 }
+                self.handle_report_tick();
             }
             Message::Cancel(req) => {
                 tmh.sender
@@ -582,12 +592,17 @@ where
     async fn handle_cmd(&mut self, msg: CtrlOfSend) {
         match msg {
             CtrlOfSend::RequestBlocks(reqs) => {
+                let mut count = 0;
                 let piece_size = reqs.piece_size;
                 for rg in reqs.range.iter() {
                     for r in rg.iter(piece_size) {
                         self.write_stream
                             .send_request(r.index, r.begin, r.len)
                             .await;
+                        // count += 1;
+                        // if count % 10 == 0 {
+                        // time::sleep(time::Duration::from_millis(500)).await;
+                        // }
                     }
                 }
             }

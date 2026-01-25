@@ -30,23 +30,27 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .self_id(SELF_ID)
             .build(),
     );
-    // let torrent_f = include_bytes!("../w.pcnp.torrent");
-    // let torrent = metadata::FileMetadata::load(torrent_f).unwrap();
-    // let (metadata, announce_list) = torrent.to_metadata();
-    // let info_hash = metadata.info_hash;
+    let torrent_f = include_bytes!("../START-451.torrent");
+    let torrent = metadata::FileMetadata::load(torrent_f).unwrap();
+    let (metadata, announce_list) = torrent.to_metadata();
+    let info_hash = metadata.info_hash;
 
-    let magnet: Magnet = ("magnet:?xt=urn:btih:2df8975c679750678f9025ceb35587e19718d72c&dn=SNOS-030&xl=5387141186&tr=http://sukebei.tracker.wf:8888/announce&tr=udp://tracker.archlinux.org.theoks.net:6969/announce&tr=udp://tracker.openbittorrent.com:6969&tr=http://tracker.tasvideos.org:6969/announce&tr=udp://tracker.leech.ie:1337/announce&tr=udp://tracker.opentrackr.org:1337/announce&tr=udp://tracker.coppersurfer.tk:6969/announce&tr=udp://tracker.internetwarriors.net:1337&tr=udp://tracker.internetwarriors.net:1337/announce&tr=udp://open.stealth.si:80/announce&tr=http://anidex.moe:6969/announce&tr=http://freerainbowtables.com:6969/announce&tr=http://www.freerainbowtables.com:6969/announce&tr=http://tracker2.itzmx.com:6961/announce&tr=http://tracker.etree.org:6969/announce&tr=http://www.thetradersden.org/forums/tracker:80/announce.php&tr=udp://udp-tracker.shittyurl.org:6969/announce&tr=https://tracker.shittyurl.org/announce&tr=http://tracker.shittyurl.org/announce&tr=udp://bt.firebit.org:2710/announce&tr=http://bt.firebit.org:2710/announce&tr=udp://exodus.desync.com:6969/announce&tr=udp://tracker.torrent.eu.org:451/announce")
+    let magnet: Magnet = ("magnet:?xt=urn:btih:80638f9c2ee3589048030d8097d5925f85eaacfe&tr=http%3a%2f%2ft.nyaatracker.com%2fannounce&tr=http%3a%2f%2ftracker.kamigami.org%3a2710%2fannounce&tr=http%3a%2f%2fshare.camoe.cn%3a8080%2fannounce&tr=http%3a%2f%2fopentracker.acgnx.se%2fannounce&tr=http%3a%2f%2fanidex.moe%3a6969%2fannounce&tr=http%3a%2f%2ft.acg.rip%3a6699%2fannounce&tr=https%3a%2f%2ftr.bangumi.moe%3a9696%2fannounce&tr=udp%3a%2f%2ftr.bangumi.moe%3a6969%2fannounce&tr=http%3a%2f%2fopen.acgtracker.com%3a1096%2fannounce&tr=udp%3a%2f%2ftracker.opentrackr.org%3a1337%2fannounce")
         .parse()
         .unwrap();
     let info_hash = magnet.info_hash;
     session
         .add_torrent(TorrentTask::Magnet(magnet), vec![])
         // .add_torrent(TorrentTask::Torrent(metadata), vec![vec!["1".into()]])
+        // .add_torrent(TorrentTask::Torrent(metadata), vec![vec![]])
+        // .add_torrent(TorrentTask::Torrent(metadata), announce_list)
         .await;
     session
         .do_work(&info_hash, async |tm| {
             // TODO: this is ugly though, only sender can clone
+            // tm.check().await;
             tm.change_state(RunningCmd::Resume).await;
+            tm.wait_downloaded().await;
         })
         .await;
     if let Some(mut tm) = session.remove_torrent(&info_hash).await {

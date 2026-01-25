@@ -15,7 +15,7 @@ pub use block_picker::{BlockPicker, BlockPickerDump, BlockStatus};
 pub use rarest_first::Picker as RarestPicker;
 
 const BLOCK_SIZE: u32 = 16384;
-pub(crate) const BW_SLOT_SIZE: usize = 10;
+pub(crate) const BW_SLOT_SIZE: usize = 50;
 
 impl PieceState {
     pub fn have(&self, index: u32) -> bool {
