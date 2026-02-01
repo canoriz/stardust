@@ -9,7 +9,7 @@ use tokio::time;
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::sync::{CancellationToken, DropGuard};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::picker::{BlockRequests, PieceState};
 use crate::protocol::{
@@ -85,7 +85,7 @@ impl ConnectionManagerHandle {
         let (recv_tx, recv_rx) = mpsc::unbounded_channel();
         let (recv_done_tx, recv_done_rx) = oneshot::channel();
         let recv_cancel = CancellationToken::new();
-        let addr = read_stream.peer_addr();
+        let addr = to_canonical_addr(read_stream.peer_addr());
         let conn_break_guard = Arc::new(NotifyTransmitGuard {
             addr,
             transmit_handle: trh.clone(),
@@ -185,6 +185,9 @@ impl ConnectionManagerHandle {
                     self.bw_stat.n_recv_req.load(Ordering::Relaxed) + n / 2,
                     Ordering::Relaxed,
                 );
+            }
+            CtrlOfSend::Cancel(req) => {
+                // self.bw_stat.n_recv_req.fetch_add(1, Ordering::Relaxed);
             }
             _ => {}
         }
@@ -303,7 +306,7 @@ async fn run_recv_stream<T>(
     info!("in recv stream");
     let report_interval = time::Duration::from_millis(100);
     let mut ticker = tokio::time::interval(report_interval);
-    let addr = conn.read_stream.peer_addr();
+    let addr = to_canonical_addr(conn.read_stream.peer_addr());
 
     let pending_recvs = conn.read_stream.maybe_recv_pending_msg().await;
     for m in pending_recvs {
@@ -325,7 +328,7 @@ async fn run_recv_stream<T>(
             }
             _ = ticker.tick() => {
                 // TODO: many ticks may come together, unfair
-                // debug!("recv conn ticker tick {} block received in this epoch", conn.blk_recv_count);
+                debug!("{addr} recv stream ticker tick");
                 conn.handle_report_tick();
             }
             r = conn.read_stream.recv_msg() => {
@@ -359,7 +362,7 @@ where
     /// returns received count of received PIECE msg since previous
     /// update
     fn update_request_stat(&mut self) -> usize {
-        const TRACE_WINDOW: usize = 30;
+        const TRACE_WINDOW: usize = 60;
         let n_recv_in_period = {
             let n_recv = self.bw_stat.n_recv_req.load(Ordering::Relaxed);
             let ret = n_recv.saturating_sub(self.prev_check_recv_count) as usize;
@@ -367,7 +370,7 @@ where
             ret
         };
 
-        if self.prev_check_time.elapsed() > time::Duration::from_secs(10) {
+        if self.prev_check_time.elapsed() > time::Duration::from_secs(1) {
             // if true {
             self.prev_check_time = time::Instant::now();
             if self.history_n_recv_req.len() < TRACE_WINDOW {
@@ -422,7 +425,7 @@ where
         self.transmit_handle
             .sender
             .send(TransmitMsg::PeerMsg(PeerMsg::BlockReceived {
-                peer: self.read_stream.peer_addr(),
+                peer: to_canonical_addr(self.read_stream.peer_addr()),
                 n_req_in_flight,
                 n_recv_in_period,
             }));
@@ -612,7 +615,14 @@ where
             CtrlOfSend::Extend(ExtendedMsg::Metadata(m)) => {
                 self.write_stream.send_extend_metadata(m).await;
             }
-            other => {}
+            CtrlOfSend::Cancel(req) => {
+                self.write_stream
+                    .send_cancel(req.index, req.begin, req.len)
+                    .await;
+            }
+            other => {
+                warn!("send stream handle unimplemented cmd: {:?}", other);
+            }
         }
     }
 }
@@ -679,6 +689,10 @@ async fn handle_extended_msg(
             Ok(())
         }
     }
+}
+
+fn to_canonical_addr(s: SocketAddr) -> SocketAddr {
+    SocketAddr::new(s.ip().to_canonical(), s.port())
 }
 
 #[cfg(test)]

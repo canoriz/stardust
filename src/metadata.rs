@@ -264,7 +264,7 @@ fn ipv4_client() -> Result<Client, reqwest::Error> {
 }
 
 static IPV4_CLIENT: LazyLock<Option<Client>> = LazyLock::new(|| ipv4_client().ok());
-static IPV6_CLIENT: LazyLock<Option<Client>> = LazyLock::new(|| ipv4_client().ok());
+static IPV6_CLIENT: LazyLock<Option<Client>> = LazyLock::new(|| ipv6_client().ok());
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
 pub enum AnnounceType {

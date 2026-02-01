@@ -62,7 +62,7 @@ impl Session {
                 _ = c
                     .ping_rpc(
                         dht::RpcAddr::NoID(
-                            "[240e:b8f:5c68:8400:560d:1feb:27b8:741]:52733"
+                            "[240e:b8f:5c68:8400:560d:1feb:27b8:741]:60978"
                                 .parse()
                                 .unwrap(),
                         ),

@@ -135,13 +135,14 @@ impl PieceBlocks {
                                         .alt_timeout
                                         .get(p)
                                         .map(|d| *d)
-                                        .unwrap_or(time::Duration::from_secs(15))
-                                        .min(time::Duration::from_secs(15))
+                                        .unwrap_or(time::Duration::from_secs(5))
+                                        .min(time::Duration::from_secs(5))
                             })
                             .count()
                             == 0;
 
-                        if all_no_response_more_than_5 {
+                        if all_no_response_more_than_5 && !addr.contains_key(&peer) {
+                            // if !addr.contains_key(&peer) {
                             count += 1;
                             info!("{peer:?} repick {req:?}, addr {addr:?}");
                             addr.insert(
@@ -482,7 +483,7 @@ impl BlockPicker {
         let endgame = self.update_endgame();
         let repick_option = if self.rush_mode() {
             RepickOption {
-                repick_limit: 2, // TODO: set a proper repick limit
+                repick_limit: 7, // TODO: set a proper repick limit
                 alt_timeout: rtts,
             }
         } else {
