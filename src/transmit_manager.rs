@@ -508,7 +508,6 @@ impl TransmitWorker {
         let opt = HandshakeOption::builder()
             .client_id(id)
             .dht_port(dht_client.as_ref().map(|c| c.port()))
-            .port()
             .build();
         let downloaded = watch::channel(false).0;
         Self {
@@ -890,19 +889,19 @@ impl TransmitWorker {
 
                 const TEN_SECS: time::Duration = time::Duration::from_secs(10);
                 // TODO: this 10 is set randomly, choose a good value value instead
-                let (max_bw, min_rtt) = conn.bw.count_max_bw_and_min_rtt(TEN_SECS);
+                let (max_bw, min_rtt_in_period) = conn.bw.count_max_bw_and_min_rtt(TEN_SECS);
                 let avg_bw =
                     conn.bw.count_bytes_within_period(TEN_SECS).0 as f32 / TEN_SECS.as_secs_f32();
                 let rtt = conn
                     .bw
                     .get_rtt(TEN_SECS)
                     .max(time::Duration::from_millis(10));
-                warn!("peer {peer} estimated max bandwidth {max_bw}, min rtt {min_rtt:?} req in flight: {n_req_in_flight}");
-                let probe_rtt_interval = (min_rtt * 10)
+                warn!("peer {peer} estimated max bandwidth {max_bw}, min rtt {min_rtt_in_period:?} req in flight: {n_req_in_flight}");
+                let probe_rtt_interval = (min_rtt_in_period * 10)
                     .max(TEN_SECS)
                     .min(time::Duration::from_secs(30));
 
-                let optimum_bdp = 2.0 * min_rtt.as_secs_f32() * max_bw;
+                let optimum_bdp = 2.0 * min_rtt_in_period.as_secs_f32() * max_bw;
 
                 let n_to_pick = match conn.bw_mode {
                     BandwidthMode::Auto {
@@ -910,27 +909,35 @@ impl TransmitWorker {
                         ref mut min_rtt,
                     } => {
                         let since_auto = *since;
-                        let min_rtt2 = *min_rtt;
-                        let slow_down_to = |optimum_inflight: usize, mode: &mut BandwidthMode| {
-                            let expire = time::Instant::now()
-                                + rtt.mul_f32(
-                                    (n_req_in_flight.saturating_sub(optimum_inflight)) as f32 * 1.3,
-                                );
-                            *mode = BandwidthMode::SlowDown {
-                                since_auto,
-                                last_piece_time: time::Instant::now(),
-                                min_rtt: min_rtt2,
-                                inflight_target: optimum_inflight,
-                                expire,
-                                rtt_before: rtt,
-                                faster: false,
+                        let slow_down_to =
+                            |optimum_inflight: usize,
+                             mode: &mut BandwidthMode,
+                             min_rtt: time::Duration| {
+                                let expire = time::Instant::now()
+                                    + rtt
+                                        .mul_f32(
+                                            (n_req_in_flight.saturating_sub(optimum_inflight))
+                                                as f32
+                                                * 1.3,
+                                        )
+                                        .max(time::Duration::from_secs(10));
+                                *mode = BandwidthMode::SlowDown {
+                                    since_auto,
+                                    last_piece_time: time::Instant::now(),
+                                    min_rtt,
+                                    inflight_target: optimum_inflight,
+                                    expire,
+                                    rtt_before: rtt,
+                                    faster: false,
+                                };
                             };
-                        };
 
                         // if false
                         if since.elapsed() > probe_rtt_interval {
                             info!("{peer} after {probe_rtt_interval:?} no smaller rtt to SlowDown mode");
-                            slow_down_to(0, &mut conn.bw_mode);
+                            let min_rtt2 = *min_rtt;
+                            conn.bw.shrink_reset_slope(10);
+                            slow_down_to(0, &mut conn.bw_mode, min_rtt2);
                             0
                         } else {
                             if rtt < min_rtt.mul_f32(1.2) {
@@ -948,15 +955,28 @@ impl TransmitWorker {
                             );
 
                             let mut optimum_inflight = optimum_bdp as usize / 16384;
+
+                            let match_slope = rtt_slope as f32 * avg_bw / 16384.0;
+                            let slow_limit =
+                                (*min_rtt + time::Duration::from_millis(500)).mul_f32(1.5);
+                            info!(
+                                "avg_bw = {avg_bw} match_slope = {} min rtt {:?} slow_limit {:?} avg rtt {:?}",
+                                match_slope, *min_rtt, slow_limit, rtt
+                            );
                             if conn.bw.get_rtt_n_points() >= 10 {
                                 if rtt_correlation > 0.85
-                                // && rtt_slope as f32 > (2.0 * 16384f32 / max_bw)
+                                    && match_slope < 1.20
+                                    && match_slope > 0.80
+                                    || rtt > slow_limit
                                 {
-                                    if rtt > *min_rtt + time::Duration::from_millis(100) {
+                                    // if rtt > min_rtt_in_period + time::Duration::from_millis(100) {
+                                    conn.bw.shrink_reset_slope(10);
+                                    if true {
                                         optimum_inflight =
                                             (conn.bw.get_optimum_in_flight() as f32 * 0.9) as usize;
-                                        info!("{peer} linear-increase threshold bw {max_bw} slow down to {optimum_inflight} inflight");
-                                        slow_down_to(optimum_inflight, &mut conn.bw_mode);
+                                        info!("{peer} linear-increase threshold bw {avg_bw} slow down to {optimum_inflight} inflight");
+                                        let min_rtt2 = *min_rtt;
+                                        slow_down_to(optimum_inflight, &mut conn.bw_mode, min_rtt2);
                                     } else {
                                         info!(
                                             "{peer} rtt linear-increase avg rtt {rtt:?}, min rtt {min_rtt:?} keep auto mode",
@@ -1031,8 +1051,14 @@ impl TransmitWorker {
                             || time::Instant::now() > expire
                         {
                             let now = time::Instant::now();
-                            let timeout = rtt_before.mul_f32(TEST_RTT_BURST as f32 * 1.2);
+                            let timeout = rtt_before
+                                .mul_f32(TEST_RTT_BURST as f32 * 1.2)
+                                .max(time::Duration::from_secs(10));
                             if *faster || inflight_target == 0 {
+                                info!(
+                                    "{peer} change from Slowdown to Auto mode, faster {} inflight target {inflight_target}",
+                                    *faster,
+                                );
                                 conn.bw_mode = BandwidthMode::Auto {
                                     since: time::Instant::now(),
                                     min_rtt: *min_rtt,
@@ -1085,16 +1111,19 @@ impl TransmitWorker {
                                 min_rtt: *min_rtt,
                             };
                         } else if *n_to_receive == 0 || time::Instant::now() > expire {
+                            info!(
+                                "{peer} probeRTT mode progress change back to Auto recv {}",
+                                *n_to_receive
+                            );
                             conn.bw_mode = BandwidthMode::Auto {
-                                since: time::Instant::now(),
-                                min_rtt: rtt,
+                                since: *since_auto,
+                                min_rtt: *min_rtt,
                             };
                         }
                         n_recv_in_period
                     }
                     BandwidthMode::Choked => 0,
                 };
-                conn.bw.shrink_reset_slope(10);
 
                 if matches!(self.running_state, RunningState::Downloading) {
                     if conn.state.peer_choke_status == ChokeStatus::Unchoked {
@@ -1268,6 +1297,20 @@ impl TransmitWorker {
             }
         };
 
+        let req = Request {
+            index: piece.index,
+            begin: piece.begin,
+            len: piece.len,
+        };
+
+        if let Some(pc) = self.connected_peers.get_mut(peer) {
+            let rtt = block_picker.get_rtt(peer, &req);
+            let inflight_when_sent = block_picker.get_inflight_when_sent(peer, &req);
+            pc.bw
+                .add_sample(piece.len as usize, rtt, inflight_when_sent);
+            info!("{peer} add sample {rtt:?}, inflight when sent {inflight_when_sent:?}");
+        }
+
         let conn = self
             .connected_peers
             .get_mut(&to_canonical_addr(*peer))
@@ -1287,20 +1330,6 @@ impl TransmitWorker {
                 *last_piece_time = time::Instant::now();
             }
         };
-
-        let req = Request {
-            index: piece.index,
-            begin: piece.begin,
-            len: piece.len,
-        };
-
-        if let Some(pc) = self.connected_peers.get_mut(peer) {
-            let rtt = block_picker.get_rtt(peer, &req);
-            let inflight_when_sent = block_picker.get_inflight_when_sent(peer, &req);
-            pc.bw
-                .add_sample(piece.len as usize, rtt, inflight_when_sent);
-            info!("{peer} add sample {rtt:?}, inflight when sent {inflight_when_sent:?}");
-        }
 
         if !block_picker.want_block(req) {
             warn!(

@@ -195,7 +195,6 @@ impl ConnectionManagerHandle {
         let c = self.send_stream.sender.clone();
         c.send(m);
         // tokio::spawn(async move {
-        //     time::sleep(time::Duration::from_secs(3)).await;
         //     c.send(m);
         // });
     }
@@ -370,7 +369,7 @@ where
             ret
         };
 
-        if self.prev_check_time.elapsed() > time::Duration::from_secs(1) {
+        if self.prev_check_time.elapsed() > time::Duration::from_secs(1000) {
             // if true {
             self.prev_check_time = time::Instant::now();
             if self.history_n_recv_req.len() < TRACE_WINDOW {

@@ -80,7 +80,7 @@ impl SlidingWindowRegression {
     }
 
     pub fn shrink_to(&mut self, n: usize) {
-        if self.window.len() > n {
+        while self.window.len() > n {
             if let Some((x, y)) = self.window.pop_front() {
                 self.remove_step(x, y)
             }

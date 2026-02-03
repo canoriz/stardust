@@ -255,7 +255,7 @@ impl metadata::Announce for FakeAnnouncer {
                 metadata::Peer {
                     peer_id: "1384".into(),
                     ip: "127.0.0.1".into(),
-                    port: 6881,
+                    port: 38070,
                 },
                 // metadata::Peer {
                 //     peer_id: "1384".into(),
