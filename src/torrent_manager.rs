@@ -25,7 +25,7 @@ impl TorrentManagerHandle {
         };
 
         let am = AnnounceManagerHandle::new(self_id, port, info_hash, tx.clone());
-        let tm = TransmitManager::new(t, self_id, tx.clone(), rx, dht_client, am);
+        let tm = TransmitManager::new(t, self_id, port, tx.clone(), rx, dht_client, am);
 
         Self {
             sender: TransmitManagerSender(tx),

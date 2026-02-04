@@ -204,6 +204,7 @@ impl TransmitManager {
     pub fn new(
         t: TorrentTask,
         id: [u8; 20],
+        port: u16,
         cmd_sender: mpsc::UnboundedSender<Msg>,
         cmd_receiver: mpsc::UnboundedReceiver<Msg>,
         dht_client: Option<Arc<DHT>>,
@@ -212,6 +213,7 @@ impl TransmitManager {
         let worker = TransmitWorker::new(
             t,
             id,
+            port,
             dht_client,
             announce_manager,
             cmd_sender,
@@ -485,6 +487,7 @@ impl TransmitWorker {
     pub fn new(
         t: TorrentTask,
         id: [u8; 20],
+        port: u16,
         dht_client: Option<Arc<DHT>>,
         announce_manager: AnnounceManagerHandle,
         cmd_sender: mpsc::UnboundedSender<Msg>,
@@ -507,6 +510,7 @@ impl TransmitWorker {
         };
         let opt = HandshakeOption::builder()
             .client_id(id)
+            .port(port)
             .dht_port(dht_client.as_ref().map(|c| c.port()))
             .build();
         let downloaded = watch::channel(false).0;
@@ -960,7 +964,7 @@ impl TransmitWorker {
                             let slow_limit =
                                 (*min_rtt + time::Duration::from_millis(500)).mul_f32(1.5);
                             info!(
-                                "avg_bw = {avg_bw} match_slope = {} min rtt {:?} slow_limit {:?} avg rtt {:?}",
+                                "{peer} avg_bw = {avg_bw} match_slope = {} min rtt {:?} slow_limit {:?} avg rtt {:?}",
                                 match_slope, *min_rtt, slow_limit, rtt
                             );
                             if conn.bw.get_rtt_n_points() >= 10 {
