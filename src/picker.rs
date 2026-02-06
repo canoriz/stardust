@@ -186,7 +186,7 @@ pub struct PieceMap {
 // }
 
 // many consecutive block ranges
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub(crate) struct BlockRequests {
     pub piece_size: u32,
     pub range: Vec<BlockRange>,
@@ -195,6 +195,13 @@ pub(crate) struct BlockRequests {
 impl BlockRequests {
     pub fn len(&self) -> usize {
         self.range.iter().map(|r| r.len(self.piece_size)).sum()
+    }
+
+    pub fn none() -> Self {
+        Self {
+            piece_size: 0,
+            range: Vec::new(),
+        }
     }
 }
 

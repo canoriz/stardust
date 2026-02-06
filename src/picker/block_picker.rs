@@ -290,8 +290,11 @@ impl PieceBlocks {
     }
 
     /// revoke request of one peer for all `Requested` which fulfils condition
-    fn revoke_all_requested_if<F>(&mut self, remove: F)
-    where
+    fn revoke_all_requested_if<F>(
+        &mut self,
+        remove: F,
+        revoked: &mut HashMap<PeerAddr, Vec<Request>>,
+    ) where
         F: Fn(&PeerAddr, &time::Instant) -> bool,
     {
         let n_blocks = self.block_map.len();
@@ -313,6 +316,10 @@ impl PieceBlocks {
                                 "revoke block {req:?} from {p}, issued at {t:?}, after {:?}",
                                 t.pick_time.elapsed()
                             );
+                            revoked
+                                .entry(*p)
+                                .and_modify(|r| r.push(req))
+                                .or_insert(vec![req]);
                             false
                         } else {
                             true
@@ -469,6 +476,7 @@ impl BlockPicker {
     /// (
     ///  picked blocks,
     ///  number of picked blocks,
+    ///  no response blocks
     /// )
     pub fn pick_blocks(
         &mut self,
@@ -476,8 +484,9 @@ impl BlockPicker {
         rtts: &HashMap<PeerAddr, time::Duration>,
         n: usize,
         mut n_in_flight: usize,
+        revoked: &mut HashMap<PeerAddr, Vec<Request>>,
     ) -> (BlockRequests, usize) {
-        self.revoke_unrespond(time::Duration::from_secs(90));
+        self.revoke_unrespond(time::Duration::from_secs(90), revoked);
         self.prev_time_check = time::Instant::now();
 
         let endgame = self.update_endgame();
@@ -508,6 +517,7 @@ impl BlockPicker {
             );
         };
 
+        // TODO: reuse vector
         let mut ret = Vec::new();
         for (index, blocks) in &mut self.requesting {
             assert!(!endgame);
@@ -739,10 +749,14 @@ impl BlockPicker {
 
     /// Mark blocks as `NotRequested` if they are `Requested` and did not respond
     /// longer than timeout
-    fn revoke_unrespond(&mut self, timeout: time::Duration) {
+    fn revoke_unrespond(
+        &mut self,
+        timeout: time::Duration,
+        revoked: &mut HashMap<PeerAddr, Vec<Request>>,
+    ) {
         let no_response = |_: &PeerAddr, at: &time::Instant| at.elapsed() > timeout;
         for (index, blocks) in self.receiving.iter_mut() {
-            blocks.revoke_all_requested_if(no_response);
+            blocks.revoke_all_requested_if(no_response, revoked);
             if !blocks.is_all_requested_or_received() {
                 self.requesting.insert(*index, blocks.clone());
             }
@@ -751,7 +765,7 @@ impl BlockPicker {
             .retain(|_, b| b.is_all_requested_or_received());
 
         for (index, blocks) in self.requesting.iter_mut() {
-            blocks.revoke_all_requested_if(no_response);
+            blocks.revoke_all_requested_if(no_response, revoked);
             if blocks.is_all_not_requested() {
                 self.piece_picker.set_have(*index, false);
             }
@@ -873,8 +887,9 @@ impl BlockPicker {
     pub fn peer_choke(&mut self, peer: &PeerAddr) {
         let requested_peer = |p: &PeerAddr, _: &time::Instant| p == peer;
 
+        let mut revoked = HashMap::new();
         for (i, b) in self.receiving.iter_mut() {
-            b.revoke_all_requested_if(requested_peer);
+            b.revoke_all_requested_if(requested_peer, &mut revoked);
             if !b.is_all_requested_or_received() {
                 self.requesting.insert(*i, b.clone());
                 info!("345");
@@ -884,7 +899,7 @@ impl BlockPicker {
             .retain(|_, b| b.is_all_requested_or_received());
 
         for (i, b) in self.requesting.iter_mut() {
-            b.revoke_all_requested_if(requested_peer);
+            b.revoke_all_requested_if(requested_peer, &mut revoked);
             if b.is_all_not_requested() {
                 self.piece_picker.set_have(*i, false);
             }
@@ -1072,7 +1087,8 @@ mod test {
             assert_eq!(b.requested_or_received_count, 49);
         }
         {
-            b.revoke_all_requested_if(|_, _| true);
+            let mut revoked = HashMap::new();
+            b.revoke_all_requested_if(|_, _| true, &mut revoked);
             assert!(!b.is_all_requested_or_received());
             assert_eq!(b.all_request_or_received_before, 10);
             assert_eq!(b.received_count, 11);
@@ -1303,7 +1319,8 @@ mod test {
         let rtts = HashMap::new();
 
         {
-            let picked = b.pick_blocks(&PEER1, &rtts, 0, 15);
+            let mut revoked = HashMap::new();
+            let picked = b.pick_blocks(&PEER1, &rtts, 0, 15, &mut revoked);
             let exp = BlockRequests {
                 piece_size: PIECE_SIZE as u32,
                 range: vec![
@@ -1339,7 +1356,8 @@ mod test {
 
         // test pick2
         {
-            let picked = b.pick_blocks(&PEER2, &rtts, 0, 1);
+            let mut revoked = HashMap::new();
+            let picked = b.pick_blocks(&PEER2, &rtts, 0, 1, &mut revoked);
             let exp = BlockRequests {
                 piece_size: PIECE_SIZE as u32,
                 range: vec![BlockRange {
@@ -1361,7 +1379,8 @@ mod test {
         // test un-select
         {
             b.select(2, false);
-            let picked = b.pick_blocks(&PEER1, &rtts, 0, 5);
+            let mut revoked = HashMap::new();
+            let picked = b.pick_blocks(&PEER1, &rtts, 0, 5, &mut revoked);
             let exp = BlockRequests {
                 piece_size: PIECE_SIZE as u32,
                 range: vec![BlockRange {

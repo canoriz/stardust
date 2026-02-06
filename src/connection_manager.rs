@@ -49,8 +49,6 @@ pub(crate) struct ConnectionManagerHandle {
     send_stream: SendStreamHandle,
     capability: CapabilityMap,
     metadata_size: usize,
-
-    bw_stat: Arc<BandwidthStat>,
 }
 
 impl ConnectionManagerHandle {
@@ -91,20 +89,10 @@ impl ConnectionManagerHandle {
             transmit_handle: trh.clone(),
         });
 
-        let bw_stat = Arc::new(BandwidthStat {
-            n_sent_req: AtomicU32::new(0),
-            n_recv_req: AtomicU32::new(0),
-            report_when: AtomicU32::new(0),
-        });
         let recv_stream = RecvStream::<BufReader<R>> {
             receiver: recv_rx,
             read_stream,
             transmit_handle: trh.clone(),
-            bw_stat: bw_stat.clone(),
-            prev_check_time: time::Instant::now(),
-            prev_check_recv_count: 0,
-            history_n_recv_req: VecDeque::new(),
-            history_n_sent_req: VecDeque::new(),
             _drop_guard: conn_break_guard.clone(),
         };
 
@@ -114,7 +102,6 @@ impl ConnectionManagerHandle {
         let send_stream = SendStream::<BufWriter<W>> {
             receiver: send_rx,
             write_stream,
-            bw_stat: bw_stat.clone(),
             _drop_guard: conn_break_guard,
         };
 
@@ -144,7 +131,6 @@ impl ConnectionManagerHandle {
             send_stream: send_stream_handle,
             capability,
             metadata_size,
-            bw_stat,
         }
     }
 
@@ -168,30 +154,7 @@ impl ConnectionManagerHandle {
     //     }
     // }
 
-    pub fn get_n_in_flight(&self) -> u32 {
-        let old_sent = self.bw_stat.n_sent_req.load(Ordering::Relaxed);
-        let old_recv = self.bw_stat.n_recv_req.load(Ordering::Relaxed);
-        old_sent.max(old_recv) - old_recv
-    }
-
     pub fn send_stream_cmd(&self, m: CtrlOfSend) {
-        match &m {
-            CtrlOfSend::RequestBlocks(reqs) => {
-                let n = reqs.len() as u32;
-                let p = self.bw_stat.n_sent_req.fetch_add(n, Ordering::Relaxed);
-
-                // woke when half of in flight request is received
-                self.bw_stat.report_when.store(
-                    self.bw_stat.n_recv_req.load(Ordering::Relaxed) + n / 2,
-                    Ordering::Relaxed,
-                );
-            }
-            CtrlOfSend::Cancel(req) => {
-                // self.bw_stat.n_recv_req.fetch_add(1, Ordering::Relaxed);
-            }
-            _ => {}
-        }
-
         let c = self.send_stream.sender.clone();
         c.send(m);
         // tokio::spawn(async move {
@@ -254,18 +217,6 @@ struct RecvStream<T> {
     read_stream: ReadStream<T>,
     transmit_handle: TransmitManagerHandle,
     _drop_guard: Arc<NotifyTransmitGuard>,
-
-    bw_stat: Arc<BandwidthStat>,
-
-    // previous check time of sent/received requests
-    prev_check_time: time::Instant,
-    prev_check_recv_count: u32,
-
-    /// history of number of received requests in every tick
-    history_n_recv_req: VecDeque<u32>,
-
-    /// history of number of sent requests in every tick
-    history_n_sent_req: VecDeque<u32>,
 }
 
 struct SendStreamHandle {
@@ -277,9 +228,6 @@ struct SendStreamHandle {
 struct SendStream<T> {
     receiver: mpsc::UnboundedReceiver<CtrlOfSend>,
     write_stream: WriteStream<T>,
-
-    bw_stat: Arc<BandwidthStat>,
-
     _drop_guard: Arc<NotifyTransmitGuard>,
 }
 
@@ -357,76 +305,11 @@ impl<T> RecvStream<T>
 where
     T: AsyncRead + Unpin,
 {
-    /// update sent REQUEST msg count and received PIECE msg count
-    /// returns received count of received PIECE msg since previous
-    /// update
-    fn update_request_stat(&mut self) -> usize {
-        const TRACE_WINDOW: usize = 60;
-        let n_recv_in_period = {
-            let n_recv = self.bw_stat.n_recv_req.load(Ordering::Relaxed);
-            let ret = n_recv.saturating_sub(self.prev_check_recv_count) as usize;
-            self.prev_check_recv_count = n_recv;
-            ret
-        };
-
-        if self.prev_check_time.elapsed() > time::Duration::from_secs(1000) {
-            // if true {
-            self.prev_check_time = time::Instant::now();
-            if self.history_n_recv_req.len() < TRACE_WINDOW {
-                self.history_n_recv_req
-                    .push_back(self.bw_stat.n_recv_req.load(Ordering::Relaxed));
-                self.history_n_sent_req
-                    .push_back(self.bw_stat.n_sent_req.load(Ordering::Relaxed));
-            } else {
-                let n_recv_ago = self.history_n_recv_req.pop_front().unwrap();
-                let n_sent_ago = self.history_n_sent_req.pop_front().unwrap();
-
-                self.prev_check_recv_count = self.prev_check_recv_count.saturating_sub(n_recv_ago);
-                self.bw_stat
-                    .n_recv_req
-                    .fetch_sub(n_recv_ago, Ordering::Relaxed);
-                self.bw_stat
-                    .report_when
-                    .fetch_sub(n_recv_ago, Ordering::Relaxed);
-                self.bw_stat
-                    .n_sent_req
-                    .fetch_sub(n_sent_ago, Ordering::Relaxed);
-
-                for v in self.history_n_recv_req.iter_mut() {
-                    *v = *v - n_recv_ago;
-                }
-                for v in self.history_n_sent_req.iter_mut() {
-                    *v = *v - n_sent_ago;
-                }
-
-                self.history_n_recv_req
-                    .push_back(self.bw_stat.n_recv_req.load(Ordering::Relaxed));
-                self.history_n_sent_req
-                    .push_back(self.bw_stat.n_sent_req.load(Ordering::Relaxed));
-            }
-        }
-        n_recv_in_period
-    }
-
-    /// return estimated number of requests in flight
-    fn n_request_in_flight(&self) -> usize {
-        let sent = self.bw_stat.n_sent_req.load(Ordering::Relaxed) as i32;
-        let recv = self.bw_stat.n_recv_req.load(Ordering::Relaxed) as i32;
-        (sent - recv).max(0) as usize
-    }
-
     fn handle_report_tick(&mut self) {
-        // TODO: FIXME: update_request_stat(push and correct deque) every time
-        // or on a scheduled basis?
-        let n_recv_in_period = self.update_request_stat();
-        let n_req_in_flight = self.n_request_in_flight();
-
         self.transmit_handle
             .sender
             .send(TransmitMsg::PeerMsg(PeerMsg::BlockReceived {
                 peer: to_canonical_addr(self.read_stream.peer_addr()),
-                n_req_in_flight,
-                n_recv_in_period,
             }));
     }
 
@@ -492,20 +375,10 @@ where
                     .send(TransmitMsg::PeerMsg(PeerMsg::Request(addr, req)));
             }
             Message::Piece(piece) => {
-                self.bw_stat.n_recv_req.fetch_add(1, Ordering::Relaxed);
                 tmh.sender
                     .send(TransmitMsg::PeerMsg(PeerMsg::Piece(addr, piece)));
 
-                // self.handle_report_tick();
-                info!("{:?}", self.bw_stat);
-                let n_recv_req = self.bw_stat.n_recv_req.load(Ordering::Relaxed);
-                let report_when = self.bw_stat.report_when.swap(u32::MAX, Ordering::Relaxed);
-                if n_recv_req >= report_when {
-                    info!("report tick1");
-                    // self.handle_report_tick();
-                } else {
-                    info!("delay report n_recv_req {n_recv_req} report when {report_when}");
-                }
+                // TODO: report only when inflight request is almost none
                 self.handle_report_tick();
             }
             Message::Cancel(req) => {
@@ -540,7 +413,6 @@ where
                 )));
             }
             Message::Reject(req) => {
-                self.bw_stat.n_recv_req.fetch_add(1, Ordering::Relaxed);
                 tmh.sender
                     .send(TransmitMsg::PeerMsg(PeerMsg::Reject(addr, req)));
             }
