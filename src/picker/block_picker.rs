@@ -608,7 +608,8 @@ impl BlockPicker {
                     {
                         remain -= n_picked;
                         let pb: Vec<_> = blks.iter(self.piece_size as u32).collect();
-                        debug!("pick piece {index} from peer {peer} (requested rush mode), picked blks: {pb:?}, repick_option: {repick_option:?}");
+                        debug!("{peer} pick piece {index} (pick_next), inflight {n_in_flight}");
+                        debug!("{peer} (pick_next), picked blks: {pb:?}, repick_option: {repick_option:?}");
                         ret.push(blks);
                     }
                 }
@@ -628,7 +629,10 @@ impl BlockPicker {
                 {
                     remain -= n_picked;
                     let pb: Vec<_> = blks.iter(self.piece_size as u32).collect();
-                    debug!("pick piece {index} from peer {peer} (pick_next), picked blks: {pb:?}, {:?}", blocks.block_map);
+                    debug!(
+                        "{peer} pick piece {index} (pick_next), inflight {n_in_flight}"
+                    );
+                    debug!("{peer} picked blks: {pb:?}, {:?}", blocks.block_map);
                     ret.push(blks);
                 }
                 assert!(!self.requesting.contains_key(&index));

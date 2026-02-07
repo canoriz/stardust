@@ -156,10 +156,11 @@ impl ConnectionManagerHandle {
 
     pub fn send_stream_cmd(&self, m: CtrlOfSend) {
         let c = self.send_stream.sender.clone();
-        c.send(m);
-        // tokio::spawn(async move {
-        //     c.send(m);
-        // });
+        // c.send(m);
+        tokio::spawn(async move {
+            time::sleep(time::Duration::from_millis(800)).await;
+            c.send(m);
+        });
     }
 
     pub fn recv_stream_cmd(&self, m: CtrlOfRecv) {
