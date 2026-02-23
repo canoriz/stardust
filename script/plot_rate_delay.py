@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 import re
 import sys
 import os
@@ -10,39 +11,57 @@ from datetime import datetime
 # --- 页面配置 ---
 st.set_page_config(page_title="Stardust CC Analyzer Pro", layout="wide")
 
-# 初始化 Session State 用于保持滑动条位置
 if 'offset_val' not in st.session_state:
     st.session_state.offset_val = 0
 
 # --- 核心解析逻辑 ---
 @st.cache_data
 def parse_log_content(lines):
+    # 正则1: 原始采样 (add sample)
     sample_re = re.compile(
-        r"src/transmit_manager\.rs:\d+:\s+(?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+)\s+add sample Some\((?P<delay>[\d.]+)(?P<unit>ms|s)\),\s+inflight when sent Some\((?P<inflight>\d+)\)"
+        r"src/transmit_manager\.rs:\d+:\s+(?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+)\s+add\s+sample\s+Some\((?P<delay>[\d.]+)(?P<unit>ms|s)\),\s+inflight\s+when\s+sent\s+Some\((?P<inflight>\d+)\)"
+    )
+    # 正则2: 自动模式指标 (Auto mode)
+    auto_re = re.compile(
+        r"src/transmit_manager\.rs:\d+:\s+(?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+)\s+Auto mode optimum inflight (?P<opt_if>\d+) min rtt (?P<min_rtt>[\d.]+)ms avg bw (?P<bw>\d+) req in flight (?P<req_if>\d+)"
     )
 
-    data = []
+    samples, autos = [], []
     for line in lines:
-        match = sample_re.search(line)
-        if match:
-            try:
-                ts_str = line.split(' ')[0].replace('Z', '+00:00')
-                ts = datetime.fromisoformat(ts_str).timestamp()
+        try:
+            parts = line.split()
+            if len(parts) < 1: continue
+            dt_str = parts[0].replace('Z', '+00:00')
+            dt = datetime.fromisoformat(dt_str)
+            ts = dt.timestamp()
 
-                raw_delay = float(match.group('delay'))
-                unit = match.group('unit')
-                delay_ms = raw_delay * 1000.0 if unit == 's' else raw_delay
+            if "add sample" in line:
+                match = sample_re.search(line)
+                if match:
+                    raw_delay = float(match.group('delay'))
+                    unit = match.group('unit')
+                    delay_ms = raw_delay * 1000.0 if unit == 's' else raw_delay
+                    samples.append({
+                        'dt': dt, 'ts': ts, 'peer': match.group('ip_port'),
+                        'delay': delay_ms, 'inflight': int(match.group('inflight'))
+                    })
+            elif "Auto mode" in line:
+                match = auto_re.search(line)
+                if match:
+                    # 将原始 B 换算为 KB
+                    bw_kb = float(match.group('bw')) / 1024.0
+                    autos.append({
+                        'dt': dt, 'ts': ts, 'peer': match.group('ip_port'),
+                        'opt_if': int(match.group('opt_if')),
+                        'min_rtt': float(match.group('min_rtt')),
+                        'bw': bw_kb,
+                        'req_if': int(match.group('req_if'))
+                    })
+        except Exception: continue
 
-                data.append({
-                    'ts': ts,
-                    'peer': match.group('ip_port'),
-                    'delay': delay_ms,
-                    'inflight': int(match.group('inflight'))
-                })
-            except: continue
-    return pd.DataFrame(data)
+    return pd.DataFrame(samples), pd.DataFrame(autos)
 
-# --- 命令行输入处理 ---
+# --- 文件加载 ---
 cmd_file = None
 if len(sys.argv) > 1:
     for arg in sys.argv[1:]:
@@ -50,9 +69,8 @@ if len(sys.argv) > 1:
             cmd_file = arg
             break
 
-# --- 侧边栏 ---
-st.sidebar.title("🚀 增强分析控制")
-uploaded_file = st.sidebar.file_uploader("1. 上传日志", type=['log', 'txt'])
+st.sidebar.title("🚀 Stardust 传输分析器")
+uploaded_file = st.sidebar.file_uploader("1. 上传日志文件", type=['log', 'txt'])
 
 lines = None
 if uploaded_file:
@@ -62,118 +80,145 @@ elif cmd_file:
         lines = f.readlines()
 
 if lines:
-    df = parse_log_content(lines)
-    if df.empty:
-        st.error("❌ 匹配失败，请检查日志格式。")
+    df_samples, df_autos = parse_log_content(lines)
+
+    if df_samples.empty and df_autos.empty:
+        st.error("❌ 未能识别到有效数据。")
         st.stop()
 
-    df = df.sort_values('ts').reset_index(drop=True)
+    # 统计 Blocks
+    sample_counts = df_samples['peer'].value_counts().to_dict() if not df_samples.empty else {}
+    peer_set_s = set(df_samples['peer'].unique()) if not df_samples.empty else set()
+    peer_set_a = set(df_autos['peer'].unique()) if not df_autos.empty else set()
+    all_peers_list = sorted(list(peer_set_s.union(peer_set_a)))
 
-    # --- 逻辑更新：按接收样本数(Recv)排序 ---
-    peer_counts = df['peer'].value_counts() # 自动降序排列
-    sorted_peers = peer_counts.index.tolist()
-    peer_labels = [f"{p} (Recv: {peer_counts[p]})" for p in sorted_peers]
+    peer_labels = [f"{p} (Blocks: {sample_counts.get(p, 0)})" for p in all_peers_list]
+    peer_labels.sort(key=lambda x: int(re.search(r'Blocks: (\d+)', x).group(1)), reverse=True)
+    label_to_peer = {f"{p} (Blocks: {sample_counts.get(p,0)})": p for p in all_peers_list}
 
-    # 建立 label 到原始 peer string 的映射
-    label_to_peer = dict(zip(peer_labels, sorted_peers))
-
-    selected_label = st.sidebar.selectbox("2. 选择 Peer (已按活跃度排序)", peer_labels)
+    selected_label = st.sidebar.selectbox("2. 选择 Peer", peer_labels)
     selected_peer = label_to_peer[selected_label]
 
-    peer_df = df[df['peer'] == selected_peer].copy().reset_index(drop=True)
+    peer_df = df_samples[df_samples['peer'] == selected_peer].copy().sort_values('ts').reset_index(drop=True)
+    peer_auto = df_autos[df_autos['peer'] == selected_peer].copy().sort_values('ts').reset_index(drop=True)
 
-    # 速率计算
-    window_pts = 20
-    peer_df['rate'] = (16.0 * window_pts) / (peer_df['ts'].diff(window_pts).fillna(1.0))
+    # 速率统计策略 (仅用于图3,4)
+    if not peer_df.empty:
+        st.sidebar.markdown("---")
+        st.sidebar.subheader("⚙️ 采样速率统计 (图3,4)")
+        min_samples = st.sidebar.number_input("最少统计点数 (N)", value=30, min_value=1)
+        min_secs = st.sidebar.number_input("最少时间片段 (秒)", value=1.0, step=0.1)
+        sample_size_kb = st.sidebar.number_input("单样本大小 (KiB)", value=16.0)
 
-    # --- 逻辑更新：保持滑动条位置 ---
+        ts_vals = peer_df['ts'].values
+        full_rates = np.zeros(len(ts_vals))
+        last_idx = 0
+        for i in range(1, len(ts_vals)):
+            count = i - last_idx
+            time_diff = ts_vals[i] - ts_vals[last_idx]
+            if count >= min_samples or time_diff >= min_secs:
+                avg_rate = (count * sample_size_kb) / max(time_diff, 0.001)
+                full_rates[last_idx:i+1] = avg_rate
+                last_idx = i
+        if last_idx < len(ts_vals):
+            full_rates[last_idx:] = full_rates[max(0, last_idx-1)] if last_idx > 0 else 0
+        peer_df['rate'] = full_rates
+
+    # 视图控制
     st.sidebar.markdown("---")
-    st.sidebar.subheader("3. 动态窗口调整")
-
-    # 使用 session_state 绑定 slider
-    offset_pct = st.sidebar.slider(
-        "起始位置 (Offset %)", 0, 100,
-        key="offset_slider",
-        value=st.session_state.offset_val
-    )
-    # 更新 session_state
+    offset_pct = st.sidebar.slider("起始位置 (%)", 0, 100, key="offset_slider", value=st.session_state.offset_val)
     st.session_state.offset_val = offset_pct
+    window_pct = st.sidebar.slider("展示窗口比例 (%)", 1, 100, 15)
 
-    window_pct = st.sidebar.slider("展示比例 (Window %)", 1, 100, 10)
+    ref_df = peer_df if not peer_df.empty else peer_auto
+    total_len = len(ref_df)
+    start_idx = int(total_len * (offset_pct / 100))
+    end_idx = min(int(start_idx + total_len * (window_pct / 100)), total_len)
 
-    total_pts = len(peer_df)
-    start_idx = int(total_pts * (offset_pct / 100))
-    end_idx = min(int(start_idx + total_pts * (window_pct / 100)), total_pts)
+    t_min, t_max = ref_df.iloc[start_idx]['ts'], ref_df.iloc[end_idx-1]['ts']
+    sub_df = peer_df[(peer_df['ts'] >= t_min) & (peer_df['ts'] <= t_max)]
+    sub_auto = peer_auto[(peer_auto['ts'] >= t_min) & (peer_auto['ts'] <= t_max)]
 
-    sub_df = peer_df.iloc[start_idx:end_idx]
-
-    # --- 绘图主体 ---
     st.title(f"📊 传输详情: {selected_peer}")
 
+    # 第一部分：旧版四张图
     if not sub_df.empty:
-        inf = sub_df['inflight'].values
-        dl = sub_df['delay'].values
-        rt = sub_df['rate'].values
-        tm = np.linspace(0, 1, len(sub_df))
+        inf, dl, rt = sub_df['inflight'].values, sub_df['delay'].values, sub_df['rate'].values
+        dts, tm = sub_df['dt'].values, np.linspace(0, 1, len(sub_df))
+        fig1 = plt.figure(figsize=(16, 12))
 
-        fig = plt.figure(figsize=(16, 12), facecolor='#ffffff')
-
-        # 1. 10x10 聚合气泡图
-        ax1 = fig.add_subplot(2, 2, 1)
-        bins_x, bins_y = 10, 10
-        inf_range = [inf.min(), inf.max()] if inf.min() != inf.max() else [inf.min()-1, inf.min()+1]
-        dl_range = [dl.min(), dl.max()] if dl.min() != dl.max() else [dl.min()-1, dl.min()+1]
-
-        inf_edges = np.linspace(inf_range[0], inf_range[1], bins_x + 1)
-        dl_edges = np.linspace(dl_range[0], dl_range[1], bins_y + 1)
-        b_inf, b_dl, b_rt, b_tm = [], [], [], []
-
-        for i in range(bins_x):
-            for j in range(bins_y):
-                mask = (inf >= inf_edges[i]) & (inf <= inf_edges[i+1]) & \
-                       (dl >= dl_edges[j]) & (dl <= dl_edges[j+1])
+        ax1 = fig1.add_subplot(2, 2, 1)
+        inf_edges = np.linspace(inf.min(), inf.max(), 11) if inf.min() != inf.max() else [inf.min(), inf.min()+1]
+        dl_edges = np.linspace(dl.min(), dl.max(), 11) if dl.min() != dl.max() else [dl.min(), dl.min()+1]
+        agg_inf, agg_dl, agg_rt, agg_tm = [], [], [], []
+        for i in range(10):
+            for j in range(10):
+                mask = (inf >= inf_edges[i]) & (inf <= inf_edges[i+1]) & (dl >= dl_edges[j]) & (dl <= dl_edges[j+1])
                 if np.any(mask):
-                    b_inf.append(np.mean(inf[mask]))
-                    b_dl.append(np.mean(dl[mask]))
-                    b_rt.append(np.mean(rt[mask]))
-                    b_tm.append(np.mean(tm[mask]))
+                    agg_inf.append(np.mean(inf[mask])); agg_dl.append(np.mean(dl[mask]))
+                    agg_rt.append(np.mean(rt[mask])); agg_tm.append(np.mean(tm[mask]))
+        if agg_inf:
+            max_rt_v = max(agg_rt) if max(agg_rt) > 0 else 1
+            ax1.scatter(agg_inf, agg_dl, s=[(r/max_rt_v*2000)+100 for r in agg_rt], c=agg_tm,
+                        cmap='rainbow_r', alpha=0.6, edgecolors='black', vmin=0, vmax=1)
+        ax1.set_title("1. Aggregate: Inflight-Delay (Size=Rate, Color=Time)"); ax1.set_ylabel("Delay (ms)"); ax1.grid(True, alpha=0.2)
 
-        if b_rt:
-            b_rt_arr = np.array(b_rt)
-            denom = b_rt_arr.max() - b_rt_arr.min() + 0.1
-            s_sizes = ((b_rt_arr - b_rt_arr.min()) / denom * 2500) + 150
-            ax1.scatter(b_inf, b_dl, c=b_tm, s=s_sizes, cmap='rainbow_r', alpha=0.8, edgecolors='black')
-        ax1.set_title("1. Performance Aggregation (10x10)", fontsize=14)
-        ax1.set_xlabel("Inflight (Packets)")
-        ax1.set_ylabel("Delay (ms)")
-        ax1.grid(True, alpha=0.3)
+        ax2 = fig1.add_subplot(2, 2, 2)
+        ax2.scatter(inf, dl, c=tm, cmap='rainbow_r', s=40, alpha=0.6, edgecolors='black', linewidths=0.1, vmin=0, vmax=1)
+        ax2.set_title("2. Raw Sample Distribution"); ax2.set_ylabel("Delay (ms)"); ax2.grid(True, alpha=0.2)
 
-        # 2. 原始分布图 (饱和度增强)
-        ax2 = fig.add_subplot(2, 2, 2)
-        ax2.scatter(inf, dl, c=tm, cmap='rainbow_r', s=45, alpha=0.7, edgecolors='black', linewidths=0.2)
-        ax2.set_title("2. Raw Inflight vs Delay (ms)", fontsize=14)
-        ax2.set_ylabel("Delay (ms)")
-        ax2.grid(True, alpha=0.3)
+        ax3 = fig1.add_subplot(2, 2, 3)
+        ax3.scatter(inf, rt, c=tm, cmap='rainbow_r', s=40, alpha=0.6, edgecolors='black', linewidths=0.1, vmin=0, vmax=1)
+        ax3.set_title("3. Inflight vs Smooth Rate"); ax3.set_xlabel("Inflight"); ax3.set_ylabel("Rate (KB/s)"); ax3.grid(True, alpha=0.2)
 
-        # 3. 原始速率图 (饱和度增强)
-        ax3 = fig.add_subplot(2, 2, 3)
-        ax3.scatter(inf, rt, c=tm, cmap='rainbow_r', s=45, alpha=0.7, edgecolors='black', linewidths=0.2)
-        ax3.set_title("3. Raw Inflight vs Rate (KB/s)", fontsize=14)
-        ax3.set_xlabel("Inflight")
-        ax3.set_ylabel("Rate (KB/s)")
-        ax3.grid(True, alpha=0.3)
+        ax4 = fig1.add_subplot(2, 2, 4)
+        ax4.plot(dts, rt, color='#1f77b4', linewidth=1.5, alpha=0.3)
+        ax4.scatter(dts, rt, c=tm, cmap='rainbow_r', s=30, alpha=0.8, edgecolors='black', vmin=0, vmax=1)
+        ax4.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
+        plt.setp(ax4.get_xticklabels(), rotation=30, ha='right')
+        ax4.set_title("4. Calculated Download Speed"); ax4.set_ylabel("Rate (KB/s)"); ax4.grid(True, alpha=0.5)
 
         plt.tight_layout()
-        st.pyplot(fig)
+        st.pyplot(fig1)
 
-        # 状态统计栏
+    # 第二部分：Auto Mode
+    if not sub_auto.empty:
         st.markdown("---")
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("样本总数", peer_counts[selected_peer])
-        c2.metric("当前窗口点数", len(sub_df))
-        c3.metric("最高速率", f"{rt.max():.1f} KB/s")
-        c4.metric("平均延迟", f"{dl.mean():.1f} ms")
-    else:
-        st.warning("当前范围内无有效数据。")
+        st.subheader("📈 算法决策与自动带宽分析 (Auto Mode)")
+
+        fig2 = plt.figure(figsize=(16, 12))
+        dts_a = sub_auto['dt'].values
+
+        # 图 5: Avg BW (换算为 KB/s)
+        ax5 = fig2.add_subplot(2, 2, 1)
+        ax5.plot(dts_a, sub_auto['bw'], color='#2ca02c', linewidth=2)
+        ax5.fill_between(dts_a, sub_auto['bw'], color='#2ca02c', alpha=0.1)
+        ax5.set_title("5. Logged Avg Bandwidth (KB/s)"); ax5.set_ylabel("Rate (KB/s)"); ax5.grid(True, alpha=0.3)
+
+        ax6 = fig2.add_subplot(2, 2, 2)
+        ax6.step(dts_a, sub_auto['opt_if'], where='post', label='Optimum Inflight', color='#1f77b4')
+        ax6.step(dts_a, sub_auto['req_if'], where='post', label='Req In Flight', color='#ff7f0e', linestyle='--')
+        ax6.set_title("6. Optimum vs Requested Inflight"); ax6.set_ylabel("Count"); ax6.legend(); ax6.grid(True, alpha=0.3)
+
+        ax7 = fig2.add_subplot(2, 2, 3)
+        ax7.plot(dts_a, sub_auto['min_rtt'], color='#d62728')
+        ax7.set_title("7. Min RTT Trend"); ax7.set_ylabel("ms"); ax7.grid(True, alpha=0.3)
+
+        for ax in [ax5, ax6, ax7]:
+            ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
+            plt.setp(ax.get_xticklabels(), rotation=30, ha='right')
+
+        plt.tight_layout()
+        st.pyplot(fig2)
+
+    st.markdown("---")
+    c1, c2, c3, c4 = st.columns(4)
+    if not sub_df.empty:
+        c1.metric("计算平均延迟", f"{sub_df['delay'].mean():.1f} ms")
+        c2.metric("计算峰值速率", f"{sub_df['rate'].max():.2f} KB/s")
+    if not sub_auto.empty:
+        # 指标卡片显示换算后的 KB/s
+        c3.metric("日志 Avg BW", f"{sub_auto['bw'].iloc[-1]:.2f} KB/s")
+        c4.metric("最新 Min RTT", f"{sub_auto['min_rtt'].iloc[-1]} ms")
 else:
-    st.info("💡 请上传日志，或在启动命令后添加日志路径。")
+    st.info("👋 请上传 Stardust 日志文件开始分析。")

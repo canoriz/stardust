@@ -12,11 +12,12 @@ use std::{
 };
 
 const BLOCK_SIZE: usize = 16384;
+const NO_RESPONSE_TIMEOUT: time::Duration = time::Duration::from_secs(90);
 
 #[derive(Eq, PartialEq, Debug, Clone)]
-struct PickedDetail {
-    pick_time: time::Instant,
-    n_in_flight_when_picked: usize,
+pub struct PickedDetail {
+    pub pick_time: time::Instant,
+    pub n_in_flight_when_picked: usize,
 }
 
 #[derive(Serialize, Deserialize, Eq, PartialEq, Debug, Clone)]
@@ -26,7 +27,11 @@ pub enum BlockStatus {
         // TODO: when serializing, make all requested state to NotRequested
         // avoid canceling not requested blocks
         #[serde(skip)]
-        addr: HashMap<PeerAddr, PickedDetail>,
+        requested: HashMap<PeerAddr, PickedDetail>,
+
+        // blocks that are requested but revoked(because of timeout or have received from other peer)
+        #[serde(skip)]
+        revoked: HashMap<PeerAddr, PickedDetail>,
     },
     Received, // TODO: maybe record which peer sends us this block?
 }
@@ -102,13 +107,14 @@ impl PieceBlocks {
                     BlockStatus::NotRequested => {
                         // TODO: todo!("does this really happen in endgame mode?");
                         *b = BlockStatus::Requested {
-                            addr: HashMap::from([(
+                            requested: HashMap::from([(
                                 peer,
                                 PickedDetail {
                                     pick_time: time::Instant::now(),
                                     n_in_flight_when_picked: *n_in_flight,
                                 },
                             )]),
+                            revoked: HashMap::new(),
                         };
                         *n_in_flight += 1;
                         self.all_request_or_received_before = i + 1;
@@ -120,32 +126,65 @@ impl PieceBlocks {
                         count += 1;
                         self.requested_or_received_count += 1;
                     }
-                    BlockStatus::Requested { addr } => {
+                    BlockStatus::Requested {
+                        requested, revoked, ..
+                    } => {
                         if self.all_request_or_received_before <= i {
                             self.all_request_or_received_before = i + 1;
                         }
 
                         // if number of requests that are in-flight and not timeout-ed are
                         // less than repick limit, request a new one
-                        let all_no_response_more_than_5 = addr
+                        let (first_eta, min_elapsed) = requested
                             .iter()
-                            .filter(|(p, t)| {
-                                t.pick_time.elapsed()
-                                    < repick_option
-                                        .alt_timeout
-                                        .get(p)
-                                        .map(|d| *d)
-                                        .unwrap_or(time::Duration::from_secs(5))
-                                        .min(time::Duration::from_secs(5))
+                            .map(|(p, t)| {
+                                let elapsed = t.pick_time.elapsed();
+                                let est_rtt = if let Some(rtt) =
+                                    repick_option.alt_timeout.get(p).map(|d| *d)
+                                {
+                                    elapsed.max(rtt)
+                                } else {
+                                    time::Duration::from_secs(10)
+                                };
+                                (t.pick_time + est_rtt, elapsed)
                             })
-                            .count()
-                            == 0;
+                            .fold(
+                                (
+                                    time::Instant::now() + time::Duration::from_secs(10),
+                                    time::Duration::from_secs(10),
+                                ),
+                                |acc, (eta, elapsed)| (acc.0.min(eta), acc.1.min(elapsed)),
+                            );
+                        let our_rtt = repick_option
+                            .alt_timeout
+                            .get(&peer)
+                            .map(|d| *d)
+                            .unwrap_or(time::Duration::from_secs(10));
 
-                        if all_no_response_more_than_5 && !addr.contains_key(&peer) {
+                        const FIVE_SECS: time::Duration = time::Duration::from_secs(5);
+
+                        let old_remain_time =
+                            first_eta.saturating_duration_since(time::Instant::now());
+                        if (old_remain_time > 2 * our_rtt || min_elapsed > FIVE_SECS)
+                            && !requested.contains_key(&peer)
+                        {
+                            if old_remain_time > our_rtt * 2 {
+                                debug!(
+                                    "{peer} estimated remain time of {req:?} {:?} is much higher than est new rtt {:?} repick",
+                                    old_remain_time, our_rtt,
+                                );
+                            }
+                            if min_elapsed > FIVE_SECS {
+                                debug!(
+                                    "{peer} min elapsed time of {req:?} is {min_elapsed:?}, higher than {FIVE_SECS:?}, repick",
+                                );
+                            }
                             // if !addr.contains_key(&peer) {
                             count += 1;
-                            info!("{peer:?} repick {req:?}, addr {addr:?}");
-                            addr.insert(
+                            info!("{peer:?} repick {req:?}, requested {requested:?}, revoked: {revoked:?}");
+                            // TODO: FIXME: this cause rtt wrongly thinks response is to second request,
+                            // should be first request's response
+                            requested.insert(
                                 peer,
                                 PickedDetail {
                                     pick_time: time::Instant::now(),
@@ -196,13 +235,14 @@ impl PieceBlocks {
                 match b {
                     BlockStatus::NotRequested => {
                         *b = BlockStatus::Requested {
-                            addr: HashMap::from([(
+                            requested: HashMap::from([(
                                 peer,
                                 PickedDetail {
                                     pick_time: time::Instant::now(),
                                     n_in_flight_when_picked: *n_in_flight,
                                 },
                             )]),
+                            revoked: HashMap::new(),
                         };
                         *n_in_flight += 1;
                         if from.is_none() {
@@ -255,9 +295,9 @@ impl PieceBlocks {
                 *b = BlockStatus::Received;
                 vec![]
             }
-            BlockStatus::Requested { addr } => {
+            BlockStatus::Requested { requested, .. } => {
                 self.received_count += 1;
-                let ret = addr.keys().map(|x| *x).collect();
+                let ret = requested.keys().map(|x| *x).collect();
                 *b = BlockStatus::Received;
                 ret
             }
@@ -273,10 +313,17 @@ impl PieceBlocks {
         #[cfg(test)]
         println!("{b:?}");
         match b {
-            BlockStatus::Requested { addr, .. } => {
+            BlockStatus::Requested {
+                requested: addr,
+                revoked,
+                ..
+            } => {
                 // A peer can only be revoked if it's requested before
-                addr.remove(peer);
-                if addr.is_empty() {
+                if let Some(v) = addr.remove(peer) {
+                    revoked.insert(*peer, v);
+                }
+                revoked.retain(|_, t| t.pick_time.elapsed() < NO_RESPONSE_TIMEOUT);
+                if addr.is_empty() && revoked.is_empty() {
                     *b = BlockStatus::NotRequested;
                     if self.all_request_or_received_before > b_index {
                         self.all_request_or_received_before = b_index;
@@ -293,7 +340,7 @@ impl PieceBlocks {
     fn revoke_all_requested_if<F>(
         &mut self,
         remove: F,
-        revoked: &mut HashMap<PeerAddr, Vec<Request>>,
+        revoked_reqs: &mut HashMap<PeerAddr, Vec<Request>>,
     ) where
         F: Fn(&PeerAddr, &time::Instant) -> bool,
     {
@@ -309,23 +356,27 @@ impl PieceBlocks {
                 } as u32,
             };
             match b {
-                BlockStatus::Requested { addr, .. } => {
-                    addr.retain(|p, t| {
+                BlockStatus::Requested {
+                    requested, revoked, ..
+                } => {
+                    requested.retain(|p, t| {
                         if remove(p, &t.pick_time) {
                             info!(
                                 "revoke block {req:?} from {p}, issued at {t:?}, after {:?}",
                                 t.pick_time.elapsed()
                             );
-                            revoked
+                            revoked_reqs
                                 .entry(*p)
                                 .and_modify(|r| r.push(req))
                                 .or_insert(vec![req]);
+                            revoked.entry(*p).or_insert(t.clone());
                             false
                         } else {
                             true
                         }
                     });
-                    if addr.is_empty() {
+                    revoked.retain(|_, t| t.pick_time.elapsed() < NO_RESPONSE_TIMEOUT);
+                    if requested.is_empty() && revoked.is_empty() {
                         *b = BlockStatus::NotRequested;
                         self.requested_or_received_count -= 1;
                         if self.all_request_or_received_before > i {
@@ -443,7 +494,15 @@ impl BlockPicker {
         if let Some(b) = self.get_block_status(req) {
             match b {
                 BlockStatus::NotRequested => None,
-                BlockStatus::Requested { addr } => addr.get(peer).map(|t| t.pick_time.elapsed()),
+                BlockStatus::Requested { requested, revoked } => {
+                    if let Some(p) = revoked.get(peer) {
+                        Some(p.pick_time.elapsed())
+                    } else if let Some(p) = requested.get(peer) {
+                        Some(p.pick_time.elapsed())
+                    } else {
+                        None
+                    }
+                }
                 BlockStatus::Received => None,
             }
         } else {
@@ -455,8 +514,14 @@ impl BlockPicker {
         if let Some(b) = self.get_block_status(req) {
             match b {
                 BlockStatus::NotRequested => None,
-                BlockStatus::Requested { addr } => {
-                    addr.get(peer).map(|t| t.n_in_flight_when_picked)
+                BlockStatus::Requested { requested, revoked } => {
+                    if let Some(p) = revoked.get(peer) {
+                        Some(p.n_in_flight_when_picked)
+                    } else if let Some(p) = requested.get(peer) {
+                        Some(p.n_in_flight_when_picked)
+                    } else {
+                        None
+                    }
                 }
                 BlockStatus::Received => None,
             }
@@ -486,7 +551,12 @@ impl BlockPicker {
         mut n_in_flight: usize,
         revoked: &mut HashMap<PeerAddr, Vec<Request>>,
     ) -> (BlockRequests, usize) {
-        self.revoke_unrespond(time::Duration::from_secs(90), revoked);
+        self.revoke_unrespond(
+            rtts.get(peer)
+                .map_or(time::Duration::from_secs(5), |x| *x)
+                .max(time::Duration::from_secs(5)),
+            revoked,
+        );
         self.prev_time_check = time::Instant::now();
 
         let endgame = self.update_endgame();
@@ -501,7 +571,7 @@ impl BlockPicker {
                 alt_timeout: &HashMap::new(),
             }
         };
-        info!("endgame {endgame}, rush {}", self.rush_mode());
+        info!("{peer} endgame {endgame}, rush {}", self.rush_mode());
 
         let mut remain = n;
         let peer_status = if let Some(h) = self.piece_picker.peer_detail(peer) {
@@ -565,7 +635,7 @@ impl BlockPicker {
                         .iter()
                         .map(|b| match b {
                             BlockStatus::NotRequested => 0,
-                            BlockStatus::Requested { addr } => addr.len(),
+                            BlockStatus::Requested { requested, .. } => requested.len(),
                             BlockStatus::Received => usize::MAX,
                         })
                         .min()
@@ -629,9 +699,7 @@ impl BlockPicker {
                 {
                     remain -= n_picked;
                     let pb: Vec<_> = blks.iter(self.piece_size as u32).collect();
-                    debug!(
-                        "{peer} pick piece {index} (pick_next), inflight {n_in_flight}"
-                    );
+                    debug!("{peer} pick piece {index} (pick_next), inflight {n_in_flight}");
                     debug!("{peer} picked blks: {pb:?}, {:?}", blocks.block_map);
                     ret.push(blks);
                 }
@@ -641,6 +709,27 @@ impl BlockPicker {
                 break;
             }
             info!("remain 3 {remain}");
+        }
+        if (self.rush_mode() || endgame) && remain > 0 {
+            info!(
+                "{peer} rush mode {} endgame {} causing less picking, remain {remain}",
+                self.rush_mode(),
+                endgame
+            );
+            for (index, blocks) in &self.receiving {
+                debug!(
+                    "{peer} rush mode, receiving piece {index}, blocks: {:?}",
+                    blocks.block_map
+                );
+            }
+            for (index, blocks) in &self.requesting {
+                debug!(
+                    "{peer} rush mode {}, endgame {} requesting piece {index}, blocks: {:?}",
+                    self.rush_mode(),
+                    endgame,
+                    blocks.block_map,
+                );
+            }
         }
 
         (
@@ -880,6 +969,18 @@ impl BlockPicker {
         self.n
     }
 
+    pub fn our_state(&self) -> PieceState {
+        let state = self.piece_picker.dump().have;
+        let ones = state.count_ones() as usize;
+        if ones == self.n {
+            PieceState::HaveAll
+        } else if ones == 0 {
+            PieceState::HaveNone
+        } else {
+            PieceState::Bitfield(state)
+        }
+    }
+
     pub fn peer_add(&mut self, addr: PeerAddr, state: PieceState) {
         self.piece_picker.peer_add(addr, state);
     }
@@ -1111,13 +1212,14 @@ mod test {
             block_map: vec![
                 BlockStatus::NotRequested,
                 BlockStatus::Requested {
-                    addr: HashMap::from([(
+                    requested: HashMap::from([(
                         PEER1,
                         PickedDetail {
                             pick_time: time::Instant::now(),
                             n_in_flight_when_picked: 0,
                         },
                     )]),
+                    revoked: HashMap::new(),
                 },
                 BlockStatus::NotRequested,
             ],
@@ -1168,13 +1270,14 @@ mod test {
             block_map: vec![
                 BlockStatus::NotRequested,
                 BlockStatus::Requested {
-                    addr: HashMap::from([(
+                    requested: HashMap::from([(
                         PEER1,
                         PickedDetail {
                             pick_time: two_mins_ago(),
                             n_in_flight_when_picked: 0,
                         },
                     )]),
+                    revoked: HashMap::new(),
                 },
                 BlockStatus::NotRequested,
                 BlockStatus::Received,

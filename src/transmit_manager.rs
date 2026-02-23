@@ -646,6 +646,9 @@ impl TransmitWorker {
 
                 if pick_n > 0 {
                     info!("really picked {_n} blocks");
+                    if _n < pick_n {
+                        warn!("only picked {_n} blocks from {addr:?}, maybe no more interesting blocks");
+                    }
                 }
             }
         }
@@ -713,6 +716,42 @@ impl TransmitWorker {
                 let peer_addr = to_canonical_addr(bt_conn.peer_addr());
                 if !self.connected_peers.contains_key(&peer_addr) {
                     let cm = ConnectionManagerHandle::new_dyn(bt_conn, self.self_handle.clone());
+                    let state = match &mut self.torrent_state {
+                        TorrentState::Metadata(d) => {
+                            Some((d.block_picker.our_state(), d.block_picker.n_pieces()))
+                        }
+                        TorrentState::Fetching(f) => None,
+                    };
+
+                    if let Some((piece_state, n)) = state {
+                        if cm.capability().contains(&protocol::Capability::Fast) {
+                            match piece_state {
+                                PieceState::HaveAll => {
+                                    cm.send_stream_cmd(CtrlOfSend::HaveAll);
+                                }
+                                PieceState::HaveNone => {
+                                    cm.send_stream_cmd(CtrlOfSend::HaveNone);
+                                }
+                                PieceState::Bitfield(bit_field) => {
+                                    cm.send_stream_cmd(CtrlOfSend::BitField(bit_field));
+                                }
+                            }
+                        } else {
+                            cm.send_stream_cmd(CtrlOfSend::BitField(piece_state.as_bitfield(n)));
+                        }
+                    } else {
+                        if cm.capability().contains(&protocol::Capability::Fast) {
+                            cm.send_stream_cmd(CtrlOfSend::HaveNone);
+                        }
+                    }
+
+                    if cm.capability().contains(&protocol::Capability::DHT) {
+                        if let Some(port) = self.handshake_opt.dht_port {
+                            cm.send_stream_cmd(CtrlOfSend::DHTPort(port));
+                        }
+                    }
+
+                    cm.send_stream_cmd(CtrlOfSend::Interested);
                     self.connected_peers.insert(
                         peer_addr,
                         PeerConn {
@@ -745,7 +784,6 @@ impl TransmitWorker {
                         .send(Msg::PeerTimeoutCheck(peer_addr));
                 }
                 self.connecting_peers.remove(&peer_addr);
-                // TODO: if is income, send bitfield
                 Ok(())
             }
             Msg::NewPeer(Err(addr)) => {
@@ -1236,7 +1274,7 @@ impl TransmitWorker {
                 const MIN_IN_FLIGHT: usize = 2;
                 const MAX_IN_FLIGHT: usize = 5000;
                 // optimum_inflight = 1250;
-                let optimum_inflight = (2.0 * min_rtt.as_secs_f32() * avg_bw / 16384.0) as usize;
+                let optimum_inflight = (2.0 * min_rtt.as_secs_f32() * max_bw / 16384.0) as usize;
                 info!(
                     "{peer} Auto mode optimum inflight {} min rtt {:?} avg bw {} req in flight {}",
                     optimum_inflight, min_rtt, avg_bw, n_req_in_flight

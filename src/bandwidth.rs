@@ -4,7 +4,7 @@ mod regression;
 mod rtt;
 pub use regression::SlidingWindowRegression;
 pub use rtt::{ALPHA, BETA, RTT};
-use tracing::info;
+use tracing::{info, trace};
 
 #[derive(Debug, Clone)]
 pub(crate) struct Bandwidth<const SLOT_SIZE: usize> {
@@ -59,7 +59,7 @@ impl Period {
 }
 
 impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
-    const SPLIT_DURATION: Duration = Duration::from_millis(100);
+    const SPLIT_DURATION: Duration = Duration::from_millis(500);
 
     pub fn new() -> Bandwidth<SLOT_SIZE> {
         Bandwidth {
@@ -142,7 +142,7 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
         let f = |acc: (f32, Duration), _begin: Instant, end: Instant, p: &Period| {
             let dt = (end - p.since).min(Self::SPLIT_DURATION);
             let bw = (p.bytes_count as f32) / dt.as_secs_f32();
-            info!(
+            trace!(
                 "bytes_count {} dt {dt:?} bw {bw}, since before {:?}",
                 p.bytes_count,
                 p.since.elapsed()

@@ -43,8 +43,8 @@ impl AnnounceManagerHandle {
             announce_timer: task::JoinSet::new(),
             url_list: HashMap::new(),
         };
-        // tokio::spawn(run_announce_manager::<metadata::Announcer>(
-        tokio::spawn(run_announce_manager::<FakeAnnouncer>(
+        tokio::spawn(run_announce_manager::<metadata::Announcer>(
+            // tokio::spawn(run_announce_manager::<FakeAnnouncer>(
             manager,
             info_hash,
             cancel.clone(),
@@ -255,7 +255,7 @@ impl metadata::Announce for FakeAnnouncer {
                 metadata::Peer {
                     peer_id: "1384".into(),
                     ip: "127.0.0.1".into(),
-                    port: 38070,
+                    port: 51774,
                 },
                 // metadata::Peer {
                 //     peer_id: "1384".into(),

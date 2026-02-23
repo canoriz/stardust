@@ -84,6 +84,14 @@ impl PieceState {
             }
         }
     }
+
+    pub fn as_bitfield(&self, n_piece: usize) -> BitField {
+        match self {
+            PieceState::HaveAll => BitField::from(vec![true; n_piece]),
+            PieceState::HaveNone => BitField::from(vec![false; n_piece]),
+            PieceState::Bitfield(b) => b.clone(),
+        }
+    }
 }
 
 impl PeerPieceDetail {
@@ -145,7 +153,7 @@ pub trait PiecePicker {
     fn is_finished(&mut self) -> bool;
 
     /// dump which piece we have
-    fn dump(&mut self) -> PieceMap {
+    fn dump(&self) -> PieceMap {
         PieceMap {
             selected: self.selected_pieces().clone(),
             have: self.have_pieces().clone(),
@@ -166,8 +174,8 @@ pub trait PiecePicker {
 /// Dumped piece map, must be size of N
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct PieceMap {
-    selected: BitField,
-    have: BitField,
+    pub selected: BitField,
+    pub have: BitField,
 }
 
 // TODO: maybe use peer_id instead of socketaddr?

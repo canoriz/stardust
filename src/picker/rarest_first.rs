@@ -146,12 +146,18 @@ impl PiecePicker for Picker {
         }
 
         if let Some(d) = self.peers.get_mut(addr) {
-            d.have.set_have(self.n, index, true);
+            // only update rarity if this is a newly reported have
+            if !d.have(index) {
+                d.have.set_have(self.n, index, true);
+                self.update_one_piece_rarity(index, true);
+            }
         } else {
             let mut have = PieceState::HaveNone;
             have.set_have(self.n, index, true);
             self.peers
                 .insert(*addr, PeerPieceDetail { have, choke: false });
+            // new peer with a single HAVE, increment rarity for this piece
+            self.update_one_piece_rarity(index, true);
         }
     }
 

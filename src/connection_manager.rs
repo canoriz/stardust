@@ -13,8 +13,8 @@ use tracing::{debug, info, warn};
 
 use crate::picker::{BlockRequests, PieceState};
 use crate::protocol::{
-    self, BTStream, Capability, CapabilityMap, Conn, ExtendedMsg, Message, ReadStream, Request,
-    Split, WriteStream,
+    self, BTStream, BitField, Capability, CapabilityMap, Conn, ExtendedMsg, Message, ReadStream,
+    Request, Split, WriteStream,
 };
 use crate::transmit_manager::Msg as TransmitMsg;
 use crate::transmit_manager::{PeerMsg, TransmitManagerHandle};
@@ -32,6 +32,12 @@ pub(crate) enum CtrlOfSend {
     Extend(ExtendedMsg),
     Reject(Request),
     Cancel(Request),
+    Interested,
+
+    DHTPort(u16),
+    BitField(BitField),
+    HaveAll,
+    HaveNone,
 
     // SendBlocks(BlockRange),
     SetWakeUp(WakeUpOption),
@@ -156,15 +162,17 @@ impl ConnectionManagerHandle {
 
     pub fn send_stream_cmd(&self, m: CtrlOfSend) {
         let c = self.send_stream.sender.clone();
-        // c.send(m);
-        tokio::spawn(async move {
-            time::sleep(time::Duration::from_millis(800)).await;
-            c.send(m);
-        });
+        c.send(m);
+        // tokio::spawn(async move {
+        //     time::sleep(time::Duration::from_millis(800)).await;
+        //     c.send(m);
+        // });
     }
 
     pub fn recv_stream_cmd(&self, m: CtrlOfRecv) {
-        self.recv_stream.sender.send(m);
+        if let Err(e) = self.recv_stream.sender.send(m) {
+            info!("handle recv stream cmd error {e:?}");
+        }
     }
 
     pub fn support_metadata_extension(&self) -> bool {
@@ -258,20 +266,22 @@ async fn run_recv_stream<T>(
 
     let pending_recvs = conn.read_stream.maybe_recv_pending_msg().await;
     for m in pending_recvs {
-        conn.handle_peer_msg(addr, m).await;
+        conn.handle_peer_msg(addr, m);
     }
 
     loop {
+        info!("{addr} recv select loop begin");
         tokio::select! {
             biased;
             _ = cancel.cancelled() => {
-                info!("recv stream cancelled");
+                info!("{addr} recv stream cancelled");
                 break;
             }
             Some(msg) = conn.receiver.recv() => {
                 // TODO: need handle None case
                 // TODO: use buffer and tokio::Notify
                 // info!("connection manager recv stream of {} received msg {msg:?}", &manager.conn);
+                info!("{addr} ctrl cmd");
                 conn.handle_ctrl_cmd(msg);
             }
             _ = ticker.tick() => {
@@ -280,23 +290,25 @@ async fn run_recv_stream<T>(
                 conn.handle_report_tick();
             }
             r = conn.read_stream.recv_msg() => {
+                info!("{addr} received {:?}", r);
                 // r = receive_peer_msg(&mut conn.read_stream, &mut conn.transmit_handle) => {
                 match r {
                     Ok(msg) => {
                         // (handle_peer_hdr(&mut conn, addr, hdr));
-                        conn.handle_peer_msg(addr, msg).await;
+                        conn.handle_peer_msg(addr, msg);
                     }
                     Err(e) => {
-                        warn!("recv stream read header error {e}");
+                        warn!("{addr} recv stream read header error {e}");
                         // TODO: notify controller and maybe try re-connect
                         break;
                     }
                 }
             }
         };
+        info!("{addr} recv select loop end");
     }
     let _ = done.send(());
-    info!("done recv stream");
+    info!("{addr} done recv stream");
 }
 
 // TODO: socketaddr use ref?
@@ -307,22 +319,27 @@ where
     T: AsyncRead + Unpin,
 {
     fn handle_report_tick(&mut self) {
-        self.transmit_handle
+        let peer = to_canonical_addr(self.read_stream.peer_addr());
+        info!("{peer} handle report tick");
+        if let Err(e) = self
+            .transmit_handle
             .sender
-            .send(TransmitMsg::PeerMsg(PeerMsg::BlockReceived {
-                peer: to_canonical_addr(self.read_stream.peer_addr()),
-            }));
+            .send(TransmitMsg::PeerMsg(PeerMsg::BlockReceived { peer }))
+        {
+            info!("{peer} handle report tick error {e:?}");
+        }
     }
 
     fn handle_ctrl_cmd(&mut self, cmd: CtrlOfRecv) {
         match cmd {
             CtrlOfRecv::ReportStat => {
+                debug!("{} received report stat cmd", self.read_stream.peer_addr());
                 self.handle_report_tick();
             }
         }
     }
 
-    async fn handle_peer_msg(&mut self, addr: SocketAddr, m: Message) {
+    fn handle_peer_msg(&mut self, addr: SocketAddr, m: Message) {
         // TODO: send statistics to transmit handle
 
         // TODO: shall we use mpsc or just lock the manager and set it
@@ -391,7 +408,7 @@ where
                     .send(TransmitMsg::PeerMsg(PeerMsg::DhtPort(addr, port)));
             }
             Message::Extended(extend) => {
-                handle_extended_msg(&addr, tmh, extend).await;
+                handle_extended_msg(&addr, tmh, extend);
             }
             Message::SuggestPiece(index) => {
                 tmh.sender
@@ -430,33 +447,34 @@ where
     T: AsyncWrite + Unpin,
 {
     let mut interval = tokio::time::interval(time::Duration::from_secs(120));
-    conn.write_stream.maybe_send_pending_msg().await?;
 
-    // TODO: shall we send interested by default?
-    conn.write_stream.send_interested().await?;
+    let peer = conn.write_stream.peer_addr();
 
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
-                info!("send stream cancelled");
+                info!("{peer} send stream cancelled");
                 break;
             }
             _ = interval.tick() => {
                 if let Err(e) = conn.write_stream.send_keepalive().await {
-                    info!("send keepalive error {e}");
+                    info!("{peer} send keepalive error {e}");
                     // TODO: tell transmit manager this connection is dead
                     break;
                 }
             }
             Some(msg) = conn.receiver.recv() => {
                 // TODO: maybe use buffer and Notify?
-                info!("send stream {} received {msg:?}", conn.write_stream.peer_addr());
-                conn.handle_cmd(msg).await;
+                info!("{peer} send stream received {msg:?}");
+                if let Err(e) = conn.handle_cmd(msg).await {
+                    info!("{peer} send stream handle cmd error {e}");
+                    break;
+                }
             }
         };
     }
     let _ = done.send(());
-    info!("done send stream");
+    info!("{peer} done send stream");
     Ok(())
 }
 
@@ -464,7 +482,7 @@ impl<T> SendStream<T>
 where
     T: AsyncWrite + Unpin,
 {
-    async fn handle_cmd(&mut self, msg: CtrlOfSend) {
+    async fn handle_cmd(&mut self, msg: CtrlOfSend) -> io::Result<()> {
         match msg {
             CtrlOfSend::RequestBlocks(reqs) => {
                 let mut count = 0;
@@ -473,7 +491,7 @@ where
                     for r in rg.iter(piece_size) {
                         self.write_stream
                             .send_request(r.index, r.begin, r.len)
-                            .await;
+                            .await?;
                         // count += 1;
                         // if count % 10 == 0 {
                         // time::sleep(time::Duration::from_millis(500)).await;
@@ -482,20 +500,50 @@ where
                 }
             }
             CtrlOfSend::Have(i) => {
-                self.write_stream.send_have(i).await;
+                self.write_stream.send_have(i).await?;
             }
             CtrlOfSend::Extend(ExtendedMsg::Metadata(m)) => {
-                self.write_stream.send_extend_metadata(m).await;
+                self.write_stream.send_extend_metadata(m).await?;
+            }
+            CtrlOfSend::Extend(ExtendedMsg::Handshake(_)) => {
+                unreachable!("handshake should not be sent after connection established")
+            }
+            CtrlOfSend::Extend(ExtendedMsg::Pex(_)) => {
+                todo!("send pex not implemented");
+            }
+            CtrlOfSend::Extend(ExtendedMsg::Unknown(code)) => {
+                warn!("try to send unknown extended message with code {code}");
+                // maybe do nothing is better than return error
             }
             CtrlOfSend::Cancel(req) => {
                 self.write_stream
                     .send_cancel(req.index, req.begin, req.len)
-                    .await;
+                    .await?;
             }
-            other => {
-                warn!("send stream handle unimplemented cmd: {:?}", other);
+            CtrlOfSend::Reject(request) => {
+                self.write_stream
+                    .send_reject(request.index, request.begin, request.len)
+                    .await?;
             }
+            CtrlOfSend::Interested => {
+                self.write_stream.send_interested().await?;
+            }
+            CtrlOfSend::DHTPort(p) => {
+                self.write_stream.send_port(p).await?;
+            }
+            CtrlOfSend::BitField(bit_field) => {
+                self.write_stream.send_bitfield(&bit_field).await?;
+            }
+            CtrlOfSend::HaveAll => {
+                self.write_stream.send_have_all().await?;
+            }
+            CtrlOfSend::HaveNone => {
+                self.write_stream.send_have_none().await?;
+            }
+            CtrlOfSend::SetWakeUp(wake_up_option) => todo!("setwakeup not implemented"),
+            CtrlOfSend::ResetWakeUp(wake_up_option) => todo!("resetwakeup not implemented"),
         }
+        Ok(())
     }
 }
 
@@ -536,7 +584,7 @@ where
 }
 */
 
-async fn handle_extended_msg(
+fn handle_extended_msg(
     peer: &SocketAddr,
     tmh: &mut TransmitManagerHandle,
     extended: protocol::ExtendedMsg,
@@ -574,6 +622,7 @@ mod test {
     use crate::transmit_manager::Msg;
 
     #[tokio::test]
+    #[ignore = "dht handling is moved to transmit manager"]
     async fn test_dht_delayed_msg() {
         // opt support dht
         let opt = HandshakeOption::builder()
@@ -594,7 +643,7 @@ mod test {
         let first2 = rx2.recv().await.unwrap();
         let inner1 = match first1 {
             Msg::PeerMsg(PeerMsg::DhtPort(sa, p)) => (sa, p),
-            _ => unreachable!(),
+            e => unreachable!("{e:?}"),
         };
         let inner2 = match first2 {
             Msg::PeerMsg(PeerMsg::DhtPort(sa, p)) => (sa, p),

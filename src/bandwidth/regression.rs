@@ -177,6 +177,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "capacity is not used now, all point removes are manual now"]
     fn test_sliding_window_removal() {
         // 测试窗口滑动。容量为5，添加10个点，应只保留后5个
         let mut reg = SlidingWindowRegression::new(5);
