@@ -560,7 +560,7 @@ impl BlockPicker {
         self.prev_time_check = time::Instant::now();
 
         let endgame = self.update_endgame();
-        let repick_option = if self.rush_mode() {
+        let repick_option = if self.rush_mode() || endgame {
             RepickOption {
                 repick_limit: 7, // TODO: set a proper repick limit
                 alt_timeout: rtts,

@@ -446,7 +446,7 @@ async fn run_send_stream<T>(
 where
     T: AsyncWrite + Unpin,
 {
-    let mut interval = tokio::time::interval(time::Duration::from_secs(120));
+    let mut interval = tokio::time::interval(time::Duration::from_secs(20));
 
     let peer = conn.write_stream.peer_addr();
 

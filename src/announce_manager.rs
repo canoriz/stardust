@@ -185,7 +185,7 @@ async fn run_announce_manager<A>(
             }
             Some(r) = manager.announce_timer.join_next() => {
                 if let Ok(t) = r {
-                    info!("announce url {}", t.url);
+                    info!("announce {:?} url {}", t.announce_type, t.url);
                     if manager.url_list.get(&(t.announce_type, t.url.clone())).is_some() {
                         announce_task_tx.send(t);
                     }
@@ -289,22 +289,22 @@ async fn announce_task<A>(
     let tg = TrackerGet {
         peer_id: id,
         port: port,
-        uploaded: 0,
-        downloaded: 0,
+        uploaded: 0,   // TODO: get real uploaded/downloaded/left
+        downloaded: 0, // TODO: get real uploaded/downloaded/left
         ip: None,
-        left: 14,
+        left: 0, // TODO: get real uploaded/downloaded/left
     };
     loop {
         tokio::select! {
             r = rx.recv() => {
-                if let Some(req) = r{
+                if let Some(req) = r {
                     let resp = A::announce_tier(
                         req.announce_type,
                         &tg,
                         &info_hash,
                         req.url.as_ref().clone(),
                     ).await;
-                    info!("announce {} response result {resp:?}", &req.url);
+                    info!("announce {:?} {} response result {resp:?}", req.announce_type, &req.url);
                     output.send((resp, req));
                 } else {
                     info!("announce rx recv None");

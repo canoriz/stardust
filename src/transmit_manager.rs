@@ -74,6 +74,13 @@ pub enum PeerMsg {
     BlockReceived { peer: PeerAddr },
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum PeerFrom {
+    DHT,
+    Tracker,
+    PEX,
+}
+
 /// (conn, is_income)
 pub type NewPeerConn = (protocol::BTStream<Box<dyn Conn>>, bool);
 
@@ -84,7 +91,10 @@ pub(crate) enum Msg {
     AnnounceMsg(announce_manager::Msg),
 
     NewPeer(Result<NewPeerConn, SocketAddr>),
-    NewDiscoveredPeer(SocketAddr),
+    NewDiscoveredPeer {
+        addr: SocketAddr,
+        from: PeerFrom,
+    },
     PeerLeave(PeerAddr),
 
     PieceBufReady {
@@ -664,7 +674,8 @@ impl TransmitWorker {
 
     fn handle_msg(&mut self, m: Msg) -> io::Result<()> {
         match m {
-            Msg::NewDiscoveredPeer(addr) => {
+            Msg::NewDiscoveredPeer { addr, from } => {
+                info!("new discovered peer {addr} from {from:?}");
                 self.handle_new_discovered_peer(addr);
                 Ok(())
             }
@@ -680,17 +691,10 @@ impl TransmitWorker {
                 //         .collect(),
                 // );
                 // TODO
-                info!("announce finish");
-                let info_hash = {
-                    match &self.torrent_state {
-                        TorrentState::Metadata(d) => d.metadata.info_hash,
-                        TorrentState::Fetching(f) => f.magnet.info_hash,
-                    }
-                };
+                info!("announce finish, get peers {:?}", a.peers);
                 for p in a.peers {
                     use std::str::FromStr;
                     if let Ok(ip) = std::net::IpAddr::from_str(&p.ip) {
-                        let h_clone = self.self_handle.clone();
                         // TODO: store peers in a map, if cannot connect this time
                         // try re-connect later
                         // TODO: if we already connected to a lot of active peers,
@@ -1271,10 +1275,10 @@ impl TransmitWorker {
                 // For peers with small bandwidth, we don't request too much from them
                 // to avoid mark these blocks as in-flight and not requesting from other peers.
                 // preventing accumulating too much partial downloaded pieces.
-                const MIN_IN_FLIGHT: usize = 2;
+                const MIN_IN_FLIGHT: usize = 5;
                 const MAX_IN_FLIGHT: usize = 5000;
                 // optimum_inflight = 1250;
-                let optimum_inflight = (2.0 * min_rtt.as_secs_f32() * max_bw / 16384.0) as usize;
+                let optimum_inflight = (2.3 * min_rtt.as_secs_f32() * max_bw / 16384.0) as usize;
                 info!(
                     "{peer} Auto mode optimum inflight {} min rtt {:?} avg bw {} req in flight {}",
                     optimum_inflight, min_rtt, avg_bw, n_req_in_flight
@@ -1848,11 +1852,13 @@ impl TransmitWorker {
 
     fn handle_extend_pex(&mut self, addr: PeerAddr, pex: ExtendedPex) {
         info!("receive pex from {addr:?}: {:?}", pex);
-        for (addr, flags) in pex.added {
-            self.handle_new_discovered_peer(addr);
+        for (paddr, flags) in pex.added {
+            info!("new discovered peer {paddr:?} from pex of {addr:?}");
+            self.handle_new_discovered_peer(paddr);
         }
-        for (addr, flags) in pex.added6 {
-            self.handle_new_discovered_peer(addr);
+        for (paddr, flags) in pex.added6 {
+            info!("new discovered peer {paddr:?} from pex of {addr:?}");
+            self.handle_new_discovered_peer(paddr);
         }
     }
 
@@ -1995,7 +2001,10 @@ async fn dht_get_peers(
     for a in addrs {
         let t = tmh.clone();
         let opt = handshake_opt.clone();
-        tmh.sender.send(Msg::NewDiscoveredPeer(a));
+        tmh.sender.send(Msg::NewDiscoveredPeer {
+            addr: a,
+            from: PeerFrom::DHT,
+        });
     }
 }
 

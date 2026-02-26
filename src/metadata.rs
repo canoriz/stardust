@@ -224,7 +224,7 @@ impl TrackerGet {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
 enum TrackerResp {
     #[serde(untagged)]
     Failure(Failure),
@@ -232,13 +232,13 @@ enum TrackerResp {
     Success(AnnounceResp),
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq)]
 pub struct AnnounceResp {
     pub interval: u32,
     pub peers: Vec<Peer>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq)]
 pub struct Peer {
     #[serde(rename = "peer id")]
     pub peer_id: ByteString,
@@ -246,7 +246,7 @@ pub struct Peer {
     pub port: u16,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
 pub struct Failure {
     #[serde(rename = "failure reason")]
     pub reason: String,
@@ -390,6 +390,26 @@ mod tests {
         .await
         .unwrap();
         dbg!(z);
+    }
+
+    #[test]
+    // some trackers return empty peers dict, not empty peer list, test if we can decode it correctly
+    fn test_deserialize_empty_announce_list() {
+        let resp = *b"d8:intervali1800e5:peersdee";
+        let r0 = bt_bencode::to_vec(&TrackerResp::Success(AnnounceResp {
+            interval: 1800,
+            peers: vec![],
+        }))
+        .unwrap();
+        println!("r0 = {:?}", String::from_utf8(r0));
+        let decoded = bt_bencode::from_slice::<TrackerResp>(&resp).unwrap();
+        assert_eq!(
+            decoded,
+            TrackerResp::Success(AnnounceResp {
+                interval: 1800,
+                peers: vec![],
+            })
+        );
     }
 
     // #[test]
