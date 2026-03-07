@@ -58,24 +58,11 @@ impl Session {
 
             // TODO: optimize: maybe wait dht bootstrap done then return session
             // TODO: share dht network between sessions?
-            tokio::spawn(async move {
-                _ = c
-                    .ping_rpc(
-                        dht::RpcAddr::NoID(
-                            "[240e:b8f:5c11:9f00:560d:1feb:27b8:741]:60981"
-                                .parse()
-                                .unwrap(),
-                        ),
-                        time::Duration::from_secs(5),
-                    )
-                    .await;
-                c.find_closest_node_to(opt.self_id, true).await;
-            });
             // tokio::spawn(async move {
             //     _ = c
             //         .ping_rpc(
             //             dht::RpcAddr::NoID(
-            //                 "[2408:820c:5b38:2140:2b53:ee8:6e69:6f1a]:60981"
+            //                 "[240e:b8f:5c11:9f00:560d:1feb:27b8:741]:60981"
             //                     .parse()
             //                     .unwrap(),
             //             ),
@@ -84,6 +71,19 @@ impl Session {
             //         .await;
             //     c.find_closest_node_to(opt.self_id, true).await;
             // });
+            tokio::spawn(async move {
+                _ = c
+                    .ping_rpc(
+                        dht::RpcAddr::NoID(
+                            "[2408:820c:5b39:1040:2bbc:c328:803c:1a21]:60981"
+                                .parse()
+                                .unwrap(),
+                        ),
+                        time::Duration::from_secs(5),
+                    )
+                    .await;
+                c.find_closest_node_to(opt.self_id, true).await;
+            });
             Some(dht_client)
         } else {
             None

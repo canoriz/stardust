@@ -89,7 +89,7 @@ impl PieceBlocks {
         let n_blocks = self.block_map.len();
 
         let repick_limit = repick_option.repick_limit;
-        if repick_limit > 1 {
+        if repick_limit > 1 || repick_option.endgame {
             for (i, b) in self.block_map.iter_mut().enumerate() {
                 if count >= n {
                     break;
@@ -139,15 +139,15 @@ impl PieceBlocks {
                             .iter()
                             .map(|(p, t)| {
                                 let elapsed = t.pick_time.elapsed();
-                                let est_rtt = if let Some(rtt) =
-                                    repick_option.alt_timeout.get(p).map(|d| *d)
-                                {
-                                    elapsed.max(rtt)
-                                } else {
-                                    time::Duration::from_secs(10)
-                                };
+                                let est_rtt =
+                                    if let Some(rtt) = repick_option.alt_timeout.get(p).copied() {
+                                        elapsed.max(rtt)
+                                    } else {
+                                        time::Duration::from_secs(10)
+                                    };
                                 (t.pick_time + est_rtt, elapsed)
                             })
+                            // TODO: use reduce instead of fold
                             .fold(
                                 (
                                     time::Instant::now() + time::Duration::from_secs(10),
@@ -165,7 +165,9 @@ impl PieceBlocks {
 
                         let old_remain_time =
                             first_eta.saturating_duration_since(time::Instant::now());
-                        if (old_remain_time > 2 * our_rtt || min_elapsed > FIVE_SECS)
+                        if (old_remain_time > 2 * our_rtt
+                            || min_elapsed > FIVE_SECS
+                            || repick_option.endgame)
                             && !requested.contains_key(&peer)
                         {
                             if old_remain_time > our_rtt * 2 {
@@ -178,6 +180,9 @@ impl PieceBlocks {
                                 debug!(
                                     "{peer} min elapsed time of {req:?} is {min_elapsed:?}, higher than {FIVE_SECS:?}, repick",
                                 );
+                            }
+                            if repick_option.endgame {
+                                debug!("{peer} in endgame mode, repick {req:?}",);
                             }
                             // if !addr.contains_key(&peer) {
                             count += 1;
@@ -254,9 +259,17 @@ impl PieceBlocks {
                         self.requested_or_received_count += 1;
                         self.all_request_or_received_before = i + 1;
                     }
-                    BlockStatus::Requested { .. } => {
+                    BlockStatus::Requested { requested, .. } => {
                         self.all_request_or_received_before = i + 1;
-                        if from.is_some() {
+                        if requested.is_empty() {
+                            *n_in_flight += 1;
+                            if from.is_none() {
+                                from = req;
+                            } else {
+                                to = req;
+                            }
+                            count += 1;
+                        } else if from.is_some() {
                             // not continuous, should break
                             break;
                         }
@@ -313,17 +326,13 @@ impl PieceBlocks {
         #[cfg(test)]
         println!("{b:?}");
         match b {
-            BlockStatus::Requested {
-                requested: addr,
-                revoked,
-                ..
-            } => {
+            BlockStatus::Requested { requested, revoked } => {
                 // A peer can only be revoked if it's requested before
-                if let Some(v) = addr.remove(peer) {
+                if let Some(v) = requested.remove(peer) {
                     revoked.insert(*peer, v);
                 }
                 revoked.retain(|_, t| t.pick_time.elapsed() < NO_RESPONSE_TIMEOUT);
-                if addr.is_empty() && revoked.is_empty() {
+                if requested.is_empty() && revoked.is_empty() {
                     *b = BlockStatus::NotRequested;
                     if self.all_request_or_received_before > b_index {
                         self.all_request_or_received_before = b_index;
@@ -395,6 +404,9 @@ struct RepickOption<'a> {
     // The upper limit of how many times a block may be requested from
     // different peers
     repick_limit: usize,
+
+    // if in endgame mode
+    endgame: bool,
 
     // The alternative timeout duration.
     // Once a peer did not response Piece or Reject
@@ -533,7 +545,7 @@ impl BlockPicker {
     fn rush_mode(&self) -> bool {
         let working_set_size = self.receiving.len() + self.requesting.len();
         // swap IO is too frequent
-        const WORKING_SET_LIMIT: usize = 10;
+        const WORKING_SET_LIMIT: usize = 30;
         working_set_size > WORKING_SET_LIMIT
     }
 
@@ -560,14 +572,22 @@ impl BlockPicker {
         self.prev_time_check = time::Instant::now();
 
         let endgame = self.update_endgame();
-        let repick_option = if self.rush_mode() || endgame {
+        let repick_option = if endgame {
+            RepickOption {
+                repick_limit: 1,
+                endgame: true,
+                alt_timeout: rtts,
+            }
+        } else if self.rush_mode() {
             RepickOption {
                 repick_limit: 7, // TODO: set a proper repick limit
+                endgame: false,
                 alt_timeout: rtts,
             }
         } else {
             RepickOption {
                 repick_limit: 1,
+                endgame: false,
                 alt_timeout: &HashMap::new(),
             }
         };
@@ -655,6 +675,7 @@ impl BlockPicker {
                 let repick_option = RepickOption {
                     repick_limit: limit,
                     alt_timeout: rtts,
+                    endgame: true,
                 };
                 for (index, blocks) in &mut self.receiving {
                     if remain > 0 && peer_status.have(*index) {
@@ -1089,6 +1110,7 @@ mod test {
                 &mut 0,
                 RepickOption {
                     repick_limit: 1,
+                    endgame: false,
                     alt_timeout: &HashMap::new(),
                 },
             );
@@ -1118,6 +1140,7 @@ mod test {
                 &mut 0,
                 RepickOption {
                     repick_limit: 1,
+                    endgame: false,
                     alt_timeout: &HashMap::new(),
                 },
             );
@@ -1231,6 +1254,7 @@ mod test {
                 &mut 0,
                 RepickOption {
                     repick_limit: 1,
+                    endgame: false,
                     alt_timeout: &HashMap::new(),
                 },
             );
@@ -1291,6 +1315,7 @@ mod test {
                 &mut 0,
                 RepickOption {
                     repick_limit: 2,
+                    endgame: false,
                     alt_timeout: &HashMap::new(),
                 },
             );
@@ -1320,6 +1345,7 @@ mod test {
                 &mut 0,
                 RepickOption {
                     repick_limit: 2,
+                    endgame: false,
                     alt_timeout: &HashMap::new(),
                 },
             );
@@ -1349,6 +1375,7 @@ mod test {
                 &mut 0,
                 RepickOption {
                     repick_limit: 2,
+                    endgame: false,
                     alt_timeout: &HashMap::new(),
                 },
             );
@@ -1378,6 +1405,7 @@ mod test {
                 &mut 0,
                 RepickOption {
                     repick_limit: 2,
+                    endgame: false,
                     alt_timeout: &HashMap::new(),
                 },
             );
