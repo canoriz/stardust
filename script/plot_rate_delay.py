@@ -48,7 +48,6 @@ def parse_log_content(lines):
             elif "Auto mode" in line:
                 match = auto_re.search(line)
                 if match:
-                    # 将原始 B 换算为 KB
                     bw_kb = float(match.group('bw')) / 1024.0
                     autos.append({
                         'dt': dt, 'ts': ts, 'peer': match.group('ip_port'),
@@ -86,7 +85,7 @@ if lines:
         st.error("❌ 未能识别到有效数据。")
         st.stop()
 
-    # 统计 Blocks
+    # 统计及选择 Peer
     sample_counts = df_samples['peer'].value_counts().to_dict() if not df_samples.empty else {}
     peer_set_s = set(df_samples['peer'].unique()) if not df_samples.empty else set()
     peer_set_a = set(df_autos['peer'].unique()) if not df_autos.empty else set()
@@ -102,10 +101,15 @@ if lines:
     peer_df = df_samples[df_samples['peer'] == selected_peer].copy().sort_values('ts').reset_index(drop=True)
     peer_auto = df_autos[df_autos['peer'] == selected_peer].copy().sort_values('ts').reset_index(drop=True)
 
-    # 速率统计策略 (仅用于图3,4)
+    # --- RTT 平滑处理与速率统计 ---
     if not peer_df.empty:
         st.sidebar.markdown("---")
-        st.sidebar.subheader("⚙️ 采样速率统计 (图3,4)")
+        st.sidebar.subheader("⚙️ 统计设置")
+        # 1. RTT 平滑
+        alpha = st.sidebar.slider("RTT 平滑因子 (Alpha)", 0.01, 0.50, 0.125, help="Alpha 越小越平滑")
+        peer_df['srtt'] = peer_df['delay'].ewm(alpha=alpha).mean()
+
+        # 2. 采样速率统计 (图3,4)
         min_samples = st.sidebar.number_input("最少统计点数 (N)", value=30, min_value=1)
         min_secs = st.sidebar.number_input("最少时间片段 (秒)", value=1.0, step=0.1)
         sample_size_kb = st.sidebar.number_input("单样本大小 (KiB)", value=16.0)
@@ -141,7 +145,7 @@ if lines:
 
     st.title(f"📊 传输详情: {selected_peer}")
 
-    # 第一部分：旧版四张图
+    # 第一部分：旧版四张图 (fig1)
     if not sub_df.empty:
         inf, dl, rt = sub_df['inflight'].values, sub_df['delay'].values, sub_df['rate'].values
         dts, tm = sub_df['dt'].values, np.linspace(0, 1, len(sub_df))
@@ -181,43 +185,56 @@ if lines:
         plt.tight_layout()
         st.pyplot(fig1)
 
-    # 第二部分：Auto Mode
-    if not sub_auto.empty:
+    # 第二部分：Auto Mode 及平滑 RTT (fig2)
+    if not sub_auto.empty or not sub_df.empty:
         st.markdown("---")
-        st.subheader("📈 算法决策与自动带宽分析 (Auto Mode)")
+        st.subheader("📈 算法决策与平滑 RTT 分析 (Auto Mode)")
 
         fig2 = plt.figure(figsize=(16, 12))
-        dts_a = sub_auto['dt'].values
 
-        # 图 5: Avg BW (换算为 KB/s)
+        # 图 5: Avg BW
         ax5 = fig2.add_subplot(2, 2, 1)
-        ax5.plot(dts_a, sub_auto['bw'], color='#2ca02c', linewidth=2)
-        ax5.fill_between(dts_a, sub_auto['bw'], color='#2ca02c', alpha=0.1)
+        if not sub_auto.empty:
+            ax5.plot(sub_auto['dt'], sub_auto['bw'], color='#2ca02c', linewidth=2)
+            ax5.fill_between(sub_auto['dt'], sub_auto['bw'], color='#2ca02c', alpha=0.1)
         ax5.set_title("5. Logged Avg Bandwidth (KB/s)"); ax5.set_ylabel("Rate (KB/s)"); ax5.grid(True, alpha=0.3)
 
+        # 图 6: Inflight
         ax6 = fig2.add_subplot(2, 2, 2)
-        ax6.step(dts_a, sub_auto['opt_if'], where='post', label='Optimum Inflight', color='#1f77b4')
-        ax6.step(dts_a, sub_auto['req_if'], where='post', label='Req In Flight', color='#ff7f0e', linestyle='--')
-        ax6.set_title("6. Optimum vs Requested Inflight"); ax6.set_ylabel("Count"); ax6.legend(); ax6.grid(True, alpha=0.3)
+        if not sub_auto.empty:
+            ax6.step(sub_auto['dt'], sub_auto['opt_if'], where='post', label='Optimum Inflight', color='#1f77b4')
+            ax6.step(sub_auto['dt'], sub_auto['req_if'], where='post', label='Req In Flight', color='#ff7f0e', linestyle='--')
+        ax6.set_title("6. Optimum vs Requested Inflight"); ax6.legend(); ax6.grid(True, alpha=0.3)
 
+        # 图 7: Min RTT
         ax7 = fig2.add_subplot(2, 2, 3)
-        ax7.plot(dts_a, sub_auto['min_rtt'], color='#d62728')
-        ax7.set_title("7. Min RTT Trend"); ax7.set_ylabel("ms"); ax7.grid(True, alpha=0.3)
+        if not sub_auto.empty:
+            ax7.plot(sub_auto['dt'], sub_auto['min_rtt'], color='#d62728')
+        ax7.set_title("7. Logged Min RTT Trend"); ax7.set_ylabel("ms"); ax7.grid(True, alpha=0.3)
 
-        for ax in [ax5, ax6, ax7]:
+        # 图 8: 平滑 RTT (新增)
+        ax8 = fig2.add_subplot(2, 2, 4)
+        if not sub_df.empty:
+            ax8.plot(sub_df['dt'], sub_df['delay'], color='gray', alpha=0.2, label='Raw Delay')
+            ax8.plot(sub_df['dt'], sub_df['srtt'], color='#9467bd', linewidth=2, label='Smoothed RTT')
+            if not sub_auto.empty:
+                ax8.step(sub_auto['dt'], sub_auto['min_rtt'], where='post', color='#d62728', linestyle=':', alpha=0.7, label='Base Min RTT')
+        ax8.set_title(f"8. Calculated Smoothed RTT (α={alpha})"); ax8.set_ylabel("ms"); ax8.legend(); ax8.grid(True, alpha=0.3)
+
+        for ax in [ax5, ax6, ax7, ax8]:
             ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
             plt.setp(ax.get_xticklabels(), rotation=30, ha='right')
 
         plt.tight_layout()
         st.pyplot(fig2)
 
+    # 底部指标卡
     st.markdown("---")
     c1, c2, c3, c4 = st.columns(4)
     if not sub_df.empty:
         c1.metric("计算平均延迟", f"{sub_df['delay'].mean():.1f} ms")
         c2.metric("计算峰值速率", f"{sub_df['rate'].max():.2f} KB/s")
     if not sub_auto.empty:
-        # 指标卡片显示换算后的 KB/s
         c3.metric("日志 Avg BW", f"{sub_auto['bw'].iloc[-1]:.2f} KB/s")
         c4.metric("最新 Min RTT", f"{sub_auto['min_rtt'].iloc[-1]} ms")
 else:
