@@ -13,7 +13,7 @@ use bytes::BytesMut;
 use tokio::{sync::mpsc, time};
 use tracing::{info, warn};
 
-const POOL_SIZE: usize = 40;
+pub const POOL_SIZE: usize = 60;
 
 const FLUSHING: u32 = 0b1;
 const DIRTY: u32 = 0b10;

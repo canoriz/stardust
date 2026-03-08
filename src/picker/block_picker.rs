@@ -5,7 +5,11 @@ use super::{
     BitField, BlockRange, BlockRequests, PeerAddr, PeerPieceDetail, PieceMap, PiecePicker,
     PieceState,
 };
-use crate::{bandwidth::RTT, math_helper::piece_total_and_last_size, protocol::Request};
+use crate::{
+    bandwidth::RTT,
+    math_helper::piece_total_and_last_size,
+    protocol::{Piece, Request},
+};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     time,
@@ -549,6 +553,13 @@ impl BlockPicker {
         working_set_size > WORKING_SET_LIMIT
     }
 
+    fn strict_rush_mode(&self) -> bool {
+        let working_set_size = self.receiving.len() + self.requesting.len();
+        // swap IO is too frequent
+        use crate::cache::simple_buffer::POOL_SIZE;
+        working_set_size > POOL_SIZE
+    }
+
     /// Pick n blocks from peer, returns
     /// (
     ///  picked blocks,
@@ -607,11 +618,28 @@ impl BlockPicker {
             );
         };
 
+        // pick blocks starting from pieces that have fewest block not requested
+        let piece_index_order = |m: &BTreeMap<u32, PieceBlocks>, n_piece: usize| {
+            let mut piece_order = m
+                .iter()
+                .map(|(i, b)| (*i, b.received_count))
+                .collect::<Vec<_>>();
+            piece_order.sort_by_cached_key(|(_, n_received)| n_piece - *n_received);
+            piece_order
+        };
+
         // TODO: reuse vector
         let mut ret = Vec::new();
-        for (index, blocks) in &mut self.requesting {
+        for index in piece_index_order(&self.requesting, self.n)
+            .iter()
+            .map(|(i, _)| i)
+        {
+            let blocks = &mut self.requesting.get_mut(index).expect("must exist");
             assert!(!endgame);
-            if remain > 0 && peer_status.have(*index) {
+            if remain <= 0 {
+                break;
+            }
+            if peer_status.have(*index) {
                 while let Some((blks, n_picked)) =
                     blocks.pick(*peer, remain, &mut n_in_flight, repick_option)
                 {
@@ -677,8 +705,15 @@ impl BlockPicker {
                     alt_timeout: rtts,
                     endgame: true,
                 };
-                for (index, blocks) in &mut self.receiving {
-                    if remain > 0 && peer_status.have(*index) {
+                for index in piece_index_order(&self.receiving, self.n)
+                    .iter()
+                    .map(|(i, _)| i)
+                {
+                    let blocks = &mut self.receiving.get_mut(index).expect("must exist");
+                    if remain <= 0 {
+                        break;
+                    }
+                    if peer_status.have(*index) {
                         while let Some((blks, n_picked)) =
                             blocks.pick(*peer, remain, &mut n_in_flight, repick_option)
                         {
@@ -692,8 +727,15 @@ impl BlockPicker {
             }
             info!("remain 1 {remain}");
         } else if remain > 0 && repick_option.repick_limit > 1 {
-            for (index, blocks) in &mut self.receiving {
-                if remain > 0 && peer_status.have(*index) {
+            for index in piece_index_order(&self.receiving, self.n)
+                .iter()
+                .map(|(i, _)| i)
+            {
+                let blocks = &mut self.receiving.get_mut(index).expect("must exist");
+                if remain <= 0 {
+                    break;
+                }
+                if peer_status.have(*index) {
                     while let Some((blks, n_picked)) =
                         blocks.pick(*peer, remain, &mut n_in_flight, repick_option)
                     {
@@ -709,8 +751,55 @@ impl BlockPicker {
         }
 
         let endgame = self.update_endgame();
-        while remain > 0 && !self.rush_mode() {
-            // while remain > 0 {
+        if self.rush_mode() {
+            for (index, blocks) in self.receiving.iter().chain(self.requesting.iter()) {
+                let n_received = blocks.received_count;
+                let n_requesting = blocks
+                    .block_map
+                    .iter()
+                    .filter(|b| matches!(b, BlockStatus::Requested { .. }))
+                    .count();
+                let n_to_request = blocks
+                    .block_map
+                    .iter()
+                    .filter(|b| matches!(b, BlockStatus::NotRequested))
+                    .count();
+                let least_waiting_time = blocks
+                    .block_map
+                    .iter()
+                    .filter_map(|b| {
+                        if let BlockStatus::Requested { requested, .. } = b {
+                            requested
+                                .iter()
+                                .map(|(p, t)| t.pick_time)
+                                .reduce(|ta, tb| ta.max(tb))
+                        } else {
+                            None
+                        }
+                    })
+                    .reduce(|va, vb| va.max(vb));
+                let most_waiting_time = blocks
+                    .block_map
+                    .iter()
+                    .filter_map(|b| {
+                        if let BlockStatus::Requested { requested, .. } = b {
+                            requested
+                                .iter()
+                                .map(|(p, t)| t.pick_time)
+                                .reduce(|ta, tb| ta.min(tb))
+                        } else {
+                            None
+                        }
+                    })
+                    .reduce(|va, vb| va.min(vb));
+                debug!(
+                    "{peer} in rush mode detail: piece {}, to request {}, requesting {}, received {}, requested least time {:?}, most time {:?}",
+                    index, n_to_request, n_requesting, n_received, least_waiting_time.map(|x| x.elapsed()), most_waiting_time.map(|x| x.elapsed()),
+                );
+            }
+        }
+        while remain > 0 && !self.strict_rush_mode() {
+            let rush_mode = self.rush_mode();
             if let Some(index) = self.piece_picker.pick_next(peer) {
                 assert!(!endgame);
                 let mut blocks = self.piece_block_of(index);
@@ -720,8 +809,14 @@ impl BlockPicker {
                 {
                     remain -= n_picked;
                     let pb: Vec<_> = blks.iter(self.piece_size as u32).collect();
-                    debug!("{peer} pick piece {index} (pick_next), inflight {n_in_flight}");
-                    debug!("{peer} picked blks: {pb:?}, {:?}", blocks.block_map);
+                    debug!(
+                        "{peer} rush mode extra {} pick piece {} (pick_next), inflight {}",
+                        rush_mode, index, n_in_flight
+                    );
+                    debug!(
+                        "{peer} rush mode extra {} picked blks: {pb:?}, {:?}",
+                        rush_mode, blocks.block_map
+                    );
                     ret.push(blks);
                 }
                 assert!(!self.requesting.contains_key(&index));
