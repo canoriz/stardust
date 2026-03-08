@@ -619,21 +619,18 @@ impl BlockPicker {
         };
 
         // pick blocks starting from pieces that have fewest block not requested
-        let piece_index_order = |m: &BTreeMap<u32, PieceBlocks>, n_piece: usize| {
+        let piece_index_order = |m: &BTreeMap<u32, PieceBlocks>| {
             let mut piece_order = m
                 .iter()
                 .map(|(i, b)| (*i, b.received_count))
                 .collect::<Vec<_>>();
-            piece_order.sort_by_cached_key(|(_, n_received)| n_piece - *n_received);
+            piece_order.sort_by(|(_, recv_a), (_, recv_b)| recv_a.cmp(recv_b).reverse());
             piece_order
         };
 
         // TODO: reuse vector
         let mut ret = Vec::new();
-        for index in piece_index_order(&self.requesting, self.n)
-            .iter()
-            .map(|(i, _)| i)
-        {
+        for index in piece_index_order(&self.requesting).iter().map(|(i, _)| i) {
             let blocks = &mut self.requesting.get_mut(index).expect("must exist");
             assert!(!endgame);
             if remain <= 0 {
@@ -705,10 +702,7 @@ impl BlockPicker {
                     alt_timeout: rtts,
                     endgame: true,
                 };
-                for index in piece_index_order(&self.receiving, self.n)
-                    .iter()
-                    .map(|(i, _)| i)
-                {
+                for index in piece_index_order(&self.receiving).iter().map(|(i, _)| i) {
                     let blocks = &mut self.receiving.get_mut(index).expect("must exist");
                     if remain <= 0 {
                         break;
@@ -727,10 +721,7 @@ impl BlockPicker {
             }
             info!("remain 1 {remain}");
         } else if remain > 0 && repick_option.repick_limit > 1 {
-            for index in piece_index_order(&self.receiving, self.n)
-                .iter()
-                .map(|(i, _)| i)
-            {
+            for index in piece_index_order(&self.receiving).iter().map(|(i, _)| i) {
                 let blocks = &mut self.receiving.get_mut(index).expect("must exist");
                 if remain <= 0 {
                     break;
