@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+import scipy.stats as stats
 import re
 import sys
 import os
@@ -13,6 +14,40 @@ st.set_page_config(page_title="Stardust CC Analyzer Pro", layout="wide")
 
 if 'offset_val' not in st.session_state:
     st.session_state.offset_val = 0
+
+# --- 分布拟合辅助函数 ---
+def fit_distributions(delays):
+    """拟合多种分布，返回拟合结果"""
+    if len(delays) < 2:
+        return None
+
+    dist_names = ['norm', 'lognorm', 'gamma', 'expon']
+    results = []
+
+    for name in dist_names:
+        try:
+            dist = getattr(stats, name)
+            if name in ['lognorm', 'gamma', 'expon']:
+                params = dist.fit(delays, floc=0)
+            else:
+                params = dist.fit(delays)
+
+            log_likelihood = np.sum(dist.logpdf(delays, *params))
+            k_val = params[0] if name in ['gamma', 'lognorm'] else np.nan
+            theta_val = params[-1]
+
+            results.append({
+                'Distribution': name,
+                'Log-Likelihood': log_likelihood,
+                'k (shape)': round(k_val, 4),
+                'theta (scale)': round(theta_val, 4),
+                'params': params,
+                'dist': dist
+            })
+        except Exception:
+            pass
+
+    return sorted(results, key=lambda x: x['Log-Likelihood'], reverse=True) if results else None
 
 # --- 核心解析逻辑 ---
 @st.cache_data
@@ -25,8 +60,12 @@ def parse_log_content(lines):
     auto_re = re.compile(
         r"src/transmit_manager\.rs:\d+:\s+(?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+)\s+Auto mode optimum inflight (?P<opt_if>\d+) min rtt (?P<min_rtt>[\d.]+)ms avg bw (?P<bw>\d+) req in flight (?P<req_if>\d+)"
     )
+    # 正则3: 状态转换
+    change_re = re.compile(
+        r"src/transmit_manager\.rs:\d+:\s+(?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+)\s+change from \w+ to (?P<target_mode>\w+) mode"
+    )
 
-    samples, autos = [], []
+    samples, autos, states = [], [], []
     for line in lines:
         try:
             parts = line.split()
@@ -45,6 +84,21 @@ def parse_log_content(lines):
                         'dt': dt, 'ts': ts, 'peer': match.group('ip_port'),
                         'delay': delay_ms, 'inflight': int(match.group('inflight'))
                     })
+            elif "change from" in line:
+                match = change_re.search(line)
+                if match:
+                    new_mode = match.group('target_mode');
+                    new_mode_f = 0.0
+                    if new_mode == "Auto":
+                        new_mode_f = 1.0
+                    elif new_mode == "SlowDown":
+                        new_mode_f = 2.0
+                    elif new_mode == "Probe":
+                        new_mode_f = 3.0
+                    states.append({
+                        'dt': dt, 'ts': ts, 'peer': match.group('ip_port'),
+                        'state': new_mode
+                    })
             elif "Auto mode" in line:
                 match = auto_re.search(line)
                 if match:
@@ -58,7 +112,7 @@ def parse_log_content(lines):
                     })
         except Exception: continue
 
-    return pd.DataFrame(samples), pd.DataFrame(autos)
+    return pd.DataFrame(samples), pd.DataFrame(autos), pd.DataFrame(states)
 
 # --- 文件加载 ---
 cmd_file = None
@@ -79,7 +133,7 @@ elif cmd_file:
         lines = f.readlines()
 
 if lines:
-    df_samples, df_autos = parse_log_content(lines)
+    df_samples, df_autos, df_states = parse_log_content(lines)
 
     if df_samples.empty and df_autos.empty:
         st.error("❌ 未能识别到有效数据。")
@@ -190,30 +244,30 @@ if lines:
         st.markdown("---")
         st.subheader("📈 算法决策与平滑 RTT 分析 (Auto Mode)")
 
-        fig2 = plt.figure(figsize=(16, 12))
+        fig2 = plt.figure(figsize=(16, 18))
 
         # 图 5: Avg BW
-        ax5 = fig2.add_subplot(2, 2, 1)
+        ax5 = fig2.add_subplot(3, 2, 1)
         if not sub_auto.empty:
             ax5.plot(sub_auto['dt'], sub_auto['bw'], color='#2ca02c', linewidth=2)
             ax5.fill_between(sub_auto['dt'], sub_auto['bw'], color='#2ca02c', alpha=0.1)
         ax5.set_title("5. Logged Avg Bandwidth (KB/s)"); ax5.set_ylabel("Rate (KB/s)"); ax5.grid(True, alpha=0.3)
 
         # 图 6: Inflight
-        ax6 = fig2.add_subplot(2, 2, 2)
+        ax6 = fig2.add_subplot(3, 2, 2)
         if not sub_auto.empty:
             ax6.step(sub_auto['dt'], sub_auto['opt_if'], where='post', label='Optimum Inflight', color='#1f77b4')
             ax6.step(sub_auto['dt'], sub_auto['req_if'], where='post', label='Req In Flight', color='#ff7f0e', linestyle='--')
         ax6.set_title("6. Optimum vs Requested Inflight"); ax6.legend(); ax6.grid(True, alpha=0.3)
 
         # 图 7: Min RTT
-        ax7 = fig2.add_subplot(2, 2, 3)
+        ax7 = fig2.add_subplot(3, 2, 3)
         if not sub_auto.empty:
             ax7.plot(sub_auto['dt'], sub_auto['min_rtt'], color='#d62728')
         ax7.set_title("7. Logged Min RTT Trend"); ax7.set_ylabel("ms"); ax7.grid(True, alpha=0.3)
 
         # 图 8: 平滑 RTT (新增)
-        ax8 = fig2.add_subplot(2, 2, 4)
+        ax8 = fig2.add_subplot(3, 2, 4)
         if not sub_df.empty:
             ax8.plot(sub_df['dt'], sub_df['delay'], color='gray', alpha=0.2, label='Raw Delay')
             ax8.plot(sub_df['dt'], sub_df['srtt'], color='#9467bd', linewidth=2, label='Smoothed RTT')
@@ -221,12 +275,76 @@ if lines:
                 ax8.step(sub_auto['dt'], sub_auto['min_rtt'], where='post', color='#d62728', linestyle=':', alpha=0.7, label='Base Min RTT')
         ax8.set_title(f"8. Calculated Smoothed RTT (α={alpha})"); ax8.set_ylabel("ms"); ax8.legend(); ax8.grid(True, alpha=0.3)
 
-        for ax in [ax5, ax6, ax7, ax8]:
+        # 图 9: 状态转换 (新增)
+        ax9 = fig2.add_subplot(3, 2, 5) # 放在第 5 个位置
+        sub_states = df_states[(df_states['peer'] == selected_peer) & (df_states['ts'] >= t_min) & (df_states['ts'] <= t_max)].copy()
+        if not sub_states.empty:
+            # 将模式名映射为数值用于绘图
+            modes = sorted(sub_states['state'].unique())
+            mode_map = {mode: i for i, mode in enumerate(modes)}
+            sub_states['state_val'] = sub_states['state'].map(mode_map)
+
+            ax9.step(sub_states['dt'], sub_states['state_val'], where='post', marker='o', color='#7f7f7f', linewidth=2)
+            ax9.set_yticks(list(mode_map.values()))
+            ax9.set_yticklabels(list(mode_map.keys()))
+            ax9.set_title("9. Transport Mode States")
+        else:
+            ax9.text(0.5, 0.5, "No State Changes in Window", ha='center')
+        ax9.grid(True, alpha=0.3)
+
+        for ax in [ax5, ax6, ax7, ax8, ax9]:
             ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
             plt.setp(ax.get_xticklabels(), rotation=30, ha='right')
 
         plt.tight_layout()
         st.pyplot(fig2)
+
+    # 第三部分：RTT 分布拟合分析 (fig3)
+    if not sub_df.empty:
+        st.markdown("---")
+        st.subheader("📊 RTT 分布拟合分析")
+
+        delays = sub_df['delay'].values
+        fitted_results = fit_distributions(delays)
+
+        if fitted_results and len(delays) > 1:
+            fig3 = plt.figure(figsize=(14, 6))
+            ax_dist = fig3.add_subplot(1, 1, 1)
+
+            # 绘制直方图
+            ax_dist.hist(delays, bins=50, density=True, alpha=0.3, color='gray', label='RTT Samples')
+
+            # 绘制拟合曲线
+            x = np.linspace(delays.min(), delays.max(), 1000)
+            colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728']
+
+            for idx, result in enumerate(fitted_results[:4]):
+                name = result['Distribution']
+                params = result['params']
+                dist = result['dist']
+                pdf = dist.pdf(x, *params)
+                ll = result['Log-Likelihood']
+                ax_dist.plot(x, pdf, label=f"{name} (LL: {ll:.2f})", linewidth=2, color=colors[idx % len(colors)])
+
+            ax_dist.set_xlabel('RTT (ms)')
+            ax_dist.set_ylabel('Density')
+            ax_dist.set_title(f'RTT Distribution - {selected_peer}')
+            ax_dist.legend(loc='upper right')
+            ax_dist.grid(True, alpha=0.2)
+            st.pyplot(fig3)
+
+            # 显示拟合参数表
+            st.write("**拟合分布参数:**")
+            results_df = pd.DataFrame([
+                {
+                    'Distribution': r['Distribution'],
+                    'Log-Likelihood': f"{r['Log-Likelihood']:.2f}",
+                    'k (shape)': r['k (shape)'],
+                    'theta (scale)': r['theta (scale)']
+                }
+                for r in fitted_results
+            ])
+            st.dataframe(results_df, width='stretch')
 
     # 底部指标卡
     st.markdown("---")

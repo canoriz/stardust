@@ -26,7 +26,10 @@ pub struct PickedDetail {
 
 #[derive(Serialize, Deserialize, Eq, PartialEq, Debug, Clone)]
 pub enum BlockStatus {
-    NotRequested,
+    NotRequested {
+        #[serde(skip)]
+        revoked: HashMap<PeerAddr, PickedDetail>,
+    },
     Requested {
         // TODO: when serializing, make all requested state to NotRequested
         // avoid canceling not requested blocks
@@ -108,7 +111,7 @@ impl PieceBlocks {
                     },
                 });
                 match b {
-                    BlockStatus::NotRequested => {
+                    BlockStatus::NotRequested { revoked } => {
                         // TODO: todo!("does this really happen in endgame mode?");
                         *b = BlockStatus::Requested {
                             requested: HashMap::from([(
@@ -118,7 +121,7 @@ impl PieceBlocks {
                                     n_in_flight_when_picked: *n_in_flight,
                                 },
                             )]),
-                            revoked: HashMap::new(),
+                            revoked: revoked.clone(), // TODO: optimize clone
                         };
                         *n_in_flight += 1;
                         self.all_request_or_received_before = i + 1;
@@ -242,7 +245,7 @@ impl PieceBlocks {
                     },
                 });
                 match b {
-                    BlockStatus::NotRequested => {
+                    BlockStatus::NotRequested { revoked } => {
                         *b = BlockStatus::Requested {
                             requested: HashMap::from([(
                                 peer,
@@ -251,7 +254,7 @@ impl PieceBlocks {
                                     n_in_flight_when_picked: *n_in_flight,
                                 },
                             )]),
-                            revoked: HashMap::new(),
+                            revoked: revoked.clone(),
                         };
                         *n_in_flight += 1;
                         if from.is_none() {
@@ -306,7 +309,7 @@ impl PieceBlocks {
         let b_index = (req.begin as usize) / BLOCK_SIZE;
         let b = &mut self.block_map[b_index];
         match b {
-            BlockStatus::NotRequested => {
+            BlockStatus::NotRequested { .. } => {
                 self.received_count += 1;
                 self.requested_or_received_count += 1;
                 *b = BlockStatus::Received;
@@ -336,15 +339,19 @@ impl PieceBlocks {
                     revoked.insert(*peer, v);
                 }
                 revoked.retain(|_, t| t.pick_time.elapsed() < NO_RESPONSE_TIMEOUT);
-                if requested.is_empty() && revoked.is_empty() {
-                    *b = BlockStatus::NotRequested;
+                if requested.is_empty() {
+                    *b = BlockStatus::NotRequested {
+                        revoked: revoked.clone(),
+                    };
                     if self.all_request_or_received_before > b_index {
                         self.all_request_or_received_before = b_index;
                     }
                     self.requested_or_received_count -= 1;
                 }
             }
-            BlockStatus::NotRequested => {}
+            BlockStatus::NotRequested { revoked } => {
+                revoked.retain(|_, t| t.pick_time.elapsed() < NO_RESPONSE_TIMEOUT);
+            }
             BlockStatus::Received => {}
         }
     }
@@ -389,13 +396,18 @@ impl PieceBlocks {
                         }
                     });
                     revoked.retain(|_, t| t.pick_time.elapsed() < NO_RESPONSE_TIMEOUT);
-                    if requested.is_empty() && revoked.is_empty() {
-                        *b = BlockStatus::NotRequested;
+                    if requested.is_empty() {
+                        *b = BlockStatus::NotRequested {
+                            revoked: revoked.clone(),
+                        };
                         self.requested_or_received_count -= 1;
                         if self.all_request_or_received_before > i {
                             self.all_request_or_received_before = i;
                         }
                     }
+                }
+                BlockStatus::NotRequested { revoked } => {
+                    revoked.retain(|_, t| t.pick_time.elapsed() < NO_RESPONSE_TIMEOUT);
                 }
                 _ => {}
             }
@@ -486,7 +498,12 @@ impl BlockPicker {
             piece_index: index,
             last_block_size,
             all_request_or_received_before: 0,
-            block_map: vec![BlockStatus::NotRequested; n_blocks],
+            block_map: vec![
+                BlockStatus::NotRequested {
+                    revoked: HashMap::new()
+                };
+                n_blocks
+            ],
             requested_or_received_count: 0,
             received_count: 0,
         }
@@ -509,7 +526,13 @@ impl BlockPicker {
     pub fn get_rtt(&self, peer: &PeerAddr, req: &Request) -> Option<time::Duration> {
         if let Some(b) = self.get_block_status(req) {
             match b {
-                BlockStatus::NotRequested => None,
+                BlockStatus::NotRequested { revoked } => {
+                    if let Some(p) = revoked.get(peer) {
+                        Some(p.pick_time.elapsed())
+                    } else {
+                        None
+                    }
+                }
                 BlockStatus::Requested { requested, revoked } => {
                     if let Some(p) = revoked.get(peer) {
                         Some(p.pick_time.elapsed())
@@ -529,7 +552,13 @@ impl BlockPicker {
     pub fn get_inflight_when_sent(&self, peer: &PeerAddr, req: &Request) -> Option<usize> {
         if let Some(b) = self.get_block_status(req) {
             match b {
-                BlockStatus::NotRequested => None,
+                BlockStatus::NotRequested { revoked } => {
+                    if let Some(p) = revoked.get(peer) {
+                        Some(p.n_in_flight_when_picked)
+                    } else {
+                        None
+                    }
+                }
                 BlockStatus::Requested { requested, revoked } => {
                     if let Some(p) = revoked.get(peer) {
                         Some(p.n_in_flight_when_picked)
@@ -679,7 +708,7 @@ impl BlockPicker {
                     p.block_map
                         .iter()
                         .map(|b| match b {
-                            BlockStatus::NotRequested => 0,
+                            BlockStatus::NotRequested { .. } => 0,
                             BlockStatus::Requested { requested, .. } => requested.len(),
                             BlockStatus::Received => usize::MAX,
                         })
@@ -753,7 +782,7 @@ impl BlockPicker {
                 let n_to_request = blocks
                     .block_map
                     .iter()
-                    .filter(|b| matches!(b, BlockStatus::NotRequested))
+                    .filter(|b| matches!(b, BlockStatus::NotRequested { .. }))
                     .count();
                 let least_waiting_time = blocks
                     .block_map
@@ -954,7 +983,8 @@ impl BlockPicker {
         timeout: time::Duration,
         revoked: &mut HashMap<PeerAddr, Vec<Request>>,
     ) {
-        let no_response = |_: &PeerAddr, at: &time::Instant| at.elapsed() > timeout;
+        let no_response =
+            |_: &PeerAddr, at: &time::Instant| at.elapsed() > timeout.min(NO_RESPONSE_TIMEOUT);
         for (index, blocks) in self.receiving.iter_mut() {
             blocks.revoke_all_requested_if(no_response, revoked);
             if !blocks.is_all_requested_or_received() {
@@ -1005,7 +1035,7 @@ impl BlockPicker {
         if let Some(b) = self.requesting.get(&index) {
             let s = &b.block_map[req.begin as usize / BLOCK_SIZE];
             match s {
-                BlockStatus::NotRequested | BlockStatus::Requested { .. } => {
+                BlockStatus::NotRequested { .. } | BlockStatus::Requested { .. } => {
                     return true;
                 }
                 BlockStatus::Received => {
@@ -1186,7 +1216,12 @@ mod test {
             all_request_or_received_before: 0,
             requested_or_received_count: 0,
             received_count: 0,
-            block_map: vec![BlockStatus::NotRequested; 50],
+            block_map: vec![
+                BlockStatus::NotRequested {
+                    revoked: HashMap::new()
+                };
+                50
+            ],
         };
 
         {
@@ -1319,7 +1354,9 @@ mod test {
             requested_or_received_count: 1,
             received_count: 0,
             block_map: vec![
-                BlockStatus::NotRequested,
+                BlockStatus::NotRequested {
+                    revoked: HashMap::new(),
+                },
                 BlockStatus::Requested {
                     requested: HashMap::from([(
                         PEER1,
@@ -1330,7 +1367,9 @@ mod test {
                     )]),
                     revoked: HashMap::new(),
                 },
-                BlockStatus::NotRequested,
+                BlockStatus::NotRequested {
+                    revoked: HashMap::new(),
+                },
             ],
         };
         {
@@ -1378,7 +1417,9 @@ mod test {
             requested_or_received_count: 2,
             received_count: 0,
             block_map: vec![
-                BlockStatus::NotRequested,
+                BlockStatus::NotRequested {
+                    revoked: HashMap::new(),
+                },
                 BlockStatus::Requested {
                     requested: HashMap::from([(
                         PEER1,
@@ -1389,9 +1430,13 @@ mod test {
                     )]),
                     revoked: HashMap::new(),
                 },
-                BlockStatus::NotRequested,
+                BlockStatus::NotRequested {
+                    revoked: HashMap::new(),
+                },
                 BlockStatus::Received,
-                BlockStatus::NotRequested,
+                BlockStatus::NotRequested {
+                    revoked: HashMap::new(),
+                },
             ],
         };
         {
