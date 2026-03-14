@@ -50,6 +50,8 @@ impl TorrentTask {
 
 type PeerAddr = SocketAddr;
 
+const INIT_RTT_STARTUP: time::Duration = time::Duration::from_secs(50);
+
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum PeerMsg {
@@ -538,14 +540,14 @@ impl TransmitWorker {
         };
 
         // TODO: optimize this, do not clone every time
+        // a request is very probably to response with in this time, if it is to be responded
         let rtts = self
             .connected_peers
             .iter()
             .map(|(k, v)| {
                 (
                     *k,
-                    v.bw.get_rtt_4var(time::Duration::from_secs(10))
-                        + time::Duration::from_millis(500),
+                    v.bw.get_rtt_4var().max(time::Duration::from_millis(1500)),
                 )
             })
             .collect();
@@ -609,14 +611,14 @@ impl TransmitWorker {
         };
 
         // TODO: optimize this, do not clone every time
+        // a request is very probably to response with in this time, if it is to be responded
         let rtts = self
             .connected_peers
             .iter()
             .map(|(k, v)| {
                 (
                     *k,
-                    v.bw.get_rtt_4var(time::Duration::from_secs(10))
-                        + time::Duration::from_millis(500),
+                    v.bw.get_rtt_4var().max(time::Duration::from_millis(1500)),
                 )
             })
             .collect();
@@ -980,8 +982,7 @@ impl TransmitWorker {
             pc.conn.recv_stream_cmd(CtrlOfRecv::ReportStat);
 
             // TODO: set a alarm at some clock instead of using tokio task?
-            let next_alarm_wait = pc.bw.get_rtt_4var(time::Duration::from_secs(10)) * 2
-                + time::Duration::from_millis(10);
+            let next_alarm_wait = pc.bw.get_rtt_4var() * 2 + time::Duration::from_millis(10);
             let s = self.self_handle.sender.clone();
             info!("check timeout for {peer:?}, next check after {next_alarm_wait:?}");
             tokio::spawn(async move {
@@ -1094,18 +1095,26 @@ impl TransmitWorker {
 
         const TEN_SECS: time::Duration = time::Duration::from_secs(10);
         // TODO: this 10 is set randomly, choose a good value value instead
-        let (max_bw, min_rtt_in_period) = conn.bw.count_max_bw_and_min_rtt(TEN_SECS * 3);
-        let avg_bw = conn.bw.count_bytes_within_period(TEN_SECS).0 as f32 / TEN_SECS.as_secs_f32();
-        let rtt = conn
+        let (max_bw, min_rtt_in_period) = conn.bw.count_max_bw_and_min_rtt(TEN_SECS * 2);
+        let bytes_10sec = conn.bw.count_bytes_within_period(TEN_SECS).0;
+        let avg_bw = bytes_10sec as f32 / TEN_SECS.as_secs_f32();
+        let rtt = conn.bw.get_rtt().max(time::Duration::from_millis(10));
+        info!("{peer} rtt {rtt:?} var {:?}", conn.bw.get_var());
+        let likely_respond_within = conn
             .bw
-            .get_rtt(TEN_SECS)
-            .max(time::Duration::from_millis(10));
+            .get_rtt_4var()
+            .max(time::Duration::from_millis(1500));
+        let likely_recv_next_within = if bytes_10sec > 0 {
+            time::Duration::from_secs_f32(7.0 * 16384.0 / avg_bw)
+                .max(time::Duration::from_millis(1500))
+        } else {
+            time::Duration::from_secs(10)
+        };
         warn!("peer {peer} estimated max bandwidth {max_bw}, min rtt {min_rtt_in_period:?} req in flight: {}", conn.inflight.inflight());
         let probe_rtt_interval = (min_rtt_in_period * 10)
             .max(TEN_SECS)
             .min(time::Duration::from_secs(30));
 
-        let optimum_bdp = 2.0 * min_rtt_in_period.as_secs_f32() * max_bw;
         let n_req_in_flight = conn.inflight.inflight();
         const TEST_RTT_BURST: usize = 5;
 
@@ -1113,42 +1122,33 @@ impl TransmitWorker {
             BandwidthMode::Auto {
                 ref mut since,
                 ref mut min_rtt,
+                slow_count,
             } => {
                 let since_auto = *since;
                 let slow_down_to = |optimum_inflight: usize,
                                     mode: &mut BandwidthMode,
                                     min_rtt: time::Duration| {
                     info!("{peer} change from Auto to Slowdown mode, optimum inflight {optimum_inflight} min rtt {min_rtt:?}");
-                    let expire = time::Instant::now()
-                        + rtt
-                            .mul_f32(
-                                (n_req_in_flight.saturating_sub(optimum_inflight)) as f32 * 1.3,
-                            )
-                            .max(time::Duration::from_secs(10));
                     *mode = BandwidthMode::SlowDown {
                         since_auto,
                         last_piece_time: time::Instant::now(),
                         min_rtt,
-                        rtt_before: rtt,
                         inflight_target: optimum_inflight,
-                        expire,
                         faster: false,
                     };
                 };
 
-                if since.elapsed() > probe_rtt_interval {
+                if slow_count > 3 {
+                    info!("{peer} after 3 times slow down, maybe really bad network or peer, slow down to minimum speed");
+                    let min_rtt2 = *min_rtt;
+                    // TODO: slow down to what?
+                    slow_down_to(3, &mut conn.bw_mode, min_rtt2);
+                } else if since.elapsed() > probe_rtt_interval {
                     info!("{peer} after {probe_rtt_interval:?} no smaller rtt to SlowDown mode");
                     let min_rtt2 = *min_rtt;
                     conn.bw.shrink_reset_slope(10);
                     slow_down_to(0, &mut conn.bw_mode, min_rtt2);
                 } else {
-                    if rtt < min_rtt.mul_f32(1.2) {
-                        *since = time::Instant::now();
-                        if rtt < *min_rtt {
-                            info!("{peer} Auto mode new min rtt = {:?}", rtt);
-                        }
-                        *min_rtt = (*min_rtt).min(rtt);
-                    }
                     let (rtt_slope, rtt_correlation) = conn.bw.get_rtt_slope_and_correlation();
                     info!(
                         "peer {peer} rtt slope {rtt_slope} correlation {rtt_correlation} points {}",
@@ -1156,19 +1156,23 @@ impl TransmitWorker {
                     );
 
                     let match_slope = rtt_slope as f32 * avg_bw / 16384.0;
-                    let slow_limit = (*min_rtt + time::Duration::from_millis(500)).mul_f32(1.5);
                     info!(
-                        "{peer} avg_bw = {avg_bw} match_slope = {} min rtt {:?} slow_limit {:?} avg rtt {:?}",
-                        match_slope, *min_rtt, slow_limit, rtt
+                        "{peer} avg_bw = {avg_bw} match_slope = {} min rtt {:?} likely recv within {:?} avg rtt {:?}",
+                        match_slope, *min_rtt, likely_recv_next_within, rtt
                     );
+                    info!("{peer} likely respond within {:?}", likely_respond_within);
+                    if rtt > likely_respond_within {
+                        info!(
+                            "{peer} rtt {rtt:?} > likely respond within {likely_respond_within:?}, maybe network congestion, maybe slow down?",
+                        );
+                    }
                     if conn.bw.get_rtt_n_points() >= 10 {
                         if rtt_correlation > 0.85 && match_slope < 1.20 && match_slope > 0.80
-                            || rtt > slow_limit
+                            || rtt > likely_respond_within
                         {
-                            // if rtt > min_rtt_in_period + time::Duration::from_millis(100) {
                             conn.bw.shrink_reset_slope(10);
                             let optimum_inflight =
-                                (min_rtt.as_secs_f32() * max_bw / 16384.0) as usize;
+                                (min_rtt.as_secs_f32() * avg_bw * 0.5 / 16384.0) as usize;
                             info!("{peer} linear-increase threshold bw {avg_bw} slow down to {optimum_inflight} inflight");
                             let min_rtt2 = *min_rtt;
                             slow_down_to(optimum_inflight, &mut conn.bw_mode, min_rtt2);
@@ -1180,38 +1184,51 @@ impl TransmitWorker {
                 ref mut since_auto,
                 ref mut min_rtt,
                 ref mut last_piece_time,
-                expire,
                 inflight_target,
-                rtt_before,
                 ref mut faster,
             } => {
-                if last_piece_time.elapsed() > time::Duration::from_secs(5) {
-                    info!("{peer} change from Slowdown to Auto mode, 5 sec no packet");
-                    conn.bw_mode = BandwidthMode::Auto {
-                        since: time::Instant::now(),
-                        min_rtt: *min_rtt,
-                    };
-                } else if n_req_in_flight <= inflight_target || time::Instant::now() > expire {
-                    let now = time::Instant::now();
-                    let timeout = rtt_before
-                        .mul_f32(TEST_RTT_BURST as f32 * 1.2)
-                        .max(time::Duration::from_secs(10));
-                    if *faster || inflight_target == 0 {
+                if last_piece_time.elapsed() > likely_recv_next_within
+                    || n_req_in_flight <= inflight_target
+                {
+                    if last_piece_time.elapsed() > likely_recv_next_within {
                         info!(
-                            "{peer} change from Slowdown to Auto mode, faster {} inflight target {inflight_target}",
+                            "{peer} change from Slowdown to Auto mode, {:?} no packet",
+                            likely_recv_next_within
+                        );
+                        conn.bw_mode = BandwidthMode::Auto {
+                            since: time::Instant::now(),
+                            min_rtt: min_rtt_in_period.min(rtt),
+                            // min_rtt: *min_rtt,
+                            slow_count: 0,
+                        };
+                    } else if *faster {
+                        info!(
+                            "{peer} change from Slowdown to Auto mode, because faster {}",
                             *faster,
                         );
                         conn.bw_mode = BandwidthMode::Auto {
                             since: time::Instant::now(),
                             min_rtt: *min_rtt,
+                            slow_count: 0,
+                        };
+                    } else if inflight_target == 0 {
+                        info!(
+                            "{peer} change from Slowdown to Auto mode, because inflight target is 0",
+                        );
+                        conn.bw_mode = BandwidthMode::Auto {
+                            since: time::Instant::now(),
+                            // min_rtt: *min_rtt,
+                            min_rtt: min_rtt_in_period.min(rtt),
+                            slow_count: 0,
                         };
                     } else {
-                        info!("{peer} change from Slowdown to Probe mode, timeout {timeout:?}");
+                        // not slow down to 0, keep min rtt
+                        let now = time::Instant::now();
+                        info!("{peer} change from Slowdown to Probe mode");
                         conn.bw_mode = BandwidthMode::ProbeRTT {
                             since_auto: *since_auto,
                             last_piece_time: now,
                             min_rtt: *min_rtt,
-                            expire: now + timeout,
                             n_to_probe: TEST_RTT_BURST,
                             to_receive: HashSet::new(),
                             from_clear: inflight_target == 0,
@@ -1229,7 +1246,6 @@ impl TransmitWorker {
                 ref mut since_auto,
                 ref mut min_rtt,
                 ref mut last_piece_time,
-                expire,
                 ref mut to_receive,
                 ref mut n_to_probe,
                 from_clear,
@@ -1239,13 +1255,15 @@ impl TransmitWorker {
                     "{peer} in ProbeRTT mode to_probe: {}, to_receive: {to_receive:?}",
                     *n_to_probe
                 );
-                if last_piece_time.elapsed() > time::Duration::from_secs(10) {
+                if last_piece_time.elapsed() > likely_recv_next_within {
                     info!(
-                        "{peer} change from Probe to Auto mode, 10 sec no packet jump out to Auto"
+                        "{peer} change from Probe to Auto mode, {:?} no packet jump out to Auto",
+                        likely_recv_next_within
                     );
                     conn.bw_mode = BandwidthMode::Auto {
                         since: time::Instant::now(),
                         min_rtt: *min_rtt,
+                        slow_count: 0,
                     };
                 } else if (*n_to_probe) == 0 && to_receive.is_empty() {
                     info!(
@@ -1258,13 +1276,8 @@ impl TransmitWorker {
                             *since_auto
                         },
                         min_rtt: *min_rtt,
+                        slow_count: 0,
                     }
-                } else if time::Instant::now() > expire {
-                    info!("{peer} change from Probe to Auto mode, Probe expired, return to Auto");
-                    conn.bw_mode = BandwidthMode::Auto {
-                        since: time::Instant::now(),
-                        min_rtt: *min_rtt,
-                    };
                 }
             }
             BandwidthMode::Choked => {}
@@ -1274,6 +1287,7 @@ impl TransmitWorker {
             BandwidthMode::Auto {
                 ref mut since,
                 ref mut min_rtt,
+                ref mut slow_count,
             } => {
                 // Only can pick more blocks if we received some or no requests in flight.
                 // For peers with small bandwidth, we don't request too much from them
@@ -1282,7 +1296,7 @@ impl TransmitWorker {
                 const MIN_IN_FLIGHT: usize = 5;
                 const MAX_IN_FLIGHT: usize = 5000;
                 // optimum_inflight = 1250;
-                let optimum_inflight = (2.3 * min_rtt.as_secs_f32() * max_bw / 16384.0) as usize;
+                let optimum_inflight = (1.8 * min_rtt.as_secs_f32() * max_bw / 16384.0) as usize;
                 info!(
                     "{peer} Auto mode optimum inflight {} min rtt {:?} avg bw {} req in flight {}",
                     optimum_inflight, min_rtt, avg_bw, n_req_in_flight
@@ -1309,9 +1323,7 @@ impl TransmitWorker {
                 ref mut since_auto,
                 ref mut min_rtt,
                 ref mut last_piece_time,
-                expire,
                 inflight_target,
-                rtt_before,
                 ref mut faster,
             } => {
                 info!(
@@ -1391,8 +1403,24 @@ impl TransmitWorker {
         info!("{peer} add sample {rtt:?}, inflight when sent {inflight_when_sent:?}");
 
         match &mut conn.bw_mode {
-            BandwidthMode::Auto { since, min_rtt } => {
+            BandwidthMode::Auto {
+                since,
+                min_rtt,
+                slow_count,
+            } => {
                 if let Some(rtt) = rtt {
+                    let mean = conn.bw.get_rtt();
+                    let deviation = conn.bw.get_var();
+                    let threshold = mean + deviation;
+                    if rtt > mean + deviation {
+                        *slow_count += 1;
+                        info!(
+                            "{peer} rtt {rtt:?} larger than {threshold:?}, slow_count {slow_count}"
+                        );
+                    } else {
+                        *slow_count = 0;
+                    }
+
                     if rtt < *min_rtt {
                         *min_rtt = rtt;
                         *since = time::Instant::now();

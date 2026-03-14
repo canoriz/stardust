@@ -12,6 +12,10 @@ pub enum BandwidthMode {
     Auto {
         since: time::Instant,
         min_rtt: time::Duration,
+
+        // how many consecutive response which have rtt greater than (mean + sigma)
+        slow_count: u32,
+        // slow_down_to: usize,
     },
 
     Choked,
@@ -26,10 +30,6 @@ pub enum BandwidthMode {
 
         // slow down to target inflight
         inflight_target: usize,
-        // TODO: need this anymore if we have last_piece_time?
-        expire: time::Instant,
-
-        rtt_before: time::Duration,
 
         // if rtt is smaller
         faster: bool,
@@ -44,9 +44,6 @@ pub enum BandwidthMode {
 
         min_rtt: time::Duration,
 
-        // TODO: need this anymore if we have last_piece_time?
-        expire: time::Instant,
-
         to_receive: HashSet<Request>,
         n_to_probe: usize,
         inflight_target: usize,
@@ -58,7 +55,9 @@ impl BandwidthMode {
     pub fn new_auto() -> Self {
         BandwidthMode::Auto {
             since: time::Instant::now(),
-            min_rtt: time::Duration::MAX.mul_f32(0.5),
+            min_rtt: time::Duration::from_secs(10),
+
+            slow_count: 0,
         }
     }
 }

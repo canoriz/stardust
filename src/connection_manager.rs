@@ -164,7 +164,10 @@ impl ConnectionManagerHandle {
         let c = self.send_stream.sender.clone();
         c.send(m);
         // tokio::spawn(async move {
-        //     time::sleep(time::Duration::from_millis(800)).await;
+        //     time::sleep(time::Duration::from_millis(
+        //         800 + rand::random_range(0..1500),
+        //     ))
+        //     .await;
         //     c.send(m);
         // });
     }

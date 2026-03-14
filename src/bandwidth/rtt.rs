@@ -27,13 +27,12 @@ pub struct RTT {
 impl RTT {
     pub fn new(alpha: f32, beta: f32) -> Self {
         Self {
-            // set start up rtt to 3 sec
             count: 0,
-            smooth_rtt: Duration::from_secs(50),
+            smooth_rtt: Duration::from_secs(6),
             rtt_var: Duration::from_secs(0),
             a: alpha,
             b: beta,
-            min_rtt: Duration::from_secs(60),
+            min_rtt: Duration::from_secs(6),
         }
     }
 

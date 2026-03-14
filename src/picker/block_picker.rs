@@ -142,50 +142,25 @@ impl PieceBlocks {
 
                         // if number of requests that are in-flight and not timeout-ed are
                         // less than repick limit, request a new one
-                        let (first_eta, min_elapsed) = requested
-                            .iter()
-                            .map(|(p, t)| {
-                                let elapsed = t.pick_time.elapsed();
-                                let est_rtt =
-                                    if let Some(rtt) = repick_option.alt_timeout.get(p).copied() {
-                                        elapsed.max(rtt)
-                                    } else {
-                                        time::Duration::from_secs(10)
-                                    };
-                                (t.pick_time + est_rtt, elapsed)
-                            })
-                            // TODO: use reduce instead of fold
-                            .fold(
-                                (
-                                    time::Instant::now() + time::Duration::from_secs(10),
-                                    time::Duration::from_secs(10),
-                                ),
-                                |acc, (eta, elapsed)| (acc.0.min(eta), acc.1.min(elapsed)),
-                            );
-                        let our_rtt = repick_option
-                            .alt_timeout
-                            .get(&peer)
-                            .map(|d| *d)
-                            .unwrap_or(time::Duration::from_secs(10));
-
-                        const FIVE_SECS: time::Duration = time::Duration::from_secs(5);
-
-                        let old_remain_time =
-                            first_eta.saturating_duration_since(time::Instant::now());
-                        if (old_remain_time > 2 * our_rtt
-                            || min_elapsed > FIVE_SECS
-                            || repick_option.endgame)
+                        let now = time::Instant::now();
+                        let all_no_response = requested.iter().all(|(p, t)| {
+                            now.duration_since(t.pick_time)
+                                >= repick_option
+                                    .alt_timeout
+                                    .get(p)
+                                    .copied()
+                                    .unwrap_or(time::Duration::from_secs(10))
+                        });
+                        if (all_no_response || repick_option.endgame)
                             && !requested.contains_key(&peer)
                         {
-                            if old_remain_time > our_rtt * 2 {
+                            if all_no_response {
                                 debug!(
-                                    "{peer} estimated remain time of {req:?} {:?} is much higher than est new rtt {:?} repick",
-                                    old_remain_time, our_rtt,
-                                );
-                            }
-                            if min_elapsed > FIVE_SECS {
-                                debug!(
-                                    "{peer} min elapsed time of {req:?} is {min_elapsed:?}, higher than {FIVE_SECS:?}, repick",
+                                    "{peer} repick {req:?} all pre no response {:?}",
+                                    requested
+                                        .iter()
+                                        .map(|(p, t)| (p, t.pick_time.elapsed()))
+                                        .collect::<Vec<_>>()
                                 );
                             }
                             if repick_option.endgame {
@@ -193,7 +168,6 @@ impl PieceBlocks {
                             }
                             // if !addr.contains_key(&peer) {
                             count += 1;
-                            info!("{peer:?} repick {req:?}, requested {requested:?}, revoked: {revoked:?}");
                             // TODO: FIXME: this cause rtt wrongly thinks response is to second request,
                             // should be first request's response
                             requested.insert(
@@ -382,7 +356,7 @@ impl PieceBlocks {
                     requested.retain(|p, t| {
                         if remove(p, &t.pick_time) {
                             info!(
-                                "revoke block {req:?} from {p}, issued at {t:?}, after {:?}",
+                                "revoke block {req:?} from {p}, after {:?}",
                                 t.pick_time.elapsed()
                             );
                             revoked_reqs
@@ -603,14 +577,10 @@ impl BlockPicker {
         mut n_in_flight: usize,
         revoked: &mut HashMap<PeerAddr, Vec<Request>>,
     ) -> (BlockRequests, usize) {
-        self.revoke_unrespond(
-            rtts.get(peer)
-                .map_or(time::Duration::from_secs(5), |x| *x)
-                .max(time::Duration::from_secs(5)),
-            revoked,
-        );
+        self.revoke_unrespond(rtts, revoked);
         self.prev_time_check = time::Instant::now();
 
+        let rush_mode = self.rush_mode();
         let endgame = self.update_endgame();
         let repick_option = if endgame {
             RepickOption {
@@ -659,32 +629,51 @@ impl BlockPicker {
 
         // TODO: reuse vector
         let mut ret = Vec::new();
-        for index in piece_index_order(&self.requesting).iter().map(|(i, _)| i) {
-            let blocks = &mut self.requesting.get_mut(index).expect("must exist");
-            assert!(!endgame);
-            if remain <= 0 {
-                break;
-            }
-            if peer_status.have(*index) {
-                while let Some((blks, n_picked)) =
-                    blocks.pick(*peer, remain, &mut n_in_flight, repick_option)
-                {
-                    remain -= n_picked;
-                    let pb: Vec<_> = blks.iter(self.piece_size as u32).collect();
-                    debug!("pick piece {index} from peer {peer} (requesting), picked blks: {pb:?}");
-                    ret.push(blks);
+        let pick_blocks_from_requesting =
+            |ret: &mut Vec<BlockRange>,
+             pieces: &mut BTreeMap<u32, PieceBlocks>,
+             peer_status: &PeerPieceDetail,
+             remain: &mut usize,
+             n_in_flight: &mut usize,
+             piece_size: usize| {
+                for index in piece_index_order(pieces).iter().map(|(i, _)| i) {
+                    let blocks = &mut pieces.get_mut(index).expect("must exist");
+                    assert!(!endgame);
+                    if *remain <= 0 {
+                        break;
+                    }
+                    if peer_status.have(*index) {
+                        while let Some((blks, n_picked)) =
+                            blocks.pick(*peer, *remain, n_in_flight, repick_option)
+                        {
+                            *remain -= n_picked;
+                            let pb: Vec<_> = blks.iter(piece_size as u32).collect();
+                            debug!("pick piece {index} from peer {peer} (requesting), picked blks: {pb:?}");
+                            ret.push(blks);
+                        }
+                    }
+                }
+            };
+
+        // if in normal more, pick requesting pieces
+        // if in rush mode, pick receiving pieces first, then requesting pieces, try to finish pieces asap
+        if !rush_mode {
+            pick_blocks_from_requesting(
+                &mut ret,
+                &mut self.requesting,
+                &peer_status,
+                &mut remain,
+                &mut n_in_flight,
+                self.piece_size,
+            );
+            for (index, blocks) in self.requesting.iter_mut() {
+                if blocks.is_all_requested_or_received() {
+                    self.receiving.insert(*index, blocks.clone());
                 }
             }
-            info!("remain 0 {remain}");
+            self.requesting
+                .retain(|_, b| !b.is_all_requested_or_received());
         }
-
-        for (index, blocks) in self.requesting.iter_mut() {
-            if blocks.is_all_requested_or_received() {
-                self.receiving.insert(*index, blocks.clone());
-            }
-        }
-        self.requesting
-            .retain(|_, b| !b.is_all_requested_or_received());
 
         let endgame = self.update_endgame();
         let peer_status = if let Some(h) = self.piece_picker.peer_detail(peer) {
@@ -749,7 +738,7 @@ impl BlockPicker {
                 }
             }
             info!("remain 1 {remain}");
-        } else if remain > 0 && repick_option.repick_limit > 1 {
+        } else if remain > 0 && rush_mode {
             for index in piece_index_order(&self.receiving).iter().map(|(i, _)| i) {
                 let blocks = &mut self.receiving.get_mut(index).expect("must exist");
                 if remain <= 0 {
@@ -768,6 +757,24 @@ impl BlockPicker {
                 }
             }
             info!("remain 2 {remain}");
+        }
+
+        if rush_mode {
+            pick_blocks_from_requesting(
+                &mut ret,
+                &mut self.requesting,
+                &peer_status,
+                &mut remain,
+                &mut n_in_flight,
+                self.piece_size,
+            );
+            for (index, blocks) in self.requesting.iter_mut() {
+                if blocks.is_all_requested_or_received() {
+                    self.receiving.insert(*index, blocks.clone());
+                }
+            }
+            self.requesting
+                .retain(|_, b| !b.is_all_requested_or_received());
         }
 
         let endgame = self.update_endgame();
@@ -980,11 +987,15 @@ impl BlockPicker {
     /// longer than timeout
     fn revoke_unrespond(
         &mut self,
-        timeout: time::Duration,
+        timeout: &HashMap<PeerAddr, time::Duration>,
         revoked: &mut HashMap<PeerAddr, Vec<Request>>,
     ) {
-        let no_response =
-            |_: &PeerAddr, at: &time::Instant| at.elapsed() > timeout.min(NO_RESPONSE_TIMEOUT);
+        let no_response = |peer: &PeerAddr, at: &time::Instant| {
+            // (*timeout.get(peer).unwrap_or(&time::Duration::from_secs(5)))
+            //     .max(time::Duration::from_millis(1500))
+            //     < at.elapsed()
+            at.elapsed() > NO_RESPONSE_TIMEOUT
+        };
         for (index, blocks) in self.receiving.iter_mut() {
             blocks.revoke_all_requested_if(no_response, revoked);
             if !blocks.is_all_requested_or_received() {
@@ -1000,7 +1011,17 @@ impl BlockPicker {
                 self.piece_picker.set_have(*index, false);
             }
         }
-        self.requesting.retain(|_, b| !b.is_all_not_requested());
+        self.requesting.retain(|_, b| {
+            !b.is_all_not_requested()
+                || b.block_map.iter().any(|s| {
+                    if let BlockStatus::NotRequested { revoked } = s {
+                        // TODO: optimize, do not loop over block_map, store a revoked_count
+                        !revoked.is_empty()
+                    } else {
+                        false
+                    }
+                })
+        });
     }
 
     fn update_endgame(&mut self) -> bool {

@@ -69,6 +69,8 @@ struct FindNodeArg {
     id: NodeID,
     #[serde(with = "serde_bytes")]
     target: NodeID,
+    #[serde(default = "Vec::new")]
+    want: Vec<ByteString>,
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -120,6 +122,8 @@ struct GetPeersArg {
     id: NodeID,
     #[serde(with = "serde_bytes")]
     info_hash: [u8; 20],
+    #[serde(default = "Vec::new")]
+    want: Vec<ByteString>,
 }
 
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
@@ -403,6 +407,7 @@ impl DHT {
             inner: KRPCInner::Request(Arg::FindNode(FindNodeArg {
                 id: self.id,
                 target,
+                want: vec![b"n4".as_ref().into(), b"n6".as_ref().into()],
             })),
         };
         self.do_rpc_req(addr, krpc, timeout).await
@@ -422,6 +427,7 @@ impl DHT {
             inner: KRPCInner::Request(Arg::GetPeers(GetPeersArg {
                 id: self.id,
                 info_hash,
+                want: vec![b"n4".as_ref().into(), b"n6".as_ref().into()],
             })),
         };
         self.do_rpc_req(addr, krpc, timeout).await
@@ -496,14 +502,13 @@ impl DHT {
                 let mut ns = Vec::with_capacity(8);
                 match client.find_node_rpc(addr, target, timeout).await {
                     Ok(r) => {
-                        if !ipv6 {
-                            if let Some(n4) = r.nodes {
-                                ns.extend(n4.0.into_iter().map(|(id, a)| NodeAddr {
-                                    id,
-                                    addr: SocketAddr::V4(a),
-                                }))
-                            }
-                        } else if let Some(n6) = r.nodes6 {
+                        if let Some(n4) = r.nodes {
+                            ns.extend(n4.0.into_iter().map(|(id, a)| NodeAddr {
+                                id,
+                                addr: SocketAddr::V4(a),
+                            }))
+                        }
+                        if let Some(n6) = r.nodes6 {
                             ns.extend(n6.0.into_iter().map(|(id, a)| NodeAddr {
                                 id,
                                 addr: SocketAddr::V6(a),

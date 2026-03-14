@@ -11,6 +11,7 @@ pub(crate) struct Bandwidth<const SLOT_SIZE: usize> {
     circular: [Period; SLOT_SIZE],
     head: usize,
 
+    rtt: RTT,
     tendency: SlidingWindowRegression,
 }
 
@@ -67,6 +68,7 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
             head: 0,
 
             tendency: SlidingWindowRegression::new(10),
+            rtt: RTT::new(ALPHA, BETA),
         }
     }
 
@@ -97,6 +99,7 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
         let n_in_flight = n_in_flight.unwrap_or(2);
 
         self.circular[self.head].add(n_bytes, 1, rtt);
+        self.rtt.add_rtt_sample(rtt);
         info!(
             "tendency add sample {rtt:?}, period: {:?}, elapsed {:?}",
             self.circular[self.head],
@@ -147,8 +150,7 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
                 p.bytes_count,
                 p.since.elapsed()
             );
-            // if dt > Duration::from_millis(100) {
-            if dt > Duration::from_millis(40) {
+            if dt > Duration::from_millis(250) {
                 // only count slots that dt are large enough slots to avoid division
                 // by near-zero duration and resulting large bandwidth
                 (acc.0.max(bw), acc.1.min(p.rtt.get_min_rtt()))
@@ -166,14 +168,12 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
         let mut slot_id = self.head;
 
         let mut end_time = Instant::now();
-        let mut min_rtt = Duration::MAX;
         let now = Instant::now();
         let begin_time = now - back_interval;
         let mut t = init;
         loop {
             let slot = &self.circular[slot_id];
 
-            min_rtt = min_rtt.min(slot.rtt.get_min_rtt());
             if begin_time <= slot.since {
                 // querying range covers entire slot
                 if slot.pkg_count > 0 {
@@ -220,41 +220,16 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
         self.fold_periods_within_interval(back_interval, (0, Duration::MAX), f)
     }
 
-    pub fn get_rtt_4var(&self, back_interval: Duration) -> Duration {
-        let f = |acc: (u32, Duration), _begin: Instant, _: Instant, p: &Period| {
-            let n = acc.0;
-
-            if p.bytes_count > 0 {
-                (
-                    n + 1,
-                    acc.1.mul_f32((n as f32) / ((n + 1) as f32))
-                        + (p.rtt.get_rtt() + 4 * p.rtt.get_variation())
-                            .mul_f32(1.0 / ((n + 1) as f32)),
-                )
-            } else {
-                acc
-            }
-        };
-        self.fold_periods_within_interval(back_interval, (0, Duration::from_secs(1)), f)
-            .1
+    pub fn get_rtt(&self) -> Duration {
+        self.rtt.get_rtt()
     }
 
-    pub fn get_rtt(&self, back_interval: Duration) -> Duration {
-        let f = |acc: (u32, Duration), _begin: Instant, _: Instant, p: &Period| {
-            let n = acc.0;
+    pub fn get_var(&self) -> Duration {
+        self.rtt.get_variation()
+    }
 
-            if p.bytes_count > 0 {
-                (
-                    n + 1,
-                    acc.1.mul_f32((n as f32) / ((n + 1) as f32))
-                        + (p.rtt.get_rtt()).mul_f32(1.0 / ((n + 1) as f32)),
-                )
-            } else {
-                acc
-            }
-        };
-        self.fold_periods_within_interval(back_interval, (0, Duration::from_secs(1)), f)
-            .1
+    pub fn get_rtt_4var(&self) -> Duration {
+        self.get_var() * 4 + self.get_rtt()
     }
 }
 

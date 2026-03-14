@@ -54,11 +54,11 @@ def fit_distributions(delays):
 def parse_log_content(lines):
     # 正则1: 原始采样 (add sample)
     sample_re = re.compile(
-        r"src/transmit_manager\.rs:\d+:\s+(?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+)\s+add\s+sample\s+Some\((?P<delay>[\d.]+)(?P<unit>ms|s)\),\s+inflight\s+when\s+sent\s+Some\((?P<inflight>\d+)\)"
+        r"src/transmit_manager\.rs:\d+:\s+(?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+)\s+add\s+sample\s+Some\((?P<delay>[\d.]+)(?P<unit>µs|ms|s)\),\s+inflight\s+when\s+sent\s+Some\((?P<inflight>\d+)\)"
     )
     # 正则2: 自动模式指标 (Auto mode)
     auto_re = re.compile(
-        r"src/transmit_manager\.rs:\d+:\s+(?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+)\s+Auto mode optimum inflight (?P<opt_if>\d+) min rtt (?P<min_rtt>[\d.]+)ms avg bw (?P<bw>\d+) req in flight (?P<req_if>\d+)"
+        r"src/transmit_manager\.rs:\d+:\s+(?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+)\s+Auto mode optimum inflight (?P<opt_if>\d+) min rtt (?P<min_rtt>[\d.]+)(?P<min_rtt_unit>µs|ms|s)? avg bw (?P<bw>\d+) req in flight (?P<req_if>\d+)"
     )
     # 正则3: 状态转换
     change_re = re.compile(
@@ -79,7 +79,13 @@ def parse_log_content(lines):
                 if match:
                     raw_delay = float(match.group('delay'))
                     unit = match.group('unit')
-                    delay_ms = raw_delay * 1000.0 if unit == 's' else raw_delay
+                    # Convert to milliseconds
+                    if unit == 'µs':
+                        delay_ms = raw_delay / 1000.0
+                    elif unit == 's':
+                        delay_ms = raw_delay * 1000.0
+                    else:  # ms
+                        delay_ms = raw_delay
                     samples.append({
                         'dt': dt, 'ts': ts, 'peer': match.group('ip_port'),
                         'delay': delay_ms, 'inflight': int(match.group('inflight'))
@@ -103,10 +109,19 @@ def parse_log_content(lines):
                 match = auto_re.search(line)
                 if match:
                     bw_kb = float(match.group('bw')) / 1024.0
+                    min_rtt_val = float(match.group('min_rtt'))
+                    min_rtt_unit = match.group('min_rtt_unit') or 'ms'  # default to ms if not specified
+                    # Convert to milliseconds
+                    if min_rtt_unit == 'µs':
+                        min_rtt_ms = min_rtt_val / 1000.0
+                    elif min_rtt_unit == 's':
+                        min_rtt_ms = min_rtt_val * 1000.0
+                    else:  # ms
+                        min_rtt_ms = min_rtt_val
                     autos.append({
                         'dt': dt, 'ts': ts, 'peer': match.group('ip_port'),
                         'opt_if': int(match.group('opt_if')),
-                        'min_rtt': float(match.group('min_rtt')),
+                        'min_rtt': min_rtt_ms,
                         'bw': bw_kb,
                         'req_if': int(match.group('req_if'))
                     })
