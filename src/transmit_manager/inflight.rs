@@ -32,22 +32,39 @@ impl Inflight {
         }
     }
 
-    pub fn cancel(&mut self, req: Request, direct: bool) {
+    /// A request is cancelled by us
+    pub fn cancel(&mut self, req: Request) {
         if let Some(request_ts) = self.requested.remove(&req) {
-            if !direct {
-                self.canceled.insert(req, request_ts);
-            }
-        } else {
-            info!("cancel a not requested {req:?}");
+            self.canceled.insert(req, request_ts);
         }
     }
 
-    pub fn receive(&mut self, req: Request) {
+    /// A request is rejected
+    pub fn reject(&mut self, req: Request) {
         self.requested.remove(&req);
         self.canceled.remove(&req);
     }
 
+    /// A request is timeout
+    pub fn timeout(&mut self, req: Request) {
+        self.requested.remove(&req);
+        self.canceled.remove(&req);
+    }
+
+    pub fn receive(&mut self, req: Request) {
+        self.canceled.remove(&req);
+        if let Some(ts) = self.requested.remove(&req) {
+            self.canceled.retain(|_, &mut v| v > ts);
+        }
+    }
+
     pub fn inflight(&self) -> usize {
+        // TODO: remove canceled requests after some rtt_mean + 4sigma
         self.requested.len()
+            + self
+                .canceled
+                .iter()
+                .filter(|(_, &v)| v.elapsed() < time::Duration::from_secs(5))
+                .count()
     }
 }

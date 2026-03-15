@@ -15,6 +15,10 @@ pub enum BandwidthMode {
 
         // how many consecutive response which have rtt greater than (mean + sigma)
         slow_count: u32,
+        slow_down_to: usize,
+
+        // timestamp of last piece receive
+        last_piece_time: time::Instant,
         // slow_down_to: usize,
     },
 
@@ -58,6 +62,8 @@ impl BandwidthMode {
             min_rtt: time::Duration::from_secs(10),
 
             slow_count: 0,
+            slow_down_to: 0,
+            last_piece_time: time::Instant::now(),
         }
     }
 }

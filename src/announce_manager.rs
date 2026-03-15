@@ -43,8 +43,8 @@ impl AnnounceManagerHandle {
             announce_timer: task::JoinSet::new(),
             url_list: HashMap::new(),
         };
-        tokio::spawn(run_announce_manager::<metadata::Announcer>(
-            // tokio::spawn(run_announce_manager::<FakeAnnouncer>(
+        // tokio::spawn(run_announce_manager::<metadata::Announcer>(
+        tokio::spawn(run_announce_manager::<FakeAnnouncer>(
             manager,
             info_hash,
             cancel.clone(),

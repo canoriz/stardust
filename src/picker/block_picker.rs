@@ -990,7 +990,7 @@ impl BlockPicker {
         timeout: &HashMap<PeerAddr, time::Duration>,
         revoked: &mut HashMap<PeerAddr, Vec<Request>>,
     ) {
-        let no_response = |peer: &PeerAddr, at: &time::Instant| {
+        let no_response = |_: &PeerAddr, at: &time::Instant| {
             // (*timeout.get(peer).unwrap_or(&time::Duration::from_secs(5)))
             //     .max(time::Duration::from_millis(1500))
             //     < at.elapsed()

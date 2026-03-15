@@ -54,7 +54,7 @@ def fit_distributions(delays):
 def parse_log_content(lines):
     # 正则1: 原始采样 (add sample)
     sample_re = re.compile(
-        r"src/transmit_manager\.rs:\d+:\s+(?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+)\s+add\s+sample\s+Some\((?P<delay>[\d.]+)(?P<unit>µs|ms|s)\),\s+inflight\s+when\s+sent\s+Some\((?P<inflight>\d+)\)"
+        r"src/transmit_manager\.rs:\d+:\s+(?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+)\s+add bw sample Some\((?P<delay>[\d.]+)(?P<unit>µs|ms|s)\), inflight when sent Some\((?P<inflight>\d+)\)"
     )
     # 正则2: 自动模式指标 (Auto mode)
     auto_re = re.compile(
@@ -74,7 +74,7 @@ def parse_log_content(lines):
             dt = datetime.fromisoformat(dt_str)
             ts = dt.timestamp()
 
-            if "add sample" in line:
+            if "add bw sample" in line:
                 match = sample_re.search(line)
                 if match:
                     raw_delay = float(match.group('delay'))

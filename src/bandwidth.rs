@@ -72,6 +72,12 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
         }
     }
 
+    /// add a rtt sample to rtt estimator
+    /// this does not add a sample to bandwidth estimator, use add_sample for that
+    pub fn add_rtt(&mut self, rtt: Duration) {
+        self.rtt.add_rtt_sample(rtt);
+    }
+
     /// updates bandwidth status
     /// how many new bytes received
     /// if given rtt, use this rtt
@@ -99,7 +105,6 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
         let n_in_flight = n_in_flight.unwrap_or(2);
 
         self.circular[self.head].add(n_bytes, 1, rtt);
-        self.rtt.add_rtt_sample(rtt);
         info!(
             "tendency add sample {rtt:?}, period: {:?}, elapsed {:?}",
             self.circular[self.head],
