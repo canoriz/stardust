@@ -41,17 +41,20 @@ pub enum BandwidthMode {
 
     /// probe rtt
     ProbeRTT {
+        // how many pieces received since probe mode start
+        cnt: usize,
+
         since_auto: time::Instant,
 
         // timestamp of last piece receive
         last_piece_time: time::Instant,
 
         min_rtt: time::Duration,
-
-        to_receive: HashSet<Request>,
-        n_to_probe: usize,
         inflight_target: usize,
         from_clear: bool,
+
+        normal_count: u32,
+        slow_count: u32,
     },
 }
 

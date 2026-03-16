@@ -54,11 +54,11 @@ def fit_distributions(delays):
 def parse_log_content(lines):
     # 正则1: 原始采样 (add sample)
     sample_re = re.compile(
-        r"src/transmit_manager\.rs:\d+:\s+(?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+)\s+add bw sample Some\((?P<delay>[\d.]+)(?P<unit>µs|ms|s)\), inflight when sent Some\((?P<inflight>\d+)\)"
+        r"src/transmit_manager\.rs:\d+:\s+(?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+)\s+add bw sample Some\((?P<delay>[\d.]+)(?P<unit>µs|ms|s)\), inflight [\d.]+ inflight when sent Some\((?P<inflight>\d+)\)"
     )
     # 正则2: 自动模式指标 (Auto mode)
     auto_re = re.compile(
-        r"src/transmit_manager\.rs:\d+:\s+(?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+)\s+Auto mode optimum inflight (?P<opt_if>\d+) min rtt (?P<min_rtt>[\d.]+)(?P<min_rtt_unit>µs|ms|s)? avg bw (?P<bw>\d+) req in flight (?P<req_if>\d+)"
+        r"src/transmit_manager\.rs:\d+:\s+(?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+)\s+Auto mode optimum inflight (?P<opt_if>\d+) min rtt (?P<min_rtt>[\d.]+)(?P<min_rtt_unit>µs|ms|s)? avg bw (?P<bw>\d+) max_bw (?P<max_bw>\d+) req in flight (?P<req_if>\d+)"
     )
     # 正则3: 状态转换
     change_re = re.compile(

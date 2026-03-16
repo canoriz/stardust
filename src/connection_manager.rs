@@ -1,9 +1,9 @@
-use std::collections::VecDeque;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::io::{BufReader, BufWriter};
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time;
 
@@ -111,6 +111,21 @@ impl ConnectionManagerHandle {
             _drop_guard: conn_break_guard,
         };
 
+        let (delayed_tx, mut delayed_rx) =
+            mpsc::unbounded_channel::<(time::Instant, UnboundedSender<CtrlOfSend>, CtrlOfSend)>();
+        tokio::spawn(async move {
+            loop {
+                if let Some((t, mut c, m)) = delayed_rx.recv().await {
+                    if t > time::Instant::now() {
+                        time::sleep_until(t).await;
+                    }
+                    c.send(m);
+                } else {
+                    break;
+                }
+            }
+        });
+
         tokio::spawn(run_recv_stream(
             recv_stream,
             recv_cancel.clone(),
@@ -130,6 +145,7 @@ impl ConnectionManagerHandle {
             sender: send_tx,
             cancel: send_cancel.drop_guard(),
             done: send_done_rx,
+            delayed_tx,
         };
 
         Self {
@@ -162,11 +178,15 @@ impl ConnectionManagerHandle {
 
     pub fn send_stream_cmd(&self, m: CtrlOfSend) {
         let c = self.send_stream.sender.clone();
+        self.send_stream
+            .delayed_tx
+            .send((
+                time::Instant::now() + time::Duration::from_millis(rand::random_range(300..400)),
+                c,
+                m,
+            ))
+            .unwrap();
         // c.send(m);
-        tokio::spawn(async move {
-            time::sleep(time::Duration::from_millis(350 + rand::random_range(0..40))).await;
-            c.send(m);
-        });
     }
 
     pub fn recv_stream_cmd(&self, m: CtrlOfRecv) {
@@ -232,6 +252,7 @@ struct SendStreamHandle {
     sender: mpsc::UnboundedSender<CtrlOfSend>,
     cancel: DropGuard,
     done: oneshot::Receiver<()>,
+    delayed_tx: mpsc::UnboundedSender<(time::Instant, UnboundedSender<CtrlOfSend>, CtrlOfSend)>,
 }
 
 struct SendStream<T> {
