@@ -43,13 +43,22 @@ impl AnnounceManagerHandle {
             announce_timer: task::JoinSet::new(),
             url_list: HashMap::new(),
         };
-        // tokio::spawn(run_announce_manager::<metadata::Announcer>(
+
+        #[cfg(feature = "mock_delay")]
         tokio::spawn(run_announce_manager::<FakeAnnouncer>(
             manager,
             info_hash,
             cancel.clone(),
             done_tx,
         ));
+        #[cfg(not(feature = "mock_delay"))]
+        tokio::spawn(run_announce_manager::<metadata::Announcer>(
+            manager,
+            info_hash,
+            cancel.clone(),
+            done_tx,
+        ));
+
         Self {
             cmd_tx,
             cancel: cancel.drop_guard(),

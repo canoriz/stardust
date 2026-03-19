@@ -111,8 +111,10 @@ impl ConnectionManagerHandle {
             _drop_guard: conn_break_guard,
         };
 
+        #[cfg(feature = "mock_delay")]
         let (delayed_tx, mut delayed_rx) =
             mpsc::unbounded_channel::<(time::Instant, UnboundedSender<CtrlOfSend>, CtrlOfSend)>();
+        #[cfg(feature = "mock_delay")]
         tokio::spawn(async move {
             loop {
                 if let Some((t, mut c, m)) = delayed_rx.recv().await {
@@ -145,6 +147,8 @@ impl ConnectionManagerHandle {
             sender: send_tx,
             cancel: send_cancel.drop_guard(),
             done: send_done_rx,
+
+            #[cfg(feature = "mock_delay")]
             delayed_tx,
         };
 
@@ -178,6 +182,8 @@ impl ConnectionManagerHandle {
 
     pub fn send_stream_cmd(&self, m: CtrlOfSend) {
         let c = self.send_stream.sender.clone();
+
+        #[cfg(feature = "mock_delay")]
         self.send_stream
             .delayed_tx
             .send((
@@ -186,7 +192,9 @@ impl ConnectionManagerHandle {
                 m,
             ))
             .unwrap();
-        // c.send(m);
+
+        #[cfg(not(feature = "mock_delay"))]
+        c.send(m);
     }
 
     pub fn recv_stream_cmd(&self, m: CtrlOfRecv) {
@@ -252,6 +260,8 @@ struct SendStreamHandle {
     sender: mpsc::UnboundedSender<CtrlOfSend>,
     cancel: DropGuard,
     done: oneshot::Receiver<()>,
+
+    #[cfg(feature = "mock_delay")]
     delayed_tx: mpsc::UnboundedSender<(time::Instant, UnboundedSender<CtrlOfSend>, CtrlOfSend)>,
 }
 

@@ -59,6 +59,10 @@ pub enum BandwidthMode {
 }
 
 impl BandwidthMode {
+    pub fn new_choked() -> Self {
+        BandwidthMode::Choked
+    }
+
     pub fn new_auto() -> Self {
         BandwidthMode::Auto {
             since: time::Instant::now(),

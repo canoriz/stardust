@@ -22,10 +22,19 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
+    #[cfg(feature = "mock_delay")]
     let mut session = Session::new(
         SessionOpt::builder()
             .maybe_dht_port(None)
-            // .dht_port(DHT_PORT)
+            .port(SELF_PORT)
+            .self_id(SELF_ID)
+            .build(),
+    );
+    #[cfg(not(feature = "mock_delay"))]
+    let mut session = Session::new(
+        SessionOpt::builder()
+            // .maybe_dht_port(None)
+            .dht_port(DHT_PORT)
             .port(SELF_PORT)
             .self_id(SELF_ID)
             .build(),
@@ -35,7 +44,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (metadata, announce_list) = torrent.to_metadata();
     let info_hash = metadata.info_hash;
 
-    // let magnet: Magnet = ("magnet:?xt=urn:btih:8a9ffab6061a14ee63eb621889d6a796279eaa1b&tr=http%3a%2f%2ft.nyaatracker.com%2fannounce&tr=http%3a%2f%2ftracker.kamigami.org%3a2710%2fannounce&tr=http%3a%2f%2fshare.camoe.cn%3a8080%2fannounce&tr=http%3a%2f%2fopentracker.acgnx.se%2fannounce&tr=http%3a%2f%2fanidex.moe%3a6969%2fannounce&tr=http%3a%2f%2ft.acg.rip%3a6699%2fannounce&tr=https%3a%2f%2ftr.bangumi.moe%3a9696%2fannounce&tr=udp%3a%2f%2ftr.bangumi.moe%3a6969%2fannounce&tr=http%3a%2f%2fopen.acgtracker.com%3a1096%2fannounce&tr=udp%3a%2f%2ftracker.opentrackr.org%3a1337%2fannounce")
+    // let magnet: Magnet = ("magnet:?xt=urn:btih:ba04ac1e04aa532971d8b384a0ae153d1d0a68ac&dn=MIKR-082&xl=5631319641&tr=http://sukebei.tracker.wf:8888/announce&tr=udp://tracker.archlinux.org.theoks.net:6969/announce&tr=udp://tracker.openbittorrent.com:6969&tr=http://tracker.tasvideos.org:6969/announce&tr=udp://tracker.leech.ie:1337/announce&tr=udp://tracker.opentrackr.org:1337/announce&tr=udp://tracker.coppersurfer.tk:6969/announce&tr=udp://tracker.internetwarriors.net:1337&tr=udp://tracker.internetwarriors.net:1337/announce&tr=udp://open.stealth.si:80/announce&tr=http://anidex.moe:6969/announce&tr=http://freerainbowtables.com:6969/announce&tr=http://www.freerainbowtables.com:6969/announce&tr=http://tracker2.itzmx.com:6961/announce&tr=http://tracker.etree.org:6969/announce&tr=http://www.thetradersden.org/forums/tracker:80/announce.php&tr=udp://udp-tracker.shittyurl.org:6969/announce&tr=https://tracker.shittyurl.org/announce&tr=http://tracker.shittyurl.org/announce&tr=udp://bt.firebit.org:2710/announce&tr=http://bt.firebit.org:2710/announce&tr=udp://exodus.desync.com:6969/announce&tr=udp://tracker.torrent.eu.org:451/announce")
     //     .parse()
     //     .unwrap();
     // let info_hash = magnet.info_hash;

@@ -51,6 +51,14 @@ impl RTT {
         self.rtt_var
     }
 
+    pub fn get_count(&self) -> usize {
+        self.count
+    }
+
+    pub fn reset(&mut self) {
+        *self = Self::new(self.a, self.b);
+    }
+
     /// add a new sample of RTT
     pub fn add_rtt_sample(&mut self, rtt: Duration) {
         self.min_rtt = self.min_rtt.min(rtt);

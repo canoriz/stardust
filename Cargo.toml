@@ -48,3 +48,6 @@ path = "src/dht-client/main.rs"
 
 [lib]
 path = "src/lib.rs"
+
+[features]
+mock_delay = []

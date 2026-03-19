@@ -36,6 +36,36 @@ use inflight::Inflight;
 const PROBE_TO_AUTO_NORMAL_RTT_LIMIT: u32 = 2;
 const PROBE_TO_SLOWDOWN_SLOW_RTT_LIMIT: u32 = 2;
 
+/// 95% 置信度 (双侧检验) 的 t 分布临界值表
+/// 适用于判定数据是否显著偏离均值（无论是变大还是变小）
+/// 索引 0 对应 df=1 (n=2), 索引 9 对应 df=10 (n=11)
+const T_TABLE_95_TWO_TAIL_DF_1_10: [f32; 10] = [
+    12.706, // df = 1: 极度保守，防止只有两个包时的随机抖动
+    4.303,  // df = 2
+    3.182,  // df = 3
+    2.776,  // df = 4
+    2.571,  // df = 5
+    2.447,  // df = 6
+    2.365,  // df = 7
+    2.306,  // df = 8
+    2.262,  // df = 9
+    2.228,  // df = 10
+];
+
+/// 获取双侧 t 临界值
+fn get_t_critical_two_tail(df: usize) -> f32 {
+    if df == 0 {
+        return T_TABLE_95_TWO_TAIL_DF_1_10[0];
+    }
+    if df <= 10 {
+        T_TABLE_95_TWO_TAIL_DF_1_10[df - 1]
+    } else {
+        // 当 df > 10 时，t 值继续向 1.960 收敛
+        // 工程上如果想省事，超过 10 就可以直接用 1.960，或者用 2.0 作为近似
+        1.960
+    }
+}
+
 pub enum TorrentTask {
     Torrent(Metadata),
     Magnet(Magnet),
@@ -734,7 +764,7 @@ impl TransmitWorker {
                             },
                             bitmap: None,
                             bw: Bandwidth::new(),
-                            bw_mode: BandwidthMode::new_auto(),
+                            bw_mode: BandwidthMode::new_choked(),
                             inflight: Inflight::new(time::Duration::from_secs(90)),
                         },
                     );

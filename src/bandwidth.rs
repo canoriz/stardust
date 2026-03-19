@@ -148,20 +148,16 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
 
     pub fn count_max_bw_and_min_rtt(&self, back_interval: Duration) -> (f32, Duration) {
         let f = |acc: (f32, Duration), _begin: Instant, end: Instant, p: &Period| {
-            let dt = end - p.since;
-            if dt >= Self::SPLIT_DURATION {
-                let bw = (p.bytes_count as f32) / Self::SPLIT_DURATION.as_secs_f32();
-                trace!(
-                    "bytes_count {} dt {dt:?} bw {bw}, since before {:?}",
-                    p.bytes_count,
-                    p.since.elapsed()
-                );
-                // only count slots that dt are large enough slots to avoid division
-                // by near-zero duration and resulting large bandwidth
-                (acc.0.max(bw), acc.1.min(p.rtt.get_min_rtt()))
-            } else {
-                (acc.0, acc.1.min(p.rtt.get_min_rtt()))
-            }
+            let dt = (end - p.since).max(Self::SPLIT_DURATION);
+            let bw = (p.bytes_count as f32) / Self::SPLIT_DURATION.as_secs_f32();
+            trace!(
+                "bytes_count {} dt {dt:?} bw {bw}, since before {:?}",
+                p.bytes_count,
+                p.since.elapsed()
+            );
+            // only count slots that dt are large enough slots to avoid division
+            // by near-zero duration and resulting large bandwidth
+            (acc.0.max(bw), acc.1.min(p.rtt.get_min_rtt()))
         };
         self.fold_periods_within_interval(back_interval, (0.0, Duration::MAX / 30), f)
     }
@@ -227,6 +223,10 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
 
     pub fn get_rtt(&self) -> Duration {
         self.rtt.get_rtt()
+    }
+
+    pub fn get_rtt_count(&self) -> usize {
+        self.rtt.get_count()
     }
 
     pub fn get_var(&self) -> Duration {
