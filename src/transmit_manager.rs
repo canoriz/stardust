@@ -1177,6 +1177,7 @@ impl TransmitWorker {
                 slow_down_to,
                 ref mut slow_count,
                 ref mut cycle_index,
+                ref mut capacity,
             } => {
                 let last_recv_time = *last_piece_time;
                 *last_piece_time = time::Instant::now();
@@ -1184,6 +1185,10 @@ impl TransmitWorker {
                 if since_cycle.elapsed() > min_rtt {
                     *cycle_index = (*cycle_index + 1) & 0x7;
                     *since_cycle = time::Instant::now();
+
+                    let (max_bw, _) = conn.bw.count_max_bw_and_min_rtt(10 * min_rtt);
+                    *capacity =
+                        BandwidthMode::compute_probe_bw_capacity(min_rtt, max_bw, *cycle_index);
                 }
 
                 const SLOW_LIMIT: u32 = 2;
@@ -1230,6 +1235,8 @@ impl TransmitWorker {
             } => {
                 if n_req_in_flight <= inflight_target {
                     if inflight_target > 0 {
+                        let (max_bw, _) = conn.bw.count_max_bw_and_min_rtt(10 * min_rtt);
+                        let cap = BandwidthMode::compute_probe_bw_capacity(min_rtt, max_bw, 0);
                         info!("{peer} change from Slowdown to ProbeBW mode, because recv rate is good even with low inflight");
                         conn.bw_mode = BandwidthMode::ProbeBW {
                             since_min_rtt,
@@ -1239,6 +1246,7 @@ impl TransmitWorker {
                             last_piece_time,
                             cycle_index: 0,
                             since_cycle: time::Instant::now(),
+                            capacity: cap,
                         };
                     } else {
                         info!("{peer} change from Slowdown to ProbeRTT mode");
@@ -1275,6 +1283,9 @@ impl TransmitWorker {
                 );
 
                 if cnt > 4 {
+                    let (max_bw, _) = conn.bw.count_max_bw_and_min_rtt(10 * min_rtt_in_period);
+                    let cap =
+                        BandwidthMode::compute_probe_bw_capacity(min_rtt_in_period, max_bw, 0);
                     info!("{peer} change from ProbeRTT to ProbeBW mode");
                     conn.bw_mode = BandwidthMode::ProbeBW {
                         since_min_rtt: time::Instant::now(),
@@ -1284,6 +1295,7 @@ impl TransmitWorker {
                         slow_down_to: 0,
                         last_piece_time,
                         cycle_index: 0,
+                        capacity: cap,
                     }
                 }
             }
@@ -1295,43 +1307,34 @@ impl TransmitWorker {
             BandwidthMode::ProbeBW {
                 min_rtt,
                 cycle_index,
+                ref mut capacity,
                 ..
             } => {
-                const PACING: [usize; 8] = [5, 3, 4, 4, 4, 4, 4, 4];
                 // Only can pick more blocks if we received some or no requests in flight.
                 // For peers with small bandwidth, we don't request too much from them
                 // to avoid mark these blocks as in-flight and not requesting from other peers.
                 // preventing accumulating too much partial downloaded pieces.
                 const MIN_IN_FLIGHT: usize = 5;
                 const MAX_IN_FLIGHT: usize = 500;
-                // let (max_bw, _) = conn.bw.count_max_bw_and_min_rtt(10 * min_rtt);
-                // optimum_inflight = 1250;
-                let avg_bw = conn.bw.count_avg_bw_in(8 * min_rtt);
+                let avg_bw = conn.bw.count_avg_bw_in(10 * min_rtt);
                 let (max_bw, _) = conn.bw.count_max_bw_and_min_rtt(10 * min_rtt);
-                let optimum_inflight =
-                    (min_rtt.as_secs_f32() * max_bw) as usize * PACING[cycle_index] / 4 / 16384;
+
+                // TODO: OPTIMIZE: pre-calculate, do not calculate every time
+                let limit = {
+                    let bdp = BandwidthMode::compute_probe_bw_capacity(min_rtt, max_bw, 3);
+                    bdp + bdp / 2
+                };
+
+                let n_to_pick = (*capacity)
+                    .min(MAX_IN_FLIGHT.saturating_sub(n_req_in_flight))
+                    .min(limit.saturating_sub(n_req_in_flight))
+                    .max(MIN_IN_FLIGHT.saturating_sub(n_req_in_flight));
                 info!(
-                    "{peer} ProbeBW mode cycle {} optimum inflight {} min rtt {:?} avg bw {} max_bw {} req in flight {}",
-                    PACING[cycle_index] as f32 / 4.0,
-                    optimum_inflight, min_rtt, avg_bw, max_bw, n_req_in_flight
+                    "{peer} ProbeBW mode cycle {} capacity {} min rtt {:?} avg bw {} max_bw {} req in flight {}",
+                    cycle_index, *capacity, min_rtt, avg_bw, max_bw, n_req_in_flight
                 );
-                if n_req_in_flight > MAX_IN_FLIGHT {
-                    0
-                } else if optimum_inflight > n_req_in_flight {
-                    info!("1111");
-                    let n_more = optimum_inflight - n_req_in_flight;
-                    if n_more + n_req_in_flight > MAX_IN_FLIGHT {
-                        MAX_IN_FLIGHT - n_req_in_flight
-                    } else {
-                        n_more
-                    }
-                } else if n_req_in_flight < MIN_IN_FLIGHT {
-                    info!("2222");
-                    MIN_IN_FLIGHT - n_req_in_flight
-                } else {
-                    info!("3333");
-                    0
-                }
+                *capacity = capacity.saturating_sub(n_to_pick);
+                n_to_pick
             }
             BandwidthMode::SlowDown {
                 since_min_rtt,

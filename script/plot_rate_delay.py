@@ -58,7 +58,7 @@ def parse_log_content(lines):
     )
     # 正则2: 自动模式指标 (Auto mode)
     auto_re = re.compile(
-        r"src/transmit_manager\.rs:\d+:\s+(?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+)\s+ProbeBW mode cycle (?P<gain>[\d.]+\.[\d.]+) optimum inflight (?P<opt_if>\d+) min rtt (?P<min_rtt>[\d.]+)(?P<min_rtt_unit>µs|ms|s)? avg bw (?P<bw>\d+) max_bw (?P<max_bw>\d+) req in flight (?P<req_if>\d+)"
+        r"src/transmit_manager\.rs:\d+:\s+(?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+)\s+ProbeBW mode cycle (?P<gain>[\d.]+) capacity (?P<opt_if>\d+) min rtt (?P<min_rtt>[\d.]+)(?P<min_rtt_unit>µs|ms|s)? avg bw (?P<bw>\d+) max_bw (?P<max_bw>\d+) req in flight (?P<req_if>\d+)"
     )
     # 正则3: 状态转换
     change_re = re.compile(

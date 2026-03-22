@@ -31,6 +31,8 @@ pub enum BandwidthMode {
         last_piece_time: time::Instant,
         // slow_down_to: usize,
         cycle_index: usize,
+
+        capacity: usize,
     },
 
     Choked,
@@ -70,6 +72,19 @@ pub enum BandwidthMode {
 }
 
 impl BandwidthMode {
+    pub const PACING: [u32; 8] = [5, 3, 4, 4, 4, 4, 4, 4];
+    pub const MIN_PROBE_BW_CAPACITY: usize = 4;
+
+    pub fn compute_probe_bw_capacity(
+        min_rtt: time::Duration,
+        max_bw: f32,
+        cycle_index: usize,
+    ) -> usize {
+        let base = (min_rtt.as_secs_f32() * max_bw.max(0.0) / 16384.0) as usize;
+        let capacity = base * Self::PACING[cycle_index] as usize / 4;
+        capacity.max(Self::MIN_PROBE_BW_CAPACITY)
+    }
+
     pub fn new_choked() -> Self {
         BandwidthMode::Choked
     }
