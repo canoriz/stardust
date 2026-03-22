@@ -58,7 +58,7 @@ def parse_log_content(lines):
     )
     # 正则2: 自动模式指标 (Auto mode)
     auto_re = re.compile(
-        r"src/transmit_manager\.rs:\d+:\s+(?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+)\s+Auto mode optimum inflight (?P<opt_if>\d+) min rtt (?P<min_rtt>[\d.]+)(?P<min_rtt_unit>µs|ms|s)? avg bw (?P<bw>\d+) max_bw (?P<max_bw>\d+) req in flight (?P<req_if>\d+)"
+        r"src/transmit_manager\.rs:\d+:\s+(?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+)\s+ProbeBW mode cycle (?P<gain>[\d.]+\.[\d.]+) optimum inflight (?P<opt_if>\d+) min rtt (?P<min_rtt>[\d.]+)(?P<min_rtt_unit>µs|ms|s)? avg bw (?P<bw>\d+) max_bw (?P<max_bw>\d+) req in flight (?P<req_if>\d+)"
     )
     # 正则3: 状态转换
     change_re = re.compile(
@@ -95,17 +95,19 @@ def parse_log_content(lines):
                 if match:
                     new_mode = match.group('target_mode');
                     new_mode_f = 0.0
-                    if new_mode == "Auto":
+                    if new_mode == "Startup":
                         new_mode_f = 1.0
                     elif new_mode == "SlowDown":
                         new_mode_f = 2.0
-                    elif new_mode == "Probe":
+                    elif new_mode == "ProbeBW":
+                        new_mode_f = 3.0
+                    elif new_mode == "ProbeRTT":
                         new_mode_f = 3.0
                     states.append({
                         'dt': dt, 'ts': ts, 'peer': match.group('ip_port'),
                         'state': new_mode
                     })
-            elif "Auto mode" in line:
+            elif "ProbeBW mode" in line:
                 match = auto_re.search(line)
                 if match:
                     bw_kb = float(match.group('bw')) / 1024.0

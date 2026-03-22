@@ -8,9 +8,19 @@ use crate::protocol::Request;
 /// we want a balanced max-bandwidth and min rtt
 #[derive(Debug)]
 pub enum BandwidthMode {
+    Startup {
+        min_rtt: time::Duration,
+        since_min_rtt: time::Instant,
+        cwnd_since: time::Instant,
+        cwnd: usize,
+        max_bw: f32,
+        limit_count: u32,
+    },
+
     /// adaptively increase requests
-    Auto {
-        since: time::Instant,
+    ProbeBW {
+        since_cycle: time::Instant,
+        since_min_rtt: time::Instant,
         min_rtt: time::Duration,
 
         // how many consecutive response which have rtt greater than (mean + sigma)
@@ -20,13 +30,15 @@ pub enum BandwidthMode {
         // timestamp of last piece receive
         last_piece_time: time::Instant,
         // slow_down_to: usize,
+        cycle_index: usize,
     },
 
     Choked,
 
     /// slow down to this in-flight
     SlowDown {
-        since_auto: time::Instant,
+        // TODO: extract common fields out of enum
+        since_min_rtt: time::Instant,
 
         // timestamp of last piece receive
         last_piece_time: time::Instant,
@@ -34,9 +46,6 @@ pub enum BandwidthMode {
 
         // slow down to target inflight
         inflight_target: usize,
-
-        // if rtt is smaller
-        faster: bool,
     },
 
     /// probe rtt
@@ -44,12 +53,14 @@ pub enum BandwidthMode {
         // how many pieces received since probe mode start
         cnt: usize,
 
-        since_auto: time::Instant,
+        since_min_rtt: time::Instant,
+        min_rtt: time::Duration,
+
+        since: time::Instant,
 
         // timestamp of last piece receive
         last_piece_time: time::Instant,
 
-        min_rtt: time::Duration,
         inflight_target: usize,
         from_clear: bool,
 
@@ -64,13 +75,13 @@ impl BandwidthMode {
     }
 
     pub fn new_auto() -> Self {
-        BandwidthMode::Auto {
-            since: time::Instant::now(),
+        BandwidthMode::Startup {
             min_rtt: time::Duration::from_secs(10),
-
-            slow_count: 0,
-            slow_down_to: 0,
-            last_piece_time: time::Instant::now(),
+            cwnd_since: time::Instant::now(),
+            since_min_rtt: time::Instant::now(),
+            cwnd: 4,
+            max_bw: 0.0,
+            limit_count: 0,
         }
     }
 }

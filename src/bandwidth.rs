@@ -146,13 +146,21 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
             }) as usize
     }
 
+    /// get average bandwidth in back_interval, and min rtt in that period
+    pub fn count_avg_bw_in(&self, back_interval: Duration) -> f32 {
+        let back = back_interval.max(Self::SPLIT_DURATION);
+        let n_bytes = self.count_bytes_within_period(back).0;
+        n_bytes as f32 / back.as_secs_f32()
+    }
+
     pub fn count_max_bw_and_min_rtt(&self, back_interval: Duration) -> (f32, Duration) {
         let f = |acc: (f32, Duration), _begin: Instant, end: Instant, p: &Period| {
-            let dt = (end - p.since).max(Self::SPLIT_DURATION);
+            let dt = end - p.since;
             let bw = (p.bytes_count as f32) / Self::SPLIT_DURATION.as_secs_f32();
             trace!(
-                "bytes_count {} dt {dt:?} bw {bw}, since before {:?}",
+                "bytes_count {} pkt_count {} dt {dt:?} bw {bw}, since before {:?}",
                 p.bytes_count,
+                p.pkg_count,
                 p.since.elapsed()
             );
             // only count slots that dt are large enough slots to avoid division
@@ -168,13 +176,12 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
     {
         let mut slot_id = self.head;
 
-        let mut end_time = Instant::now();
-        let now = Instant::now();
-        let begin_time = now - back_interval;
+        let begin_time = Instant::now() - back_interval;
         let mut t = init;
         loop {
             let slot = &self.circular[slot_id];
 
+            let end_time = slot.since + Self::SPLIT_DURATION;
             if begin_time <= slot.since {
                 // querying range covers entire slot
                 if slot.pkg_count > 0 {
@@ -188,7 +195,6 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
                 break;
             }
 
-            end_time = slot.since;
             if slot_id == 0 {
                 slot_id = SLOT_SIZE - 1;
             } else {
