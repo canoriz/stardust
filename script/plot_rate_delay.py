@@ -56,15 +56,25 @@ def parse_log_content(lines):
     sample_re = re.compile(
         r"src/transmit_manager\.rs:\d+:\s+(?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+)\s+add bw sample Some\((?P<delay>[\d.]+)(?P<unit>µs|ms|s)\), inflight [\d.]+ inflight when sent Some\((?P<inflight>\d+)\)"
     )
-    # 正则2: 自动模式指标 (Auto mode)
-    auto_re = re.compile(
-        r"src/transmit_manager\.rs:\d+:\s+(?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+)\s+ProbeBW mode cycle (?P<gain>[\d.]+) capacity (?P<opt_if>\d+) min rtt (?P<min_rtt>[\d.]+)(?P<min_rtt_unit>µs|ms|s)? avg bw (?P<bw>\d+) max_bw (?P<max_bw>\d+) req in flight (?P<req_if>\d+)"
+    # Regex for different modes
+    # ProbeBW
+    probe_re = re.compile(
+        r"stardust::transmit_manager: src/transmit_manager\.rs:\d+: (?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+) ProbeBW mode cycle (?P<cycle>\d+) capacity (?P<capacity>\d+) min rtt (?P<min_rtt>[\d.]+)ms avg bw (?P<bw>[\d.]+) max_bw (?P<max_bw>[\d.]+) req in flight (?P<req_if>\d+)"
     )
-    # 正则3: 状态转换
+    # Startup
+    startup_re = re.compile(
+        r"stardust::transmit_manager: src/transmit_manager\.rs:\d+: (?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+) in (?P<mode>Startup) mode, cwnd (?P<cwnd>\d+), inflight (?P<inflight>\d+) prev max bw (?P<prev_max_bw>[\d.]+), avg-bw (?P<bw>[\d.]+) new max bw (?P<max_bw>[\d.]+), limit count (?P<limit_count>\d+)"
+    )
+    # Slowdown
+    slowdown_re = re.compile(
+        r"stardust::transmit_manager: src/transmit_manager\.rs:\d+: (?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+) (?P<mode>Slowdown) mode min rtt (?P<min_rtt>[\d.]+)ms avg bw (?P<bw>[\d.]+) req in flight (?P<req_if>\d+)"
+    )
+    # 状态转换
     change_re = re.compile(
         r"src/transmit_manager\.rs:\d+:\s+(?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+)\s+change from \w+ to (?P<target_mode>\w+) mode"
     )
 
+    # --- 核心解析逻辑 ---
     samples, autos, states = [], [], []
     for line in lines:
         try:
@@ -94,39 +104,38 @@ def parse_log_content(lines):
                 match = change_re.search(line)
                 if match:
                     new_mode = match.group('target_mode');
-                    new_mode_f = 0.0
-                    if new_mode == "Startup":
-                        new_mode_f = 1.0
-                    elif new_mode == "SlowDown":
-                        new_mode_f = 2.0
-                    elif new_mode == "ProbeBW":
-                        new_mode_f = 3.0
-                    elif new_mode == "ProbeRTT":
-                        new_mode_f = 3.0
                     states.append({
                         'dt': dt, 'ts': ts, 'peer': match.group('ip_port'),
                         'state': new_mode
                     })
-            elif "ProbeBW mode" in line:
-                match = auto_re.search(line)
+            elif "mode" in line:
+                # Try each mode regex
+                match = probe_re.search(line)
+                mode = "ProbeBW"
+                if not match:
+                    match = startup_re.search(line)
+                    mode = "Startup"
+                if not match:
+                    match = slowdown_re.search(line)
+                    mode = "Slowdown"
+
                 if match:
                     bw_kb = float(match.group('bw')) / 1024.0
-                    min_rtt_val = float(match.group('min_rtt'))
-                    min_rtt_unit = match.group('min_rtt_unit') or 'ms'  # default to ms if not specified
-                    # Convert to milliseconds
-                    if min_rtt_unit == 'µs':
-                        min_rtt_ms = min_rtt_val / 1000.0
-                    elif min_rtt_unit == 's':
-                        min_rtt_ms = min_rtt_val * 1000.0
-                    else:  # ms
-                        min_rtt_ms = min_rtt_val
-                    autos.append({
-                        'dt': dt, 'ts': ts, 'peer': match.group('ip_port'),
-                        'opt_if': int(match.group('opt_if')),
-                        'min_rtt': min_rtt_ms,
+                    peer = match.group('ip_port')
+
+                    data = {
+                        'dt': dt, 'ts': ts, 'peer': peer,
                         'bw': bw_kb,
-                        'req_if': int(match.group('req_if'))
-                    })
+                        'mode': mode
+                    }
+                    if 'max_bw' in match.groupdict():
+                        data['max_bw'] = float(match.group('max_bw')) / 1024.0
+
+                    if mode == "ProbeBW" or mode == "Slowdown":
+                        data['min_rtt'] = float(match.group('min_rtt'))
+                        data['req_if'] = int(match.group('req_if'))
+
+                    autos.append(data)
         except Exception: continue
 
     return pd.DataFrame(samples), pd.DataFrame(autos), pd.DataFrame(states)
@@ -263,18 +272,57 @@ if lines:
 
         fig2 = plt.figure(figsize=(16, 18))
 
-        # 图 5: Avg BW
+        # 图 5: Avg BW with Mode-based Coloring
         ax5 = fig2.add_subplot(3, 2, 1)
         if not sub_auto.empty:
-            ax5.plot(sub_auto['dt'], sub_auto['bw'], color='#2ca02c', linewidth=2)
-            ax5.fill_between(sub_auto['dt'], sub_auto['bw'], color='#2ca02c', alpha=0.1)
-        ax5.set_title("5. Logged Avg Bandwidth (KB/s)"); ax5.set_ylabel("Rate (KB/s)"); ax5.grid(True, alpha=0.3)
+            # Color mapping for modes
+            mode_colors = {
+                'Startup': '#1f77b4',  # Blue
+                'Slowdown': '#ff7f0e', # Orange
+                'ProbeBW': '#2ca02c',  # Green
+                'ProbeRTT': '#d62728'  # Red
+            }
+
+            # Group by mode and plot colored segments
+            # We use a loop to plot segments to show different colors for different modes
+            # To handle continuous line with different colors, we can plot each point with its mode color
+            # or segments. Segments are better for performance.
+
+            current_mode = None
+            start_idx = 0
+            for i in range(len(sub_auto)):
+                mode = sub_auto.iloc[i]['mode']
+                if current_mode is None:
+                    current_mode = mode
+                    start_idx = i
+                elif mode != current_mode:
+                    # Plot previous segment
+                    segment = sub_auto.iloc[start_idx:i+1] # Include the first point of next segment to connect
+                    ax5.plot(segment['dt'], segment['bw'], color=mode_colors.get(current_mode, '#2ca02c'), linewidth=2, label=f"{current_mode} avg-bw" if f"{current_mode} avg-bw" not in [l.get_label() for l in ax5.get_lines()] else "")
+                    if 'max_bw' in segment.columns and current_mode in ['Startup', 'ProbeBW']:
+                        ax5.plot(segment['dt'], segment['max_bw'], color=mode_colors.get(current_mode, '#2ca02c'), linestyle=':', linewidth=1.5, alpha=0.8, label=f"{current_mode} max-bw" if f"{current_mode} max-bw" not in [l.get_label() for l in ax5.get_lines()] else "")
+                    ax5.fill_between(segment['dt'], segment['bw'], color=mode_colors.get(current_mode, '#2ca02c'), alpha=0.1)
+                    current_mode = mode
+                    start_idx = i
+
+            # Plot last segment
+            segment = sub_auto.iloc[start_idx:]
+            ax5.plot(segment['dt'], segment['bw'], color=mode_colors.get(current_mode, '#2ca02c'), linewidth=2, label=f"{current_mode} avg-bw" if f"{current_mode} avg-bw" not in [l.get_label() for l in ax5.get_lines()] else "")
+            if 'max_bw' in segment.columns and current_mode in ['Startup', 'ProbeBW']:
+                ax5.plot(segment['dt'], segment['max_bw'], color=mode_colors.get(current_mode, '#2ca02c'), linestyle=':', linewidth=1.5, alpha=0.8, label=f"{current_mode} max-bw" if f"{current_mode} max-bw" not in [l.get_label() for l in ax5.get_lines()] else "")
+            ax5.fill_between(segment['dt'], segment['bw'], color=mode_colors.get(current_mode, '#2ca02c'), alpha=0.1)
+
+            ax5.legend(loc='upper left', fontsize='small')
+
+        ax5.set_title("5. Logged Avg Bandwidth (KB/s) - Mode Colored"); ax5.set_ylabel("Rate (KB/s)"); ax5.grid(True, alpha=0.3)
 
         # 图 6: Inflight
         ax6 = fig2.add_subplot(3, 2, 2)
         if not sub_auto.empty:
-            ax6.step(sub_auto['dt'], sub_auto['opt_if'], where='post', label='Optimum Inflight', color='#1f77b4')
-            ax6.step(sub_auto['dt'], sub_auto['req_if'], where='post', label='Req In Flight', color='#ff7f0e', linestyle='--')
+            if 'opt_if' in sub_auto.columns:
+                ax6.step(sub_auto['dt'], sub_auto['opt_if'], where='post', label='Optimum Inflight', color='#1f77b4')
+            if 'req_if' in sub_auto.columns:
+                ax6.step(sub_auto['dt'], sub_auto['req_if'], where='post', label='Req In Flight', color='#ff7f0e', linestyle='--')
         ax6.set_title("6. Optimum vs Requested Inflight"); ax6.legend(); ax6.grid(True, alpha=0.3)
 
         # 图 7: Min RTT
@@ -294,7 +342,10 @@ if lines:
 
         # 图 9: 状态转换 (新增)
         ax9 = fig2.add_subplot(3, 2, 5) # 放在第 5 个位置
-        sub_states = df_states[(df_states['peer'] == selected_peer) & (df_states['ts'] >= t_min) & (df_states['ts'] <= t_max)].copy()
+        if not df_states.empty and 'peer' in df_states.columns:
+            sub_states = df_states[(df_states['peer'] == selected_peer) & (df_states['ts'] >= t_min) & (df_states['ts'] <= t_max)].copy()
+        else:
+            sub_states = pd.DataFrame()
         if not sub_states.empty:
             # 将模式名映射为数值用于绘图
             modes = sorted(sub_states['state'].unique())

@@ -143,13 +143,16 @@ impl PieceBlocks {
                         // if number of requests that are in-flight and not timeout-ed are
                         // less than repick limit, request a new one
                         let now = time::Instant::now();
+                        const REPICK_NO_RESPONSE_TIMEOUT_CAP: time::Duration =
+                            time::Duration::from_secs(5);
                         let all_no_response = requested.iter().all(|(p, t)| {
-                            now.duration_since(t.pick_time)
-                                >= repick_option
-                                    .alt_timeout
-                                    .get(p)
-                                    .copied()
-                                    .unwrap_or(time::Duration::from_secs(10))
+                            let timeout = repick_option
+                                .alt_timeout
+                                .get(p)
+                                .copied()
+                                .unwrap_or(REPICK_NO_RESPONSE_TIMEOUT_CAP)
+                                .min(REPICK_NO_RESPONSE_TIMEOUT_CAP);
+                            now.duration_since(t.pick_time) >= timeout
                         });
                         if (all_no_response || repick_option.endgame)
                             && !requested.contains_key(&peer)

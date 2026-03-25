@@ -9,8 +9,6 @@ use crate::protocol::Request;
 #[derive(Debug)]
 pub enum BandwidthMode {
     Startup {
-        min_rtt: time::Duration,
-        since_min_rtt: time::Instant,
         cwnd_since: time::Instant,
         cwnd: usize,
         max_bw: f32,
@@ -20,8 +18,6 @@ pub enum BandwidthMode {
     /// adaptively increase requests
     ProbeBW {
         since_cycle: time::Instant,
-        since_min_rtt: time::Instant,
-        min_rtt: time::Duration,
 
         // how many consecutive response which have rtt greater than (mean + sigma)
         slow_count: u32,
@@ -39,12 +35,8 @@ pub enum BandwidthMode {
 
     /// slow down to this in-flight
     SlowDown {
-        // TODO: extract common fields out of enum
-        since_min_rtt: time::Instant,
-
         // timestamp of last piece receive
         last_piece_time: time::Instant,
-        min_rtt: time::Duration,
 
         // slow down to target inflight
         inflight_target: usize,
@@ -54,9 +46,6 @@ pub enum BandwidthMode {
     ProbeRTT {
         // how many pieces received since probe mode start
         cnt: usize,
-
-        since_min_rtt: time::Instant,
-        min_rtt: time::Duration,
 
         since: time::Instant,
 
@@ -91,9 +80,7 @@ impl BandwidthMode {
 
     pub fn new_auto() -> Self {
         BandwidthMode::Startup {
-            min_rtt: time::Duration::from_secs(10),
             cwnd_since: time::Instant::now(),
-            since_min_rtt: time::Instant::now(),
             cwnd: 4,
             max_bw: 0.0,
             limit_count: 0,

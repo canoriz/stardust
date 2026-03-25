@@ -18,6 +18,18 @@ use tokio::net::tcp;
 use tokio::sync::oneshot;
 use tracing::{info, warn};
 
+// Hex-encode bytes (lowercase, no prefix). Efficient: avoids per-byte
+// temporary strings by pushing characters directly.
+fn to_hex(bs: &[u8]) -> String {
+    const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bs.len() * 2);
+    for &b in bs {
+        s.push(HEX_CHARS[(b >> 4) as usize] as char);
+        s.push(HEX_CHARS[(b & 0x0f) as usize] as char);
+    }
+    s
+}
+
 const DEFAULT_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0);
 
 pub type InfoHash = [u8; 20];
@@ -751,8 +763,24 @@ where
         <T as Split>::R: Reunite<W = <T as Split>::W, U = T>,
     {
         let (h, eh) = opt.handshake();
+        // Log outgoing handshake (peer first, then handshake detail)
+        info!(
+            "{} sending handshake reserved={:?} client_id={} info_hash={}",
+            t.remote_addr(),
+            h.reserved,
+            to_hex(&h.client_id),
+            to_hex(&info_hash)
+        );
         send_handshake(&mut t, &h, &info_hash).await?;
         let (peer_info_hash, peer_handshake) = recv_handshake(&mut t).await?;
+        // Log received handshake (peer first, then handshake detail)
+        info!(
+            "{} recv handshake reserved={:?} client_id={} info_hash={}",
+            t.remote_addr(),
+            peer_handshake.reserved,
+            to_hex(&peer_handshake.client_id),
+            to_hex(&peer_info_hash)
+        );
         if peer_info_hash != info_hash {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
@@ -805,6 +833,13 @@ where
 
             let mut s =
                 BTStream::<T>::reunite(read_end, write_end).expect("reunite BTStream should OK");
+            // Log extended-handshake details after negotiation (peer first)
+            info!(
+                "{} extended-handshake recv: {:?}, pending_msgs={}",
+                s.peer_addr(),
+                exth,
+                pending_recvs.len()
+            );
             s.extension_id = exth
                 .m
                 .iter()
@@ -853,6 +888,14 @@ where
         }
 
         send_handshake(&mut t, &h, &peer_info_hash).await?;
+        // Log outgoing handshake reply
+        info!(
+            "{} sending handshake reserved={:?} client_id={} info_hash={}",
+            t.remote_addr(),
+            h.reserved,
+            to_hex(&h.client_id),
+            to_hex(&peer_info_hash)
+        );
 
         let reserved = peer_handshake.reserved.common(&h.reserved);
         let support_dht = reserved.have_dht();
@@ -894,6 +937,13 @@ where
 
             let mut s =
                 BTStream::<T>::reunite(read_end, write_end).expect("reunite BTStream should OK");
+            // Log extended-handshake details after negotiation (peer first)
+            info!(
+                "{} extended-handshake recv: {:?}, pending_msgs={}",
+                s.peer_addr(),
+                exth,
+                pending_recvs.len()
+            );
             s.extension_id = exth
                 .m
                 .iter()

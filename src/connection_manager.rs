@@ -187,7 +187,7 @@ impl ConnectionManagerHandle {
         self.send_stream
             .delayed_tx
             .send((
-                time::Instant::now() + time::Duration::from_millis(rand::random_range(300..400)),
+                time::Instant::now() + time::Duration::from_millis(rand::random_range(300..600)),
                 c,
                 m,
             ))

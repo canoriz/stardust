@@ -26,6 +26,9 @@ struct Period {
     /// time since when
     since: Instant,
 
+    /// slot duration for this period
+    dur: Duration,
+
     rtt: RTT,
 }
 
@@ -48,6 +51,8 @@ impl Period {
             pkg_count: 0,
             bytes_count: 0,
             since: now,
+            // default slot duration kept as 500ms for initial periods
+            dur: Duration::from_millis(500),
             rtt: RTT::new(ALPHA, BETA),
         }
     }
@@ -60,8 +65,6 @@ impl Period {
 }
 
 impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
-    const SPLIT_DURATION: Duration = Duration::from_millis(500);
-
     pub fn new() -> Bandwidth<SLOT_SIZE> {
         Bandwidth {
             circular: [Period::new(); SLOT_SIZE],
@@ -90,14 +93,26 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
     ) {
         let before_rtt = self.circular[self.head].rtt.get_rtt();
 
-        // alloc a new slot if time of rtt has passed
-        if self.circular[self.head].since.elapsed() > Self::SPLIT_DURATION {
+        let cur_rtt = self.current_slot_duration();
+        let elapsed = self.circular[self.head].since.elapsed();
+        let pre_dur = self.circular[self.head].dur;
+
+        let rtt_changed = elapsed > cur_rtt && elapsed < pre_dur;
+        if elapsed > pre_dur || rtt_changed {
+            if rtt_changed {
+                // update old slot's duration
+                self.circular[self.head].dur = elapsed;
+            }
+
+            // normal rotation: this slot has expired
             if self.head + 1 >= SLOT_SIZE {
                 self.head = 0;
             } else {
                 self.head += 1;
             }
-            self.circular[self.head] = Period::new();
+            let mut p = Period::new();
+            p.dur = cur_rtt;
+            self.circular[self.head] = p;
         }
 
         info!("rtt: {rtt:?}");
@@ -106,8 +121,8 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
 
         self.circular[self.head].add(n_bytes, 1, rtt);
         info!(
-            "tendency add sample {rtt:?}, period: {:?}, elapsed {:?}",
-            self.circular[self.head],
+            "tendency add sample {rtt:?}, period dur {:?}, elapsed {:?}",
+            self.circular[self.head].dur,
             self.circular[self.head].since.elapsed()
         );
         self.tendency.add(n_in_flight as f64, rtt.as_secs_f64());
@@ -148,26 +163,36 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
 
     /// get average bandwidth in back_interval, and min rtt in that period
     pub fn count_avg_bw_in(&self, back_interval: Duration) -> f32 {
-        let back = back_interval.max(Self::SPLIT_DURATION);
+        // ensure we consider at least one slot duration
+        let back = back_interval.max(self.current_slot_duration());
         let n_bytes = self.count_bytes_within_period(back).0;
         n_bytes as f32 / back.as_secs_f32()
     }
 
-    pub fn count_max_bw_and_min_rtt(&self, back_interval: Duration) -> (f32, Duration) {
-        let f = |acc: (f32, Duration), _begin: Instant, end: Instant, p: &Period| {
+    pub fn count_max_bw_and_min_rtt(&self, back_interval: Duration) -> (f32, Duration, Instant) {
+        let f = |acc: (f32, Duration, Instant), _begin: Instant, end: Instant, p: &Period| {
             let dt = end - p.since;
-            let bw = (p.bytes_count as f32) / Self::SPLIT_DURATION.as_secs_f32();
+            let bw = (p.bytes_count as f32) / p.dur.as_secs_f32();
             trace!(
                 "bytes_count {} pkt_count {} dt {dt:?} bw {bw}, since before {:?}",
                 p.bytes_count,
                 p.pkg_count,
                 p.since.elapsed()
             );
-            // only count slots that dt are large enough slots to avoid division
-            // by near-zero duration and resulting large bandwidth
-            (acc.0.max(bw), acc.1.min(p.rtt.get_min_rtt()))
+
+            let (p_min, p_min_at) = p.rtt.get_min_rtt_with_timestamp();
+            if p_min < acc.1 {
+                (acc.0.max(bw), p_min, p_min_at)
+            } else {
+                (acc.0.max(bw), acc.1, acc.2)
+            }
         };
-        self.fold_periods_within_interval(back_interval, (0.0, Duration::MAX / 30), f)
+
+        self.fold_periods_within_interval(
+            back_interval,
+            (0.0, Duration::MAX / 30, Instant::now()),
+            f,
+        )
     }
 
     fn fold_periods_within_interval<T, F>(&self, back_interval: Duration, init: T, mut f: F) -> T
@@ -181,7 +206,7 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
         loop {
             let slot = &self.circular[slot_id];
 
-            let end_time = slot.since + Self::SPLIT_DURATION;
+            let end_time = slot.since + slot.dur;
             if begin_time <= slot.since {
                 // querying range covers entire slot
                 if slot.pkg_count > 0 {
@@ -219,9 +244,10 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
                 (end - begin).div_duration_f32(end - p.since)
             };
 
+            let (p_min, _) = p.rtt.get_min_rtt_with_timestamp();
             (
                 acc.0 + (ratio * (p.bytes_count as f32)) as usize,
-                acc.1.min(p.rtt.get_min_rtt()),
+                acc.1.min(p_min),
             )
         };
         self.fold_periods_within_interval(back_interval, (0, Duration::MAX), f)
@@ -241,6 +267,14 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
 
     pub fn get_rtt_4var(&self) -> Duration {
         self.get_var() * 4 + self.get_rtt()
+    }
+
+    /// compute current slot duration based on RTT estimator with clamping
+    fn current_slot_duration(&self) -> Duration {
+        let est = self.rtt.get_rtt();
+        let min = Duration::from_millis(50);
+        let max = Duration::from_millis(500);
+        est.min(max).max(min)
     }
 }
 

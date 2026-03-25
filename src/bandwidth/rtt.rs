@@ -1,4 +1,4 @@
-use tokio::time::Duration;
+use tokio::time::{Duration, Instant};
 
 pub const ALPHA: f32 = 0.125;
 pub const BETA: f32 = 0.25;
@@ -22,10 +22,14 @@ pub struct RTT {
 
     /// historical minimum rtt
     min_rtt: Duration,
+
+    /// timestamp when historical minimum rtt is observed
+    min_rtt_at: Instant,
 }
 
 impl RTT {
     pub fn new(alpha: f32, beta: f32) -> Self {
+        let now = Instant::now();
         Self {
             count: 0,
             smooth_rtt: Duration::from_secs(6),
@@ -33,6 +37,7 @@ impl RTT {
             a: alpha,
             b: beta,
             min_rtt: Duration::from_secs(6),
+            min_rtt_at: now,
         }
     }
 
@@ -41,9 +46,9 @@ impl RTT {
         self.smooth_rtt
     }
 
-    /// get historical min rtt
-    pub fn get_min_rtt(&self) -> Duration {
-        self.min_rtt
+    /// get historical min rtt with timestamp when it was observed
+    pub fn get_min_rtt_with_timestamp(&self) -> (Duration, Instant) {
+        (self.min_rtt, self.min_rtt_at)
     }
 
     /// get variation of RTT
@@ -61,7 +66,10 @@ impl RTT {
 
     /// add a new sample of RTT
     pub fn add_rtt_sample(&mut self, rtt: Duration) {
-        self.min_rtt = self.min_rtt.min(rtt);
+        if self.count == 0 || rtt < self.min_rtt {
+            self.min_rtt = rtt;
+            self.min_rtt_at = Instant::now();
+        }
         if self.count as f32 * self.a >= 1.0 {
             self.rtt_var =
                 self.rtt_var.mul_f32(1.0 - self.b) + self.smooth_rtt.abs_diff(rtt).mul_f32(self.b);
@@ -72,7 +80,6 @@ impl RTT {
             self.rtt_var = (self.rtt_var.mul_f32(self.count as f32)
                 + self.smooth_rtt.abs_diff(rtt))
                 / ((self.count + 1) as u32);
-            self.min_rtt = self.min_rtt.min(rtt);
         }
         self.count += 1;
     }
