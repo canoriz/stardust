@@ -1093,9 +1093,10 @@ impl TransmitWorker {
             .get_mut(&to_canonical_addr(peer))
             .expect("should exist");
 
+        let avg_rtt = conn.bw.get_rtt();
         let (max_bw, min_rtt_in_period, min_rtt_in_period_at) =
-            conn.bw.count_max_bw_and_min_rtt(conn.min_rtt * 10);
-        let probe_rtt_interval = (conn.min_rtt * 10).max(time::Duration::from_secs(6));
+            conn.bw.count_max_bw_and_min_rtt(avg_rtt * 10);
+        let probe_rtt_interval = (avg_rtt * 10).max(time::Duration::from_secs(6));
 
         const TEN_SECS: time::Duration = time::Duration::from_secs(10);
         let bytes_10sec = conn.bw.count_bytes_within_period(TEN_SECS).0;

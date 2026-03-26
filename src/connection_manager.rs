@@ -184,14 +184,35 @@ impl ConnectionManagerHandle {
         let c = self.send_stream.sender.clone();
 
         #[cfg(feature = "mock_delay")]
-        self.send_stream
-            .delayed_tx
-            .send((
-                time::Instant::now() + time::Duration::from_millis(rand::random_range(300..600)),
-                c,
-                m,
-            ))
-            .unwrap();
+        {
+            /// generates a delay based on normal distribution
+            /// mean: mean value (ms)
+            /// std_dev: standard deviation (ms)
+            fn normal_sample(mean: f64, std_dev: f64) -> f64 {
+                use rand::Rng;
+                let mut rng = rand::rng();
+
+                // Box-Muller transform
+                let u1: f64 = rng.gen_range(0.0..1.0);
+                let u2: f64 = rng.gen_range(0.0..1.0);
+                let z0 = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+                (z0 * std_dev + mean).max(1.0) // clamp at 1ms
+            }
+
+            // configurable mean and std_dev
+            const MOCK_RTT_MEAN_MS: f64 = 40.0;
+            const MOCK_RTT_STD_DEV_MS: f64 = 20.0;
+            let delay_ms = normal_sample(MOCK_RTT_MEAN_MS, MOCK_RTT_STD_DEV_MS);
+
+            self.send_stream
+                .delayed_tx
+                .send((
+                    time::Instant::now() + time::Duration::from_millis(delay_ms as u64),
+                    c,
+                    m,
+                ))
+                .unwrap();
+        }
 
         #[cfg(not(feature = "mock_delay"))]
         c.send(m);

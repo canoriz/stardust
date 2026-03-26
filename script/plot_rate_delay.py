@@ -73,9 +73,13 @@ def parse_log_content(lines):
     change_re = re.compile(
         r"src/transmit_manager\.rs:\d+:\s+(?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+)\s+change from \w+ to (?P<target_mode>\w+) mode"
     )
+    # RTT & Variance
+    rtt_var_re = re.compile(
+        r"src/transmit_manager\.rs:\d+:\s+(?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+)\s+rtt\s+(?P<rtt>[\d.]+)(?P<rtt_unit>s|ms|µs)\s+var\s+(?P<var>[\d.]+)(?P<var_unit>s|ms|µs)"
+    )
 
     # --- 核心解析逻辑 ---
-    samples, autos, states = [], [], []
+    samples, autos, states, rtt_vars = [], [], [], []
     for line in lines:
         try:
             parts = line.split()
@@ -108,6 +112,23 @@ def parse_log_content(lines):
                         'dt': dt, 'ts': ts, 'peer': match.group('ip_port'),
                         'state': new_mode
                     })
+            elif "rtt" in line and "var" in line:
+                match = rtt_var_re.search(line)
+                if match:
+                    # RTT ms convert
+                    r_val = float(match.group('rtt'))
+                    r_unit = match.group('rtt_unit')
+                    r_ms = r_val * 1000.0 if r_unit == 's' else (r_val / 1000.0 if r_unit == 'µs' else r_val)
+
+                    # Var ms convert
+                    v_val = float(match.group('var'))
+                    v_unit = match.group('var_unit')
+                    v_ms = v_val * 1000.0 if v_unit == 's' else (v_val / 1000.0 if v_unit == 'µs' else v_val)
+
+                    rtt_vars.append({
+                        'dt': dt, 'ts': ts, 'peer': match.group('ip_port'),
+                        'rtt': r_ms, 'var': v_ms
+                    })
             elif "mode" in line:
                 # Try each mode regex
                 match = probe_re.search(line)
@@ -138,7 +159,7 @@ def parse_log_content(lines):
                     autos.append(data)
         except Exception: continue
 
-    return pd.DataFrame(samples), pd.DataFrame(autos), pd.DataFrame(states)
+    return pd.DataFrame(samples), pd.DataFrame(autos), pd.DataFrame(states), pd.DataFrame(rtt_vars)
 
 # --- 文件加载 ---
 cmd_file = None
@@ -159,9 +180,9 @@ elif cmd_file:
         lines = f.readlines()
 
 if lines:
-    df_samples, df_autos, df_states = parse_log_content(lines)
+    df_samples, df_autos, df_states, df_rtt_vars = parse_log_content(lines)
 
-    if df_samples.empty and df_autos.empty:
+    if df_samples.empty and df_autos.empty and df_rtt_vars.empty:
         st.error("❌ 未能识别到有效数据。")
         st.stop()
 
@@ -169,7 +190,8 @@ if lines:
     sample_counts = df_samples['peer'].value_counts().to_dict() if not df_samples.empty else {}
     peer_set_s = set(df_samples['peer'].unique()) if not df_samples.empty else set()
     peer_set_a = set(df_autos['peer'].unique()) if not df_autos.empty else set()
-    all_peers_list = sorted(list(peer_set_s.union(peer_set_a)))
+    peer_set_r = set(df_rtt_vars['peer'].unique()) if not df_rtt_vars.empty else set()
+    all_peers_list = sorted(list(peer_set_s.union(peer_set_a).union(peer_set_r)))
 
     peer_labels = [f"{p} (Blocks: {sample_counts.get(p, 0)})" for p in all_peers_list]
     peer_labels.sort(key=lambda x: int(re.search(r'Blocks: (\d+)', x).group(1)), reverse=True)
@@ -180,33 +202,41 @@ if lines:
 
     peer_df = df_samples[df_samples['peer'] == selected_peer].copy().sort_values('ts').reset_index(drop=True)
     peer_auto = df_autos[df_autos['peer'] == selected_peer].copy().sort_values('ts').reset_index(drop=True)
+    peer_rtt_var = df_rtt_vars[df_rtt_vars['peer'] == selected_peer].copy().sort_values('ts').reset_index(drop=True)
 
     # --- RTT 平滑处理与速率统计 ---
-    if not peer_df.empty:
+    if not peer_df.empty or not peer_rtt_var.empty:
         st.sidebar.markdown("---")
         st.sidebar.subheader("⚙️ 统计设置")
         # 1. RTT 平滑
         alpha = st.sidebar.slider("RTT 平滑因子 (Alpha)", 0.01, 0.50, 0.125, help="Alpha 越小越平滑")
-        peer_df['srtt'] = peer_df['delay'].ewm(alpha=alpha).mean()
+
+        if not peer_df.empty:
+            peer_df['srtt'] = peer_df['delay'].ewm(alpha=alpha, adjust=False).mean()
+
+        if not peer_rtt_var.empty:
+            peer_rtt_var['srtt'] = peer_rtt_var['rtt'].ewm(alpha=alpha, adjust=False).mean()
+            peer_rtt_var['svar'] = peer_rtt_var['var'].ewm(alpha=alpha, adjust=False).mean()
 
         # 2. 采样速率统计 (图3,4)
         min_samples = st.sidebar.number_input("最少统计点数 (N)", value=30, min_value=1)
         min_secs = st.sidebar.number_input("最少时间片段 (秒)", value=1.0, step=0.1)
         sample_size_kb = st.sidebar.number_input("单样本大小 (KiB)", value=16.0)
 
-        ts_vals = peer_df['ts'].values
-        full_rates = np.zeros(len(ts_vals))
-        last_idx = 0
-        for i in range(1, len(ts_vals)):
-            count = i - last_idx
-            time_diff = ts_vals[i] - ts_vals[last_idx]
-            if count >= min_samples or time_diff >= min_secs:
-                avg_rate = (count * sample_size_kb) / max(time_diff, 0.001)
-                full_rates[last_idx:i+1] = avg_rate
-                last_idx = i
-        if last_idx < len(ts_vals):
-            full_rates[last_idx:] = full_rates[max(0, last_idx-1)] if last_idx > 0 else 0
-        peer_df['rate'] = full_rates
+        if not peer_df.empty:
+            ts_vals = peer_df['ts'].values
+            full_rates = np.zeros(len(ts_vals))
+            last_idx = 0
+            for i in range(1, len(ts_vals)):
+                count = i - last_idx
+                time_diff = ts_vals[i] - ts_vals[last_idx]
+                if count >= min_samples or time_diff >= min_secs:
+                    avg_rate = (count * sample_size_kb) / max(time_diff, 0.001)
+                    full_rates[last_idx:i+1] = avg_rate
+                    last_idx = i
+            if last_idx < len(ts_vals):
+                full_rates[last_idx:] = full_rates[max(0, last_idx-1)] if last_idx > 0 else 0
+            peer_df['rate'] = full_rates
 
     # 视图控制
     st.sidebar.markdown("---")
@@ -214,7 +244,7 @@ if lines:
     st.session_state.offset_val = offset_pct
     window_pct = st.sidebar.slider("展示窗口比例 (%)", 1, 100, 15)
 
-    ref_df = peer_df if not peer_df.empty else peer_auto
+    ref_df = peer_df if not peer_df.empty else (peer_auto if not peer_auto.empty else peer_rtt_var)
     total_len = len(ref_df)
     start_idx = int(total_len * (offset_pct / 100))
     end_idx = min(int(start_idx + total_len * (window_pct / 100)), total_len)
@@ -222,6 +252,7 @@ if lines:
     t_min, t_max = ref_df.iloc[start_idx]['ts'], ref_df.iloc[end_idx-1]['ts']
     sub_df = peer_df[(peer_df['ts'] >= t_min) & (peer_df['ts'] <= t_max)]
     sub_auto = peer_auto[(peer_auto['ts'] >= t_min) & (peer_auto['ts'] <= t_max)]
+    sub_rtt_var = peer_rtt_var[(peer_rtt_var['ts'] >= t_min) & (peer_rtt_var['ts'] <= t_max)]
 
     st.title(f"📊 传输详情: {selected_peer}")
 
@@ -413,6 +444,53 @@ if lines:
                 for r in fitted_results
             ])
             st.dataframe(results_df, width='stretch')
+
+    # 第四部分：RTT 与 Variance 走势图 (来自 plot_rtt_var)
+    if not sub_rtt_var.empty:
+        st.markdown("---")
+        st.subheader("📈 协议层 RTT 与 Variance 走势")
+
+        fig4, (ax_r1, ax_r2) = plt.subplots(2, 1, figsize=(16, 10))
+
+        dts_rtt = sub_rtt_var['dt']
+        rtt_vals = sub_rtt_var['rtt']
+        var_vals = sub_rtt_var['var']
+        srtt_vals = sub_rtt_var['srtt']
+        svar_vals = sub_rtt_var['svar']
+
+        # 上图：RTT 原值与平滑值
+        ax_r1.plot(dts_rtt, rtt_vals, marker='o', linestyle='-', linewidth=0.5,
+                  markersize=3, alpha=0.5, label='Raw RTT', color='lightblue')
+        ax_r1.plot(dts_rtt, srtt_vals, linestyle='-', linewidth=2,
+                  label=f'Smoothed RTT (α={alpha})', color='darkblue')
+
+        upper = srtt_vals + svar_vals
+        lower = (srtt_vals - svar_vals).clip(lower=0)
+        ax_r1.fill_between(dts_rtt, lower, upper, alpha=0.2, color='blue', label='±Variance')
+
+        ax_r1.set_ylabel('RTT (ms)', fontsize=11)
+        ax_r1.set_title(f'Round Trip Time for {selected_peer}', fontsize=12, fontweight='bold')
+        ax_r1.grid(True, alpha=0.3)
+        ax_r1.legend(loc='best')
+        ax_r1.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
+        plt.setp(ax_r1.get_xticklabels(), rotation=30, ha='right')
+
+        # 下图：Variance 原值与平滑值
+        ax_r2.plot(dts_rtt, var_vals, marker='s', linestyle='-', linewidth=0.5,
+                  markersize=3, alpha=0.5, label='Raw Variance', color='lightsalmon')
+        ax_r2.plot(dts_rtt, svar_vals, linestyle='-', linewidth=2,
+                  label=f'Smoothed Variance (α={alpha})', color='darkred')
+        ax_r2.fill_between(dts_rtt, 0, svar_vals, alpha=0.2, color='red')
+        ax_r2.set_ylabel('Variance (ms)', fontsize=11)
+        ax_r2.set_xlabel('Time', fontsize=11)
+        ax_r2.set_title('RTT Variance Tracker', fontsize=12, fontweight='bold')
+        ax_r2.grid(True, alpha=0.3)
+        ax_r2.legend(loc='best')
+        ax_r2.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
+        plt.setp(ax_r2.get_xticklabels(), rotation=30, ha='right')
+
+        plt.tight_layout()
+        st.pyplot(fig4)
 
     # 底部指标卡
     st.markdown("---")
