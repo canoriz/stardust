@@ -261,6 +261,10 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
         self.rtt.get_count()
     }
 
+    pub fn reset_var(&mut self) {
+        self.rtt.reset_var();
+    }
+
     pub fn get_var(&self) -> Duration {
         self.rtt.get_variation()
     }

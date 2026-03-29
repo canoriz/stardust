@@ -21,6 +21,8 @@ pub enum BandwidthMode {
 
         // how many consecutive response which have rtt greater than (mean + sigma)
         slow_count: u32,
+        // degrees of freedom for one-tail t critical value in current ProbeBW phase
+        probe_df: usize,
         slow_down_to: usize,
 
         // timestamp of last piece receive
@@ -64,13 +66,15 @@ impl BandwidthMode {
     pub const PACING: [u32; 8] = [5, 3, 4, 4, 4, 4, 4, 4];
     pub const MIN_PROBE_BW_CAPACITY: usize = 4;
 
+    // gain: increase final result by (gain/4)
     pub fn compute_probe_bw_capacity(
-        min_rtt: time::Duration,
+        rtt: time::Duration,
         max_bw: f32,
         cycle_index: usize,
+        gain: usize, //
     ) -> usize {
-        let base = (min_rtt.as_secs_f32() * max_bw.max(0.0) / 16384.0) as usize;
-        let capacity = base * Self::PACING[cycle_index] as usize / 4;
+        let base = (rtt.as_secs_f32() * max_bw.max(0.0)) as usize;
+        let capacity = base * Self::PACING[cycle_index] as usize * gain / 4 / 4 / 16384;
         capacity.max(Self::MIN_PROBE_BW_CAPACITY)
     }
 

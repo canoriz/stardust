@@ -54,12 +54,12 @@ def fit_distributions(delays):
 def parse_log_content(lines):
     # 正则1: 原始采样 (add sample)
     sample_re = re.compile(
-        r"src/transmit_manager\.rs:\d+:\s+(?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+)\s+add bw sample Some\((?P<delay>[\d.]+)(?P<unit>µs|ms|s)\), inflight [\d.]+ inflight when sent Some\((?P<inflight>\d+)\)"
+        r"src/transmit_manager\.rs:\d+:\s+(?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+)\s+add bw sample Some\((?P<delay>[\d.]+)(?P<unit>ns|us|µs|ms|s)\), inflight [\d.]+ inflight when sent Some\((?P<inflight>\d+)\)"
     )
     # Regex for different modes
     # ProbeBW
     probe_re = re.compile(
-        r"stardust::transmit_manager: src/transmit_manager\.rs:\d+: (?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+) ProbeBW mode cycle (?P<cycle>\d+) capacity (?P<capacity>\d+) min rtt (?P<min_rtt>[\d.]+)ms avg bw (?P<bw>[\d.]+) max_bw (?P<max_bw>[\d.]+) req in flight (?P<req_if>\d+)"
+        r"stardust::transmit_manager: src/transmit_manager\.rs:\d+: (?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+) ProbeBW mode cycle (?P<cycle>\d+) capacity (?P<capacity>\d+) min rtt (?P<min_rtt>[\d.]+)ms probe rtt (?P<probe_rtt>[\d.]+)ms avg bw (?P<bw>[\d.]+) max_bw (?P<max_bw>[\d.]+) req in flight (?P<req_if>\d+)"
     )
     # Startup
     startup_re = re.compile(
@@ -67,7 +67,11 @@ def parse_log_content(lines):
     )
     # Slowdown
     slowdown_re = re.compile(
-        r"stardust::transmit_manager: src/transmit_manager\.rs:\d+: (?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+) (?P<mode>Slowdown) mode min rtt (?P<min_rtt>[\d.]+)ms avg bw (?P<bw>[\d.]+) req in flight (?P<req_if>\d+)"
+        r"stardust::transmit_manager: src/transmit_manager\.rs:\d+: (?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+) (?P<mode>Slowdown) mode min rtt (?P<min_rtt>[\d.]+)(ms|µs|us|s|ns) avg bw (?P<bw>[\d.]+) req in flight (?P<req_if>\d+)"
+    )
+    # ProbeRTT
+    probe_rtt_re = re.compile(
+        r"stardust::transmit_manager: src/transmit_manager\.rs:\d+: (?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+) (?P<mode>ProbeRTT) mode min rtt (?P<min_rtt>[\d.]+)(ms|µs|us|s|ns) avg bw (?P<bw>[\d.]+) inflight_target (?P<inflight_target>\d+) req in flight (?P<req_if>\d+)"
     )
     # 状态转换
     change_re = re.compile(
@@ -75,7 +79,7 @@ def parse_log_content(lines):
     )
     # RTT & Variance
     rtt_var_re = re.compile(
-        r"src/transmit_manager\.rs:\d+:\s+(?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+)\s+rtt\s+(?P<rtt>[\d.]+)(?P<rtt_unit>s|ms|µs)\s+var\s+(?P<var>[\d.]+)(?P<var_unit>s|ms|µs)"
+        r"src/transmit_manager\.rs:\d+:\s+(?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+)\s+rtt\s+(?P<rtt>[\d.]+)(?P<rtt_unit>ns|us|µs|ms|s)\s+var\s+(?P<var>[\d.]+)(?P<var_unit>ns|us|µs|ms|s)"
     )
 
     # --- 核心解析逻辑 ---
@@ -96,6 +100,10 @@ def parse_log_content(lines):
                     # Convert to milliseconds
                     if unit == 'µs':
                         delay_ms = raw_delay / 1000.0
+                    elif unit == 'us':
+                        delay_ms = raw_delay / 1000.0
+                    elif unit == 'ns':
+                        delay_ms = raw_delay / 1_000_000.0
                     elif unit == 's':
                         delay_ms = raw_delay * 1000.0
                     else:  # ms
@@ -118,12 +126,26 @@ def parse_log_content(lines):
                     # RTT ms convert
                     r_val = float(match.group('rtt'))
                     r_unit = match.group('rtt_unit')
-                    r_ms = r_val * 1000.0 if r_unit == 's' else (r_val / 1000.0 if r_unit == 'µs' else r_val)
+                    if r_unit == 's':
+                        r_ms = r_val * 1000.0
+                    elif r_unit in ('us', 'µs'):
+                        r_ms = r_val / 1000.0
+                    elif r_unit == 'ns':
+                        r_ms = r_val / 1_000_000.0
+                    else:
+                        r_ms = r_val
 
                     # Var ms convert
                     v_val = float(match.group('var'))
                     v_unit = match.group('var_unit')
-                    v_ms = v_val * 1000.0 if v_unit == 's' else (v_val / 1000.0 if v_unit == 'µs' else v_val)
+                    if v_unit == 's':
+                        v_ms = v_val * 1000.0
+                    elif v_unit in ('us', 'µs'):
+                        v_ms = v_val / 1000.0
+                    elif v_unit == 'ns':
+                        v_ms = v_val / 1_000_000.0
+                    else:
+                        v_ms = v_val
 
                     rtt_vars.append({
                         'dt': dt, 'ts': ts, 'peer': match.group('ip_port'),
@@ -139,6 +161,9 @@ def parse_log_content(lines):
                 if not match:
                     match = slowdown_re.search(line)
                     mode = "Slowdown"
+                if not match:
+                    match = probe_rtt_re.search(line)
+                    mode = "ProbeRTT"
 
                 if match:
                     bw_kb = float(match.group('bw')) / 1024.0
@@ -152,9 +177,11 @@ def parse_log_content(lines):
                     if 'max_bw' in match.groupdict():
                         data['max_bw'] = float(match.group('max_bw')) / 1024.0
 
-                    if mode == "ProbeBW" or mode == "Slowdown":
+                    if mode in ["ProbeBW", "Slowdown", "ProbeRTT"]:
                         data['min_rtt'] = float(match.group('min_rtt'))
                         data['req_if'] = int(match.group('req_if'))
+                    if mode == "ProbeBW" and 'probe_rtt' in match.groupdict() and match.group('probe_rtt'):
+                        data['probe_rtt'] = float(match.group('probe_rtt'))
 
                     autos.append(data)
         except Exception: continue

@@ -60,27 +60,30 @@ impl RTT {
         self.count
     }
 
-    pub fn reset(&mut self) {
-        *self = Self::new(self.a, self.b);
+    pub fn reset_var(&mut self) {
+        self.count = 0;
+        self.rtt_var = Duration::from_secs(0);
     }
 
     /// add a new sample of RTT
     pub fn add_rtt_sample(&mut self, rtt: Duration) {
-        if self.count == 0 || rtt < self.min_rtt {
+        if self.count == 0 {
+            self.smooth_rtt = rtt;
+            self.rtt_var = Duration::from_secs(0);
+            self.min_rtt = rtt;
+            self.min_rtt_at = Instant::now();
+            self.count = 1;
+            return;
+        }
+
+        if rtt < self.min_rtt {
             self.min_rtt = rtt;
             self.min_rtt_at = Instant::now();
         }
-        if self.count as f32 * self.a >= 1.0 {
-            self.rtt_var =
-                self.rtt_var.mul_f32(1.0 - self.b) + self.smooth_rtt.abs_diff(rtt).mul_f32(self.b);
-            self.smooth_rtt = self.smooth_rtt.mul_f32(1.0 - self.a) + rtt.mul_f32(self.a);
-        } else {
-            self.smooth_rtt =
-                (self.smooth_rtt.mul_f32(self.count as f32) + rtt) / ((self.count + 1) as u32);
-            self.rtt_var = (self.rtt_var.mul_f32(self.count as f32)
-                + self.smooth_rtt.abs_diff(rtt))
-                / ((self.count + 1) as u32);
-        }
+
+        self.rtt_var =
+            self.rtt_var.mul_f32(1.0 - self.b) + self.smooth_rtt.abs_diff(rtt).mul_f32(self.b);
+        self.smooth_rtt = self.smooth_rtt.mul_f32(1.0 - self.a) + rtt.mul_f32(self.a);
         self.count += 1;
     }
 }

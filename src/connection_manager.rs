@@ -196,12 +196,12 @@ impl ConnectionManagerHandle {
                 let u1: f64 = rng.gen_range(0.0..1.0);
                 let u2: f64 = rng.gen_range(0.0..1.0);
                 let z0 = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
-                (z0 * std_dev + mean).max(1.0) // clamp at 1ms
+                (z0 * std_dev + mean).max(5.0).min(60.0) // clamp at 5ms to 60ms
             }
 
             // configurable mean and std_dev
-            const MOCK_RTT_MEAN_MS: f64 = 40.0;
-            const MOCK_RTT_STD_DEV_MS: f64 = 20.0;
+            const MOCK_RTT_MEAN_MS: f64 = 20.0;
+            const MOCK_RTT_STD_DEV_MS: f64 = 10.0;
             let delay_ms = normal_sample(MOCK_RTT_MEAN_MS, MOCK_RTT_STD_DEV_MS);
 
             self.send_stream
