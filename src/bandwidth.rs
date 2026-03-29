@@ -170,7 +170,7 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
     }
 
     pub fn count_max_bw_and_min_rtt(&self, back_interval: Duration) -> (f32, Duration, Instant) {
-        let f = |acc: (f32, Duration, Instant), _begin: Instant, end: Instant, p: &Period| {
+        let map_f = |_begin: Instant, end: Instant, p: &Period| {
             let dt = end - p.since;
             let bw = (p.bytes_count as f32) / p.dur.as_secs_f32();
             trace!(
@@ -181,6 +181,11 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
             );
 
             let (p_min, p_min_at) = p.rtt.get_min_rtt_with_timestamp();
+            (bw, p_min, p_min_at)
+        };
+
+        let reduce_f = |acc: (f32, Duration, Instant), this: (f32, Duration, Instant)| {
+            let (bw, p_min, p_min_at) = this;
             if p_min < acc.1 {
                 (acc.0.max(bw), p_min, p_min_at)
             } else {
@@ -188,38 +193,38 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
             }
         };
 
-        self.fold_periods_within_interval(
-            back_interval,
-            (0.0, Duration::MAX / 30, Instant::now()),
-            f,
-        )
+        let (min_rtt, min_rtt_at) = self.rtt.get_min_rtt_with_timestamp();
+        self.reduce_periods_within_interval(back_interval, map_f, reduce_f)
+            .unwrap_or((0.0, min_rtt, min_rtt_at))
     }
 
-    fn fold_periods_within_interval<T, F>(&self, back_interval: Duration, init: T, mut f: F) -> T
+    fn reduce_periods_within_interval<T, MF, RF>(
+        &self,
+        back_interval: Duration,
+        mut map_f: MF,
+        mut reduce_f: RF,
+    ) -> Option<T>
     where
-        F: FnMut(T, Instant /* begin */, Instant /* end */, &Period) -> T,
+        MF: FnMut(Instant /* begin */, Instant /* end */, &Period) -> T,
+        RF: FnMut(T, T) -> T,
     {
         let mut slot_id = self.head;
 
         let begin_time = Instant::now() - back_interval;
-        let mut t = init;
-        loop {
+        let mut acc = {
             let slot = &self.circular[slot_id];
 
             let end_time = slot.since + slot.dur;
             if begin_time <= slot.since {
-                // querying range covers entire slot
-                if slot.pkg_count > 0 {
-                    t = f(t, slot.since, end_time, slot);
-                }
+                map_f(slot.since, end_time, slot)
             } else if begin_time < end_time {
-                // querying range covers part of this slot's time range
-                if slot.pkg_count > 0 {
-                    t = f(t, begin_time, end_time, slot);
-                }
-                break;
+                map_f(begin_time, end_time, slot)
+            } else {
+                return None;
             }
+        };
 
+        loop {
             if slot_id == 0 {
                 slot_id = SLOT_SIZE - 1;
             } else {
@@ -230,27 +235,42 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
             if slot_id == self.head {
                 break;
             }
+            let slot = &self.circular[slot_id];
+
+            let end_time = slot.since + slot.dur;
+            if begin_time <= slot.since {
+                let t = map_f(slot.since, end_time, slot);
+                // querying range covers entire slot
+                acc = reduce_f(acc, t);
+            } else if begin_time < end_time {
+                // querying range covers part of this slot's time range
+                let t = map_f(begin_time, end_time, slot);
+                acc = reduce_f(acc, t);
+                break;
+            }
         }
 
-        t
+        Some(acc)
     }
 
-    /// returns how many bytes received in back_interval, and average RTT
+    /// returns how many bytes received in back_interval, and min RTT
     pub fn count_bytes_within_period(&self, back_interval: Duration) -> (usize, Duration) {
-        let f = |acc: (usize, Duration), begin: Instant, end: Instant, p: &Period| {
+        let map_f = |begin: Instant, end: Instant, p: &Period| {
             let ratio = if begin <= p.since {
                 1.0
             } else {
                 (end - begin).div_duration_f32(end - p.since)
             };
-
-            let (p_min, _) = p.rtt.get_min_rtt_with_timestamp();
-            (
-                acc.0 + (ratio * (p.bytes_count as f32)) as usize,
-                acc.1.min(p_min),
-            )
+            let (min_rtt, _) = p.rtt.get_min_rtt_with_timestamp();
+            ((ratio * (p.bytes_count as f32)) as usize, min_rtt)
         };
-        self.fold_periods_within_interval(back_interval, (0, Duration::MAX), f)
+
+        let reduce_f = |acc: (usize, Duration), this: (usize, Duration)| -> (usize, Duration) {
+            let (n, min_rtt) = this;
+            (acc.0 + n, acc.1.min(min_rtt))
+        };
+        self.reduce_periods_within_interval(back_interval, map_f, reduce_f)
+            .unwrap_or((0, Duration::from_secs(2)))
     }
 
     pub fn get_rtt(&self) -> Duration {
