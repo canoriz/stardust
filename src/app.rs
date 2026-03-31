@@ -31,7 +31,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .self_id(SELF_ID)
                 .build(),
         );
-        let torrent_f = include_bytes!("../tutu.torrent");
+        let torrent_f = include_bytes!("../test-large.torrent");
         let torrent = metadata::FileMetadata::load(torrent_f).unwrap();
         let (metadata, announce_list) = torrent.to_metadata();
         let info_hash = metadata.info_hash;
@@ -51,14 +51,27 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .self_id(SELF_ID)
                 .build(),
         );
-        let magnet: Magnet = ("magnet:?xt=urn:btih:c51c90de42499ea4d1acd4159673b3197cdb2f02&tr=http%3a%2f%2ft.nyaatracker.com%2fannounce&tr=http%3a%2f%2ftracker.kamigami.org%3a2710%2fannounce&tr=http%3a%2f%2fshare.camoe.cn%3a8080%2fannounce&tr=http%3a%2f%2fopentracker.acgnx.se%2fannounce&tr=http%3a%2f%2fanidex.moe%3a6969%2fannounce&tr=http%3a%2f%2ft.acg.rip%3a6699%2fannounce&tr=https%3a%2f%2ftr.bangumi.moe%3a9696%2fannounce&tr=udp%3a%2f%2ftr.bangumi.moe%3a6969%2fannounce&tr=http%3a%2f%2fopen.acgtracker.com%3a1096%2fannounce&tr=udp%3a%2f%2ftracker.opentrackr.org%3a1337%2fannounce")
+
+        let magnet = false;
+        if magnet {
+            let magnet: Magnet = ("magnet:?xt=urn:btih:7d27edeb2c364c2756cd5105e3b3b16745e9491b&tr=http%3a%2f%2ft.nyaatracker.com%2fannounce&tr=http%3a%2f%2ftracker.kamigami.org%3a2710%2fannounce&tr=http%3a%2f%2fshare.camoe.cn%3a8080%2fannounce&tr=http%3a%2f%2fopentracker.acgnx.se%2fannounce&tr=http%3a%2f%2fanidex.moe%3a6969%2fannounce&tr=http%3a%2f%2ft.acg.rip%3a6699%2fannounce&tr=https%3a%2f%2ftr.bangumi.moe%3a9696%2fannounce&tr=udp%3a%2f%2ftr.bangumi.moe%3a6969%2fannounce&tr=http%3a%2f%2fopen.acgtracker.com%3a1096%2fannounce&tr=udp%3a%2f%2ftracker.opentrackr.org%3a1337%2fannounce")
         .parse()
         .unwrap();
-        let info_hash = magnet.info_hash;
-        session
-            .add_torrent(TorrentTask::Magnet(magnet), vec![])
-            .await;
-        (session, info_hash)
+            let info_hash = magnet.info_hash;
+            session
+                .add_torrent(TorrentTask::Magnet(magnet), vec![])
+                .await;
+            (session, info_hash)
+        } else {
+            let torrent_f = include_bytes!("../hikari.torrent");
+            let torrent = metadata::FileMetadata::load(torrent_f).unwrap();
+            let (metadata, announce_list) = torrent.to_metadata();
+            let info_hash = metadata.info_hash;
+            session
+                .add_torrent(TorrentTask::Torrent(metadata), announce_list)
+                .await;
+            (session, info_hash)
+        }
     };
 
     session

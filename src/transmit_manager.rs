@@ -604,26 +604,16 @@ impl TransmitWorker {
             }
         };
 
-        // TODO: optimize this, do not clone every time
-        // a request is very probably to response with in this time, if it is to be responded
-        let rtts = self
-            .connected_peers
-            .iter()
-            .map(|(k, v)| {
-                (
-                    *k,
-                    v.bw.get_rtt_4var().max(time::Duration::from_millis(1500)),
-                )
-            })
-            .collect();
-
         let mut revoked = HashMap::new();
         for (addr, h) in &mut self.connected_peers {
             info!("peer status {addr}: {:?}", h.state);
             if h.state.peer_choke_status == ChokeStatus::Unchoked {
                 let in_flight = h.inflight.inflight();
+                let probe_bdp_rtt = compute_probe_bdp_rtt(h.min_rtt);
+                let look_back_duration = bw_look_back_window(probe_bdp_rtt);
+                let avg_bw = h.bw.count_avg_bw_in(look_back_duration);
                 let (reqs, pick_n) =
-                    block_picker.pick_blocks(addr, &rtts, n_blocks, in_flight, &mut revoked);
+                    block_picker.pick_blocks(addr, n_blocks, in_flight, avg_bw, h.min_rtt, &mut revoked);
                 for rg in reqs.range.iter() {
                     for req in rg.iter(reqs.piece_size) {
                         h.inflight.request(req);
@@ -656,25 +646,15 @@ impl TransmitWorker {
             }
         };
 
-        // TODO: optimize this, do not clone every time
-        // a request is very probably to response with in this time, if it is to be responded
-        let rtts = self
-            .connected_peers
-            .iter()
-            .map(|(k, v)| {
-                (
-                    *k,
-                    v.bw.get_rtt_4var().max(time::Duration::from_millis(1500)),
-                )
-            })
-            .collect();
-
         let mut revoked = HashMap::new();
         if let Some(h) = self.connected_peers.get_mut(addr) {
             if h.state.peer_choke_status == ChokeStatus::Unchoked {
                 let n_in_flight = h.inflight.inflight();
+                let probe_bdp_rtt = compute_probe_bdp_rtt(h.min_rtt);
+                let look_back_duration = bw_look_back_window(probe_bdp_rtt);
+                let avg_bw = h.bw.count_avg_bw_in(look_back_duration);
                 let (reqs, picked_n) =
-                    block_picker.pick_blocks(addr, &rtts, pick_n, n_in_flight, &mut revoked);
+                    block_picker.pick_blocks(addr, pick_n, n_in_flight, avg_bw, h.min_rtt, &mut revoked);
                 for rg in reqs.range.iter() {
                     for req in rg.iter(reqs.piece_size) {
                         h.inflight.request(req);
@@ -694,13 +674,16 @@ impl TransmitWorker {
                             max_bw
                         });
                         h.app_limited = true;
-                        warn!("only picked {picked_n} blocks from {addr:?}, maybe no more interesting blocks");
+                        debug!("{addr} only picked {picked_n} blocks from {addr:?} app limited");
                     } else if matches!(
                         h.bw_mode,
                         BandwidthMode::ProbeBW { .. } | BandwidthMode::Startup { .. }
                     ) {
                         // in slowdown mode or probeRTT mode, pipe is easily full, only reset app_limited if
                         // if we are in startup|probeBW mode
+                        if h.app_limited {
+                            debug!("{addr} exit app limited");
+                        }
                         h.app_limited = false;
                     }
                 }
@@ -1473,6 +1456,7 @@ impl TransmitWorker {
             .get_mut(&to_canonical_addr(*peer))
             .expect("should exist");
         let rtt = block_picker.get_rtt(peer, &req);
+        let expected_response_time = block_picker.get_expected_response_time(peer, &req);
         let inflight_when_sent = block_picker.get_inflight_when_sent(peer, &req);
         conn.bw
             .add_sample(piece.len as usize, rtt, inflight_when_sent);
@@ -1480,6 +1464,17 @@ impl TransmitWorker {
             "{peer} add bw sample {rtt:?}, inflight {} inflight when sent {inflight_when_sent:?}",
             conn.inflight.inflight()
         );
+
+        if let (Some(real_recv_time), Some(expected_recv_time)) = (rtt, expected_response_time) {
+            let (sign, delta) = if real_recv_time >= expected_recv_time {
+                ('+', real_recv_time - expected_recv_time)
+            } else {
+                ('-', expected_recv_time - real_recv_time)
+            };
+            info!(
+                "{peer} piece timing {req:?} expected {expected_recv_time:?} real {real_recv_time:?} {sign}{delta:?}",
+            );
+        }
 
         if let Some(rtt) = rtt {
             let mean = conn.bw.get_rtt();

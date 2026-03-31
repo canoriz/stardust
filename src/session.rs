@@ -71,11 +71,12 @@ impl Session {
             //         .await;
             //     c.find_closest_node_to(opt.self_id, true).await;
             // });
+
             tokio::spawn(async move {
                 _ = c
                     .ping_rpc(
                         dht::RpcAddr::NoID(
-                            "[2408:820c:5b39:1040:2bbc:c328:803c:1a21]:60135"
+                            "[2408:820c:5b39:1040:2bbc:c328:803c:1a21]:64199"
                                 .parse()
                                 .unwrap(),
                         ),
@@ -84,6 +85,16 @@ impl Session {
                     .await;
                 c.find_closest_node_to(opt.self_id, true).await;
             });
+
+            // tokio::spawn(async move {
+            //     _ = c
+            //         .ping_rpc(
+            //             dht::RpcAddr::NoID("[::1]:51774".parse().unwrap()),
+            //             time::Duration::from_secs(5),
+            //         )
+            //         .await;
+            //     c.find_closest_node_to(opt.self_id, true).await;
+            // });
             Some(dht_client)
         } else {
             None
