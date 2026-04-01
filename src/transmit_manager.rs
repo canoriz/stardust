@@ -612,8 +612,14 @@ impl TransmitWorker {
                 let probe_bdp_rtt = compute_probe_bdp_rtt(h.min_rtt);
                 let look_back_duration = bw_look_back_window(probe_bdp_rtt);
                 let avg_bw = h.bw.count_avg_bw_in(look_back_duration);
-                let (reqs, pick_n) =
-                    block_picker.pick_blocks(addr, n_blocks, in_flight, avg_bw, h.min_rtt, &mut revoked);
+                let (reqs, pick_n) = block_picker.pick_blocks(
+                    addr,
+                    n_blocks,
+                    in_flight,
+                    avg_bw,
+                    h.min_rtt,
+                    &mut revoked,
+                );
                 for rg in reqs.range.iter() {
                     for req in rg.iter(reqs.piece_size) {
                         h.inflight.request(req);
@@ -653,8 +659,14 @@ impl TransmitWorker {
                 let probe_bdp_rtt = compute_probe_bdp_rtt(h.min_rtt);
                 let look_back_duration = bw_look_back_window(probe_bdp_rtt);
                 let avg_bw = h.bw.count_avg_bw_in(look_back_duration);
-                let (reqs, picked_n) =
-                    block_picker.pick_blocks(addr, pick_n, n_in_flight, avg_bw, h.min_rtt, &mut revoked);
+                let (reqs, picked_n) = block_picker.pick_blocks(
+                    addr,
+                    pick_n,
+                    n_in_flight,
+                    avg_bw,
+                    h.min_rtt,
+                    &mut revoked,
+                );
                 for rg in reqs.range.iter() {
                     for req in rg.iter(reqs.piece_size) {
                         h.inflight.request(req);
@@ -673,8 +685,12 @@ impl TransmitWorker {
                             let (max_bw, _, _) = h.get_max_bw(look_back_duration);
                             max_bw
                         });
+                        if !h.app_limited {
+                            debug!(
+                                "{addr} only picked {picked_n} blocks from {addr:?} app limited"
+                            );
+                        }
                         h.app_limited = true;
-                        debug!("{addr} only picked {picked_n} blocks from {addr:?} app limited");
                     } else if matches!(
                         h.bw_mode,
                         BandwidthMode::ProbeBW { .. } | BandwidthMode::Startup { .. }
@@ -1801,7 +1817,7 @@ impl TransmitWorker {
             let c = c.clone();
             addr.set_port(port);
             tokio::spawn(async move {
-                _ = c.ping_rpc(RpcAddr::NoID(addr), Self::DHT_TIMEOUT).await;
+                _ = c.ping_rpc(RpcAddr::no_id(addr), Self::DHT_TIMEOUT).await;
             });
         }
         Ok(())

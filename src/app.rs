@@ -77,7 +77,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
     session
         .do_work(&info_hash, async |tm| {
             // TODO: this is ugly though, only sender can clone
-            // tm.check().await;
+            tm.check().await;
             tm.change_state(RunningCmd::Resume).await;
             tm.wait_downloaded().await;
         })

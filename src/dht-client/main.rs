@@ -34,11 +34,7 @@ async fn main() -> std::io::Result<()> {
     let r = timeout(
         time::Duration::from_millis(5000),
         client.ping_rpc(
-            RpcAddr::NoID(
-                "[240e:b8f:5c68:8400:4c07:3e69:7b5a:741]:59999"
-                    .parse()
-                    .unwrap(),
-            ),
+            RpcAddr::no_id("[240e:b8f:5c68:8400:4c07:3e69:7b5a:741]:59999"),
             time::Duration::from_secs(4),
         ),
     )
@@ -48,11 +44,7 @@ async fn main() -> std::io::Result<()> {
 
     let r = client
         .find_node_rpc(
-            RpcAddr::NoID(
-                "[240e:b8f:5c68:8400:4c07:3e69:7b5a:741]:59999"
-                    .parse()
-                    .unwrap(),
-            ),
+            RpcAddr::no_id("[240e:b8f:5c68:8400:4c07:3e69:7b5a:741]:59999"),
             id,
             time::Duration::from_secs(4),
         )
@@ -111,11 +103,6 @@ async fn process_line_async(line: String, client: Arc<DHT>) -> String {
         let res = client.find_closest_node_to(id, true).await;
         format!("{:?}", res)
     } else {
-        let addr = if let Ok(a) = addr.parse() {
-            a
-        } else {
-            return "addr format wrong".into();
-        };
         let res = if cmd.starts_with("p") {
             client
                 .ping_rpc(RpcAddr::no_id(addr), Duration::from_secs(5))

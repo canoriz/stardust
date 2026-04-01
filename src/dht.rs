@@ -4,9 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::io;
-use std::net::SocketAddr;
-use std::net::SocketAddrV4;
-use std::net::SocketAddrV6;
+use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6, ToSocketAddrs};
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -184,18 +182,21 @@ pub struct NodeAddr {
 }
 
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
-pub enum RpcAddr {
-    ID(NodeAddr),
-    NoID(SocketAddr),
+pub struct RpcAddr<A> {
+    id: Option<NodeID>,
+    addr: A,
 }
 
-impl RpcAddr {
-    pub fn no_id(addr: SocketAddr) -> Self {
-        Self::NoID(addr)
+impl<A> RpcAddr<A>
+where
+    A: ToSocketAddrs,
+{
+    pub fn no_id(addr: A) -> Self {
+        Self { id: None, addr }
     }
 
-    pub fn id(id: NodeID, addr: SocketAddr) -> Self {
-        Self::ID(NodeAddr { id, addr })
+    pub fn id(id: NodeID, addr: A) -> Self {
+        Self { id: Some(id), addr }
     }
 }
 
@@ -305,44 +306,62 @@ impl DHT {
         })
     }
 
-    async fn do_rpc_req(
+    async fn do_rpc_req<A>(
         &self,
-        addr: RpcAddr,
-        krpc: KRPC,
+        addr: RpcAddr<A>,
+        krpc_inner: KRPCInner,
         timeout: time::Duration,
-    ) -> io::Result<Resp> {
-        let (tx, rx) = oneshot::channel();
-        let tid = krpc.t.clone();
-        let sock_addr = match addr {
-            RpcAddr::ID(na) => na.addr,
-            RpcAddr::NoID(a) => a,
-        };
-        let ipv6 = is_ipv6(sock_addr);
-        let req = Req::KRPC {
-            addr: sock_addr,
-            krpc,
-        };
+    ) -> io::Result<Resp>
+    where
+        A: ToSocketAddrs,
+    {
+        use io::Error;
 
-        let _drop_guard = TransactionGuard::new(tid.into_vec(), self.tmap.clone(), tx);
-        if self.tx.send(req).await.is_err() {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                "send KRPC request to worker error",
-            ));
+        let mut last_err = None;
+        for sock_addr in addr.addr.to_socket_addrs()? {
+            let (tx, rx) = oneshot::channel();
+            let tid = self.tid.fetch_add(1, Ordering::Relaxed).to_be_bytes();
+            let tid: ByteString = tid[..].into();
+            let krpc = KRPC {
+                t: tid.clone(),
+                v: self.version.clone().into(),
+                inner: krpc_inner.clone(),
+            };
+
+            let ipv6 = is_ipv6(sock_addr);
+            let req = Req::KRPC {
+                addr: sock_addr,
+                krpc,
+            };
+
+            let _drop_guard = TransactionGuard::new(tid.into_vec(), self.tmap.clone(), tx);
+            if self.tx.send(req).await.is_err() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "send KRPC request to worker error",
+                ));
+            }
+
+            match tokio::time::timeout(timeout, rx).await {
+                Ok(Ok(r)) => return r,
+                Ok(Err(_)) => {
+                    last_err = Some(io::Error::new(
+                        io::ErrorKind::Other,
+                        "recv result from worker error",
+                    ))
+                }
+                Err(_) => {
+                    if let Some(id) = addr.id {
+                        self.remove_route(ipv6, id).await?;
+                    }
+                    last_err = Some(io::Error::new(io::ErrorKind::Other, "timeout"));
+                }
+            }
         }
 
-        match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(r)) => r,
-            Ok(Err(_)) => Err(io::Error::new(
-                io::ErrorKind::Other,
-                "recv result from worker error",
-            )),
-            Err(_) => {
-                if let RpcAddr::ID(na) = addr {
-                    self.remove_route(ipv6, na.id).await?;
-                }
-                Err(io::Error::new(io::ErrorKind::Other, "timeout"))
-            }
+        match last_err {
+            Some(err) => Err(err),
+            None => Err(Error::new(io::ErrorKind::InvalidInput, "can not resolve")),
         }
     }
 
@@ -377,85 +396,74 @@ impl DHT {
         nodes
     }
 
-    pub async fn ping_rpc(
+    pub async fn ping_rpc<A>(
         self: &Arc<Self>,
-        addr: RpcAddr,
+        addr: RpcAddr<A>,
         timeout: time::Duration,
-    ) -> io::Result<Resp> {
-        let tid = self.tid.fetch_add(1, Ordering::Relaxed).to_be_bytes();
-        let tid: ByteString = tid[..].into();
-        let krpc = KRPC {
-            t: tid.clone(),
-            v: self.version.clone().into(),
-            inner: KRPCInner::Request(Arg::Ping(PingArg { id: self.id })),
-        };
+    ) -> io::Result<Resp>
+    where
+        A: ToSocketAddrs,
+    {
+        let krpc = KRPCInner::Request(Arg::Ping(PingArg { id: self.id }));
         self.do_rpc_req(addr, krpc, timeout).await
     }
 
-    pub async fn find_node_rpc(
+    pub async fn find_node_rpc<A>(
         self: &Arc<Self>,
-        addr: RpcAddr,
+        addr: RpcAddr<A>,
         target: NodeID,
         timeout: time::Duration,
-    ) -> io::Result<Resp> {
-        debug!("request find_node {target:?} to {addr:?}");
+    ) -> io::Result<Resp>
+    where
+        A: ToSocketAddrs,
+    {
         let tid = self.tid.fetch_add(1, Ordering::Relaxed).to_be_bytes();
         let tid: ByteString = tid[..].into();
-        let krpc = KRPC {
-            t: tid.clone(),
-            v: self.version.clone().into(),
-            inner: KRPCInner::Request(Arg::FindNode(FindNodeArg {
-                id: self.id,
-                target,
-                want: vec![b"n4".as_ref().into(), b"n6".as_ref().into()],
-            })),
-        };
-        self.do_rpc_req(addr, krpc, timeout).await
+        let krpc_inner = KRPCInner::Request(Arg::FindNode(FindNodeArg {
+            id: self.id,
+            target,
+            want: vec![b"n4".as_ref().into(), b"n6".as_ref().into()],
+        }));
+        self.do_rpc_req(addr, krpc_inner, timeout).await
     }
 
-    pub async fn get_peers_rpc(
+    pub async fn get_peers_rpc<A>(
         self: &Arc<Self>,
-        addr: RpcAddr,
+        addr: RpcAddr<A>,
         info_hash: NodeID,
         timeout: time::Duration,
-    ) -> io::Result<Resp> {
-        let tid = self.tid.fetch_add(1, Ordering::Relaxed).to_be_bytes();
-        let tid: ByteString = tid[..].into();
-        let krpc = KRPC {
-            t: tid.clone(),
-            v: self.version.clone().into(),
-            inner: KRPCInner::Request(Arg::GetPeers(GetPeersArg {
-                id: self.id,
-                info_hash,
-                want: vec![b"n4".as_ref().into(), b"n6".as_ref().into()],
-            })),
-        };
-        self.do_rpc_req(addr, krpc, timeout).await
+    ) -> io::Result<Resp>
+    where
+        A: ToSocketAddrs,
+    {
+        let krpc_inner = KRPCInner::Request(Arg::GetPeers(GetPeersArg {
+            id: self.id,
+            info_hash,
+            want: vec![b"n4".as_ref().into(), b"n6".as_ref().into()],
+        }));
+        self.do_rpc_req(addr, krpc_inner, timeout).await
     }
 
-    pub async fn announce_peer_rpc(
+    pub async fn announce_peer_rpc<A>(
         self: &Arc<Self>,
-        addr: RpcAddr,
+        addr: RpcAddr<A>,
         info_hash: NodeID,
         port: u16,
         implied: bool,
         token: &[u8],
         timeout: time::Duration,
-    ) -> io::Result<Resp> {
-        let tid = self.tid.fetch_add(1, Ordering::Relaxed).to_be_bytes();
-        let tid: ByteString = tid[..].into();
-        let krpc = KRPC {
-            t: tid,
-            v: self.version.clone().into(),
-            inner: KRPCInner::Request(Arg::AnnouncePeer(AnnouncePeerArg {
-                id: self.id,
-                implied_port: if implied { Some(1) } else { Some(0) },
-                info_hash,
-                port,
-                token: token.into(),
-            })),
-        };
-        self.do_rpc_req(addr, krpc, timeout).await
+    ) -> io::Result<Resp>
+    where
+        A: ToSocketAddrs,
+    {
+        let krpc_inner = KRPCInner::Request(Arg::AnnouncePeer(AnnouncePeerArg {
+            id: self.id,
+            implied_port: if implied { Some(1) } else { Some(0) },
+            info_hash,
+            port,
+            token: token.into(),
+        }));
+        self.do_rpc_req(addr, krpc_inner, timeout).await
     }
 
     pub async fn get_peers(self: &Arc<Self>, target: NodeID, ipv6: bool) -> Vec<SocketAddr> {
@@ -467,7 +475,10 @@ impl DHT {
 
         for n in ns {
             let cl = self.clone();
-            js.spawn(async move { cl.get_peers_rpc(RpcAddr::ID(n), target, timeout).await });
+            js.spawn(async move {
+                cl.get_peers_rpc(RpcAddr::id(n.id, n.addr), target, timeout)
+                    .await
+            });
         }
 
         let mut ret = vec![];
@@ -496,7 +507,7 @@ impl DHT {
         let send_req = |client: Arc<DHT>,
                         target: NodeID,
                         timeout: time::Duration,
-                        addr: RpcAddr,
+                        addr: RpcAddr<SocketAddr>,
                         resp: mpsc::Sender<Result<Vec<NodeAddr>, NodeID>>| {
             tokio::spawn(async move {
                 let mut ns = Vec::with_capacity(8);
@@ -581,7 +592,7 @@ impl DHT {
                             self.clone(),
                             target,
                             timeout,
-                            RpcAddr::ID(*addr),
+                            RpcAddr::id(addr.id, addr.addr),
                             resp_tx.clone(),
                         );
                         q += 1;
@@ -885,6 +896,7 @@ impl Server {
 
     async fn handle_out_req(&mut self, addr: SocketAddr, krpc: KRPC) {
         self.out_buf.clear();
+        // TODO: add logs
         match bt_bencode::to_writer(&mut self.out_buf, &krpc) {
             Ok(b) => b,
             Err(e) => {

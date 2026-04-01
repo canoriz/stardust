@@ -86,6 +86,10 @@ pub struct FileMetadata {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Info {
+    // TODO: FIXME: need RawValue to support unknown field, for
+    // example:
+    // pub private: u8,
+    // and also support original torrent have a non-alphabetical order
     pub name: String,
     #[serde(rename = "piece length")]
     pub piece_length: u32,

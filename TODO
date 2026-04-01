@@ -1,0 +1,53 @@
+1
+BT protocol
+announce
+download/seed control system
+file implementation (mmap)
+compact announce
+udp announce
+ipv6 announce
+ipv6 ipv4 dual stack
+announce list
+only select a part of files of a torrent (and handle only chosen a part of block)
+
+2
+PEX
+lt_extension
+fast_extension
+obfuscation (encryption)
+DHT
+upnp and nat-pmp
+
+3
+uTP (micro transmission protocol)
+
+4
+self implement bencode
+
+
+compact announce
+2025-12-22T16:44:19.106311Z  WARN stardust::metadata: src/metadata.rs:355: announce bencode decode error, url: http://sukebei.tracker.wf:8888/announce, raw: b"d8:completei83e10:downloadedi3636e10:incompletei64e8:intervali1831e12:min intervali60e5:peers300:\xd3\xd8\xc7#=\xd5\xd8\x83j\xfa\xa0d\xda\x01\xd2\x9d\xab\t\xda({\x9c\xfc\x9d\xda5\x8b\x95\x1f\xa0\xdag\x8a*\xf6\xed\xdbM\xfa\x0f.\xf6\xdc\xfa.s`n\xddqpw\x96\xa5\xdf\x12j_A\xf1\xdf\x84\x9e\x88\xc8\xd5\xdf\xa0\x7f\x8a\xc3P\x01 \x10\xb1\xd1\xe1\x01@\xd5\xda8\x86\x01\xa2\xe3W\xdd\xd5\x01\xe9P_BE\x01\xf2\xc4'~~\x02\x87\x8fg\x0f\xd7\x0e\x08>@o2\x0e\r\xc1\xa0`\x89\x0e\x14\x81@\xcfQ$\x189\xa8:\x98$&:\x06\x96H$\xef\x80\x92\xb5\x05'q^\x05\xbe\xa0'vE4\x1a\xe1*\x03\x03\xd5-\x9a*\x03\xacMI\x0e*w\x8f\x16\xfe\xe7-[\x17j\x8f\x0e-^\xd2r\xd8c-\x80\xc7\xa8\xc1\xc1. \xb9%K\x811\xe4k\x84\xf4*2\\R\x93\x1a\xe1:\x08\xacP%\x07:\n$\\}\x95:Nv\xa6\"B:\x98\x940\x90\x1f:\x99`\xd49\xdb:\xd9a=\x9b\n;\x14\x7f\xba\x8eO<\xae&\x96e\x94=(\x8fW\xc90=R\xb3\x11\xdc6=\x8d\xa8\xb5\xf5\xdc=\x8d\xaf\xd6:\x98=\xaa\x94\x89d\x84=\xaa\xa0\xf2!\x1e=\xde\x89\xcd\x12y6:peers60:e"
+2025-12-22T16:44:19.106395Z  INFO stardust::announce_manager: src/announce_manager.rs:307: announce http://sukebei.tracker.wf:8888/announce response result Err(BencodeErr(Error { kind: data did not match any variant of untagged enum TrackerResp, byte_offset: 0 }))
+
+2025-12-24T15:35:46.631836Z  WARN stardust::metadata: src/metadata.rs:355: announce bencode decode error, url: http://t.nyaatracker.com/announce, raw: b"d8:intervali1800e5:peersdee"
+2025-12-24T15:35:46.631880Z  INFO stardust::announce_manager: src/announce_manager.rs:307: announce http://t.nyaatracker.com/announce response result Err(BencodeErr(Error { kind: data did not match any variant of untagged enum TrackerResp, byte_offset: 0 }))
+
+dynamic block report interval (deal with fast response but pending requests too much, causing bulk rejects)
+fix write amplify
+
+thread 'tokio-runtime-worker' (1810783) panicked at src/picker/block_picker.rs:414:17:
+assertion failed: !self.requesting.contains_key(&index)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+try to pick a piece from exclusively one peer so that if one peer response slowly,
+only one piece is waiting response
+
+===
+mar 29 2026
+app limited mark
+some no response peer takes 4 pieces, which finally causing no response
+limit read/write task number to prevent high temporary high mem usage
+for peers whose rtt is bigger, every startup stage should last longer
+
+see spikes in bw-time graph, is it because our inflight counter mistakenly makes slowdown
+waits for never-coming requests? typically holds for about 10 secs
