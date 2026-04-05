@@ -985,7 +985,12 @@ impl TransmitWorker {
                 });
                 Ok(())
             }
-            PeerMsg::BlockReceived { peer } => self.handle_blocks_receieved(peer),
+            PeerMsg::BlockReceived { peer } => {
+                // TODO: FIXME: add backlog:
+                // if waiting_for_piece has too many pending pieces, slow down picking
+                // and mark app_limited
+                self.handle_blocks_receieved(peer)
+            }
             PeerMsg::Piece(addr, piece) => self.handle_piece_msg(&addr, piece),
             PeerMsg::DhtPort(addr, port) => self.handle_dht_port_msg(addr, port),
             PeerMsg::ExtendMetadata(pa, m) => {
@@ -1631,8 +1636,6 @@ impl TransmitWorker {
                 info!("invalid piece {piece:?}");
             }
             Err(e) => {
-                // TODO: maybe set some unblock_conn upper limit
-                // piece.unblock_conn();
                 let index = piece.index;
                 let full_received = piece_received.is_some();
                 match self.waiting_for_piecebuf.get_mut(&index) {

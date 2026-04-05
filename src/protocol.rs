@@ -1,4 +1,3 @@
-use crate::cache::{AbortErr, AsyncAbortRead, Ref};
 use crate::metadata::Metadata;
 use bon::Builder;
 use bt_bencode::ByteIpAddr;
@@ -6,7 +5,7 @@ use bt_bencode::ByteString;
 
 use bytes::BytesMut;
 use core::fmt;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Formatter;
@@ -121,7 +120,6 @@ impl Split for net::TcpStream {
     }
 
     fn remote_addr(&self) -> SocketAddr {
-        const DEFAULT_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0);
         self.peer_addr().unwrap_or(DEFAULT_ADDR)
     }
 
@@ -148,8 +146,6 @@ const EMPTY_PARTIAL_HEADER: PartialHeader = PartialHeader {
     filled: 0,
     discard_remain: 0,
 };
-const INITIAL_PARTIAL_READ: PartialRead = PartialRead::Header(EMPTY_PARTIAL_HEADER);
-
 const EXTENSION_NAME_PEX: &str = "ut_pex";
 const EXTENSION_NAME_METADATA: &str = "ut_metadata";
 const EXTENSION_ID_PEX: u8 = 1;
@@ -370,12 +366,14 @@ pub struct ReadStream<T> {
 
 #[derive(Debug)]
 enum PartialRead {
-    Header(PartialHeader),
+    Header {
+        partial_header: PartialHeader,
+        reuse_buf: oneshot::Receiver<BytesMut>,
+    },
     BitField(PartialExtend),
     Extend(PartialExtend),
     Piece(PartialPiece),
     Discard(PartialExtend),
-    Processing(oneshot::Receiver<BytesMut>),
 }
 
 // store partial received header,
@@ -792,7 +790,7 @@ where
         // TODO: check peer_handshake's client id
         let s = BTStream {
             inner: t,
-            partial_read: INITIAL_PARTIAL_READ,
+            partial_read: init_partial_read(),
             extension_id: HashMap::new(),
             peer_id: peer_handshake.client_id,
             info_hash,
@@ -901,7 +899,7 @@ where
         let support_dht = reserved.have_dht();
         let s = BTStream {
             inner: t,
-            partial_read: INITIAL_PARTIAL_READ,
+            partial_read: init_partial_read(),
             extension_id: HashMap::new(),
             peer_id: peer_handshake.client_id,
             info_hash: peer_info_hash,
@@ -1541,15 +1539,6 @@ impl Piece {
     pub fn buf(&self) -> Option<&BytesMut> {
         self.piece.as_ref().map(|(p, _)| p)
     }
-
-    /// Drops the sender so that the connection receiver may
-    /// unblock. The bytes used is not recycled
-    pub fn unblock_conn(&mut self) {
-        self.piece.as_mut().map(|(_, s)| {
-            let (mut ns, _) = oneshot::channel();
-            std::mem::swap(s, &mut ns);
-        });
-    }
 }
 
 impl Eq for Piece {}
@@ -2149,6 +2138,13 @@ where
     Ok(())
 }
 
+fn init_partial_read() -> PartialRead {
+    PartialRead::Header {
+        partial_header: EMPTY_PARTIAL_HEADER,
+        reuse_buf: oneshot::channel().1,
+    }
+}
+
 async fn recv_msg<'a, T>(
     reader: &'a mut T,
     partial_read: &'a mut PartialRead,
@@ -2159,8 +2155,29 @@ where
 {
     loop {
         match partial_read {
-            PartialRead::Header(partial_header) => {
-                match recv_msg_header(reader, partial_header).await? {
+            PartialRead::Header {
+                partial_header,
+                reuse_buf,
+            } => {
+                let hdr = recv_msg_header(reader, partial_header).await?;
+
+                // next piece is coming, check if previous buffer is ready
+                // TODO: FIXME: add backlog to avoid allocating too many new piecebuf
+                if piece_buf.is_none() {
+                    match reuse_buf.try_recv() {
+                        Ok(rb) => *piece_buf = Some(rb),
+                        Err(e) => {
+                            info!("BytesMut not recycled {e}, make a new one");
+                            *piece_buf = Some(BytesMut::new());
+                        }
+                    }
+                }
+                piece_buf
+                    .as_mut()
+                    .expect("piece_buf should be some")
+                    .clear();
+
+                match hdr {
                     MessageHeader::BitField { capacity } => {
                         *partial_read = PartialRead::BitField(PartialExtend {
                             id: 0,
@@ -2169,10 +2186,6 @@ where
                         });
                     }
                     MessageHeader::Piece { index, begin, len } => {
-                        piece_buf
-                            .as_mut()
-                            .expect("when receiving a PIECE, piece_buf should be Some")
-                            .clear();
                         *partial_read = PartialRead::Piece(PartialPiece {
                             index,
                             begin,
@@ -2212,12 +2225,12 @@ where
             }
             PartialRead::BitField(p) => {
                 let res = Ok(Message::BitField(recv_bitfield_msg(reader, p).await?));
-                *partial_read = INITIAL_PARTIAL_READ;
+                *partial_read = init_partial_read();
                 return res;
             }
             PartialRead::Extend(p) => {
                 let res = Ok(Message::Extended(recv_extend_msg(reader, p).await?));
-                *partial_read = INITIAL_PARTIAL_READ;
+                *partial_read = init_partial_read();
                 return res;
             }
             PartialRead::Piece(p) => {
@@ -2239,30 +2252,15 @@ where
                     len: p.len as u32,
                     piece: Some((piece, tx)),
                 }));
-                *partial_read = PartialRead::Processing(rx);
+                *partial_read = PartialRead::Header {
+                    partial_header: EMPTY_PARTIAL_HEADER,
+                    reuse_buf: rx,
+                };
                 return ret;
             }
             PartialRead::Discard(p) => {
                 discard_remain(reader, p).await?;
-                *partial_read = INITIAL_PARTIAL_READ;
-            }
-            PartialRead::Processing(done) => {
-                let timeout = tokio::time::Duration::from_secs(1);
-                match tokio::time::timeout(timeout, done).await {
-                    Ok(Ok(buf)) => *piece_buf = Some(buf),
-                    Ok(_) => {
-                        // sender not sends buffer back, make a new one
-                        warn!("receive BytesMut failed");
-                        *piece_buf = Some(BytesMut::new());
-                    }
-                    Err(_) => {
-                        // for any reason buffer are not returned
-                        // make a new one
-                        warn!("receive BytesMut time elapsed, make a new one");
-                        *piece_buf = Some(BytesMut::new());
-                    }
-                }
-                *partial_read = INITIAL_PARTIAL_READ;
+                *partial_read = init_partial_read();
             }
         }
     }
@@ -2752,7 +2750,7 @@ pub mod tests {
                 ReadStream {
                     inner: read_end,
                     peer_addr: DEFAULT_ADDR,
-                    partial_read: INITIAL_PARTIAL_READ,
+                    partial_read: init_partial_read(),
                     peer_id: [0; 20],
                     info_hash: [0; 20],
                     reserved: [0; 8].into(),

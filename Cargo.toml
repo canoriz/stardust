@@ -8,7 +8,9 @@ edition = "2021"
 [dependencies]
 anyhow = "1"
 bon = "3.8.1"
-bt_bencode = { git = "https://github.com/canoriz/bt_bencode", rev = "e98a891" }
+bt_bencode = { git = "https://github.com/canoriz/bt_bencode", rev = "88f34d4", features = [
+    "raw_value",
+] }
 bytes = "1.10.1"
 futures = "0.3.31"
 hex = "0.4.3"
@@ -27,6 +29,9 @@ tokio-test = "0.4.4"
 tokio-util = "0.7.15"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+
+# [patch."https://github.com/canoriz/bt_bencode"]
+# bt_bencode = { path = "./bt_bencode" }
 
 [target.'cfg(mloom)'.dependencies]
 loom = { version = "0.7", features = ["checkpoint"] }

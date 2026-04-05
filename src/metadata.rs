@@ -1,4 +1,3 @@
-// use anyhow::{anyhow, Result};
 pub use bt_bencode::ByteString;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};

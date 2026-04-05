@@ -95,15 +95,17 @@ impl Access for NormalFile {
     }
 
     fn write_all_at(&mut self, buf: &[u8], offset: usize) -> Result<()> {
-        warn!("write_all at offset {offset} len {}", buf.len());
-        self.file.write_all_at(buf, offset as u64)
-        // Ok(())
+        warn!("write_all begin at offset {offset} len {}", buf.len());
+        let r = self.file.write_all_at(buf, offset as u64);
+        warn!("write_all end at offset {offset} len {}", buf.len());
+        r
     }
 
     fn read_exact_at(&mut self, buf: &mut [u8], offset: usize) -> Result<()> {
-        info!("read_exact at offset {offset} len {}", buf.len());
-        self.file.read_exact_at(buf, offset as u64)
-        // Ok(())
+        info!("read_exact begin at offset {offset} len {}", buf.len());
+        let r = self.file.read_exact_at(buf, offset as u64);
+        info!("read_exact end at offset {offset} len {}", buf.len());
+        r
     }
 
     fn metadata(&self) -> Result<FileMetadata> {
