@@ -1,5 +1,6 @@
 use bt_bencode::ByteString;
 use bt_bencode::Value as BtValue;
+use derivative::Derivative;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::collections::HashMap;
@@ -55,17 +56,22 @@ enum KRPCInner {
     Err(Vec<(u32, String)>),
 }
 
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, Derivative, PartialEq, Serialize, Deserialize)]
+#[derivative(Debug)]
 struct PingArg {
     #[serde(with = "serde_bytes")]
+    #[derivative(Debug(format_with = "crate::helper::format_hex"))]
     id: NodeID,
 }
 
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, Derivative, PartialEq, Serialize, Deserialize)]
+#[derivative(Debug)]
 struct FindNodeArg {
     #[serde(with = "serde_bytes")]
+    #[derivative(Debug(format_with = "crate::helper::format_hex"))]
     id: NodeID,
     #[serde(with = "serde_bytes")]
+    #[derivative(Debug(format_with = "crate::helper::format_hex"))]
     target: NodeID,
     #[serde(default = "Vec::new")]
     want: Vec<ByteString>,
@@ -114,33 +120,48 @@ struct FindNodeResp {
     nodes: Option<VecNode6>,
 }
 
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, Derivative, PartialEq, Serialize, Deserialize)]
+#[derivative(Debug)]
 struct GetPeersArg {
     #[serde(with = "serde_bytes")]
+    #[derivative(Debug(format_with = "crate::helper::format_hex"))]
     id: NodeID,
+
     #[serde(with = "serde_bytes")]
+    #[derivative(Debug(format_with = "crate::helper::format_hex"))]
     info_hash: [u8; 20],
+
     #[serde(default = "Vec::new")]
     want: Vec<ByteString>,
 }
 
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, Derivative, PartialEq, Serialize, Deserialize)]
+#[derivative(Debug)]
 struct AnnouncePeerArg {
     #[serde(with = "serde_bytes")]
+    #[derivative(Debug(format_with = "crate::helper::format_hex"))]
     id: NodeID,
+
     #[serde(skip_serializing_if = "Option::is_none")]
     implied_port: Option<u32>,
+
     #[serde(with = "serde_bytes")]
+    #[derivative(Debug(format_with = "crate::helper::format_hex"))]
     info_hash: NodeID,
+
     port: u16,
     token: ByteString,
 }
 
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, Derivative, PartialEq, Serialize, Deserialize)]
+#[derivative(Debug)]
 struct AnnouncePeerResp {
     implied_port: u32,
+
     #[serde(with = "serde_bytes")]
+    #[derivative(Debug(format_with = "crate::helper::format_hex"))]
     info_hash: NodeID,
+
     port: u16,
     token: ByteString,
 }
@@ -153,9 +174,11 @@ enum Arg {
     GetPeers(GetPeersArg),
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Derivative, PartialEq, Serialize, Deserialize)]
+#[derivative(Debug)]
 pub struct Resp {
     #[serde(with = "serde_bytes")]
+    #[derivative(Debug(format_with = "crate::helper::format_hex"))]
     id: NodeID,
 
     /// if find_node/get_peers response
@@ -175,10 +198,13 @@ pub struct Resp {
     values: Option<Vec<ByteSocketAddr>>,
 }
 
-#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Copy, Clone, Derivative, Eq, Hash, PartialEq)]
+#[derivative(Debug)]
 pub struct NodeAddr {
+    #[derivative(Debug(format_with = "crate::helper::format_hex"))]
     pub id: NodeID,
     pub addr: SocketAddr,
+    // TODO: maybe store both v4 and v6 addr if peer have both
 }
 
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
@@ -354,6 +380,7 @@ impl DHT {
                     if let Some(id) = addr.id {
                         self.remove_route(ipv6, id).await?;
                     }
+                    debug!("dht rpc request to {sock_addr} timeout req: {krpc_inner:?}");
                     last_err = Some(io::Error::new(io::ErrorKind::Other, "timeout"));
                 }
             }
@@ -417,8 +444,6 @@ impl DHT {
     where
         A: ToSocketAddrs,
     {
-        let tid = self.tid.fetch_add(1, Ordering::Relaxed).to_be_bytes();
-        let tid: ByteString = tid[..].into();
         let krpc_inner = KRPCInner::Request(Arg::FindNode(FindNodeArg {
             id: self.id,
             target,
@@ -466,9 +491,11 @@ impl DHT {
         self.do_rpc_req(addr, krpc_inner, timeout).await
     }
 
+    /// get_peers queries peers of target
     pub async fn get_peers(self: &Arc<Self>, target: NodeID, ipv6: bool) -> Vec<SocketAddr> {
         let timeout = time::Duration::from_secs(5);
         let ns = self.find_closest_node_to(target, ipv6).await;
+        debug!("dht {target:?} nearest nodes: {ns:?}");
 
         use tokio::task::JoinSet;
         let mut js = JoinSet::new();
@@ -478,6 +505,10 @@ impl DHT {
             js.spawn(async move {
                 cl.get_peers_rpc(RpcAddr::id(n.id, n.addr), target, timeout)
                     .await
+                    .map_err(|e| {
+                        debug!("dht get_peers from node {n:?} error {e}");
+                        e
+                    })
             });
         }
 
@@ -510,6 +541,7 @@ impl DHT {
                         addr: RpcAddr<SocketAddr>,
                         resp: mpsc::Sender<Result<Vec<NodeAddr>, NodeID>>| {
             tokio::spawn(async move {
+                let node_id = addr.id;
                 let mut ns = Vec::with_capacity(8);
                 match client.find_node_rpc(addr, target, timeout).await {
                     Ok(r) => {
@@ -529,8 +561,12 @@ impl DHT {
                         _ = resp.send(Ok(ns)).await;
                     }
                     Err(e) => {
-                        debug!("in find_closest_node, node {target:?} does not respond, error {e}");
-                        _ = resp.send(Err(target)).await;
+                        if let Some(id) = node_id {
+                            debug!(
+                                "in find_closest_node, node {addr:?} does not respond, error {e}"
+                            );
+                            _ = resp.send(Err(id)).await;
+                        }
                     }
                 };
             })
@@ -549,12 +585,15 @@ impl DHT {
         let mut closest_nodes: BTreeSet<Dist> = BTreeSet::new();
 
         // send the initial node candidates
+        // in_flight tracks responses still pending; start at 1 for the initial seed message.
+        let mut in_flight: usize = 1;
         _ = resp_tx
             .send(Ok(self.get_k_closest(target, K, ipv6).await))
             .await;
 
         let mut nodes = vec![];
         while let Some(r) = resp_rx.recv().await {
+            in_flight -= 1;
             match r {
                 Ok(nodes) => {
                     for n in nodes {
@@ -583,6 +622,7 @@ impl DHT {
                 }
             }
 
+            // how many node we know
             let mut q = 0;
             for Dist { addr, .. } in closest_nodes.iter() {
                 match node_state.get(&addr.id) {
@@ -595,6 +635,7 @@ impl DHT {
                             RpcAddr::id(addr.id, addr.addr),
                             resp_tx.clone(),
                         );
+                        in_flight += 1;
                         q += 1;
                         if q >= ALPHA {
                             break;
@@ -604,8 +645,8 @@ impl DHT {
                 }
             }
 
-            if q == 0 {
-                // TODO: is the correct, may there any request in flight?
+            if in_flight == 0 {
+                // we did not found any closer nodes
                 nodes = closest_nodes.into_iter().map(|x| x.addr).collect();
                 break;
             }
@@ -667,7 +708,7 @@ fn to_nodes64(ns: &[NodeAddr], v4: &mut VecNode4, v6: &mut VecNode6) {
 
 fn is_ipv6(addr: SocketAddr) -> bool {
     match addr {
-        SocketAddr::V4(_) => true,
+        SocketAddr::V4(_) => false,
         SocketAddr::V6(v6) => v6.ip().to_ipv4_mapped().is_none(),
     }
 }
@@ -728,7 +769,7 @@ impl Server {
         let msg: KRPC = match bt_bencode::from_slice(&buf[..n]) {
             Ok(m) => m,
             Err(e) => {
-                info!("dht: bdecode error {e}");
+                info!("dht: bdecode error {e} raw: {:?}", &buf[..n]);
                 return;
             }
         };
@@ -890,7 +931,10 @@ impl Server {
                     debug!("dht unknown transaction id");
                 }
             }
-            KRPCInner::Err(items) => todo!(),
+            KRPCInner::Err(items) => {
+                // TODO: properly handle this
+                debug!("dht received error from {}: {:?}", from_addr, items);
+            }
         }
     }
 

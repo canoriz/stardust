@@ -517,7 +517,7 @@ where
             }
             Some(msg) = conn.receiver.recv() => {
                 // TODO: maybe use buffer and Notify?
-                info!("{peer} send stream received {msg:?}");
+                info!("{peer} send stream to send {msg:?}");
                 if let Err(e) = conn.handle_cmd(msg).await {
                     info!("{peer} send stream handle cmd error {e}");
                     break;

@@ -732,22 +732,21 @@ impl BlockPicker {
         };
 
         if remain > 0 && endgame {
+            // the fewest number of peers we have requested for a given block among all receiving blocks
             let from = self
                 .receiving
                 .iter()
-                .map(|(_, p)| {
+                .filter_map(|(_, p)| {
                     p.block_map
                         .iter()
-                        .map(|b| match b {
-                            BlockStatus::NotRequested { .. } => 0,
-                            BlockStatus::Requested { requested, .. } => requested.len(),
-                            BlockStatus::Received => usize::MAX,
+                        .filter_map(|b| match b {
+                            BlockStatus::NotRequested { .. } => Some(0),
+                            BlockStatus::Requested { requested, .. } => Some(requested.len()),
+                            BlockStatus::Received => None,
                         })
                         .min()
-                        .unwrap_or(usize::MAX)
                 })
-                .min()
-                .unwrap_or(2);
+                .min();
 
             // If in endgame mode, we re-requesting requested blocks
             // In endgame mode, duplicate requested count of every block should be put evenly,
@@ -756,29 +755,31 @@ impl BlockPicker {
             // TODO: set dynamic upper limit, optimize impossible pick(if all blocks requested before
             // simply add limit does not work
             // maybe add a BTreeSet to maintain this
-            for limit in from..=from + 1 {
-                let repick_option = RepickOption {
-                    repick_limit: limit,
-                    endgame: true,
-                };
-                for index in piece_index_order(&self.receiving).iter().map(|(i, _)| i) {
-                    let blocks = &mut self.receiving.get_mut(index).expect("must exist");
-                    if remain <= 0 {
-                        break;
-                    }
-                    if peer_status.have(*index) {
-                        while let Some((blks, n_picked)) = blocks.pick(
-                            *peer,
-                            remain,
-                            &mut n_in_flight,
-                            avg_speed,
-                            rtt,
-                            repick_option,
-                        ) {
-                            remain -= n_picked;
-                            let pb: Vec<_> = blks.iter(self.piece_size as u32).collect();
-                            debug!("pick piece {index} from peer {peer} (requested endgame), picked blks: {pb:?}");
-                            ret.push(blks);
+            if let Some(from) = from {
+                for limit in from..=from.saturating_add(1) {
+                    let repick_option = RepickOption {
+                        repick_limit: limit,
+                        endgame: true,
+                    };
+                    for index in piece_index_order(&self.receiving).iter().map(|(i, _)| i) {
+                        let blocks = &mut self.receiving.get_mut(index).expect("must exist");
+                        if remain <= 0 {
+                            break;
+                        }
+                        if peer_status.have(*index) {
+                            while let Some((blks, n_picked)) = blocks.pick(
+                                *peer,
+                                remain,
+                                &mut n_in_flight,
+                                avg_speed,
+                                rtt,
+                                repick_option,
+                            ) {
+                                remain -= n_picked;
+                                let pb: Vec<_> = blks.iter(self.piece_size as u32).collect();
+                                debug!("pick piece {index} from peer {peer} (requested endgame), picked blks: {pb:?}");
+                                ret.push(blks);
+                            }
                         }
                     }
                 }

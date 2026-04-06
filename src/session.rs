@@ -5,10 +5,11 @@ use std::sync::{Arc, Mutex};
 use std::{io, time};
 
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::lookup_host;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio_util::sync::{CancellationToken, DropGuard};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::dht::{self, DHT};
 use crate::metadata::Magnet;
@@ -73,13 +74,64 @@ impl Session {
             // });
 
             tokio::spawn(async move {
-                let bootstrap_node =
-                    dht::RpcAddr::no_id("[2408:820c:5b39:1040:2bbc:c328:803c:1a21]:64199");
+                // Ping well-known public bootstrap nodes concurrently to seed the routing tables.
+                const BOOTSTRAP_NODES: &[&str] = &[
+                    "router.bittorrent.com:6881",
+                    "router.utorrent.com:6881",
+                    "[2408:820c:5b39:1040:2bbc:c328:803c:1a21]:64199",
+                    // "dht.transmissionbt.com:6881",
+                    // "dht.libtorrent.org:25401",
+                ];
+                let timeout = time::Duration::from_secs(5);
+                let mut tasks = tokio::task::JoinSet::new();
+                for &node in BOOTSTRAP_NODES {
+                    let cl = c.clone();
+                    tasks.spawn(async move {
+                        // Try both families explicitly: one IPv4 and one IPv6 per hostname.
+                        let addrs = match lookup_host(node).await {
+                            Ok(v) => v,
+                            Err(e) => {
+                                warn!("dht bootstrap resolve {} failed: {}", node, e);
+                                return;
+                            }
+                        };
 
-                _ = c
-                    .ping_rpc(bootstrap_node, time::Duration::from_secs(5))
-                    .await;
-                c.find_closest_node_to(opt.self_id, true).await;
+                        let mut v4 = None;
+                        let mut v6 = None;
+                        for addr in addrs {
+                            match addr {
+                                SocketAddr::V4(_) if v4.is_none() => v4 = Some(addr),
+                                SocketAddr::V6(v)
+                                    if v.ip().to_ipv4_mapped().is_none() && v6.is_none() =>
+                                {
+                                    v6 = Some(SocketAddr::V6(v))
+                                }
+                                _ => {}
+                            }
+                            if v4.is_some() && v6.is_some() {
+                                break;
+                            }
+                        }
+
+                        if let Some(addr) = v4 {
+                            if let Err(e) = cl.ping_rpc(dht::RpcAddr::no_id(addr), timeout).await {
+                                warn!("dht bootstrap v4 ping {} failed: {}", addr, e);
+                            }
+                        }
+
+                        if let Some(addr) = v6 {
+                            if let Err(e) = cl.ping_rpc(dht::RpcAddr::no_id(addr), timeout).await {
+                                warn!("dht bootstrap v6 ping {} failed: {}", addr, e);
+                            }
+                        }
+                    });
+                }
+                while tasks.join_next().await.is_some() {}
+                // Populate both routing tables (IPv4 and IPv6) in parallel.
+                tokio::join!(
+                    c.find_closest_node_to(opt.self_id, false),
+                    c.find_closest_node_to(opt.self_id, true),
+                );
             });
 
             // tokio::spawn(async move {

@@ -1452,6 +1452,16 @@ impl TransmitWorker {
     ) -> io::Result<()> {
         debug!("recv {piece:?} from {peer:?}");
 
+        let req = Request {
+            index: piece.index,
+            begin: piece.begin,
+            len: piece.len,
+        };
+
+        if let Some(conn) = self.connected_peers.get_mut(peer) {
+            conn.inflight.receive(req);
+        }
+
         let (block_picker, metadata, storage) = match &mut self.torrent_state {
             TorrentState::Metadata(d) => (&mut d.block_picker, &d.metadata, &mut d.storage),
             TorrentState::Fetching(_) => {
@@ -1464,12 +1474,6 @@ impl TransmitWorker {
                 );
                 return Ok(());
             }
-        };
-
-        let req = Request {
-            index: piece.index,
-            begin: piece.begin,
-            len: piece.len,
         };
 
         let conn = self
@@ -1598,10 +1602,6 @@ impl TransmitWorker {
             return Ok(());
         }
 
-        if let Some(conn) = self.connected_peers.get_mut(peer) {
-            conn.inflight.receive(req);
-        }
-
         let (piece_received, peers_revoked) = block_picker.receive_block(req);
         for addr in peers_revoked {
             if addr != *peer {
@@ -1653,9 +1653,10 @@ impl TransmitWorker {
                         );
                     }
                 }
-                info!("piecebuf not present err {e:?}");
+                info!("piecebuf {index} not present err {e:?}");
             }
         }
+        debug!("return piece {req:?} to pool");
         Ok(())
     }
 

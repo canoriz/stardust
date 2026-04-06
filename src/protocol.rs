@@ -190,6 +190,8 @@ pub struct BTStream<T> {
     partial_read: PartialRead,
     extension_id: HashMap<ExtensionType, u8>,
 
+    peer_addr: SocketAddr,
+
     metadata_size: usize,
 
     reserved: FuncBits,
@@ -217,12 +219,13 @@ where
     T: Split + Send + 'static,
 {
     pub fn peer_addr(&self) -> SocketAddr {
-        self.inner.remote_addr()
+        self.peer_addr
     }
 
     pub fn to_dyn(self) -> BTStream<Box<dyn Conn>> {
         BTStream {
             inner: Box::new(self.inner),
+            peer_addr: self.peer_addr,
             partial_read: self.partial_read,
             extension_id: self.extension_id,
             reserved: self.reserved,
@@ -450,6 +453,7 @@ impl BTStream<net::TcpStream> {
     }
 }
 
+// TODO: optimize, use xor flags, not a hashset
 pub type CapabilityMap = HashSet<Capability>;
 
 #[derive(Eq, Hash, PartialEq)]
@@ -541,6 +545,7 @@ where
         }
         Ok(Self {
             inner: r.inner.reunite(w.inner)?,
+            peer_addr: r.peer_addr,
             partial_read: r.partial_read,
             extension_id: w.extension_id,
             reserved: r.reserved,
@@ -787,9 +792,11 @@ where
         }
 
         let reserved = peer_handshake.reserved.common(&h.reserved);
+        let peer_addr = t.remote_addr();
         // TODO: check peer_handshake's client id
         let s = BTStream {
             inner: t,
+            peer_addr,
             partial_read: init_partial_read(),
             extension_id: HashMap::new(),
             peer_id: peer_handshake.client_id,
@@ -895,10 +902,12 @@ where
             to_hex(&peer_info_hash)
         );
 
+        let peer_addr = t.remote_addr();
         let reserved = peer_handshake.reserved.common(&h.reserved);
         let support_dht = reserved.have_dht();
         let s = BTStream {
             inner: t,
+            peer_addr,
             partial_read: init_partial_read(),
             extension_id: HashMap::new(),
             peer_id: peer_handshake.client_id,
@@ -1238,7 +1247,7 @@ impl FuncBits {
     }
 
     pub const fn have_fast(&self) -> bool {
-        self.0[7] & 0x1 > 0
+        self.0[7] & 0x4 > 0
     }
 
     pub const fn new(b: [u8; 8]) -> Self {
@@ -2161,22 +2170,6 @@ where
             } => {
                 let hdr = recv_msg_header(reader, partial_header).await?;
 
-                // next piece is coming, check if previous buffer is ready
-                // TODO: FIXME: add backlog to avoid allocating too many new piecebuf
-                if piece_buf.is_none() {
-                    match reuse_buf.try_recv() {
-                        Ok(rb) => *piece_buf = Some(rb),
-                        Err(e) => {
-                            info!("BytesMut not recycled {e}, make a new one");
-                            *piece_buf = Some(BytesMut::new());
-                        }
-                    }
-                }
-                piece_buf
-                    .as_mut()
-                    .expect("piece_buf should be some")
-                    .clear();
-
                 match hdr {
                     MessageHeader::BitField { capacity } => {
                         *partial_read = PartialRead::BitField(PartialExtend {
@@ -2186,6 +2179,23 @@ where
                         });
                     }
                     MessageHeader::Piece { index, begin, len } => {
+                        // next piece is coming, check if previous buffer is ready
+                        // TODO: FIXME: add backlog to avoid allocating too many new piecebuf
+                        let req = Request { index, begin, len };
+                        if piece_buf.is_none() {
+                            match reuse_buf.try_recv() {
+                                Ok(rb) => *piece_buf = Some(rb),
+                                Err(e) => {
+                                    info!("piece {req:?} coming, BytesMut not recycled {e}, make a new one");
+                                    *piece_buf = Some(BytesMut::new());
+                                }
+                            }
+                        }
+                        piece_buf
+                            .as_mut()
+                            .expect("piece_buf should be some")
+                            .clear();
+
                         *partial_read = PartialRead::Piece(PartialPiece {
                             index,
                             begin,
