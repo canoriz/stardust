@@ -59,19 +59,19 @@ def parse_log_content(lines):
     # Regex for different modes
     # ProbeBW
     probe_re = re.compile(
-        r"stardust::transmit_manager: src/transmit_manager\.rs:\d+: (?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+) ProbeBW mode cycle (?P<cycle>\d+) capacity (?P<capacity>\d+) min rtt (?P<min_rtt>[\d.]+)ms probe rtt (?P<probe_rtt>[\d.]+)ms avg bw (?P<bw>[\d.]+) max_bw (?P<max_bw>[\d.]+) req in flight (?P<req_if>\d+)"
+        r"stardust::transmit_manager: src/transmit_manager\.rs:\d+: (?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+) ProbeBW mode cycle (?P<cycle>\d+) capacity (?P<capacity>\d+) min rtt (?P<min_rtt>[\d.]+)ms probe rtt (?P<probe_rtt>[\d.]+)ms avg bw (?P<bw>[\d.]+) avg_bw_10s (?P<bw10>[\d.]+) max_bw (?P<max_bw>[\d.]+) req in flight (?P<req_if>\d+)"
     )
     # Startup
     startup_re = re.compile(
-        r"stardust::transmit_manager: src/transmit_manager\.rs:\d+: (?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+) in (?P<mode>Startup) mode, cwnd (?P<cwnd>\d+), inflight (?P<inflight>\d+) prev max bw (?P<prev_max_bw>[\d.]+), avg-bw (?P<bw>[\d.]+) new max bw (?P<max_bw>[\d.]+), limit count (?P<limit_count>\d+)"
+        r"stardust::transmit_manager: src/transmit_manager\.rs:\d+: (?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+) in (?P<mode>Startup) mode, cwnd (?P<cwnd>\d+), inflight (?P<inflight>\d+) prev max bw (?P<prev_max_bw>[\d.]+), avg-bw (?P<bw>[\d.]+) avg_bw_10s (?P<bw10>[\d.]+) new max bw (?P<max_bw>[\d.]+), limit count (?P<limit_count>\d+)"
     )
     # Slowdown
     slowdown_re = re.compile(
-        r"stardust::transmit_manager: src/transmit_manager\.rs:\d+: (?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+) (?P<mode>Slowdown) mode min rtt (?P<min_rtt>[\d.]+)(ms|µs|us|s|ns) avg bw (?P<bw>[\d.]+) req in flight (?P<req_if>\d+)"
+        r"stardust::transmit_manager: src/transmit_manager\.rs:\d+: (?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+) (?P<mode>Slowdown) mode min rtt (?P<min_rtt>[\d.]+)(ms|µs|us|s|ns) avg bw (?P<bw>[\d.]+) avg_bw_10s (?P<bw10>[\d.]+) req in flight (?P<req_if>\d+)"
     )
     # ProbeRTT
     probe_rtt_re = re.compile(
-        r"stardust::transmit_manager: src/transmit_manager\.rs:\d+: (?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+) (?P<mode>ProbeRTT) mode min rtt (?P<min_rtt>[\d.]+)(ms|µs|us|s|ns) avg bw (?P<bw>[\d.]+) inflight_target (?P<inflight_target>\d+) req in flight (?P<req_if>\d+)"
+        r"stardust::transmit_manager: src/transmit_manager\.rs:\d+: (?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+) (?P<mode>ProbeRTT) mode min rtt (?P<min_rtt>[\d.]+)(ms|µs|us|s|ns) avg bw (?P<bw>[\d.]+) avg_bw_10s (?P<bw10>[\d.]+) inflight_target (?P<inflight_target>\d+) req in flight (?P<req_if>\d+)"
     )
     # 状态转换
     change_re = re.compile(
@@ -167,11 +167,13 @@ def parse_log_content(lines):
 
                 if match:
                     bw_kb = float(match.group('bw')) / 1024.0
+                    bw10_kb = float(match.group('bw10')) / 1024.0 if 'bw10' in match.groupdict() and match.group('bw10') else bw_kb
                     peer = match.group('ip_port')
 
                     data = {
                         'dt': dt, 'ts': ts, 'peer': peer,
                         'bw': bw_kb,
+                        'bw10': bw10_kb,
                         'mode': mode
                     }
                     if 'max_bw' in match.groupdict():
@@ -370,6 +372,12 @@ if lines:
                 ax5.plot(segment['dt'], segment['max_bw'], color=mode_colors.get(current_mode, '#2ca02c'), linestyle=':', linewidth=1.5, alpha=0.8, label=f"{current_mode} max-bw" if f"{current_mode} max-bw" not in [l.get_label() for l in ax5.get_lines()] else "")
             ax5.fill_between(segment['dt'], segment['bw'], color=mode_colors.get(current_mode, '#2ca02c'), alpha=0.1)
 
+            ax5.legend(loc='upper left', fontsize='small')
+
+        # Overlay 10s avg bandwidth curve
+        if not sub_auto.empty and 'bw10' in sub_auto.columns:
+            ax5.plot(sub_auto['dt'], sub_auto['bw10'], color='black', linewidth=1.5,
+                     linestyle='--', alpha=0.7, label='Avg BW 10s')
             ax5.legend(loc='upper left', fontsize='small')
 
         ax5.set_title("5. Logged Avg Bandwidth (KB/s) - Mode Colored"); ax5.set_ylabel("Rate (KB/s)"); ax5.grid(True, alpha=0.3)

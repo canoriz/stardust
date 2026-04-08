@@ -1156,7 +1156,8 @@ impl TransmitWorker {
 
         const TEN_SECS: time::Duration = time::Duration::from_secs(10);
         let bytes_10sec = conn.bw.count_bytes_within_period(TEN_SECS).0;
-        let avg_bw = conn.bw.count_avg_bw_in(TEN_SECS);
+        let avg_bw_10s = conn.bw.count_avg_bw_in(TEN_SECS);
+        let avg_bw = conn.bw.count_avg_bw_in(look_back_duration);
 
         let rtt = conn.bw.get_rtt().max(time::Duration::from_millis(10));
         let likely_respond_within = conn
@@ -1164,10 +1165,9 @@ impl TransmitWorker {
             .get_rtt_4var()
             .max(time::Duration::from_millis(1500))
             .min(time::Duration::from_secs(6));
-        let likely_recv_next_within = if bytes_10sec > 0 {
-            time::Duration::from_secs_f32(7.0 * 16384.0 / avg_bw)
+        let likely_recv_next_within = if bytes_10sec > 0 && avg_bw > 0.0 {
+            time::Duration::from_secs_f32((7.0 * 16384.0 / avg_bw).min(6.0))
                 .max(time::Duration::from_millis(1500))
-                .min(time::Duration::from_secs(6))
         } else {
             time::Duration::from_secs(6)
         };
@@ -1197,8 +1197,8 @@ impl TransmitWorker {
                     // get_max_bw auto deals with app_limited
                     let (max_bw_in_rtt, _, _) = conn.bw.count_max_bw_and_min_rtt(cwnd_duration);
                     info!(
-                        "{peer} in Startup mode, cwnd {}, inflight {} prev max bw {}, avg-bw {} new max bw {}, limit count {} app limited {}",
-                        *cwnd, n_req_in_flight, *max_bw, avg_bw, max_bw_in_rtt, *limit_count, conn.app_limited,
+                        "{peer} in Startup mode, cwnd {}, inflight {} prev max bw {}, avg-bw {} avg_bw_10s {} new max bw {}, limit count {} app limited {}",
+                        *cwnd, n_req_in_flight, *max_bw, avg_bw, avg_bw_10s, max_bw_in_rtt, *limit_count, conn.app_limited,
                     );
                     info!("{cwnd_probe_interval:?}, {:?}", cwnd_since.elapsed());
                     *cwnd_since = time::Instant::now();
@@ -1264,8 +1264,8 @@ impl TransmitWorker {
                         6, // 1.5
                     );
                     info!(
-                        "{peer} ProbeBW cycle update {}, probe df {}, max bw {}, avg bw {}, min rtt {:?}, probe rtt {:?} capacity {}",
-                        *cycle_index, *probe_df, max_bw, avg_bw, conn.min_rtt, probe_bdp_rtt, *capacity,
+                        "{peer} ProbeBW cycle update {}, probe df {}, max bw {}, avg bw {}, avg_bw_10s {}, min rtt {:?}, probe rtt {:?} capacity {}",
+                        *cycle_index, *probe_df, max_bw, avg_bw, avg_bw_10s, conn.min_rtt, probe_bdp_rtt, *capacity,
                     );
                 }
 
@@ -1348,9 +1348,9 @@ impl TransmitWorker {
                 ..
             } => {
                 info!(
-                    "{peer} in ProbeRTT mode cnt {} normal count {} min rtt {:?} avg bw {} req in flight {}",
+                    "{peer} in ProbeRTT mode cnt {} normal count {} min rtt {:?} avg bw {} avg_bw_10s {} req in flight {}",
                     cnt, normal_count,
-                    conn.min_rtt, avg_bw, n_req_in_flight
+                    conn.min_rtt, avg_bw, avg_bw_10s, n_req_in_flight
                 );
 
                 if cnt > 4 {
@@ -1385,7 +1385,6 @@ impl TransmitWorker {
                 // preventing accumulating too much partial downloaded pieces.
                 const MIN_IN_FLIGHT: usize = 5;
                 const MAX_IN_FLIGHT: usize = 500;
-                let avg_bw = conn.bw.count_avg_bw_in(look_back_duration);
 
                 // TODO: OPTIMIZE: pre-calculate, do not calculate every time
                 let limit = {
@@ -1393,8 +1392,8 @@ impl TransmitWorker {
                     bdp + bdp / 2
                 };
                 info!(
-                    "{peer} ProbeBW mode max bw {}, avg bw {}, limit {}",
-                    max_bw, avg_bw, limit
+                    "{peer} ProbeBW mode max bw {}, avg bw {}, avg_bw_10s {}, limit {}",
+                    max_bw, avg_bw, avg_bw_10s, limit
                 );
 
                 let n_to_pick = (*capacity)
@@ -1402,8 +1401,8 @@ impl TransmitWorker {
                     .min(limit.saturating_sub(n_req_in_flight))
                     .max(MIN_IN_FLIGHT.saturating_sub(n_req_in_flight));
                 info!(
-                    "{peer} ProbeBW mode cycle {} capacity {} min rtt {:?} probe rtt {:?} avg bw {} max_bw {} req in flight {}",
-                    cycle_index, *capacity, conn.min_rtt, probe_bdp_rtt, avg_bw, max_bw, n_req_in_flight
+                    "{peer} ProbeBW mode cycle {} capacity {} min rtt {:?} probe rtt {:?} avg bw {} avg_bw_10s {} max_bw {} req in flight {}",
+                    cycle_index, *capacity, conn.min_rtt, probe_bdp_rtt, avg_bw, avg_bw_10s, max_bw, n_req_in_flight
                 );
                 *capacity = capacity.saturating_sub(n_to_pick);
                 n_to_pick
@@ -1418,8 +1417,8 @@ impl TransmitWorker {
                     n_req_in_flight.saturating_sub(*inflight_target)
                 );
                 info!(
-                    "{peer} Slowdown mode min rtt {:?} avg bw {} req in flight {}",
-                    conn.min_rtt, avg_bw, n_req_in_flight
+                    "{peer} Slowdown mode min rtt {:?} avg bw {} avg_bw_10s {} req in flight {}",
+                    conn.min_rtt, avg_bw, avg_bw_10s, n_req_in_flight
                 );
                 0
             }
@@ -1427,8 +1426,8 @@ impl TransmitWorker {
                 inflight_target, ..
             } => {
                 info!(
-                    "{peer} ProbeRTT mode min rtt {:?} avg bw {} inflight_target {} req in flight {}",
-                    conn.min_rtt, avg_bw, inflight_target, n_req_in_flight
+                    "{peer} ProbeRTT mode min rtt {:?} avg bw {} avg_bw_10s {} inflight_target {} req in flight {}",
+                    conn.min_rtt, avg_bw, avg_bw_10s, inflight_target, n_req_in_flight
                 );
                 inflight_target.saturating_sub(n_req_in_flight)
             }

@@ -1,11 +1,14 @@
+use derivative::Derivative;
 use percent_encoding::percent_decode_str;
 use serde::{Deserialize, Serialize};
 /// implements magnet link parsing, see BEP 9
 use std::net::SocketAddr;
 use std::str::FromStr;
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Derivative, Eq, PartialEq, Serialize, Deserialize)]
+#[derivative(Debug)]
 pub struct Magnet {
+    #[derivative(Debug(format_with = "crate::helper::format_hex"))]
     pub info_hash: [u8; 20],
 
     // display name
