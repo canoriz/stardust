@@ -8,7 +8,7 @@ use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration};
 
 use stardust::metadata;
-use stardust::protocol::{self, AcceptOpt, BitField, HandshakeOption, Message};
+use stardust::protocol::{self, AcceptOpt, BitField, HandshakeOption, Message, RecvResult};
 use tracing::info;
 
 #[tokio::main]
@@ -108,8 +108,22 @@ async fn handle_conn(
 
     // main read loop: on Request, spawn a task that waits 3s then enqueues the response
     loop {
-        match read_stream.recv_msg().await {
-            Ok(m) => match m {
+        let m = match read_stream.recv_msg_header().await {
+            Ok(RecvResult::Message(m)) => m,
+            Ok(RecvResult::PiecePending { len, .. }) => {
+                // seeder doesn't receive pieces; just discard the body and continue
+                let mut discard = bytes::BytesMut::with_capacity(len as usize);
+                if read_stream.recv_piece_body(&mut discard).await.is_err() {
+                    return Ok(());
+                }
+                continue;
+            }
+            Err(e) => {
+                info!("peer {} closed: {}", addr, e);
+                return Ok(());
+            }
+        };
+        match m {
                 Message::Request(r) => {
                     let tx = tx.clone();
                     let file_path = file_path.clone();
@@ -148,11 +162,6 @@ async fn handle_conn(
                 other => {
                     info!("received {:?} from {}", other, addr);
                 }
-            },
-            Err(e) => {
-                info!("peer {} closed: {}", addr, e);
-                return Ok(());
-            }
         }
     }
 }

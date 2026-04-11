@@ -1,20 +1,27 @@
+use bytes::BytesMut;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use tokio::io::{BufReader, BufWriter};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time;
 
+const BLOCK_SIZE: usize = 16384;
+const POOL_SLOTS: usize = 256;
+static BLOCK_BUF_POOL: LazyLock<Arc<BufferPool<BytesMut>>> =
+    LazyLock::new(|| BufferPool::new(POOL_SLOTS, || BytesMut::with_capacity(BLOCK_SIZE)));
+
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{debug, info, warn};
 
+use crate::buffer_pool::{BlockBuf, BufferPool, PooledBuf};
 use crate::picker::{BlockRequests, PieceState};
 use crate::protocol::{
-    self, BTStream, BitField, Capability, CapabilityMap, Conn, ExtendedMsg, Message, ReadStream,
-    Request, Split, WriteStream,
+    self, BTStream, BitField, Capability, CapabilityMap, Conn, ExtendedMsg, Message, Piece,
+    ReadStream, RecvResult, Request, Split, WriteStream,
 };
 use crate::transmit_manager::Msg as TransmitMsg;
 use crate::transmit_manager::{PeerMsg, TransmitManagerHandle};
@@ -100,6 +107,7 @@ impl ConnectionManagerHandle {
             read_stream,
             transmit_handle: trh.clone(),
             _drop_guard: conn_break_guard.clone(),
+            current_buf: None,
         };
 
         let (send_tx, send_rx) = mpsc::unbounded_channel();
@@ -275,6 +283,10 @@ struct RecvStream<T> {
     read_stream: ReadStream<T>,
     transmit_handle: TransmitManagerHandle,
     _drop_guard: Arc<NotifyTransmitGuard>,
+    /// Holds the partially-filled block buffer across a cancel inside `recv_piece_body`.
+    /// `None` until `recv_next` receives `RecvResult::PiecePending` and allocates a slot.
+    /// Set back to `None` after the body is fully received.
+    current_buf: Option<PooledBuf<BytesMut>>,
 }
 
 struct SendStreamHandle {
@@ -317,8 +329,13 @@ async fn run_recv_stream<T>(
     let addr = to_canonical_addr(conn.read_stream.peer_addr());
 
     let pending_recvs = conn.read_stream.maybe_recv_pending_msg().await;
-    for m in pending_recvs {
-        conn.handle_peer_msg(addr, m);
+    for mut m in pending_recvs {
+        let block_buf = if let Message::Piece(ref mut piece) = m {
+            piece.buf.take().map(BlockBuf::Owned)
+        } else {
+            None
+        };
+        conn.handle_peer_msg(addr, m, block_buf);
     }
 
     loop {
@@ -341,13 +358,16 @@ async fn run_recv_stream<T>(
                 debug!("{addr} recv stream ticker tick");
                 conn.handle_report_tick();
             }
-            r = conn.read_stream.recv_msg() => {
+            r = RecvStream::recv_next(
+                &mut conn.read_stream,
+                &mut conn.current_buf,
+                &mut conn.transmit_handle,
+                addr,
+            ) => {
                 info!("{addr} received {:?}", r);
-                // r = receive_peer_msg(&mut conn.read_stream, &mut conn.transmit_handle) => {
                 match r {
-                    Ok(msg) => {
-                        // (handle_peer_hdr(&mut conn, addr, hdr));
-                        conn.handle_peer_msg(addr, msg);
+                    Ok((msg, block_buf)) => {
+                        conn.handle_peer_msg(addr, msg, block_buf);
                     }
                     Err(e) => {
                         warn!("{addr} recv stream read header error {e}");
@@ -382,6 +402,51 @@ where
         }
     }
 
+    /// Cancel-safe message receive using the pooled-buffer path.
+    /// On `PiecePending`, checks `current_buf`:
+    /// - `None`: fresh piece or cancel during pool acquisition — allocate a new pooled buffer.
+    /// - `Some`: cancel during `recv_piece_body` — reuse the partial buffer.
+    /// Returns `(msg, Some(BlockBuf::Pooled(_)))` for Piece; `(msg, None)` otherwise.
+    async fn recv_next(
+        read_stream: &mut ReadStream<T>,
+        current_buf: &mut Option<PooledBuf<BytesMut>>,
+        transmit_handle: &mut TransmitManagerHandle,
+        addr: SocketAddr,
+    ) -> io::Result<(Message, Option<BlockBuf>)> {
+        match read_stream.recv_msg_header().await? {
+            RecvResult::Message(msg) => Ok((msg, None)),
+            RecvResult::PiecePending { index, begin, len } => {
+                if current_buf.is_none() {
+                    let mut buf = match BLOCK_BUF_POOL.try_acquire() {
+                        Some(b) => b,
+                        None => {
+                            let _ = transmit_handle
+                                .sender
+                                .send(TransmitMsg::PeerMsg(PeerMsg::BufferWaiting { peer: addr }));
+                            BLOCK_BUF_POOL.acquire().await
+                        }
+                    };
+                    buf.clear();
+                    *current_buf = Some(buf);
+                }
+                read_stream
+                    .recv_piece_body(&mut **current_buf.as_mut().unwrap())
+                    .await?;
+                // Extract the full PooledBuf; dropping the BlockBuf returns the slot to the pool.
+                let pooled = current_buf.take().unwrap();
+                Ok((
+                    Message::Piece(Piece {
+                        index,
+                        begin,
+                        len,
+                        buf: None,
+                    }),
+                    Some(BlockBuf::Pooled(pooled)),
+                ))
+            }
+        }
+    }
+
     fn handle_ctrl_cmd(&mut self, cmd: CtrlOfRecv) {
         match cmd {
             CtrlOfRecv::ReportStat => {
@@ -391,7 +456,7 @@ where
         }
     }
 
-    fn handle_peer_msg(&mut self, addr: SocketAddr, m: Message) {
+    fn handle_peer_msg(&mut self, addr: SocketAddr, m: Message, block_buf: Option<BlockBuf>) {
         // TODO: send statistics to transmit handle
 
         // TODO: shall we use mpsc or just lock the manager and set it
@@ -445,8 +510,11 @@ where
                     .send(TransmitMsg::PeerMsg(PeerMsg::Request(addr, req)));
             }
             Message::Piece(piece) => {
-                tmh.sender
-                    .send(TransmitMsg::PeerMsg(PeerMsg::Piece(addr, piece)));
+                tmh.sender.send(TransmitMsg::PeerMsg(PeerMsg::Piece {
+                    addr,
+                    piece,
+                    buf: block_buf.expect("Piece message must carry a block buffer"),
+                }));
 
                 // TODO: report only when inflight request is almost none
                 self.handle_report_tick();

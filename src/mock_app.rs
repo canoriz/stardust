@@ -10,7 +10,7 @@ use tracing::{error, info, warn};
 
 use crate::dht::{self, DHT};
 use crate::metadata::Magnet;
-use crate::protocol::{self, BTStream, HandshakeOption, Message, Reunite, Split};
+use crate::protocol::{self, BTStream, HandshakeOption, Message, RecvResult, Reunite, Split};
 use crate::torrent_manager::TorrentManagerHandle;
 use crate::transmit_manager::{self, TorrentTask, TransmitDump};
 use crate::{announce_manager, metadata};
@@ -255,9 +255,9 @@ where
     const A: [u8; 16384] = [0u8; 16384];
     loop {
         tokio::select! {
-            msg = bt_stream.recv_msg() => {
-                match msg {
-                    Ok(m) => match m {
+            r = bt_stream.recv_msg_header() => {
+                match r {
+                    Ok(RecvResult::Message(m)) => match m {
                         Message::Request(r) => {
                             if !choked && accum < limit {
                                 info!("response");
@@ -273,6 +273,11 @@ where
                         _ => {
                             info!("received msg {:?} from {}", m, addr);
                         }
+                    }
+                    Ok(RecvResult::PiecePending { len, .. }) => {
+                        // seeder doesn't receive pieces; discard
+                        let mut discard = bytes::BytesMut::with_capacity(len as usize);
+                        let _ = bt_stream.recv_piece_body(&mut discard).await;
                     }
                     Err(e) => {
                         warn!("main mock close conn {} {e}", addr);

@@ -1,6 +1,7 @@
 use crate::announce_manager::{self, AnnounceManagerHandle};
 use crate::backfile::{BackFile, NormalFile};
 use crate::bandwidth::{self, Bandwidth, RTT};
+use crate::buffer_pool::BlockBuf;
 use crate::cache::simple_buffer::{BufStorage, FlushErr};
 use crate::cache::simple_buffer::{GetPieceErr, PieceBuf};
 use crate::connection_manager::{
@@ -95,7 +96,11 @@ pub enum PeerMsg {
     Uninterested(PeerAddr),
     PieceState(PeerAddr, PieceState),
     Have(PeerAddr, u32),
-    Piece(PeerAddr, Piece),
+    Piece {
+        addr: PeerAddr,
+        piece: Piece,
+        buf: BlockBuf,
+    },
     DhtPort(PeerAddr, u16),
     SuggestPiece(PeerAddr, u32),
     AllowedFast(PeerAddr, u32),
@@ -104,7 +109,13 @@ pub enum PeerMsg {
     Request(PeerAddr, Request),
     ExtendMetadata(PeerAddr, ExtendedMetadata),
     ExtendPex(PeerAddr, ExtendedPex),
-    BlockReceived { peer: PeerAddr },
+    BlockReceived {
+        peer: PeerAddr,
+    },
+    /// Peer is stalled waiting for a block buffer from the pool; mark app_limited.
+    BufferWaiting {
+        peer: PeerAddr,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -493,6 +504,7 @@ pub struct TransmitWorker {
 
 struct BlockWaitingBuf {
     piece: Piece,
+    buf: BlockBuf,
 
     /// if this piece is all_received
     full_received: bool,
@@ -670,6 +682,7 @@ impl TransmitWorker {
                 for rg in reqs.range.iter() {
                     for req in rg.iter(reqs.piece_size) {
                         h.inflight.request(req);
+                        debug!("{addr} pick block request {req:?}");
                     }
                 }
 
@@ -708,6 +721,7 @@ impl TransmitWorker {
 
         for (peer, reqs) in revoked {
             for req in reqs {
+                debug!("{peer} revoke block request {req:?}");
                 if let Some(h) = self.connected_peers.get_mut(&peer) {
                     h.inflight.timeout(req);
                 }
@@ -991,7 +1005,16 @@ impl TransmitWorker {
                 // and mark app_limited
                 self.handle_blocks_receieved(peer)
             }
-            PeerMsg::Piece(addr, piece) => self.handle_piece_msg(&addr, piece),
+            PeerMsg::BufferWaiting { peer } => {
+                if let Some(h) = self.connected_peers.get_mut(&to_canonical_addr(peer)) {
+                    if !h.app_limited {
+                        info!("peer {peer} waiting for block buffer — marking app_limited");
+                    }
+                    h.app_limited = true;
+                }
+                Ok(())
+            }
+            PeerMsg::Piece { addr, piece, buf } => self.handle_piece_msg(&addr, piece, buf),
             PeerMsg::DhtPort(addr, port) => self.handle_dht_port_msg(addr, port),
             PeerMsg::ExtendMetadata(pa, m) => {
                 self.handle_extend_metadata(pa, m);
@@ -1447,7 +1470,8 @@ impl TransmitWorker {
     fn handle_piece_msg(
         &mut self,
         peer: &SocketAddr,
-        mut piece: protocol::Piece,
+        piece: protocol::Piece,
+        buf: BlockBuf,
     ) -> io::Result<()> {
         debug!("recv {piece:?} from {peer:?}");
 
@@ -1621,7 +1645,7 @@ impl TransmitWorker {
             piece.index as usize,
         ) {
             Ok(piecebuf) => {
-                copy_to_piecebuf(&piece, piecebuf);
+                copy_to_piecebuf(&piece, &buf, piecebuf);
                 if let Some(_) = piece_received {
                     Self::handle_full_piece_received(
                         piecebuf,
@@ -1640,6 +1664,7 @@ impl TransmitWorker {
                 match self.waiting_for_piecebuf.get_mut(&index) {
                     Some(v) => v.push(BlockWaitingBuf {
                         piece,
+                        buf,
                         full_received,
                     }),
                     None => {
@@ -1647,6 +1672,7 @@ impl TransmitWorker {
                             index,
                             vec![BlockWaitingBuf {
                                 piece,
+                                buf,
                                 full_received,
                             }],
                         );
@@ -1678,7 +1704,7 @@ impl TransmitWorker {
                     for p in ps {
                         // full_received should be set at most once
                         assert!(!full_received);
-                        copy_to_piecebuf(&p.piece, &mut buf);
+                        copy_to_piecebuf(&p.piece, &p.buf, &mut buf);
                         if p.full_received {
                             full_received = true;
                             info!("flush new ready piecebuf {index}");
@@ -2110,10 +2136,10 @@ pub(crate) async fn run_transmit_worker(
     println!("transmit manager done");
 }
 
-fn copy_to_piecebuf(piece: &Piece, piecebuf: &mut PieceBuf) {
+fn copy_to_piecebuf(piece: &Piece, data: &[u8], piecebuf: &mut PieceBuf) {
     let begin = piece.begin as usize;
     let end = begin + piece.len as usize;
-    piecebuf.as_mut()[begin..end].copy_from_slice(piece.buf().expect("received piece should be OK"))
+    piecebuf.as_mut()[begin..end].copy_from_slice(data);
 }
 
 fn run_dht(transmit: &mut TransmitWorker) {

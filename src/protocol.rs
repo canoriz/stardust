@@ -1,11 +1,8 @@
-use crate::buffer_pool::{BufferPool, PooledBuf};
 use crate::metadata::Metadata;
 use bon::Builder;
 use bt_bencode::ByteIpAddr;
 use bt_bencode::ByteString;
-use std::ops::DerefMut;
-
-use bytes::BytesMut;
+use bytes::{BufMut, BytesMut};
 use core::fmt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -17,13 +14,6 @@ use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufRea
 use tokio::net;
 use tokio::net::tcp;
 use tracing::{info, warn};
-
-/// Shared pool of block receive buffers.
-/// 256 slots × 16 KiB = 4096 KiB total.
-const BLOCK_SIZE: usize = 16384;
-const POOL_SLOTS: usize = 4096 * 1024 / BLOCK_SIZE; // 256
-static BLOCK_BUF_POOL: LazyLock<Arc<BufferPool<BytesMut>>> =
-    LazyLock::new(|| BufferPool::new(POOL_SLOTS, || BytesMut::with_capacity(BLOCK_SIZE)));
 
 // Hex-encode bytes (lowercase, no prefix). Efficient: avoids per-byte
 // temporary strings by pushing characters directly.
@@ -152,7 +142,6 @@ const EMPTY_PARTIAL_HEADER: PartialHeader = PartialHeader {
     field2: [0; 4],
     field3: [0; 4],
     filled: 0,
-    discard_remain: 0,
 };
 const EXTENSION_NAME_PEX: &str = "ut_pex";
 const EXTENSION_NAME_METADATA: &str = "ut_metadata";
@@ -211,12 +200,9 @@ pub struct BTStream<T> {
     // what this peer knows about our connected peers
     pex_peers: HashMap<SocketAddr, Option<PexFlag>>,
 
-    // handle to pool for acquiring piece receive buffers
-    buf_pool: Option<Arc<BufferPool<BytesMut>>>,
-
     // Received messages during handshake phase (after handshake and before extend handshake).
     // To be sent to upper layer.
-    // Some implementation may sent Port and BitField messaged between handshake and extend handshake
+    // Some implementations send Port and BitField messages between handshake and extend handshake.
     pending_recvs: Vec<Message>,
 }
 
@@ -239,7 +225,6 @@ where
             info_hash: self.info_hash,
             pex_peers: self.pex_peers,
             metadata_size: self.metadata_size,
-            buf_pool: self.buf_pool,
             pending_recvs: self.pending_recvs,
         }
     }
@@ -367,9 +352,6 @@ pub struct ReadStream<T> {
     info_hash: [u8; 20],
     reserved: FuncBits,
 
-    // handle to pool for acquiring piece receive buffers
-    buf_pool: Option<Arc<BufferPool<BytesMut>>>,
-
     pending_recvs: Vec<Message>,
 }
 
@@ -392,8 +374,6 @@ struct PartialHeader {
     field2: [u8; 4],
     field3: [u8; 4],
     filled: usize,
-
-    discard_remain: usize,
 }
 
 #[derive(Debug)]
@@ -402,7 +382,10 @@ struct PartialPiece {
     begin: u32,
     len: usize,
     remain: usize,
-    buf: Option<BlockBuf>,
+    /// Buffer for the cancel-safe `recv_msg` path. Lazily allocated on first entry;
+    /// preserved across cancellation so resumption can append to partial data.
+    /// `None` on the external-buffer (`recv_piece_body`) path.
+    buf: Option<BytesMut>,
 }
 
 #[derive(Debug)]
@@ -430,26 +413,6 @@ pub struct WriteStream<T> {
 }
 
 impl BTStream<net::TcpStream> {
-    // pub async fn connect_tcp(peer_addr: SocketAddr) -> io::Result<BTStream<net::TcpStream>> {
-    //     // TODO: fix type of peer_addr
-    //     // TODO: add timeout
-    //     let tcp_stream = net::TcpStream::connect(peer_addr).await?;
-    //     Ok(BTStream::<net::TcpStream> {
-    //         // inner: BufStream::new(tcp_stream),
-    //         inner: tcp_stream,
-    //         partial_header: PartialHeader {
-    //             field_len: [0; 4],
-    //             field_ty: 0,
-    //             field1: [0; 4],
-    //             field2: [0; 4],
-    //             field3: [0; 4],
-    //             filled: 0,
-    //             discard_remain: 0,
-    //         },
-    //         extension_id: HashMap::new(),
-    //     })
-    // }
-
     pub fn local_addr(&self) -> SocketAddr {
         // TODO: is this possible to be error?
         // self.inner.get_ref().local_addr().expect("expect ok")
@@ -521,7 +484,6 @@ where
                 info_hash: self.info_hash,
                 reserved: self.reserved,
                 metadata_size: self.metadata_size,
-                buf_pool: self.buf_pool,
                 pending_recvs: self.pending_recvs,
             },
             WriteStream {
@@ -557,7 +519,6 @@ where
             info_hash: r.info_hash,
             pex_peers: w.pex_peers,
             metadata_size: r.metadata_size,
-            buf_pool: r.buf_pool,
             pending_recvs: r.pending_recvs,
         })
     }
@@ -579,7 +540,6 @@ where
                 info_hash: self.info_hash,
                 reserved: self.reserved,
                 metadata_size: self.metadata_size,
-                buf_pool: self.buf_pool,
                 pending_recvs: self.pending_recvs,
             },
             WriteStream {
@@ -609,7 +569,6 @@ impl BTStream<Box<dyn Conn>> {
                 info_hash: self.info_hash,
                 reserved: self.reserved,
                 metadata_size: self.metadata_size,
-                buf_pool: self.buf_pool,
                 pending_recvs: self.pending_recvs,
             },
             WriteStream {
@@ -642,7 +601,6 @@ impl BTStream<Box<dyn Conn>> {
                 info_hash: self.info_hash,
                 reserved: self.reserved,
                 metadata_size: self.metadata_size,
-                buf_pool: self.buf_pool,
                 pending_recvs: self.pending_recvs,
             },
             WriteStream {
@@ -808,7 +766,6 @@ where
             reserved,
             pex_peers: HashMap::new(),
             metadata_size: 0,
-            buf_pool: Some(Arc::clone(&BLOCK_BUF_POOL)),
             pending_recvs: vec![],
         };
 
@@ -829,11 +786,8 @@ where
                 .await?;
                 io::Result::Ok(write_end)
             });
-            let recv_ext_handshake = recv_extend_handshake(
-                &mut read_end.inner,
-                &mut read_end.partial_read,
-                read_end.buf_pool.as_ref(),
-            );
+            let recv_ext_handshake =
+                recv_extend_handshake(&mut read_end.inner, &mut read_end.partial_read);
             let (write_end, exth, pending_recvs) = {
                 let (w, eh_res) = tokio::join!(send_ext_handshake, recv_ext_handshake);
                 let (exth, pending_recvs) = eh_res?;
@@ -919,7 +873,6 @@ where
             reserved,
             pex_peers: HashMap::new(),
             metadata_size: 0,
-            buf_pool: Some(Arc::clone(&BLOCK_BUF_POOL)),
             pending_recvs: vec![],
         };
 
@@ -935,11 +888,8 @@ where
                 .await?;
                 io::Result::Ok(write_end)
             });
-            let recv_ext_handshake = recv_extend_handshake(
-                &mut read_end.inner,
-                &mut read_end.partial_read,
-                read_end.buf_pool.as_ref(),
-            );
+            let recv_ext_handshake =
+                recv_extend_handshake(&mut read_end.inner, &mut read_end.partial_read);
             let (write_end, exth, pending_recvs) = {
                 let (w, eh_res) = tokio::join!(send_ext_handshake, recv_ext_handshake);
                 let (exth, pending_recvs) = eh_res?;
@@ -1195,15 +1145,25 @@ impl<T> BTStream<T>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
-    /// # Cancel Safety
-    /// this is safe
+    /// Read the next message header. BitField and Extended bodies are read internally.
+    /// Returns [`RecvResult::PiecePending`] for Piece (both fresh and cancel-resume).
+    /// Cancel-safe.
+    pub async fn recv_msg_header(&mut self) -> io::Result<RecvResult> {
+        recv_msg_header_pub(&mut self.inner, &mut self.partial_read).await
+    }
+
+    /// Read piece body data into `buf`, appending the outstanding portion (`len` bytes on
+    /// a fresh call, fewer bytes on cancel-resume). Requires that `recv_msg_header` returned
+    /// [`RecvResult::PiecePending`].
+    /// Cancel-safe: if the future is dropped, re-call with the same `buf` to resume.
+    pub async fn recv_piece_body<B: BufMut>(&mut self, buf: &mut B) -> io::Result<()> {
+        recv_piece_body_pub(&mut self.inner, &mut self.partial_read, buf).await
+    }
+
+    /// Receive one complete message. Cancel-safe, including for Piece messages.
+    /// For [`Message::Piece`], `Piece::buf` holds the received block data.
     pub async fn recv_msg(&mut self) -> io::Result<Message> {
-        recv_msg(
-            &mut self.inner,
-            &mut self.partial_read,
-            self.buf_pool.as_ref(),
-        )
-        .await
+        recv_msg(&mut self.inner, &mut self.partial_read).await
     }
 }
 
@@ -1215,20 +1175,29 @@ where
         self.peer_addr
     }
 
-    /// receive one message
-    /// # Cancel safety
-    /// this is cancel safe
-    pub async fn recv_msg(&mut self) -> io::Result<Message> {
-        recv_msg(
-            &mut self.inner,
-            &mut self.partial_read,
-            self.buf_pool.as_ref(),
-        )
-        .await
+    /// Read the next message header. BitField and Extended bodies are read internally.
+    /// Returns [`RecvResult::PiecePending`] for Piece (both fresh and cancel-resume).
+    /// Cancel-safe.
+    pub async fn recv_msg_header(&mut self) -> io::Result<RecvResult> {
+        recv_msg_header_pub(&mut self.inner, &mut self.partial_read).await
     }
 
-    /// called after split reader and writer
-    /// the pending DHT PORT message can now be sent
+    /// Read piece body data into `buf`, appending the outstanding portion (`len` bytes on
+    /// a fresh call, fewer bytes on cancel-resume). Requires that `recv_msg_header` returned
+    /// [`RecvResult::PiecePending`].
+    /// Cancel-safe: if the future is dropped, re-call with the same `buf` to resume.
+    pub async fn recv_piece_body<B: BufMut>(&mut self, buf: &mut B) -> io::Result<()> {
+        recv_piece_body_pub(&mut self.inner, &mut self.partial_read, buf).await
+    }
+
+    /// Receive one complete message. Cancel-safe, including for Piece messages.
+    /// For [`Message::Piece`], `Piece::buf` holds the received block data.
+    pub async fn recv_msg(&mut self) -> io::Result<Message> {
+        recv_msg(&mut self.inner, &mut self.partial_read).await
+    }
+
+    /// Drains messages buffered during the extension handshake phase.
+    /// For [`Message::Piece`] entries, `Piece::buf` holds the owned block data.
     pub async fn maybe_recv_pending_msg(&mut self) -> Vec<Message> {
         self.pending_recvs.drain(0..).collect()
     }
@@ -1381,6 +1350,46 @@ pub enum MessageHeader {
     Reject(Request),
     Extended { id: u8, len: usize },
     Discard { len: usize },
+}
+
+/// Result returned by [`ReadStream::recv_msg_header`] and [`BTStream::recv_msg_header`].
+///
+/// - [`RecvResult::Message`]: message is complete, no further action needed.
+/// - [`RecvResult::PiecePending`]: a piece header is pending body data. Call `recv_piece_body`
+///   with a buffer. On first return allocate a fresh buffer; on cancel-resume reuse the
+///   same partial buffer (or rely on `recv_msg` which manages this automatically).
+#[derive(Debug)]
+#[must_use]
+pub enum RecvResult {
+    /// A fully-received message (simple control, BitField body already read, Extended body already read).
+    Message(Message),
+    /// A Piece header is consumed; call `recv_piece_body` to read the block data.
+    /// Returned both on first encounter and on cancel-resume.
+    PiecePending { index: u32, begin: u32, len: u32 },
+}
+
+impl MessageHeader {
+    /// Convert a simple (no-body) message header into the corresponding Message.
+    /// Panics if called on a body-carrying variant (Piece, BitField, Extended, Discard).
+    pub fn into_simple_message(self) -> Message {
+        match self {
+            MessageHeader::KeepAlive => Message::KeepAlive,
+            MessageHeader::Choke => Message::Choke,
+            MessageHeader::Unchoke => Message::Unchoke,
+            MessageHeader::Interested => Message::Interested,
+            MessageHeader::NotInterested => Message::NotInterested,
+            MessageHeader::Have(h) => Message::Have(h),
+            MessageHeader::Request(r) => Message::Request(r),
+            MessageHeader::Cancel(r) => Message::Cancel(r),
+            MessageHeader::Port(p) => Message::Port(p),
+            MessageHeader::SuggestPiece(i) => Message::SuggestPiece(i),
+            MessageHeader::AllowedFast(i) => Message::AllowedFast(i),
+            MessageHeader::HaveAll => Message::HaveAll,
+            MessageHeader::HaveNone => Message::HaveNone,
+            MessageHeader::Reject(r) => Message::Reject(r),
+            _ => unreachable!("body-carrying MessageHeader has no simple Message conversion"),
+        }
+    }
 }
 
 impl std::fmt::Debug for Message {
@@ -1551,76 +1560,12 @@ pub struct Request {
     pub len: u32,
 }
 
-/// Holds either a pooled or a freshly-allocated block buffer.
-/// Auto-returns to the pool on drop when pooled.
-pub enum BlockBuf {
-    Pooled(PooledBuf<BytesMut>),
-    Owned(BytesMut),
-}
-
-impl std::ops::Deref for BlockBuf {
-    type Target = BytesMut;
-    fn deref(&self) -> &BytesMut {
-        match self {
-            BlockBuf::Pooled(b) => b,
-            BlockBuf::Owned(b) => b,
-        }
-    }
-}
-
-impl std::ops::DerefMut for BlockBuf {
-    fn deref_mut(&mut self) -> &mut BytesMut {
-        match self {
-            BlockBuf::Pooled(b) => b,
-            BlockBuf::Owned(b) => b,
-        }
-    }
-}
-
-impl fmt::Debug for BlockBuf {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        match self {
-            BlockBuf::Pooled(b) => write!(f, "Pooled({:?})", &**b),
-            BlockBuf::Owned(b) => write!(f, "Owned({:?})", b),
-        }
-    }
-}
-
+#[derive(Debug, PartialEq, Eq)]
 pub struct Piece {
     pub index: u32,
     pub begin: u32,
     pub len: u32,
-    pub piece: Option<BlockBuf>,
-}
-
-impl Piece {
-    pub fn buf(&self) -> Option<&BytesMut> {
-        self.piece.as_deref()
-    }
-}
-
-impl Eq for Piece {}
-impl PartialEq for Piece {
-    fn eq(&self, other: &Self) -> bool {
-        let range_ok =
-            self.index == other.index && self.begin == other.begin && self.len == other.len;
-        let all_none = self.piece.is_none() && other.piece.is_none();
-        let all_same = self
-            .buf()
-            .is_some_and(|b| other.buf().is_some_and(|ob| b.as_ref() == ob.as_ref()));
-        range_ok && (all_none || all_same)
-    }
-}
-
-impl fmt::Debug for Piece {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Piece")
-            .field("index", &self.index)
-            .field("begin", &self.begin)
-            .field("len", &self.len)
-            .field("buffer len", &self.buf().map_or(0, |b| b.len()))
-            .finish()
-    }
+    pub buf: Option<BytesMut>,
 }
 
 #[derive(Eq, PartialEq)]
@@ -2194,108 +2139,34 @@ fn init_partial_read() -> PartialRead {
     }
 }
 
-async fn recv_msg<'a, T>(
-    reader: &'a mut T,
-    partial_read: &'a mut PartialRead,
-    pool: Option<&Arc<BufferPool<BytesMut>>>,
-) -> io::Result<Message>
+/// Cancel-safe: if cancelled during piece body read, `PartialRead::Piece` state is preserved;
+/// the next call resumes from where it left off without re-reading the header.
+/// For [`Message::Piece`], `Piece::buf` is filled with the received block data.
+async fn recv_msg<T>(reader: &mut T, partial_read: &mut PartialRead) -> io::Result<Message>
 where
     T: AsyncRead + Unpin,
 {
-    loop {
-        match partial_read {
-            PartialRead::Header { partial_header } => {
-                let hdr = recv_msg_header(reader, partial_header).await?;
-
-                match hdr {
-                    MessageHeader::BitField { capacity } => {
-                        *partial_read = PartialRead::BitField(PartialExtend {
-                            id: 0,
-                            remain: capacity,
-                            buf: BytesMut::new(),
-                        });
-                    }
-                    MessageHeader::Piece { index, begin, len } => {
-                        let mut block_buf = match pool {
-                            Some(p) => {
-                                let mut b = p.acquire().await;
-                                b.clear();
-                                BlockBuf::Pooled(b)
-                            }
-                            None => BlockBuf::Owned(BytesMut::new()),
-                        };
-                        *partial_read = PartialRead::Piece(PartialPiece {
-                            index,
-                            begin,
-                            len: len as usize,
-                            remain: len as usize,
-                            buf: Some(block_buf),
-                        })
-                    }
-                    MessageHeader::Extended { id, len } => {
-                        *partial_read = PartialRead::Extend(PartialExtend {
-                            id,
-                            remain: len,
-                            buf: BytesMut::new(),
-                        })
-                    }
-                    MessageHeader::Discard { len } => {
-                        *partial_read = PartialRead::Discard(PartialExtend {
-                            id: 0,
-                            remain: len,
-                            buf: BytesMut::new(),
-                        })
-                    }
-                    MessageHeader::KeepAlive => return Ok(Message::KeepAlive),
-                    MessageHeader::Choke => return Ok(Message::Choke),
-                    MessageHeader::Unchoke => return Ok(Message::Unchoke),
-                    MessageHeader::Interested => return Ok(Message::Interested),
-                    MessageHeader::NotInterested => return Ok(Message::NotInterested),
-                    MessageHeader::Have(have) => return Ok(Message::Have(have)),
-                    MessageHeader::Request(req) => return Ok(Message::Request(req)),
-                    MessageHeader::Cancel(req) => return Ok(Message::Cancel(req)),
-                    MessageHeader::Port(port) => return Ok(Message::Port(port)),
-                    MessageHeader::HaveAll => return Ok(Message::HaveAll),
-                    MessageHeader::HaveNone => return Ok(Message::HaveNone),
-                    MessageHeader::SuggestPiece(index) => return Ok(Message::SuggestPiece(index)),
-                    MessageHeader::AllowedFast(index) => return Ok(Message::AllowedFast(index)),
-                    MessageHeader::Reject(req) => return Ok(Message::Reject(req)),
-                }
+    match recv_msg_header_pub(reader, partial_read).await? {
+        RecvResult::Message(msg) => Ok(msg),
+        RecvResult::PiecePending { index, begin, len } => {
+            // partial_read is now PartialRead::Piece(p).
+            // p.buf is the cancel-safe buffer: lazily allocated on first entry,
+            // preserved across cancellation so the next call can append remaining bytes.
+            let PartialRead::Piece(ref mut p) = partial_read else {
+                unreachable!("PiecePending implies PartialRead::Piece");
+            };
+            if p.buf.is_none() {
+                p.buf = Some(BytesMut::with_capacity(p.len));
             }
-            PartialRead::BitField(p) => {
-                let res = Ok(Message::BitField(recv_bitfield_msg(reader, p).await?));
-                *partial_read = init_partial_read();
-                return res;
-            }
-            PartialRead::Extend(p) => {
-                let res = Ok(Message::Extended(recv_extend_msg(reader, p).await?));
-                *partial_read = init_partial_read();
-                return res;
-            }
-            PartialRead::Piece(p) => {
-                let (index, begin, len) = (p.index, p.begin, p.len);
-                recv_piece_msg(
-                    reader,
-                    &mut p.remain,
-                    p.buf
-                        .as_mut()
-                        .expect("buf set when Piece header arrived")
-                        .deref_mut(),
-                )
-                .await?;
-                let piece = p.buf.take().expect("buf set when Piece header arrived");
-                *partial_read = init_partial_read();
-                return Ok(Message::Piece(Piece {
-                    index,
-                    begin,
-                    len: len as u32,
-                    piece: Some(piece),
-                }));
-            }
-            PartialRead::Discard(p) => {
-                discard_remain(reader, p).await?;
-                *partial_read = init_partial_read();
-            }
+            recv_piece_msg(reader, &mut p.remain, p.buf.as_mut().unwrap()).await?;
+            let buf = p.buf.take().unwrap();
+            *partial_read = init_partial_read();
+            Ok(Message::Piece(Piece {
+                index,
+                begin,
+                len,
+                buf: Some(buf),
+            }))
         }
     }
 }
@@ -2527,13 +2398,14 @@ where
     }
 }
 
-async fn recv_piece_msg<'a, T>(
+async fn recv_piece_msg<'a, T, B>(
     reader: &'a mut T,
     remain: &'a mut usize,
-    piece_buf: &'a mut BytesMut,
+    piece_buf: &'a mut B,
 ) -> io::Result<()>
 where
     T: AsyncRead + Unpin,
+    B: BufMut,
 {
     let mut limit_reader = reader.take(*remain as u64);
 
@@ -2615,17 +2487,132 @@ where
 
 // waiting for extend handshake, returns extend handshake and message
 // before extend handshake
-async fn recv_extend_handshake<'a, T>(
-    reader: &'a mut T,
+/// Reads the next message. Cancel-safe.
+///
+/// - Simple control messages: returned immediately as [`RecvResult::Message`].
+/// - BitField / Extended: body is read internally; returned as [`RecvResult::Message`].
+/// - Piece (fresh): header just consumed → returns [`RecvResult::PiecePending`].
+///   Caller must supply a buffer and call `recv_piece_body`.
+/// - Piece (resume): stream already in `PartialRead::Piece` (cancel mid-body) →
+///   returns [`RecvResult::PiecePending`] **without any I/O**.
+/// - Discard: unknown messages are consumed internally; loop continues to the next.
+async fn recv_msg_header_pub<T>(
+    reader: &mut T,
+    partial_read: &mut PartialRead,
+) -> io::Result<RecvResult>
+where
+    T: AsyncRead + Unpin,
+{
+    loop {
+        match partial_read {
+            PartialRead::Header { partial_header } => {
+                let hdr = recv_msg_header(reader, partial_header).await?;
+                match hdr {
+                    MessageHeader::Piece { index, begin, len } => {
+                        *partial_read = PartialRead::Piece(PartialPiece {
+                            index,
+                            begin,
+                            len: len as usize,
+                            remain: len as usize,
+                            buf: None,
+                        });
+                        return Ok(RecvResult::PiecePending { index, begin, len });
+                    }
+                    MessageHeader::BitField { capacity } => {
+                        *partial_read = PartialRead::BitField(PartialExtend {
+                            id: 0,
+                            remain: capacity,
+                            buf: BytesMut::new(),
+                        });
+                        // Fall through to BitField arm to read body.
+                    }
+                    MessageHeader::Extended { id, len } => {
+                        *partial_read = PartialRead::Extend(PartialExtend {
+                            id,
+                            remain: len,
+                            buf: BytesMut::new(),
+                        });
+                        // Fall through to Extend arm to read body.
+                    }
+                    MessageHeader::Discard { len } => {
+                        *partial_read = PartialRead::Discard(PartialExtend {
+                            id: 0,
+                            remain: len,
+                            buf: BytesMut::new(),
+                        });
+                        // Fall through to Discard arm.
+                    }
+                    simple => {
+                        *partial_read = init_partial_read();
+                        return Ok(RecvResult::Message(simple.into_simple_message()));
+                    }
+                }
+            }
+            PartialRead::Piece(p) => {
+                // Resume: piece header already consumed. Return PiecePending so caller
+                // can supply / reuse a buffer and call recv_piece_body.
+                return Ok(RecvResult::PiecePending {
+                    index: p.index,
+                    begin: p.begin,
+                    len: p.len as u32,
+                });
+            }
+            PartialRead::BitField(p) => {
+                let res = recv_bitfield_msg(reader, p).await?;
+                *partial_read = init_partial_read();
+                return Ok(RecvResult::Message(Message::BitField(res)));
+            }
+            PartialRead::Extend(p) => {
+                let res = recv_extend_msg(reader, p).await?;
+                *partial_read = init_partial_read();
+                return Ok(RecvResult::Message(Message::Extended(res)));
+            }
+            PartialRead::Discard(p) => {
+                discard_remain(reader, p).await?;
+                *partial_read = init_partial_read();
+                // Loop back to read the next header.
+            }
+        }
+    }
+}
+
+/// Reads piece body data into `buf`. Appends exactly `remain` bytes.
+/// Cancel-safe: pass the same `buf` on resume; already-received bytes stay at the
+/// front and only the remaining bytes are appended.
+/// Requires the stream is in [`PartialRead::Piece`] state (i.e. `recv_msg_header_pub`
+/// returned `RecvResult::PiecePending`).
+async fn recv_piece_body_pub<T, B>(
+    reader: &mut T,
+    partial_read: &mut PartialRead,
+    buf: &mut B,
+) -> io::Result<()>
+where
+    T: AsyncRead + Unpin,
+    B: BufMut,
+{
+    match partial_read {
+        PartialRead::Piece(p) => {
+            recv_piece_msg(reader, &mut p.remain, buf).await?;
+            *partial_read = init_partial_read();
+            Ok(())
+        }
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "recv_piece_body called but not in piece-reading state",
+        )),
+    }
+}
+
+async fn recv_extend_handshake<T>(
+    reader: &mut T,
     pr: &mut PartialRead,
-    pool: Option<&Arc<BufferPool<BytesMut>>>,
 ) -> io::Result<(ExtendedHandshake, Vec<Message>)>
 where
     T: AsyncRead + Unpin,
 {
     let mut pending_recvs = vec![];
     loop {
-        let msg = recv_msg(reader, pr, pool).await?;
+        let msg = recv_msg(reader, pr).await?;
         match msg {
             Message::Extended(ExtendedMsg::Handshake(e)) => break Ok((e, pending_recvs)),
             m => pending_recvs.push(m),
@@ -2789,7 +2776,6 @@ pub mod tests {
                     info_hash: [0; 20],
                     reserved: [0; 8].into(),
                     metadata_size: 0,
-                    buf_pool: Some(Arc::clone(&BLOCK_BUF_POOL)),
                     pending_recvs: self.pending_recvs,
                 },
                 WriteStream {
@@ -3102,7 +3088,7 @@ pub mod tests {
         assert_eq!(piece.index, index);
         assert_eq!(piece.begin, begin);
         assert_eq!(piece.len, random_bytes.len() as u32);
-        assert_eq!(piece.buf().unwrap().as_ref(), random_bytes);
+        assert_eq!(piece.buf.as_deref().unwrap(), &random_bytes[..]);
 
         // TODO: test long piece are dropped
 
@@ -3117,7 +3103,7 @@ pub mod tests {
         assert_eq!(piece.index, index);
         assert_eq!(piece.begin, begin);
         assert_eq!(piece.len, random_bytes.len() as u32);
-        assert_eq!(piece.buf().unwrap().as_ref(), random_bytes);
+        assert_eq!(piece.buf.as_deref().unwrap(), &random_bytes[..]);
         // TODO: test long piece are dropped
     }
 
@@ -3136,10 +3122,7 @@ pub mod tests {
         assert_eq!(piece.index, index);
         assert_eq!(piece.begin, begin);
         assert_eq!(piece.len, random_bytes.len() as u32);
-        assert_eq!(piece.buf().unwrap().as_ref(), random_bytes);
-
-        // drop this piece so the buffer can be returned
-        drop(piece);
+        assert_eq!(piece.buf.as_deref().unwrap(), &random_bytes[..]);
 
         peer1
             .send_piece(index, begin, &random_bytes)
@@ -3150,7 +3133,7 @@ pub mod tests {
         assert_eq!(piece.index, index);
         assert_eq!(piece.begin, begin);
         assert_eq!(piece.len, random_bytes.len() as u32);
-        assert_eq!(piece.buf().unwrap().as_ref(), random_bytes);
+        assert_eq!(piece.buf.as_deref().unwrap(), &random_bytes[..]);
     }
 
     #[tokio::test]
@@ -3415,7 +3398,70 @@ pub mod tests {
     }
 
     #[tokio::test]
-    async fn read_msg_header_cancel_safe() {
+    async fn recv_msg_header_cancel_safe() {
+        // Piece header (13 bytes): u32(len=9+6) | u8(7) | u32(index=3) | u32(begin=7)
+        // body (6 bytes) is written separately after recv_msg_header to avoid confusing the test.
+        let piece_header: [u8; 13] = [0, 0, 0, 15, 7, 0, 0, 0, 3, 0, 0, 0, 7];
+
+        struct MockWaker3;
+        impl Wake for MockWaker3 {
+            fn wake(self: Arc<Self>) {}
+        }
+        let waker = Arc::new(MockWaker3).into();
+        let mut cx = Context::from_waker(&waker);
+
+        // Test every split point of the 13-byte header.
+        for split_at in 1..piece_header.len() {
+            let ((_, mut p1w), (mut p2r, _)) = make_ends_split().await;
+
+            // Write first half.
+            p1w.inner
+                .write_all(&piece_header[..split_at])
+                .await
+                .unwrap();
+            p1w.inner.flush().await.unwrap();
+
+            {
+                // Poll once — must be Pending because the header is incomplete.
+                let mut fut = Box::pin(p2r.recv_msg_header());
+                let res = fut.as_mut().poll(&mut cx);
+                assert!(
+                    matches!(res, Poll::Pending),
+                    "split_at={split_at}: expected Pending"
+                );
+                // Simulate cancellation by dropping the future.
+            }
+
+            // Write the second half.
+            p1w.inner
+                .write_all(&piece_header[split_at..])
+                .await
+                .unwrap();
+            p1w.inner.flush().await.unwrap();
+
+            // Create a fresh future and drive it to completion.
+            let result = p2r.recv_msg_header().await.unwrap();
+            assert!(
+                matches!(
+                    result,
+                    RecvResult::PiecePending {
+                        index: 3,
+                        begin: 7,
+                        len: 6
+                    }
+                ),
+                "split_at={split_at}: unexpected result {result:?}",
+            );
+
+            // Consume the 6 body bytes to leave the stream clean.
+            let mut sink = BytesMut::new();
+            p1w.inner.write_all(&[0u8; 6]).await.unwrap();
+            p2r.recv_piece_body(&mut sink).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn recv_msg_cancel_safe() {
         let ((p1r, mut p1w), (mut p2r, p2w)) = make_ends_split().await;
         let request_msg = [
             0u8, 0, 0, 13, 6, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xa, 0xb, 0xc,
@@ -3472,5 +3518,82 @@ pub mod tests {
                 }))
             ));
         }
+    }
+
+    /// `recv_piece_body` accepts any `BufMut`, here `Vec<u8>`.
+    #[tokio::test]
+    async fn recv_piece_body_with_generic_buf() {
+        let ((_, mut p1w), (mut p2r, _)) = make_ends_split().await;
+        // length=13 (9+4), type=7, index=1, begin=2, body=[0xAA,0xBB,0xCC,0xDD]
+        let mut msg = vec![0u8, 0, 0, 13, 7, 0, 0, 0, 1, 0, 0, 0, 2];
+        msg.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        p1w.inner.write_all(&msg).await.unwrap();
+        p1w.inner.flush().await.unwrap();
+
+        let res = p2r.recv_msg_header().await.unwrap();
+        assert!(matches!(
+            res,
+            RecvResult::PiecePending {
+                index: 1,
+                begin: 2,
+                len: 4
+            }
+        ));
+
+        let mut buf: Vec<u8> = Vec::new();
+        p2r.recv_piece_body(&mut buf).await.unwrap();
+        assert_eq!(buf, vec![0xAA, 0xBB, 0xCC, 0xDD]);
+    }
+
+    /// Dropping `recv_piece_body` mid-read leaves partial state in the stream.
+    /// A new call with the same buffer appends the remaining bytes correctly.
+    #[tokio::test]
+    async fn recv_piece_body_cancel_safe() {
+        let ((_, mut p1w), (mut p2r, _)) = make_ends_split().await;
+        // length=15 (9+6), type=7, index=0, begin=0, body=[0x11..0x66]
+        let header = [0u8, 0, 0, 15, 7, 0, 0, 0, 0, 0, 0, 0, 0];
+        let body = [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66];
+
+        p1w.inner.write_all(&header).await.unwrap();
+        p1w.inner.flush().await.unwrap();
+
+        let res = p2r.recv_msg_header().await.unwrap();
+        assert!(matches!(
+            res,
+            RecvResult::PiecePending {
+                index: 0,
+                begin: 0,
+                len: 6
+            }
+        ));
+
+        struct MockWaker2;
+        impl Wake for MockWaker2 {
+            fn wake(self: Arc<Self>) {}
+        }
+        let waker = Arc::new(MockWaker2).into();
+        let mut cx = Context::from_waker(&waker);
+
+        let mut buf = BytesMut::new();
+
+        // Write only the first half; poll once — should be Pending because 3 of 6 bytes remain.
+        p1w.inner.write_all(&body[..3]).await.unwrap();
+        p1w.inner.flush().await.unwrap();
+        {
+            let mut fut_pin = Box::pin(p2r.recv_piece_body(&mut buf));
+            let res = fut_pin.as_mut().poll(&mut cx);
+            assert!(matches!(res, Poll::Pending));
+            // Drop fut_pin here — simulates cancellation.
+        }
+
+        // After cancellation the ReadStream retains `remain = 3` in its PartialRead state.
+        let res = p2r.recv_msg_header().await.unwrap();
+        assert!(matches!(res, RecvResult::PiecePending { .. }));
+
+        // Write remaining bytes and resume with the same buffer; it should complete.
+        p1w.inner.write_all(&body[3..]).await.unwrap();
+        p1w.inner.flush().await.unwrap();
+        p2r.recv_piece_body(&mut buf).await.unwrap();
+        assert_eq!(&buf[..], &body[..]);
     }
 }
