@@ -3,6 +3,8 @@ pub mod dht;
 pub mod metadata;
 pub mod protocol;
 
+pub(crate) mod buffer_pool;
+
 pub(crate) mod announce_manager;
 pub(crate) mod backfile;
 pub(crate) mod bandwidth;

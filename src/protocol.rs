@@ -1,7 +1,9 @@
+use crate::buffer_pool::{BufferPool, PooledBuf};
 use crate::metadata::Metadata;
 use bon::Builder;
 use bt_bencode::ByteIpAddr;
 use bt_bencode::ByteString;
+use std::ops::DerefMut;
 
 use bytes::BytesMut;
 use core::fmt;
@@ -14,8 +16,14 @@ use std::sync::{Arc, LazyLock};
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net;
 use tokio::net::tcp;
-use tokio::sync::oneshot;
 use tracing::{info, warn};
+
+/// Shared pool of block receive buffers.
+/// 256 slots × 16 KiB = 4096 KiB total.
+const BLOCK_SIZE: usize = 16384;
+const POOL_SLOTS: usize = 4096 * 1024 / BLOCK_SIZE; // 256
+static BLOCK_BUF_POOL: LazyLock<Arc<BufferPool<BytesMut>>> =
+    LazyLock::new(|| BufferPool::new(POOL_SLOTS, || BytesMut::with_capacity(BLOCK_SIZE)));
 
 // Hex-encode bytes (lowercase, no prefix). Efficient: avoids per-byte
 // temporary strings by pushing characters directly.
@@ -203,12 +211,10 @@ pub struct BTStream<T> {
     // what this peer knows about our connected peers
     pex_peers: HashMap<SocketAddr, Option<PexFlag>>,
 
-    // buffer for incoming piece
-    // this might be transferred to other place for further
-    // processing and returns back when done
-    piece_buf: Option<BytesMut>,
+    // handle to pool for acquiring piece receive buffers
+    buf_pool: Option<Arc<BufferPool<BytesMut>>>,
 
-    // Received messages during handshake phase(after handshake and before extend handshake).
+    // Received messages during handshake phase (after handshake and before extend handshake).
     // To be sent to upper layer.
     // Some implementation may sent Port and BitField messaged between handshake and extend handshake
     pending_recvs: Vec<Message>,
@@ -233,7 +239,7 @@ where
             info_hash: self.info_hash,
             pex_peers: self.pex_peers,
             metadata_size: self.metadata_size,
-            piece_buf: Some(BytesMut::new()),
+            buf_pool: self.buf_pool,
             pending_recvs: self.pending_recvs,
         }
     }
@@ -361,18 +367,15 @@ pub struct ReadStream<T> {
     info_hash: [u8; 20],
     reserved: FuncBits,
 
-    // buffer for incoming piece
-    piece_buf: Option<BytesMut>,
+    // handle to pool for acquiring piece receive buffers
+    buf_pool: Option<Arc<BufferPool<BytesMut>>>,
 
     pending_recvs: Vec<Message>,
 }
 
 #[derive(Debug)]
 enum PartialRead {
-    Header {
-        partial_header: PartialHeader,
-        reuse_buf: oneshot::Receiver<BytesMut>,
-    },
+    Header { partial_header: PartialHeader },
     BitField(PartialExtend),
     Extend(PartialExtend),
     Piece(PartialPiece),
@@ -399,6 +402,7 @@ struct PartialPiece {
     begin: u32,
     len: usize,
     remain: usize,
+    buf: Option<BlockBuf>,
 }
 
 #[derive(Debug)]
@@ -517,7 +521,7 @@ where
                 info_hash: self.info_hash,
                 reserved: self.reserved,
                 metadata_size: self.metadata_size,
-                piece_buf: self.piece_buf,
+                buf_pool: self.buf_pool,
                 pending_recvs: self.pending_recvs,
             },
             WriteStream {
@@ -553,7 +557,7 @@ where
             info_hash: r.info_hash,
             pex_peers: w.pex_peers,
             metadata_size: r.metadata_size,
-            piece_buf: r.piece_buf,
+            buf_pool: r.buf_pool,
             pending_recvs: r.pending_recvs,
         })
     }
@@ -575,7 +579,7 @@ where
                 info_hash: self.info_hash,
                 reserved: self.reserved,
                 metadata_size: self.metadata_size,
-                piece_buf: self.piece_buf,
+                buf_pool: self.buf_pool,
                 pending_recvs: self.pending_recvs,
             },
             WriteStream {
@@ -605,7 +609,7 @@ impl BTStream<Box<dyn Conn>> {
                 info_hash: self.info_hash,
                 reserved: self.reserved,
                 metadata_size: self.metadata_size,
-                piece_buf: self.piece_buf,
+                buf_pool: self.buf_pool,
                 pending_recvs: self.pending_recvs,
             },
             WriteStream {
@@ -638,7 +642,7 @@ impl BTStream<Box<dyn Conn>> {
                 info_hash: self.info_hash,
                 reserved: self.reserved,
                 metadata_size: self.metadata_size,
-                piece_buf: self.piece_buf,
+                buf_pool: self.buf_pool,
                 pending_recvs: self.pending_recvs,
             },
             WriteStream {
@@ -804,7 +808,7 @@ where
             reserved,
             pex_peers: HashMap::new(),
             metadata_size: 0,
-            piece_buf: Some(BytesMut::new()),
+            buf_pool: Some(Arc::clone(&BLOCK_BUF_POOL)),
             pending_recvs: vec![],
         };
 
@@ -828,7 +832,7 @@ where
             let recv_ext_handshake = recv_extend_handshake(
                 &mut read_end.inner,
                 &mut read_end.partial_read,
-                &mut read_end.piece_buf,
+                read_end.buf_pool.as_ref(),
             );
             let (write_end, exth, pending_recvs) = {
                 let (w, eh_res) = tokio::join!(send_ext_handshake, recv_ext_handshake);
@@ -915,7 +919,7 @@ where
             reserved,
             pex_peers: HashMap::new(),
             metadata_size: 0,
-            piece_buf: Some(BytesMut::new()),
+            buf_pool: Some(Arc::clone(&BLOCK_BUF_POOL)),
             pending_recvs: vec![],
         };
 
@@ -934,7 +938,7 @@ where
             let recv_ext_handshake = recv_extend_handshake(
                 &mut read_end.inner,
                 &mut read_end.partial_read,
-                &mut read_end.piece_buf,
+                read_end.buf_pool.as_ref(),
             );
             let (write_end, exth, pending_recvs) = {
                 let (w, eh_res) = tokio::join!(send_ext_handshake, recv_ext_handshake);
@@ -1194,7 +1198,12 @@ where
     /// # Cancel Safety
     /// this is safe
     pub async fn recv_msg(&mut self) -> io::Result<Message> {
-        recv_msg(&mut self.inner, &mut self.partial_read, &mut self.piece_buf).await
+        recv_msg(
+            &mut self.inner,
+            &mut self.partial_read,
+            self.buf_pool.as_ref(),
+        )
+        .await
     }
 }
 
@@ -1210,7 +1219,12 @@ where
     /// # Cancel safety
     /// this is cancel safe
     pub async fn recv_msg(&mut self) -> io::Result<Message> {
-        recv_msg(&mut self.inner, &mut self.partial_read, &mut self.piece_buf).await
+        recv_msg(
+            &mut self.inner,
+            &mut self.partial_read,
+            self.buf_pool.as_ref(),
+        )
+        .await
     }
 
     /// called after split reader and writer
@@ -1537,16 +1551,51 @@ pub struct Request {
     pub len: u32,
 }
 
+/// Holds either a pooled or a freshly-allocated block buffer.
+/// Auto-returns to the pool on drop when pooled.
+pub enum BlockBuf {
+    Pooled(PooledBuf<BytesMut>),
+    Owned(BytesMut),
+}
+
+impl std::ops::Deref for BlockBuf {
+    type Target = BytesMut;
+    fn deref(&self) -> &BytesMut {
+        match self {
+            BlockBuf::Pooled(b) => b,
+            BlockBuf::Owned(b) => b,
+        }
+    }
+}
+
+impl std::ops::DerefMut for BlockBuf {
+    fn deref_mut(&mut self) -> &mut BytesMut {
+        match self {
+            BlockBuf::Pooled(b) => b,
+            BlockBuf::Owned(b) => b,
+        }
+    }
+}
+
+impl fmt::Debug for BlockBuf {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            BlockBuf::Pooled(b) => write!(f, "Pooled({:?})", &**b),
+            BlockBuf::Owned(b) => write!(f, "Owned({:?})", b),
+        }
+    }
+}
+
 pub struct Piece {
     pub index: u32,
     pub begin: u32,
     pub len: u32,
-    pub piece: Option<(BytesMut, oneshot::Sender<BytesMut>)>,
+    pub piece: Option<BlockBuf>,
 }
 
 impl Piece {
     pub fn buf(&self) -> Option<&BytesMut> {
-        self.piece.as_ref().map(|(p, _)| p)
+        self.piece.as_deref()
     }
 }
 
@@ -1571,14 +1620,6 @@ impl fmt::Debug for Piece {
             .field("len", &self.len)
             .field("buffer len", &self.buf().map_or(0, |b| b.len()))
             .finish()
-    }
-}
-
-impl Drop for Piece {
-    fn drop(&mut self) {
-        if let Some((buf, tx)) = self.piece.take() {
-            _ = tx.send(buf);
-        }
     }
 }
 
@@ -2150,24 +2191,20 @@ where
 fn init_partial_read() -> PartialRead {
     PartialRead::Header {
         partial_header: EMPTY_PARTIAL_HEADER,
-        reuse_buf: oneshot::channel().1,
     }
 }
 
 async fn recv_msg<'a, T>(
     reader: &'a mut T,
     partial_read: &'a mut PartialRead,
-    piece_buf: &'a mut Option<BytesMut>,
+    pool: Option<&Arc<BufferPool<BytesMut>>>,
 ) -> io::Result<Message>
 where
     T: AsyncRead + Unpin,
 {
     loop {
         match partial_read {
-            PartialRead::Header {
-                partial_header,
-                reuse_buf,
-            } => {
+            PartialRead::Header { partial_header } => {
                 let hdr = recv_msg_header(reader, partial_header).await?;
 
                 match hdr {
@@ -2179,28 +2216,20 @@ where
                         });
                     }
                     MessageHeader::Piece { index, begin, len } => {
-                        // next piece is coming, check if previous buffer is ready
-                        // TODO: FIXME: add backlog to avoid allocating too many new piecebuf
-                        let req = Request { index, begin, len };
-                        if piece_buf.is_none() {
-                            match reuse_buf.try_recv() {
-                                Ok(rb) => *piece_buf = Some(rb),
-                                Err(e) => {
-                                    info!("piece {req:?} coming, BytesMut not recycled {e}, make a new one");
-                                    *piece_buf = Some(BytesMut::new());
-                                }
+                        let mut block_buf = match pool {
+                            Some(p) => {
+                                let mut b = p.acquire().await;
+                                b.clear();
+                                BlockBuf::Pooled(b)
                             }
-                        }
-                        piece_buf
-                            .as_mut()
-                            .expect("piece_buf should be some")
-                            .clear();
-
+                            None => BlockBuf::Owned(BytesMut::new()),
+                        };
                         *partial_read = PartialRead::Piece(PartialPiece {
                             index,
                             begin,
                             len: len as usize,
                             remain: len as usize,
+                            buf: Some(block_buf),
                         })
                     }
                     MessageHeader::Extended { id, len } => {
@@ -2244,29 +2273,24 @@ where
                 return res;
             }
             PartialRead::Piece(p) => {
+                let (index, begin, len) = (p.index, p.begin, p.len);
                 recv_piece_msg(
                     reader,
-                    p,
-                    piece_buf
+                    &mut p.remain,
+                    p.buf
                         .as_mut()
-                        .expect("when receiving a PIECE, piece_buf should be Some"),
+                        .expect("buf set when Piece header arrived")
+                        .deref_mut(),
                 )
                 .await?;
-                let piece = piece_buf
-                    .take()
-                    .expect("when receiving a PIECE, piece_buf should be Some");
-                let (tx, rx) = oneshot::channel();
-                let ret = Ok(Message::Piece(Piece {
-                    index: p.index,
-                    begin: p.begin,
-                    len: p.len as u32,
-                    piece: Some((piece, tx)),
+                let piece = p.buf.take().expect("buf set when Piece header arrived");
+                *partial_read = init_partial_read();
+                return Ok(Message::Piece(Piece {
+                    index,
+                    begin,
+                    len: len as u32,
+                    piece: Some(piece),
                 }));
-                *partial_read = PartialRead::Header {
-                    partial_header: EMPTY_PARTIAL_HEADER,
-                    reuse_buf: rx,
-                };
-                return ret;
             }
             PartialRead::Discard(p) => {
                 discard_remain(reader, p).await?;
@@ -2505,16 +2529,16 @@ where
 
 async fn recv_piece_msg<'a, T>(
     reader: &'a mut T,
-    state: &'a mut PartialPiece,
+    remain: &'a mut usize,
     piece_buf: &'a mut BytesMut,
 ) -> io::Result<()>
 where
     T: AsyncRead + Unpin,
 {
-    let mut limit_reader = reader.take(state.remain as u64);
+    let mut limit_reader = reader.take(*remain as u64);
 
-    while state.remain > 0 {
-        state.remain -= match limit_reader.read_buf(piece_buf).await? {
+    while *remain > 0 {
+        *remain -= match limit_reader.read_buf(piece_buf).await? {
             0 => {
                 return Err(io::Error::new(io::ErrorKind::BrokenPipe, "!"));
             }
@@ -2594,14 +2618,14 @@ where
 async fn recv_extend_handshake<'a, T>(
     reader: &'a mut T,
     pr: &mut PartialRead,
-    buf: &mut Option<BytesMut>, // not used here
+    pool: Option<&Arc<BufferPool<BytesMut>>>,
 ) -> io::Result<(ExtendedHandshake, Vec<Message>)>
 where
     T: AsyncRead + Unpin,
 {
     let mut pending_recvs = vec![];
     loop {
-        let msg = recv_msg(reader, pr, buf).await?;
+        let msg = recv_msg(reader, pr, pool).await?;
         match msg {
             Message::Extended(ExtendedMsg::Handshake(e)) => break Ok((e, pending_recvs)),
             m => pending_recvs.push(m),
@@ -2765,7 +2789,7 @@ pub mod tests {
                     info_hash: [0; 20],
                     reserved: [0; 8].into(),
                     metadata_size: 0,
-                    piece_buf: Some(BytesMut::new()),
+                    buf_pool: Some(Arc::clone(&BLOCK_BUF_POOL)),
                     pending_recvs: self.pending_recvs,
                 },
                 WriteStream {
