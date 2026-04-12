@@ -11,8 +11,10 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
     const SELF_PORT: u16 = 41773;
     const DHT_PORT: u16 = 41774;
 
+    let (non_blocking, _guard) = tracing_appender::non_blocking(std::io::stdout());
     tracing_subscriber::registry();
     tracing_subscriber::fmt()
+        .with_writer(non_blocking)
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_ansi(false)
         .event_format(
@@ -54,7 +56,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let magnet = true;
         if magnet {
-            let magnet: Magnet = ("magnet:?xt=urn:btih:f519d19932012f627e253bb4ec66ae28c89ea9cd&tr=http%3a%2f%2ft.nyaatracker.com%2fannounce&tr=http%3a%2f%2ftracker.kamigami.org%3a2710%2fannounce&tr=http%3a%2f%2fshare.camoe.cn%3a8080%2fannounce&tr=http%3a%2f%2fopentracker.acgnx.se%2fannounce&tr=http%3a%2f%2fanidex.moe%3a6969%2fannounce&tr=http%3a%2f%2ft.acg.rip%3a6699%2fannounce&tr=https%3a%2f%2ftr.bangumi.moe%3a9696%2fannounce&tr=udp%3a%2f%2ftr.bangumi.moe%3a6969%2fannounce&tr=http%3a%2f%2fopen.acgtracker.com%3a1096%2fannounce&tr=udp%3a%2f%2ftracker.opentrackr.org%3a1337%2fannounce")
+            let magnet: Magnet = ("magnet:?xt=urn:btih:9ab078927b3c36d52aee22f36dc85561d66bb1ee&tr=http%3a%2f%2ft.nyaatracker.com%2fannounce&tr=http%3a%2f%2ftracker.kamigami.org%3a2710%2fannounce&tr=http%3a%2f%2fshare.camoe.cn%3a8080%2fannounce&tr=http%3a%2f%2fopentracker.acgnx.se%2fannounce&tr=http%3a%2f%2fanidex.moe%3a6969%2fannounce&tr=http%3a%2f%2ft.acg.rip%3a6699%2fannounce&tr=https%3a%2f%2ftr.bangumi.moe%3a9696%2fannounce&tr=udp%3a%2f%2ftr.bangumi.moe%3a6969%2fannounce&tr=http%3a%2f%2fopen.acgtracker.com%3a1096%2fannounce&tr=udp%3a%2f%2ftracker.opentrackr.org%3a1337%2fannounce")
         .parse()
         .unwrap();
             let info_hash = magnet.info_hash;

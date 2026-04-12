@@ -355,4 +355,39 @@ mod test {
             85
         );
     }
+
+    #[test]
+    fn perf_add_sample_and_query() {
+        // Benchmark: add_sample + count_avg_bw_in + count_bytes_within_period + get_rtt
+        // This simulates what handle_blocks_received does on every call.
+        const ITERATIONS: usize = 10_000;
+
+        let mut bw = Bandwidth::<50>::new();
+        // Warm up with some data
+        for _ in 0..100 {
+            bw.add_sample(16384, Some(Duration::from_millis(300)), Some(100));
+        }
+
+        let start = std::time::Instant::now();
+        for _ in 0..ITERATIONS {
+            bw.add_sample(16384, Some(Duration::from_millis(300)), Some(100));
+            let _ = std::hint::black_box(bw.count_avg_bw_in(Duration::from_millis(1500)));
+            let _ = std::hint::black_box(bw.count_bytes_within_period(Duration::from_secs(10)));
+            let _ = std::hint::black_box(bw.get_rtt());
+            let _ = std::hint::black_box(bw.get_rtt_4var());
+            let _ = std::hint::black_box(bw.count_max_bw_and_min_rtt(Duration::from_millis(1500)));
+        }
+        let elapsed = start.elapsed();
+        let per_iter = elapsed / ITERATIONS as u32;
+
+        eprintln!(
+            "perf_add_sample_and_query: {} iterations, total {:?}, per iter {:?}",
+            ITERATIONS, elapsed, per_iter
+        );
+        assert!(
+            per_iter < std::time::Duration::from_micros(50),
+            "bandwidth add_sample+query too slow: {:?}/iter",
+            per_iter
+        );
+    }
 }

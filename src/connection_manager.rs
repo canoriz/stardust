@@ -514,6 +514,7 @@ where
                     addr,
                     piece,
                     buf: block_buf.expect("Piece message must carry a block buffer"),
+                    recv_time: std::time::Instant::now(),
                 }));
 
                 // TODO: report only when inflight request is almost none

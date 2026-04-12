@@ -100,6 +100,7 @@ pub enum PeerMsg {
         addr: PeerAddr,
         piece: Piece,
         buf: BlockBuf,
+        recv_time: std::time::Instant,
     },
     DhtPort(PeerAddr, u16),
     SuggestPiece(PeerAddr, u32),
@@ -1010,11 +1011,23 @@ impl TransmitWorker {
                     if !h.app_limited {
                         info!("peer {peer} waiting for block buffer — marking app_limited");
                     }
+                    h.max_bw_unlimited = h.max_bw_unlimited.max({
+                        // TODO: FIXME: optimize
+                        let probe_bdp_rtt = compute_probe_bdp_rtt(h.min_rtt);
+                        let look_back_duration = bw_look_back_window(probe_bdp_rtt);
+                        let (max_bw, _, _) = h.get_max_bw(look_back_duration);
+                        max_bw
+                    });
                     h.app_limited = true;
                 }
                 Ok(())
             }
-            PeerMsg::Piece { addr, piece, buf } => self.handle_piece_msg(&addr, piece, buf),
+            PeerMsg::Piece {
+                addr,
+                piece,
+                buf,
+                recv_time,
+            } => self.handle_piece_msg(&addr, piece, buf, recv_time),
             PeerMsg::DhtPort(addr, port) => self.handle_dht_port_msg(addr, port),
             PeerMsg::ExtendMetadata(pa, m) => {
                 self.handle_extend_metadata(pa, m);
@@ -1472,8 +1485,10 @@ impl TransmitWorker {
         peer: &SocketAddr,
         piece: protocol::Piece,
         buf: BlockBuf,
+        recv_time: std::time::Instant,
     ) -> io::Result<()> {
-        debug!("recv {piece:?} from {peer:?}");
+        let queue_delay = recv_time.elapsed();
+        debug!("recv {piece:?} from {peer:?}, queue_delay {queue_delay:?}");
 
         let req = Request {
             index: piece.index,
@@ -1503,7 +1518,7 @@ impl TransmitWorker {
             .connected_peers
             .get_mut(&to_canonical_addr(*peer))
             .expect("should exist");
-        let rtt = block_picker.get_rtt(peer, &req);
+        let rtt = block_picker.get_rtt(peer, &req, recv_time);
         let expected_response_time = block_picker.get_expected_response_time(peer, &req);
         let inflight_when_sent = block_picker.get_inflight_when_sent(peer, &req);
         conn.bw

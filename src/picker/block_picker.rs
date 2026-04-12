@@ -516,21 +516,26 @@ impl BlockPicker {
         }
     }
 
-    pub fn get_rtt(&self, peer: &PeerAddr, req: &Request) -> Option<time::Duration> {
+    pub fn get_rtt(
+        &self,
+        peer: &PeerAddr,
+        req: &Request,
+        recv_time: time::Instant,
+    ) -> Option<time::Duration> {
         if let Some(b) = self.get_block_status(req) {
             match b {
                 BlockStatus::NotRequested { revoked } => {
                     if let Some(p) = revoked.get(peer) {
-                        Some(p.pick_time.elapsed())
+                        Some(recv_time.duration_since(p.pick_time))
                     } else {
                         None
                     }
                 }
                 BlockStatus::Requested { requested, revoked } => {
                     if let Some(p) = revoked.get(peer) {
-                        Some(p.pick_time.elapsed())
+                        Some(recv_time.duration_since(p.pick_time))
                     } else if let Some(p) = requested.get(peer) {
-                        Some(p.pick_time.elapsed())
+                        Some(recv_time.duration_since(p.pick_time))
                     } else {
                         None
                     }
@@ -618,8 +623,10 @@ impl BlockPicker {
         rtt: time::Duration,
         revoked: &mut HashMap<PeerAddr, Vec<Request>>,
     ) -> (BlockRequests, usize) {
-        self.revoke_unrespond(revoked);
-        self.prev_time_check = time::Instant::now();
+        if self.prev_time_check.elapsed() >= time::Duration::from_secs(1) {
+            self.revoke_unrespond(revoked);
+            self.prev_time_check = time::Instant::now();
+        }
 
         let rush_mode = self.rush_mode();
         let endgame = self.update_endgame();
@@ -832,53 +839,53 @@ impl BlockPicker {
         }
 
         let endgame = self.update_endgame();
-        if self.rush_mode() {
-            for (index, blocks) in self.receiving.iter().chain(self.requesting.iter()) {
-                let n_received = blocks.received_count;
-                let n_requesting = blocks
-                    .block_map
-                    .iter()
-                    .filter(|b| matches!(b, BlockStatus::Requested { .. }))
-                    .count();
-                let n_to_request = blocks
-                    .block_map
-                    .iter()
-                    .filter(|b| matches!(b, BlockStatus::NotRequested { .. }))
-                    .count();
-                let least_waiting_time = blocks
-                    .block_map
-                    .iter()
-                    .filter_map(|b| {
-                        if let BlockStatus::Requested { requested, .. } = b {
-                            requested
-                                .iter()
-                                .map(|(p, t)| t.pick_time)
-                                .reduce(|ta, tb| ta.max(tb))
-                        } else {
-                            None
-                        }
-                    })
-                    .reduce(|va, vb| va.max(vb));
-                let most_waiting_time = blocks
-                    .block_map
-                    .iter()
-                    .filter_map(|b| {
-                        if let BlockStatus::Requested { requested, .. } = b {
-                            requested
-                                .iter()
-                                .map(|(p, t)| t.pick_time)
-                                .reduce(|ta, tb| ta.min(tb))
-                        } else {
-                            None
-                        }
-                    })
-                    .reduce(|va, vb| va.min(vb));
-                debug!(
-                    "{peer} in rush mode detail: piece {}, to request {}, requesting {}, received {}, requested least time {:?}, most time {:?}",
-                    index, n_to_request, n_requesting, n_received, least_waiting_time.map(|x| x.elapsed()), most_waiting_time.map(|x| x.elapsed()),
-                );
-            }
-        }
+        // if self.rush_mode() {
+        //     for (index, blocks) in self.receiving.iter().chain(self.requesting.iter()) {
+        //         let n_received = blocks.received_count;
+        //         let n_requesting = blocks
+        //             .block_map
+        //             .iter()
+        //             .filter(|b| matches!(b, BlockStatus::Requested { .. }))
+        //             .count();
+        //         let n_to_request = blocks
+        //             .block_map
+        //             .iter()
+        //             .filter(|b| matches!(b, BlockStatus::NotRequested { .. }))
+        //             .count();
+        //         let least_waiting_time = blocks
+        //             .block_map
+        //             .iter()
+        //             .filter_map(|b| {
+        //                 if let BlockStatus::Requested { requested, .. } = b {
+        //                     requested
+        //                         .iter()
+        //                         .map(|(p, t)| t.pick_time)
+        //                         .reduce(|ta, tb| ta.max(tb))
+        //                 } else {
+        //                     None
+        //                 }
+        //             })
+        //             .reduce(|va, vb| va.max(vb));
+        //         let most_waiting_time = blocks
+        //             .block_map
+        //             .iter()
+        //             .filter_map(|b| {
+        //                 if let BlockStatus::Requested { requested, .. } = b {
+        //                     requested
+        //                         .iter()
+        //                         .map(|(_, t)| t.pick_time)
+        //                         .reduce(|ta, tb| ta.min(tb))
+        //                 } else {
+        //                     None
+        //                 }
+        //             })
+        //             .reduce(|va, vb| va.min(vb));
+        //         debug!(
+        //             "{peer} in rush mode detail: piece {}, to request {}, requesting {}, received {}, requested least time {:?}, most time {:?}",
+        //             index, n_to_request, n_requesting, n_received, least_waiting_time.map(|x| x.elapsed()), most_waiting_time.map(|x| x.elapsed()),
+        //         );
+        //     }
+        // }
         while remain > 0 && !self.strict_rush_mode() {
             let rush_mode = self.rush_mode();
             if let Some(index) = self.piece_picker.pick_next(peer) {
@@ -1922,5 +1929,346 @@ mod test {
         // b.check_block_validity(req)
         // b.have(index);
         // b.is_finished();
+    }
+
+    // ---- Performance benchmarks ----
+
+    /// Helper: create a BlockPicker with `n_pieces` pieces, optionally with some pieces
+    /// already in requesting/receiving state, and `n_peers` peers added.
+    fn make_block_picker_with_state(
+        n_pieces: usize,
+        piece_size: usize,
+        n_peers: usize,
+        n_requesting: usize,
+        n_receiving: usize,
+    ) -> (BlockPicker, Vec<PeerAddr>) {
+        use crate::picker::RarestPicker;
+        let total_size = n_pieces * piece_size;
+        let p = Box::new(RarestPicker::new(total_size, piece_size));
+        let mut bp = BlockPicker::new(total_size, piece_size, p, time::Duration::from_secs(10));
+
+        let mut peers = Vec::new();
+        for i in 0..n_peers {
+            let addr = SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(10, 0, (i / 256) as u8, (i % 256) as u8)),
+                (6881 + i) as u16,
+            );
+            bp.peer_add(addr, PieceState::HaveAll);
+            peers.push(addr);
+        }
+
+        for i in 0..n_pieces {
+            bp.select(i as u32, true);
+        }
+
+        // Simulate some pieces in requesting state
+        let mut revoked = HashMap::new();
+        if n_requesting > 0 && !peers.is_empty() {
+            let (_, _) = bp.pick_blocks(
+                &peers[0],
+                n_requesting * (piece_size / BLOCK_SIZE + 1),
+                0,
+                BLOCK_SIZE as f32,
+                time::Duration::from_millis(100),
+                &mut revoked,
+            );
+        }
+
+        // Move some to receiving state
+        for i in 0..n_receiving.min(n_requesting) {
+            let idx = i as u32;
+            if let Some(blocks) = bp.requesting.remove(&idx) {
+                bp.receiving.insert(idx, blocks);
+            }
+        }
+
+        (bp, peers)
+    }
+
+    #[test]
+    fn perf_pick_blocks_normal_mode() {
+        // Simulate: 500 total pieces, 32 blocks/piece (512KB pieces), 12 peers
+        // Some pieces already in-flight
+        const N_PIECES: usize = 500;
+        const PIECE_SIZE: usize = 16384 * 32; // 512KB
+        const N_PEERS: usize = 12;
+        const N_REQUESTING: usize = 20;
+        const N_RECEIVING: usize = 10;
+        const ITERATIONS: usize = 5000;
+
+        let (mut bp, peers) = make_block_picker_with_state(
+            N_PIECES,
+            PIECE_SIZE,
+            N_PEERS,
+            N_REQUESTING,
+            N_RECEIVING,
+        );
+
+        let start = std::time::Instant::now();
+        for i in 0..ITERATIONS {
+            let peer = &peers[i % N_PEERS];
+            let mut revoked = HashMap::new();
+            let _ = bp.pick_blocks(
+                peer,
+                0, // ticker only: n=0
+                100,
+                BLOCK_SIZE as f32,
+                time::Duration::from_millis(100),
+                &mut revoked,
+            );
+        }
+        let elapsed = start.elapsed();
+        let per_call = elapsed / ITERATIONS as u32;
+
+        eprintln!(
+            "perf_pick_blocks_normal_mode: {} iterations, total {:?}, per call {:?}",
+            ITERATIONS, elapsed, per_call
+        );
+        // Expect < 10µs per call for n=0 pick (ticker path)
+        assert!(
+            per_call < std::time::Duration::from_micros(100),
+            "pick_blocks(n=0) too slow: {:?}/call",
+            per_call
+        );
+    }
+
+    #[test]
+    fn perf_pick_blocks_with_picks() {
+        // Simulate picking blocks in normal mode: 7 requesting pieces, pick 1 at a time
+        // (realistic scenario: 219 in-flight blocks across ~7 pieces)
+        const N_PIECES: usize = 500;
+        const PIECE_SIZE: usize = 16384 * 32;
+        const N_PEERS: usize = 12;
+        const N_PREPICK: usize = 200;
+        const ITERATIONS: usize = 5000;
+
+        let (mut bp, peers) = make_block_picker_with_state(N_PIECES, PIECE_SIZE, N_PEERS, 0, 0);
+
+        // Pre-pick some blocks to simulate in-flight state
+        let mut revoked = HashMap::new();
+        let _ = bp.pick_blocks(
+            &peers[0],
+            N_PREPICK,
+            0,
+            BLOCK_SIZE as f32,
+            time::Duration::from_millis(100),
+            &mut revoked,
+        );
+        eprintln!(
+            "perf_pick_blocks_with_picks setup: {} requesting, {} receiving",
+            bp.requesting.len(),
+            bp.receiving.len()
+        );
+
+        // Measure n=0 path (ticker only, no actual picks)
+        let start = std::time::Instant::now();
+        for i in 0..ITERATIONS {
+            let peer = &peers[i % N_PEERS];
+            let mut revoked = HashMap::new();
+            let _ = bp.pick_blocks(
+                peer,
+                0,
+                N_PREPICK,
+                BLOCK_SIZE as f32,
+                time::Duration::from_millis(100),
+                &mut revoked,
+            );
+        }
+        let elapsed_n0 = start.elapsed();
+        let per_call_n0 = elapsed_n0 / ITERATIONS as u32;
+
+        // Measure n=1 path (pick 1 block per call, also receive blocks to keep state realistic)
+        let start = std::time::Instant::now();
+        let mut max_req = 0usize;
+        let mut max_recv = 0usize;
+        let mut block_cursor = 0u32; // track which blocks we've "received"
+        for i in 0..ITERATIONS {
+            let peer = &peers[i % N_PEERS];
+            let mut revoked = HashMap::new();
+            let _ = bp.pick_blocks(
+                peer,
+                1,
+                200,
+                BLOCK_SIZE as f32,
+                time::Duration::from_millis(100),
+                &mut revoked,
+            );
+            // Simulate receiving work: receive 1 block for every pick
+            // (balance pick and receive to maintain steady-state)
+            let piece_idx = block_cursor / 32;
+            let block_idx = block_cursor % 32;
+            let req = Request {
+                index: piece_idx,
+                begin: block_idx * BLOCK_SIZE as u32,
+                len: BLOCK_SIZE as u32,
+            };
+            if bp.want_block(req) {
+                let _ = bp.receive_block(req);
+            }
+            block_cursor += 1;
+
+            max_req = max_req.max(bp.requesting.len());
+            max_recv = max_recv.max(bp.receiving.len());
+        }
+        let elapsed_n1 = start.elapsed();
+        let per_call_n1 = elapsed_n1 / ITERATIONS as u32;
+
+        eprintln!(
+            "perf_pick_blocks_with_picks: {} iterations\n  n=0 path: total {:?}, per call {:?}\n  n=1 path: total {:?}, per call {:?}\n  max requesting: {}, max receiving: {}",
+            ITERATIONS, elapsed_n0, per_call_n0, elapsed_n1, per_call_n1, max_req, max_recv
+        );
+    }
+
+    #[test]
+    fn perf_receive_block() {
+        // Benchmark receive_block throughput
+        const N_PIECES: usize = 100;
+        const PIECE_SIZE: usize = 16384 * 32;
+        const N_PEERS: usize = 4;
+
+        let (mut bp, peers) = make_block_picker_with_state(N_PIECES, PIECE_SIZE, N_PEERS, 0, 0);
+
+        // First pick enough blocks to fill requesting
+        let mut revoked = HashMap::new();
+        for p in &peers {
+            let _ = bp.pick_blocks(
+                p,
+                1000,
+                0,
+                BLOCK_SIZE as f32,
+                time::Duration::from_millis(100),
+                &mut revoked,
+            );
+        }
+
+        // Now benchmark receiving blocks
+        let n_blocks_per_piece = PIECE_SIZE / BLOCK_SIZE;
+        let total_blocks = N_PIECES * n_blocks_per_piece;
+        let start = std::time::Instant::now();
+        let mut received_count = 0;
+        for piece_idx in 0..N_PIECES as u32 {
+            for block_idx in 0..n_blocks_per_piece as u32 {
+                let req = Request {
+                    index: piece_idx,
+                    begin: block_idx * BLOCK_SIZE as u32,
+                    len: BLOCK_SIZE as u32,
+                };
+                let _ = bp.receive_block(req);
+                received_count += 1;
+            }
+        }
+        let elapsed = start.elapsed();
+        let per_block = elapsed / received_count;
+
+        eprintln!(
+            "perf_receive_block: {} blocks, total {:?}, per block {:?}",
+            received_count, elapsed, per_block
+        );
+        assert!(
+            per_block < std::time::Duration::from_micros(10),
+            "receive_block too slow: {:?}/block",
+            per_block
+        );
+    }
+
+    #[test]
+    fn perf_revoke_unrespond() {
+        // Benchmark revoke_unrespond with many in-flight pieces
+        const N_PIECES: usize = 200;
+        const PIECE_SIZE: usize = 16384 * 32;
+        const N_PEERS: usize = 12;
+        const ITERATIONS: usize = 1000;
+
+        let (mut bp, peers) = make_block_picker_with_state(N_PIECES, PIECE_SIZE, N_PEERS, 0, 0);
+
+        // Fill up requesting and receiving
+        let mut revoked = HashMap::new();
+        for p in &peers {
+            let _ = bp.pick_blocks(
+                p,
+                500,
+                0,
+                BLOCK_SIZE as f32,
+                time::Duration::from_millis(100),
+                &mut revoked,
+            );
+        }
+        eprintln!(
+            "revoke_unrespond setup: {} requesting, {} receiving",
+            bp.requesting.len(),
+            bp.receiving.len()
+        );
+
+        let start = std::time::Instant::now();
+        for _ in 0..ITERATIONS {
+            let mut revoked = HashMap::new();
+            bp.revoke_unrespond(&mut revoked);
+        }
+        let elapsed = start.elapsed();
+        let per_call = elapsed / ITERATIONS as u32;
+
+        eprintln!(
+            "perf_revoke_unrespond: {} iterations ({}req + {}recv pieces), total {:?}, per call {:?}",
+            ITERATIONS,
+            bp.requesting.len(),
+            bp.receiving.len(),
+            elapsed,
+            per_call
+        );
+        assert!(
+            per_call < std::time::Duration::from_millis(1),
+            "revoke_unrespond too slow: {:?}/call",
+            per_call
+        );
+    }
+
+    #[test]
+    fn perf_piece_index_order_sort() {
+        // Benchmark the piece_index_order sort that happens on every pick_blocks call
+        use std::collections::BTreeMap;
+        const N_PIECES: usize = 200;
+        const ITERATIONS: usize = 5000;
+
+        let mut map = BTreeMap::new();
+        for i in 0..N_PIECES as u32 {
+            map.insert(
+                i,
+                PieceBlocks {
+                    piece_index: i,
+                    last_block_size: BLOCK_SIZE,
+                    all_request_or_received_before: 0,
+                    requested_or_received_count: (i as usize) % 32,
+                    received_count: (i as usize) % 16,
+                    block_map: vec![
+                        BlockStatus::NotRequested {
+                            revoked: HashMap::new(),
+                        };
+                        32
+                    ],
+                },
+            );
+        }
+
+        let start = std::time::Instant::now();
+        for _ in 0..ITERATIONS {
+            let mut piece_order: Vec<_> = map
+                .iter()
+                .map(|(i, b)| (*i, b.received_count))
+                .collect();
+            piece_order.sort_by(|(_, recv_a), (_, recv_b)| recv_a.cmp(recv_b).reverse());
+            std::hint::black_box(&piece_order);
+        }
+        let elapsed = start.elapsed();
+        let per_call = elapsed / ITERATIONS as u32;
+
+        eprintln!(
+            "perf_piece_index_order_sort: {} pieces, {} iterations, total {:?}, per call {:?}",
+            N_PIECES, ITERATIONS, elapsed, per_call
+        );
+        assert!(
+            per_call < std::time::Duration::from_micros(100),
+            "piece_index_order sort too slow: {:?}/call",
+            per_call
+        );
     }
 }

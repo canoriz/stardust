@@ -81,9 +81,17 @@ def parse_log_content(lines):
     rtt_var_re = re.compile(
         r"src/transmit_manager\.rs:\d+:\s+(?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+)\s+rtt\s+(?P<rtt>[\d.]+)(?P<rtt_unit>ns|us|µs|ms|s)\s+var\s+(?P<var>[\d.]+)(?P<var_unit>ns|us|µs|ms|s)"
     )
+    # queue_delay
+    queue_delay_re = re.compile(
+        r"src/transmit_manager\.rs:\d+:\s+recv Piece.*from (?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+),\s+queue_delay\s+(?P<val>[\d.]+)(?P<unit>ns|us|µs|ms|s)"
+    )
+    # rush mode (from block_picker: "{peer} endgame {bool}, rush {bool}")
+    rush_re = re.compile(
+        r"block_picker\.rs:\d+:\s+(?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+)\s+endgame (?:true|false), rush (?P<rush>true|false)"
+    )
 
     # --- 核心解析逻辑 ---
-    samples, autos, states, rtt_vars = [], [], [], []
+    samples, autos, states, rtt_vars, queue_delays, rush_events = [], [], [], [], [], []
     for line in lines:
         try:
             parts = line.split()
@@ -111,6 +119,30 @@ def parse_log_content(lines):
                     samples.append({
                         'dt': dt, 'ts': ts, 'peer': match.group('ip_port'),
                         'delay': delay_ms, 'inflight': int(match.group('inflight'))
+                    })
+            elif "queue_delay" in line:
+                match = queue_delay_re.search(line)
+                if match:
+                    raw_val = float(match.group('val'))
+                    unit = match.group('unit')
+                    if unit in ('µs', 'us'):
+                        qd_ms = raw_val / 1000.0
+                    elif unit == 'ns':
+                        qd_ms = raw_val / 1_000_000.0
+                    elif unit == 's':
+                        qd_ms = raw_val * 1000.0
+                    else:
+                        qd_ms = raw_val
+                    queue_delays.append({
+                        'dt': dt, 'ts': ts, 'peer': match.group('ip_port'),
+                        'queue_delay': qd_ms
+                    })
+            elif "endgame" in line and "rush" in line:
+                match = rush_re.search(line)
+                if match:
+                    rush_events.append({
+                        'dt': dt, 'ts': ts, 'peer': match.group('ip_port'),
+                        'rush': match.group('rush') == 'true'
                     })
             elif "change from" in line:
                 match = change_re.search(line)
@@ -188,7 +220,7 @@ def parse_log_content(lines):
                     autos.append(data)
         except Exception: continue
 
-    return pd.DataFrame(samples), pd.DataFrame(autos), pd.DataFrame(states), pd.DataFrame(rtt_vars)
+    return pd.DataFrame(samples), pd.DataFrame(autos), pd.DataFrame(states), pd.DataFrame(rtt_vars), pd.DataFrame(queue_delays), pd.DataFrame(rush_events)
 
 # --- 文件加载 ---
 cmd_file = None
@@ -209,7 +241,7 @@ elif cmd_file:
         lines = f.readlines()
 
 if lines:
-    df_samples, df_autos, df_states, df_rtt_vars = parse_log_content(lines)
+    df_samples, df_autos, df_states, df_rtt_vars, df_queue_delays, df_rush_events = parse_log_content(lines)
 
     if df_samples.empty and df_autos.empty and df_rtt_vars.empty:
         st.error("❌ 未能识别到有效数据。")
@@ -232,6 +264,8 @@ if lines:
     peer_df = df_samples[df_samples['peer'] == selected_peer].copy().sort_values('ts').reset_index(drop=True)
     peer_auto = df_autos[df_autos['peer'] == selected_peer].copy().sort_values('ts').reset_index(drop=True)
     peer_rtt_var = df_rtt_vars[df_rtt_vars['peer'] == selected_peer].copy().sort_values('ts').reset_index(drop=True)
+    peer_queue_delays = df_queue_delays[df_queue_delays['peer'] == selected_peer].copy().sort_values('ts').reset_index(drop=True) if not df_queue_delays.empty else pd.DataFrame()
+    peer_rush_events = df_rush_events[df_rush_events['peer'] == selected_peer].copy().sort_values('ts').reset_index(drop=True) if not df_rush_events.empty else pd.DataFrame()
 
     # --- RTT 平滑处理与速率统计 ---
     if not peer_df.empty or not peer_rtt_var.empty:
@@ -282,6 +316,8 @@ if lines:
     sub_df = peer_df[(peer_df['ts'] >= t_min) & (peer_df['ts'] <= t_max)]
     sub_auto = peer_auto[(peer_auto['ts'] >= t_min) & (peer_auto['ts'] <= t_max)]
     sub_rtt_var = peer_rtt_var[(peer_rtt_var['ts'] >= t_min) & (peer_rtt_var['ts'] <= t_max)]
+    sub_queue_delays = peer_queue_delays[(peer_queue_delays['ts'] >= t_min) & (peer_queue_delays['ts'] <= t_max)] if not peer_queue_delays.empty else pd.DataFrame()
+    sub_rush_events = peer_rush_events[(peer_rush_events['ts'] >= t_min) & (peer_rush_events['ts'] <= t_max)] if not peer_rush_events.empty else pd.DataFrame()
 
     st.title(f"📊 传输详情: {selected_peer}")
 
@@ -526,6 +562,123 @@ if lines:
 
         plt.tight_layout()
         st.pyplot(fig4)
+
+    # 第五部分：Queue Delay & Rush Mode 关系图
+    if not sub_queue_delays.empty:
+        st.markdown("---")
+        st.subheader("⏱️ Queue Delay vs Rush Mode")
+
+        # Build rush mode intervals from events: find contiguous True spans
+        def get_rush_intervals(rush_df):
+            """Return list of (start_dt, end_dt) for rush=True spans."""
+            intervals = []
+            if rush_df.empty:
+                return intervals
+            in_rush = False
+            start_dt = None
+            for _, row in rush_df.iterrows():
+                if row['rush'] and not in_rush:
+                    in_rush = True
+                    start_dt = row['dt']
+                elif not row['rush'] and in_rush:
+                    in_rush = False
+                    intervals.append((start_dt, row['dt']))
+            if in_rush and start_dt is not None:
+                intervals.append((start_dt, rush_df.iloc[-1]['dt']))
+            return intervals
+
+        rush_intervals = get_rush_intervals(sub_rush_events) if not sub_rush_events.empty else []
+
+        fig5, (ax_qd, ax_rush) = plt.subplots(2, 1, figsize=(16, 10), sharex=True)
+
+        # Top: queue_delay over time
+        qd_vals = sub_queue_delays['queue_delay'].values
+        qd_dts = sub_queue_delays['dt'].values
+
+        ax_qd.plot(qd_dts, qd_vals, color='gray', linewidth=0.5, alpha=0.4, label='Raw queue_delay')
+        # EWMA smoothed
+        qd_smooth = sub_queue_delays['queue_delay'].ewm(alpha=0.2, adjust=False).mean().values
+        ax_qd.plot(qd_dts, qd_smooth, color='#e377c2', linewidth=2, label='Smoothed (α=0.2)')
+
+        # Shade rush mode regions
+        for (rs, re_) in rush_intervals:
+            ax_qd.axvspan(rs, re_, color='#ff7f0e', alpha=0.15, label='Rush mode' if (rs, re_) == rush_intervals[0] else "")
+
+        ax_qd.set_ylabel('Queue Delay (ms)')
+        ax_qd.set_title('Queue Delay over Time (orange = rush mode active)')
+        ax_qd.legend(loc='upper left', fontsize='small')
+        ax_qd.grid(True, alpha=0.3)
+        ax_qd.set_yscale('symlog', linthresh=1.0)
+
+        # Bottom: rush mode as step plot (True=1, False=0) — shows when global picker is in rush
+        if not sub_rush_events.empty:
+            rush_y = sub_rush_events['rush'].astype(int).values
+            rush_dts = sub_rush_events['dt'].values
+            ax_rush.step(rush_dts, rush_y, where='post', color='#ff7f0e', linewidth=2)
+            ax_rush.fill_between(rush_dts, rush_y, step='post', color='#ff7f0e', alpha=0.3)
+            ax_rush.set_yticks([0, 1])
+            ax_rush.set_yticklabels(['Normal', 'Rush'])
+        else:
+            ax_rush.text(0.5, 0.5, 'No rush mode events in window', ha='center', transform=ax_rush.transAxes)
+
+        ax_rush.set_ylabel('Picker Mode')
+        ax_rush.set_title('Rush Mode State (all peers)')
+        ax_rush.grid(True, alpha=0.3)
+
+        for ax in [ax_qd, ax_rush]:
+            ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
+            plt.setp(ax.get_xticklabels(), rotation=30, ha='right')
+
+        plt.tight_layout()
+        st.pyplot(fig5)
+
+        # Scatter: queue_delay vs rush state — join on nearest timestamp
+        if not sub_rush_events.empty:
+            st.subheader("📊 Queue Delay Distribution: Rush vs Normal")
+            # For each queue_delay point, find the most recent rush state
+            qd_df2 = sub_queue_delays.copy()
+            rush_sorted = sub_rush_events.sort_values('ts')
+            def last_rush_state(ts_val):
+                idx = rush_sorted['ts'].searchsorted(ts_val, side='right') - 1
+                if idx < 0:
+                    return False
+                return bool(rush_sorted.iloc[idx]['rush'])
+            qd_df2['in_rush'] = qd_df2['ts'].apply(last_rush_state)
+
+            rush_qd = qd_df2[qd_df2['in_rush']]['queue_delay'].values
+            normal_qd = qd_df2[~qd_df2['in_rush']]['queue_delay'].values
+
+            fig6, axes6 = plt.subplots(1, 2, figsize=(14, 5))
+            max_val = max(qd_df2['queue_delay'].max(), 1.0)
+            bins = np.logspace(np.log10(0.01), np.log10(max_val + 1), 60)
+
+            if len(rush_qd) > 0:
+                axes6[0].hist(rush_qd, bins=bins, color='#ff7f0e', alpha=0.7, label=f'Rush (n={len(rush_qd)})')
+            if len(normal_qd) > 0:
+                axes6[0].hist(normal_qd, bins=bins, color='#1f77b4', alpha=0.7, label=f'Normal (n={len(normal_qd)})')
+            axes6[0].set_xscale('log')
+            axes6[0].set_xlabel('Queue Delay (ms, log scale)')
+            axes6[0].set_ylabel('Count')
+            axes6[0].set_title('Queue Delay Histogram by Mode')
+            axes6[0].legend()
+            axes6[0].grid(True, alpha=0.3)
+
+            box_data = [d for d in [rush_qd, normal_qd] if len(d) > 0]
+            box_labels = [lbl for lbl, d in zip(['Rush', 'Normal'], [rush_qd, normal_qd]) if len(d) > 0]
+            if box_data:
+                axes6[1].boxplot(box_data, tick_labels=box_labels, patch_artist=True,
+                                 boxprops=dict(facecolor='#ff7f0e', alpha=0.6),
+                                 notch=True)
+                axes6[1].set_yscale('symlog', linthresh=1.0)
+                axes6[1].set_ylabel('Queue Delay (ms, symlog)')
+                axes6[1].set_title('Box Plot: Queue Delay Rush vs Normal')
+                axes6[1].grid(True, alpha=0.3)
+                rush_med = np.median(rush_qd) if len(rush_qd) > 0 else 0
+                norm_med = np.median(normal_qd) if len(normal_qd) > 0 else 0
+                st.info(f"Median queue_delay — Rush: **{rush_med:.2f} ms** | Normal: **{norm_med:.2f} ms**")
+
+            plt.tight_layout()
+            st.pyplot(fig6)
 
     # 底部指标卡
     st.markdown("---")
