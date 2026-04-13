@@ -5,7 +5,7 @@ use crate::buffer_pool::BlockBuf;
 use crate::cache::simple_buffer::{BufStorage, FlushErr};
 use crate::cache::simple_buffer::{GetPieceErr, PieceBuf};
 use crate::connection_manager::{
-    ConnectionManagerHandle, CtrlOfRecv, CtrlOfSend, CtrlOfSend as ConnMsg,
+    ConnectionManagerHandle, CtrlOfRecv, CtrlOfSend, CtrlOfSend as ConnMsg, ReceivedBlocks,
 };
 use crate::dht::DHT;
 use crate::metadata::{self, Magnet, Metadata};
@@ -96,6 +96,7 @@ pub enum PeerMsg {
     Uninterested(PeerAddr),
     PieceState(PeerAddr, PieceState),
     Have(PeerAddr, u32),
+    Pieces2(PeerAddr, Option<ReceivedBlocks>),
     Piece {
         addr: PeerAddr,
         piece: Piece,
@@ -1025,7 +1026,10 @@ impl TransmitWorker {
                 // TODO: FIXME: add backlog:
                 // if waiting_for_piece has too many pending pieces, slow down picking
                 // and mark app_limited
-                self.handle_blocks_receieved(peer)
+                if let Some(pc) = self.connected_peers.get_mut(&peer) {
+                    pc.conn.recv_stream_cmd(CtrlOfRecv::GetBlocks);
+                }
+                Ok(())
             }
             PeerMsg::BufferWaiting { peer } => {
                 if let Some(h) = self.connected_peers.get_mut(&to_canonical_addr(peer)) {
@@ -1049,6 +1053,17 @@ impl TransmitWorker {
                 buf,
                 recv_time,
             } => self.handle_piece_msg(&addr, piece, buf, recv_time),
+            PeerMsg::Pieces2(peer, receive_blks) => {
+                if let Some(blks) = receive_blks {
+                    for (piece_index, p) in blks.blocks {
+                        for piece in p {
+                            self.handle_piece_msg(&peer, piece.piece, piece.buf, piece.recv_time)?;
+                        }
+                    }
+                }
+                self.handle_blocks_receieved(peer)
+                // todo!();
+            }
             PeerMsg::DhtPort(addr, port) => self.handle_dht_port_msg(addr, port),
             PeerMsg::ExtendMetadata(pa, m) => {
                 self.handle_extend_metadata(pa, m);

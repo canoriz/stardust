@@ -1,4 +1,5 @@
 use bytes::BytesMut;
+use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -52,9 +53,34 @@ pub(crate) enum CtrlOfSend {
 }
 
 #[derive(Debug)]
+pub struct ReceivedPiece {
+    /// The piece msg
+    pub piece: Piece,
+    /// piece data
+    pub buf: BlockBuf,
+    /// timestamp when the piece is received
+    pub recv_time: std::time::Instant,
+}
+
+#[derive(Debug)]
+pub struct ReceivedBlocks {
+    /// map of piece_index -> blocks of this piece
+    pub blocks: HashMap<u32, Vec<ReceivedPiece>>,
+}
+
+impl ReceivedBlocks {
+    pub fn new() -> Self {
+        Self {
+            blocks: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub(crate) enum CtrlOfRecv {
     /// force recv stream to report statistics
     ReportStat,
+    GetBlocks,
 }
 
 pub(crate) struct ConnectionManagerHandle {
@@ -108,6 +134,7 @@ impl ConnectionManagerHandle {
             transmit_handle: trh.clone(),
             _drop_guard: conn_break_guard.clone(),
             current_buf: None,
+            received_blocks: None,
         };
 
         let (send_tx, send_rx) = mpsc::unbounded_channel();
@@ -283,10 +310,14 @@ struct RecvStream<T> {
     read_stream: ReadStream<T>,
     transmit_handle: TransmitManagerHandle,
     _drop_guard: Arc<NotifyTransmitGuard>,
+
     /// Holds the partially-filled block buffer across a cancel inside `recv_piece_body`.
     /// `None` until `recv_next` receives `RecvResult::PiecePending` and allocates a slot.
     /// Set back to `None` after the body is fully received.
     current_buf: Option<PooledBuf<BytesMut>>,
+
+    /// Received blocks are stored here until transmit manager asks for
+    received_blocks: Option<ReceivedBlocks>,
 }
 
 struct SendStreamHandle {
@@ -453,6 +484,18 @@ where
                 debug!("{} received report stat cmd", self.read_stream.peer_addr());
                 self.handle_report_tick();
             }
+            CtrlOfRecv::GetBlocks => {
+                debug!("{} received get blocks cmd", self.read_stream.peer_addr());
+                let blks = self.received_blocks.take();
+                self.transmit_handle
+                    .sender
+                    .send(TransmitMsg::PeerMsg(PeerMsg::Pieces2(
+                        self.read_stream.peer_addr(),
+                        blks,
+                    )))
+                    .unwrap();
+                // TODO: handle get blocks command
+            }
         }
     }
 
@@ -510,15 +553,26 @@ where
                     .send(TransmitMsg::PeerMsg(PeerMsg::Request(addr, req)));
             }
             Message::Piece(piece) => {
-                tmh.sender.send(TransmitMsg::PeerMsg(PeerMsg::Piece {
-                    addr,
-                    piece,
-                    buf: block_buf.expect("Piece message must carry a block buffer"),
-                    recv_time: std::time::Instant::now(),
-                }));
-
-                // TODO: report only when inflight request is almost none
-                self.handle_report_tick();
+                let new = if self.received_blocks.is_none() {
+                    self.received_blocks = Some(ReceivedBlocks::new());
+                    true
+                } else {
+                    false
+                };
+                self.received_blocks
+                    .as_mut()
+                    .unwrap()
+                    .blocks
+                    .entry(piece.index)
+                    .or_default()
+                    .push(ReceivedPiece {
+                        piece,
+                        buf: block_buf.expect("Piece message must carry a block buffer"),
+                        recv_time: std::time::Instant::now(),
+                    });
+                if new {
+                    self.handle_report_tick();
+                }
             }
             Message::Cancel(req) => {
                 tmh.sender
