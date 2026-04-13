@@ -18,6 +18,9 @@ pub struct NormalFile {
     file: File,
 }
 
+/// writes to void, used for tests only
+pub struct VoidFile {}
+
 pub trait Access: Sized + Sync {
     // Now have difficulties set attributes for opener
     // every single change needs a totally new type
@@ -113,6 +116,27 @@ impl Access for NormalFile {
         Ok(FileMetadata {
             len: meta.len() as usize,
         })
+    }
+}
+
+impl Access for VoidFile {
+    fn open<P>(_path: P) -> Result<Self>
+    where
+        P: AsRef<Path>,
+    {
+        Ok(Self {})
+    }
+
+    fn write_all_at(&mut self, _buf: &[u8], _offset: usize) -> Result<()> {
+        Ok(())
+    }
+
+    fn read_exact_at(&mut self, _buf: &mut [u8], _offset: usize) -> Result<()> {
+        Ok(())
+    }
+
+    fn metadata(&self) -> Result<FileMetadata> {
+        Ok(FileMetadata { len: 0 })
     }
 }
 

@@ -1,5 +1,5 @@
 use crate::announce_manager::{self, AnnounceManagerHandle};
-use crate::backfile::{BackFile, NormalFile};
+use crate::backfile::{BackFile, NormalFile, VoidFile};
 use crate::bandwidth::{self, Bandwidth, RTT};
 use crate::buffer_pool::BlockBuf;
 use crate::cache::simple_buffer::{BufStorage, FlushErr};
