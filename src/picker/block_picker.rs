@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info};
+use tracing::{debug, info, instrument};
 
 use super::{
     BitField, BlockRange, BlockRequests, PeerAddr, PeerPieceDetail, PieceMap, PiecePicker,
@@ -516,6 +516,7 @@ impl BlockPicker {
         }
     }
 
+    #[instrument(skip_all)]
     pub fn get_rtt(
         &self,
         peer: &PeerAddr,
@@ -547,6 +548,7 @@ impl BlockPicker {
         }
     }
 
+    #[instrument(skip_all)]
     pub fn get_inflight_when_sent(&self, peer: &PeerAddr, req: &Request) -> Option<usize> {
         if let Some(b) = self.get_block_status(req) {
             match b {
@@ -573,6 +575,7 @@ impl BlockPicker {
         }
     }
 
+    #[instrument(skip_all)]
     pub fn get_expected_response_time(
         &self,
         peer: &PeerAddr,
@@ -1006,6 +1009,7 @@ impl BlockPicker {
     /// if a piece is fully received,
     /// revoked requests,
     /// )
+    #[instrument(skip_all)]
     pub fn receive_block(&mut self, req: Request) -> (Option<u32>, Vec<PeerAddr>) {
         if !self.check_block_validity(&req) {
             return (None, vec![]);
@@ -1093,6 +1097,7 @@ impl BlockPicker {
     }
 
     /// check if we want this block
+    #[instrument(skip_all)]
     pub fn want_block(&mut self, req: Request) -> bool {
         if !self.check_block_validity(&req) {
             println!("unwant because invalid {req:?}");
@@ -1996,13 +2001,8 @@ mod test {
         const N_RECEIVING: usize = 10;
         const ITERATIONS: usize = 5000;
 
-        let (mut bp, peers) = make_block_picker_with_state(
-            N_PIECES,
-            PIECE_SIZE,
-            N_PEERS,
-            N_REQUESTING,
-            N_RECEIVING,
-        );
+        let (mut bp, peers) =
+            make_block_picker_with_state(N_PIECES, PIECE_SIZE, N_PEERS, N_REQUESTING, N_RECEIVING);
 
         let start = std::time::Instant::now();
         for i in 0..ITERATIONS {
@@ -2251,10 +2251,7 @@ mod test {
 
         let start = std::time::Instant::now();
         for _ in 0..ITERATIONS {
-            let mut piece_order: Vec<_> = map
-                .iter()
-                .map(|(i, b)| (*i, b.received_count))
-                .collect();
+            let mut piece_order: Vec<_> = map.iter().map(|(i, b)| (*i, b.received_count)).collect();
             piece_order.sort_by(|(_, recv_a), (_, recv_b)| recv_a.cmp(recv_b).reverse());
             std::hint::black_box(&piece_order);
         }

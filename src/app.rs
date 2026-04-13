@@ -1,6 +1,7 @@
 use anyhow::Result;
 use tokio::time::{self, Duration};
 use tracing::info;
+use tracing_subscriber::fmt::format::FmtSpan;
 
 use crate::metadata::{self, Magnet};
 use crate::session::{Session, SessionOpt};
@@ -17,6 +18,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_writer(non_blocking)
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_ansi(false)
+        .with_span_events(FmtSpan::CLOSE | FmtSpan::ENTER)
         .event_format(
             tracing_subscriber::fmt::format()
                 .with_file(true)
@@ -33,7 +35,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .self_id(SELF_ID)
                 .build(),
         );
-        let torrent_f = include_bytes!("../tutu.torrent");
+        let torrent_f = include_bytes!("../test-large.torrent");
         let torrent = metadata::FileMetadata::load(torrent_f).unwrap();
         let (metadata, announce_list) = torrent.to_metadata();
         let info_hash = metadata.info_hash;

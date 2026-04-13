@@ -27,7 +27,7 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time;
 use tokio_util::sync::{CancellationToken, DropGuard as CancelDropGuard};
-use tracing::{debug, info, warn};
+use tracing::{debug, info, instrument, span, warn, Level};
 
 mod bandwidth_mode;
 mod inflight;
@@ -502,6 +502,27 @@ pub struct TransmitWorker {
 
     downloaded: watch::Sender<bool>,
 }
+
+// impl std::fmt::Debug for TransmitWorker {
+//     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+//         use crate::helper::to_hex;
+//         f.debug_struct("TransmitWorker")
+//             .field("id", &to_hex(&self.id))
+//             .field("info_hash", &to_hex(&self.info_hash))
+//             // .field("handshake_opt", &self.handshake_opt)
+//             // .field("dht_client", &self.dht_client)
+//             // .field("announce_manager", &self.announce_manager)
+//             // .field("torrent_state", &self.torrent_state)
+//             // .field("running_state", &self.running_state)
+//             // .field("receiver", &self.receiver)
+//             // .field("self_handle", &self.self_handle)
+//             // .field("connected_peers", &self.connected_peers)
+//             // .field("connecting_peers", &self.connecting_peers)
+//             // .field("waiting_for_piecebuf", &self.waiting_for_piecebuf)
+//             // .field("downloaded", &self.downloaded)
+//             .finish()
+//     }
+// }
 
 struct BlockWaitingBuf {
     piece: Piece,
@@ -1125,6 +1146,7 @@ impl TransmitWorker {
         }
     }
 
+    #[instrument(skip_all)]
     fn get_piecebuf(
         storage: &mut BufStorage,
         sender: mpsc::UnboundedSender<Msg>,
@@ -1168,6 +1190,7 @@ impl TransmitWorker {
         Ok(storage.get_piece(index, |_| {}, Box::new(|_| {})).unwrap())
     }
 
+    #[instrument(skip_all)]
     fn handle_blocks_receieved(&mut self, peer: PeerAddr) -> io::Result<()> {
         info!("get BlockReceived from {peer}");
         // TODO: OPTIMIZE: return connection handle to reduce map search
@@ -1480,6 +1503,7 @@ impl TransmitWorker {
 
     /// handle PIECE message
     // TODO: fix the return type
+    #[instrument(skip(self, buf, recv_time), fields(delay = ?recv_time.elapsed()))]
     fn handle_piece_msg(
         &mut self,
         peer: &SocketAddr,
@@ -1488,7 +1512,7 @@ impl TransmitWorker {
         recv_time: std::time::Instant,
     ) -> io::Result<()> {
         let queue_delay = recv_time.elapsed();
-        debug!("recv {piece:?} from {peer:?}, queue_delay {queue_delay:?}");
+        warn!("recv {piece:?} from {peer:?}, queue_delay {queue_delay:?}");
 
         let req = Request {
             index: piece.index,
@@ -1552,6 +1576,8 @@ impl TransmitWorker {
             }
         }
 
+        let span2 = span!(Level::INFO, "span2");
+        let _enter = span2.enter();
         let mut switch_to_slowdown_due_to_slow_rtt = false;
         match &mut conn.bw_mode {
             BandwidthMode::Startup { .. } => {

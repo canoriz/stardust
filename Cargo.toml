@@ -58,3 +58,6 @@ path = "src/lib.rs"
 
 [features]
 mock_delay = []
+
+[profile.release]
+debug = true

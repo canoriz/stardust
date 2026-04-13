@@ -663,7 +663,7 @@ where
     }
 }
 
-#[derive(Builder, Clone)]
+#[derive(Builder, Clone, Debug)]
 pub struct HandshakeOption {
     #[builder(default = true)]
     pub pex: bool,
@@ -1651,7 +1651,8 @@ fn bytes_to_metadata(mut data: BytesMut) -> io::Result<ExtendedMetadata> {
             piece,
             total_size,
         } => {
-            let rest = data.split_off(de.byte_offset());
+            let at = de.byte_offset();
+            let rest = data.freeze().split_off(at);
             Ok(ExtendedMetadata::Data {
                 piece,
                 data: rest.to_vec(),

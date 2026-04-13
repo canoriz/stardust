@@ -4,7 +4,7 @@ mod regression;
 mod rtt;
 pub use regression::SlidingWindowRegression;
 pub use rtt::{ALPHA, BETA, RTT};
-use tracing::{info, trace};
+use tracing::{info, instrument, trace};
 
 #[derive(Debug, Clone)]
 pub(crate) struct Bandwidth<const SLOT_SIZE: usize> {
@@ -85,6 +85,7 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
     /// how many new bytes received
     /// if given rtt, use this rtt
     /// if not given, will use an average rtt
+    #[instrument(skip_all)]
     pub fn add_sample(
         &mut self,
         n_bytes: usize,
