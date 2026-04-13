@@ -1054,13 +1054,16 @@ impl TransmitWorker {
                 recv_time,
             } => self.handle_piece_msg(&addr, piece, buf, recv_time),
             PeerMsg::Pieces2(peer, receive_blks) => {
+                let mut count = 0;
                 if let Some(blks) = receive_blks {
                     for (piece_index, p) in blks.blocks {
                         for piece in p {
+                            count += 1;
                             self.handle_piece_msg(&peer, piece.piece, piece.buf, piece.recv_time)?;
                         }
                     }
                 }
+                debug!("handled {count} piece messages");
                 self.handle_blocks_receieved(peer)
                 // todo!();
             }
@@ -1251,7 +1254,7 @@ impl TransmitWorker {
             likely_respond_within,
             likely_recv_next_within
         );
-        warn!("peer {peer} estimated max bandwidth {max_bw}, min rtt {:?}, min rtt in period {:?} req in flight: {}", conn.min_rtt, min_rtt_in_period, conn.inflight.inflight());
+        info!("peer {peer} estimated max bandwidth {max_bw}, min rtt {:?}, min rtt in period {:?} req in flight: {}", conn.min_rtt, min_rtt_in_period, conn.inflight.inflight());
 
         let n_req_in_flight = conn.inflight.inflight();
 
@@ -1527,7 +1530,7 @@ impl TransmitWorker {
         recv_time: std::time::Instant,
     ) -> io::Result<()> {
         let queue_delay = recv_time.elapsed();
-        warn!("recv {piece:?} from {peer:?}, queue_delay {queue_delay:?}");
+        info!("recv {piece:?} from {peer:?}, queue_delay {queue_delay:?}");
 
         let req = Request {
             index: piece.index,

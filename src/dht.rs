@@ -14,6 +14,7 @@ use std::time;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::{CancellationToken, DropGuard};
+use tracing::instrument;
 use tracing::{debug, info, warn};
 
 mod routing;
@@ -332,6 +333,7 @@ impl DHT {
         })
     }
 
+    #[instrument(skip_all, fields(krpc_inner = ?krpc_inner, timeout), ret)]
     async fn do_rpc_req<A>(
         &self,
         addr: RpcAddr<A>,
@@ -452,6 +454,7 @@ impl DHT {
         self.do_rpc_req(addr, krpc_inner, timeout).await
     }
 
+    #[instrument(skip_all)]
     pub async fn get_peers_rpc<A>(
         self: &Arc<Self>,
         addr: RpcAddr<A>,
@@ -461,6 +464,9 @@ impl DHT {
     where
         A: ToSocketAddrs,
     {
+        if let Some(id) = &addr.id {
+            debug!("send get_peers to {:?}", crate::helper::to_hex(id));
+        }
         let krpc_inner = KRPCInner::Request(Arg::GetPeers(GetPeersArg {
             id: self.id,
             info_hash,
@@ -492,10 +498,11 @@ impl DHT {
     }
 
     /// get_peers queries peers of target
+    #[instrument(skip_all, fields(target = crate::helper::to_hex(&target), ipv6), ret)]
     pub async fn get_peers(self: &Arc<Self>, target: NodeID, ipv6: bool) -> Vec<SocketAddr> {
         let timeout = time::Duration::from_secs(5);
         let ns = self.find_closest_node_to(target, ipv6).await;
-        debug!("dht {target:?} nearest nodes: {ns:?}");
+        debug!("nearest nodes: {ns:?}");
 
         use tokio::task::JoinSet;
         let mut js = JoinSet::new();
@@ -876,7 +883,7 @@ impl Server {
                 _ = self.send_response(from_addr, &resp).await;
             }
             KRPCInner::Request(Arg::GetPeers(gp)) => {
-                debug!("receive get_peer from {}", from_addr);
+                debug!("receive get_peer from {} {gp:?}", from_addr);
                 add_route(gp.id);
                 self.nodes_buf.clear();
                 if ipv6 {
