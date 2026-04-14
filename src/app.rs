@@ -35,7 +35,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .self_id(SELF_ID)
                 .build(),
         );
-        let torrent_f = include_bytes!("../tutu.torrent");
+        let torrent_f = include_bytes!("../test-large.torrent");
         let torrent = metadata::FileMetadata::load(torrent_f).unwrap();
         let (metadata, announce_list) = torrent.to_metadata();
         let info_hash = metadata.info_hash;
