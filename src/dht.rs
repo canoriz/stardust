@@ -283,7 +283,7 @@ impl DHT {
         tmap: Arc<Mutex<TransactionMap>>,
         cancel: CancellationToken,
     ) -> io::Result<()> {
-        use socket2::{Domain, Protocol, Socket, Type};
+        use socket2::{Domain, Protocol, Type};
 
         // TODO: multi-homing is common in ipv6
         // should bind to public address, see BEP 32
@@ -497,11 +497,12 @@ impl DHT {
         self.do_rpc_req(addr, krpc_inner, timeout).await
     }
 
-    /// get_peers queries peers of target
-    #[instrument(skip_all, fields(target = crate::helper::to_hex(&target), ipv6), ret)]
-    pub async fn get_peers(self: &Arc<Self>, target: NodeID, ipv6: bool) -> Vec<SocketAddr> {
+    /// get_peers queries peers of target across both IPv4 and IPv6.
+    #[instrument(skip_all, fields(target = crate::helper::to_hex(&target)), ret)]
+    pub async fn get_peers(self: &Arc<Self>, target: NodeID) -> Vec<SocketAddr> {
         let timeout = time::Duration::from_secs(5);
-        let ns = self.find_closest_node_to(target, ipv6).await;
+        let (ns4, ns6) = self.find_closest_node_to(target).await;
+        let ns: Vec<NodeAddr> = ns4.into_iter().chain(ns6).collect();
         debug!("nearest nodes: {ns:?}");
 
         use tokio::task::JoinSet;
@@ -532,113 +533,149 @@ impl DHT {
         ret
     }
 
-    /// find closest nodes to target, returns closest IPV4 or IPV6 nodes
+    /// Find the K closest nodes to `target` across both IPv4 and IPv6.
+    ///
+    /// Returns `(v4_closest, v6_closest)` — up to K nodes each, converged
+    /// independently.  Each family runs a full Kademlia iterative lookup:
+    /// referrals from either family are fed into the correct candidate set,
+    /// and the search terminates only when no family has unqueried candidates
+    /// left in its top-K.
     pub async fn find_closest_node_to(
         self: &Arc<Self>,
         target: NodeID,
-        ipv6: bool,
-    ) -> Vec<NodeAddr> {
+    ) -> (Vec<NodeAddr>, Vec<NodeAddr>) {
         const K: usize = 8;
         const ALPHA: usize = 3;
         let timeout = time::Duration::from_secs(5);
 
-        let send_req = |client: Arc<DHT>,
-                        target: NodeID,
-                        timeout: time::Duration,
-                        addr: RpcAddr<SocketAddr>,
-                        resp: mpsc::Sender<Result<Vec<NodeAddr>, NodeID>>| {
+        // Channel message: Ok((v4_referrals, v6_referrals)) on success, Err(id) on timeout.
+        type Err = (SocketAddr, Option<NodeID>);
+        type Msg = Result<(Vec<NodeAddr>, Vec<NodeAddr>), Err>;
+
+        // Spawns a FindNode RPC; splits the response into (v4, v6) candidate lists.
+        // `target` and `timeout` are Copy and captured from the outer scope.
+        let send_req = |client: Arc<DHT>, addr: RpcAddr<SocketAddr>, tx: mpsc::Sender<Msg>| {
             tokio::spawn(async move {
                 let node_id = addr.id;
-                let mut ns = Vec::with_capacity(8);
                 match client.find_node_rpc(addr, target, timeout).await {
                     Ok(r) => {
-                        if let Some(n4) = r.nodes {
-                            ns.extend(n4.0.into_iter().map(|(id, a)| NodeAddr {
-                                id,
-                                addr: SocketAddr::V4(a),
-                            }))
-                        }
-                        if let Some(n6) = r.nodes6 {
-                            ns.extend(n6.0.into_iter().map(|(id, a)| NodeAddr {
-                                id,
-                                addr: SocketAddr::V6(a),
-                            }))
-                        }
-                        ns.sort_by_cached_key(|n| dist(&target, &n.id));
-                        _ = resp.send(Ok(ns)).await;
+                        let mut v4 = r.nodes.map_or(vec![], |n| {
+                            n.0.into_iter()
+                                .map(|(id, a)| NodeAddr {
+                                    id,
+                                    addr: SocketAddr::V4(a),
+                                })
+                                .collect()
+                        });
+                        let v6 = r.nodes6.map_or(vec![], |n| {
+                            n.0.into_iter()
+                                .filter_map(|(id, a)| {
+                                    // IPv4-mapped addresses belong in v4
+                                    if let Some(v4addr) = a.ip().to_ipv4_mapped() {
+                                        v4.push(NodeAddr {
+                                            id,
+                                            addr: SocketAddr::V4(SocketAddrV4::new(
+                                                v4addr,
+                                                a.port(),
+                                            )),
+                                        });
+                                        return None;
+                                    }
+                                    Some(NodeAddr {
+                                        id,
+                                        addr: SocketAddr::V6(a),
+                                    })
+                                })
+                                .collect()
+                        });
+                        _ = tx.send(Ok((v4, v6))).await;
+                        // TODO we did not sort result
                     }
                     Err(e) => {
-                        if let Some(id) = node_id {
-                            debug!(
-                                "in find_closest_node, node {addr:?} does not respond, error {e}"
-                            );
-                            _ = resp.send(Err(id)).await;
-                        }
+                        debug!("find_closest_node: {addr:?} did not respond: {e}");
+                        _ = tx.send(Err((addr.addr, node_id))).await;
                     }
-                };
+                }
             })
         };
 
         #[derive(Debug, Eq, PartialEq)]
-        enum State {
-            Seen,    // known but not queried nodes
-            Queried, // queried nodes
-            Deleted, // unreachable nodes
+        enum NodeState {
+            Seen,    // candidate discovered, not yet queried
+            Queried, // query in flight or completed
+            Dead,    // did not respond
         }
 
         use routing::Dist;
-        let (resp_tx, mut resp_rx) = mpsc::channel::<Result<Vec<NodeAddr>, NodeID>>(K);
-        let mut node_state: HashMap<NodeID, State> = HashMap::new();
-        let mut closest_nodes: BTreeSet<Dist> = BTreeSet::new();
+        let (resp_tx, mut resp_rx) = mpsc::channel::<Msg>(8 * K);
+        let mut node_state4: HashMap<NodeID, NodeState> = HashMap::new();
+        let mut node_state6: HashMap<NodeID, NodeState> = HashMap::new();
+        let mut closest_nodes4: BTreeSet<Dist> = BTreeSet::new();
+        let mut closest_nodes6: BTreeSet<Dist> = BTreeSet::new();
 
         // send the initial node candidates
         // in_flight tracks responses still pending; start at 1 for the initial seed message.
         let mut in_flight: usize = 1;
         _ = resp_tx
-            .send(Ok(self.get_k_closest(target, K, ipv6).await))
+            .send(Ok((
+                self.get_k_closest(target, K, false).await,
+                self.get_k_closest(target, K, true).await,
+            )))
             .await;
 
-        let mut nodes = vec![];
+        let mut nodes4 = vec![];
+        let mut nodes6 = vec![];
         while let Some(r) = resp_rx.recv().await {
             in_flight -= 1;
             match r {
-                Ok(nodes) => {
-                    for n in nodes {
-                        match node_state.get(&n.id) {
-                            Some(State::Deleted) => {
-                                closest_nodes.retain(|x| x.addr.id != n.id);
+                Ok((n4, n6)) => {
+                    for n in n4 {
+                        if matches!(node_state4.get(&n.id), None) {
+                            node_state4.insert(n.id, NodeState::Seen);
+                            closest_nodes4.insert(Dist {
+                                dist: dist(&target, &n.id),
+                                addr: n,
+                            });
+                            if closest_nodes4.len() > K {
+                                closest_nodes4.pop_last();
                             }
-                            None => {
-                                node_state.insert(n.id, State::Seen);
-                                closest_nodes.insert(Dist {
-                                    dist: dist(&target, &n.id),
-                                    addr: n,
-                                });
-                                if closest_nodes.len() > K {
-                                    closest_nodes.pop_last();
-                                }
+                        }
+                    }
+                    for n in n6 {
+                        if matches!(node_state6.get(&n.id), None) {
+                            node_state6.insert(n.id, NodeState::Seen);
+                            closest_nodes6.insert(Dist {
+                                dist: dist(&target, &n.id),
+                                addr: n,
+                            });
+                            if closest_nodes6.len() > K {
+                                closest_nodes6.pop_last();
                             }
-                            Some(_) => {}
                         }
                     }
                 }
-                Err(id) => {
+                Err((addr, id)) => {
                     debug!("receive response from {id:?} error");
-                    node_state.insert(id, State::Deleted);
-                    closest_nodes.retain(|x| x.addr.id != id);
+                    if let Some(id) = id {
+                        if addr.is_ipv4() {
+                            node_state4.insert(id, NodeState::Dead);
+                            closest_nodes4.retain(|x| x.addr.id != id);
+                        } else {
+                            node_state6.insert(id, NodeState::Dead);
+                            closest_nodes6.retain(|x| x.addr.id != id);
+                        }
+                    }
                 }
             }
 
-            // how many node we know
+            // q: how many closest nodes we know
             let mut q = 0;
-            for Dist { addr, .. } in closest_nodes.iter() {
-                match node_state.get(&addr.id) {
-                    Some(State::Seen) | None => {
-                        node_state.insert(addr.id, State::Queried);
+            for Dist { addr, .. } in closest_nodes4.iter() {
+                match node_state4.get(&addr.id) {
+                    Some(NodeState::Seen) | None => {
+                        node_state4.insert(addr.id, NodeState::Queried);
                         send_req(
                             self.clone(),
-                            target,
-                            timeout,
                             RpcAddr::id(addr.id, addr.addr),
                             resp_tx.clone(),
                         );
@@ -648,17 +685,41 @@ impl DHT {
                             break;
                         }
                     }
-                    Some(s) => assert_eq!(*s, State::Queried),
+                    Some(NodeState::Queried) => {}
+                    Some(NodeState::Dead) => unreachable!("dead node in closest_nodes4"),
+                }
+            }
+
+            // q: how many closest nodes we know
+            let mut q = 0;
+            for Dist { addr, .. } in closest_nodes6.iter() {
+                match node_state6.get(&addr.id) {
+                    Some(NodeState::Seen) | None => {
+                        node_state6.insert(addr.id, NodeState::Queried);
+                        send_req(
+                            self.clone(),
+                            RpcAddr::id(addr.id, addr.addr),
+                            resp_tx.clone(),
+                        );
+                        in_flight += 1;
+                        q += 1;
+                        if q >= ALPHA {
+                            break;
+                        }
+                    }
+                    Some(NodeState::Queried) => {}
+                    Some(NodeState::Dead) => unreachable!("dead node in closest_nodes6"),
                 }
             }
 
             if in_flight == 0 {
                 // we did not found any closer nodes
-                nodes = closest_nodes.into_iter().map(|x| x.addr).collect();
+                nodes4 = closest_nodes4.into_iter().map(|x| x.addr).collect();
+                nodes6 = closest_nodes6.into_iter().map(|x| x.addr).collect();
                 break;
             }
         }
-        nodes
+        (nodes4, nodes6)
     }
 }
 
@@ -711,6 +772,17 @@ fn to_nodes64(ns: &[NodeAddr], v4: &mut VecNode4, v6: &mut VecNode6) {
             SocketAddr::V6(s6) => r6.push((na.id, s6)),
         }
     }
+}
+
+/// Convert an IPv4-mapped IPv6 address (::ffff:x.x.x.x) to a plain IPv4 address.
+/// All other addresses are returned unchanged.
+fn normalize_addr(addr: SocketAddr) -> SocketAddr {
+    if let SocketAddr::V6(v6) = addr {
+        if let Some(ipv4) = v6.ip().to_ipv4_mapped() {
+            return SocketAddr::V4(SocketAddrV4::new(ipv4, v6.port()));
+        }
+    }
+    addr
 }
 
 fn is_ipv6(addr: SocketAddr) -> bool {
@@ -797,18 +869,15 @@ impl Server {
 
     async fn handle_krpc_in(&mut self, krpc: KRPC, from_addr: SocketAddr) {
         let version: ByteString = "st01".into();
-        let ipv6 = is_ipv6(from_addr);
-        let mut add_route = |id: NodeID| {
+        let from_ipv6 = is_ipv6(from_addr);
+        let mut add_route = |id: NodeID, addr: SocketAddr, reachable: bool| {
+            // Normalize IPv4-mapped-IPv6 addresses so they go into route4 with a true IPv4 addr.
+            let addr = normalize_addr(addr);
+            let ipv6 = is_ipv6(addr);
             if ipv6 {
-                self.route6.add_route(NodeAddr {
-                    id,
-                    addr: from_addr,
-                });
+                self.route6.add_route(NodeAddr { id, addr }, reachable);
             } else {
-                self.route4.add_route(NodeAddr {
-                    id,
-                    addr: from_addr,
-                });
+                self.route4.add_route(NodeAddr { id, addr }, reachable);
             }
         };
         match krpc.inner {
@@ -825,12 +894,12 @@ impl Server {
                         values: None,
                     }),
                 };
-                add_route(p.id);
+                add_route(p.id, from_addr, false);
                 _ = self.send_response(from_addr, &resp).await;
             }
             KRPCInner::Request(Arg::AnnouncePeer(a)) => {
                 debug!("receive announce_peer from {}", from_addr);
-                add_route(a.id);
+                add_route(a.id, from_addr, false);
                 let port = if let Some(1) = a.implied_port {
                     from_addr.port()
                 } else {
@@ -857,9 +926,9 @@ impl Server {
             }
             KRPCInner::Request(Arg::FindNode(f)) => {
                 debug!("receive find_node from {}", from_addr);
-                add_route(f.id);
+                add_route(f.id, from_addr, false);
                 self.nodes_buf.clear();
-                if ipv6 {
+                if from_ipv6 {
                     // TODO: support "want" field
                     self.route6
                         .get_k_closest_nodes(&f.target, 8, &mut self.nodes_buf);
@@ -874,8 +943,8 @@ impl Server {
                     inner: KRPCInner::Response(Resp {
                         id: self.id,
                         // TODO: optimize clone, use ref or cow
-                        nodes: (!ipv6).then_some(self.nodes4_buf.clone()),
-                        nodes6: (ipv6).then_some(self.nodes6_buf.clone()),
+                        nodes: (!from_ipv6).then_some(self.nodes4_buf.clone()),
+                        nodes6: (from_ipv6).then_some(self.nodes6_buf.clone()),
                         token: None,
                         values: None,
                     }),
@@ -884,9 +953,9 @@ impl Server {
             }
             KRPCInner::Request(Arg::GetPeers(gp)) => {
                 debug!("receive get_peer from {} {gp:?}", from_addr);
-                add_route(gp.id);
+                add_route(gp.id, from_addr, false);
                 self.nodes_buf.clear();
-                if ipv6 {
+                if from_ipv6 {
                     // TODO: support "want" field
                     self.route6
                         .get_k_closest_nodes(&gp.info_hash, 8, &mut self.nodes_buf);
@@ -897,17 +966,18 @@ impl Server {
                 to_nodes64(&self.nodes_buf, &mut self.nodes4_buf, &mut self.nodes6_buf);
                 let peers: Vec<ByteSocketAddr> = self
                     .storage
-                    .get(&gp.info_hash, ipv6)
+                    .get(&gp.info_hash, from_ipv6)
                     .into_iter()
                     .map(|v| v.addr.into())
                     .collect();
+                // TODO: support "want" field
                 let resp = KRPC {
                     t: krpc.t,
                     v: version,
                     inner: KRPCInner::Response(Resp {
                         id: self.id,
-                        nodes: (!ipv6).then_some(self.nodes4_buf.clone()),
-                        nodes6: (ipv6).then_some(self.nodes6_buf.clone()),
+                        nodes: (!from_ipv6).then_some(self.nodes4_buf.clone()),
+                        nodes6: (from_ipv6).then_some(self.nodes6_buf.clone()),
                         token: Some("abaaabba".into()), // TODO generate token
                         values: if peers.is_empty() { None } else { Some(peers) },
                     }),
@@ -915,21 +985,16 @@ impl Server {
                 _ = self.send_response(from_addr, &resp).await;
             }
             KRPCInner::Response(resp) => {
-                add_route(resp.id);
+                // This node replied to our outgoing request — it is proven reachable.
+                add_route(resp.id, from_addr, true);
                 if let Some(ns) = &resp.nodes6 {
                     for (id, addr) in &ns.0 {
-                        self.route6.add_route(NodeAddr {
-                            id: *id,
-                            addr: SocketAddr::V6(*addr),
-                        });
+                        add_route(*id, SocketAddr::V6(*addr), false);
                     }
                 }
                 if let Some(ns) = &resp.nodes {
                     for (id, addr) in &ns.0 {
-                        self.route4.add_route(NodeAddr {
-                            id: *id,
-                            addr: SocketAddr::V4(*addr),
-                        });
+                        add_route(*id, SocketAddr::V4(*addr), false);
                     }
                 }
                 if let Some(ret) = self.tmap.lock().unwrap().remove(krpc.t.as_slice()) {

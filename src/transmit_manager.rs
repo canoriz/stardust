@@ -2221,11 +2221,8 @@ async fn dht_get_peers(
     handshake_opt: HandshakeOption,
     tmh: TransmitManagerHandle,
 ) {
-    let mut addrs = client.get_peers(target, false).await;
-    addrs.extend_from_slice(&client.get_peers(target, true).await);
+    let addrs = client.get_peers(target).await;
     for a in addrs {
-        let t = tmh.clone();
-        let opt = handshake_opt.clone();
         tmh.sender.send(Msg::NewDiscoveredPeer {
             addr: a,
             from: PeerFrom::DHT,

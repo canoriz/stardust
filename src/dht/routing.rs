@@ -2,11 +2,12 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::time::Instant;
 
-use tracing::{debug, info};
+use tracing::debug;
 
 use super::{NodeAddr, NodeID};
 const BUCKET_MAX: usize = 160;
 const K: usize = 8;
+const BACKUP_MAX: usize = K;
 
 pub struct Dist {
     pub dist: NodeID,
@@ -38,12 +39,25 @@ pub struct RoutingTable {
     bucket: [Bucket; BUCKET_MAX + 1],
 }
 
-type ContactInfo = (SocketAddr, Instant);
+struct NodeEntry {
+    addr: SocketAddr,
+    last_seen: Instant,
+    /// True once this node has replied to one of our outgoing requests.
+    reachable: bool,
+}
 
+/// Per-bucket state.
+///
+/// Backup lists are separate for reachable and unreachable nodes so that
+/// when a slot opens up we always promote a reachable node first.
 #[derive(Default)]
 struct Bucket {
-    inuse: HashMap<NodeID, ContactInfo>,
-    backup: VecDeque<(NodeID, ContactInfo)>,
+    inuse: HashMap<NodeID, NodeEntry>,
+    // reachable_backup is for nodes that have replied to us,
+    reachable_backup: VecDeque<(NodeID, SocketAddr, Instant)>,
+    // unreachable_backup is for nodes that have never replied to us,
+    // maybe they are unreachable, or maybe we never requested them
+    unreachable_backup: VecDeque<(NodeID, SocketAddr, Instant)>,
 }
 
 impl RoutingTable {
@@ -54,21 +68,54 @@ impl RoutingTable {
         }
     }
 
-    pub fn add_route(&mut self, addr: NodeAddr) {
+    /// Add or update a node in the routing table.
+    ///
+    /// `reachable` should be `true` only if this node just replied to one of
+    /// our outgoing requests (proving two-way reachability).  For nodes we
+    /// learned about passively (incoming requests, third-party referrals) pass
+    /// `false`.
+    pub fn add_route(&mut self, addr: NodeAddr, reachable: bool) {
         let prefix = common_bits(&self.id, &addr.id) as usize;
         let bucket = &mut self.bucket[prefix];
-        let contact_info = (addr.addr, Instant::now());
-        if bucket.inuse.len() < K {
-            bucket.inuse.insert(addr.id, contact_info);
-            debug!("dht routing: add route to bucket {:?}", addr);
-        } else {
-            while bucket.backup.len() > K {
-                // nodes at front will always be the early ones
-                bucket.backup.pop_front();
-            }
-            bucket.backup.push_back((addr.id, contact_info));
-            debug!("dht routing: add route to backup {:?}", addr);
+
+        // Already in inuse: refresh, never downgrade reachability.
+        if let Some(e) = bucket.inuse.get_mut(&addr.id) {
+            e.addr = addr.addr;
+            e.last_seen = Instant::now();
+            e.reachable |= reachable;
+            return;
         }
+
+        // Slot available: insert directly.
+        if bucket.inuse.len() < K {
+            bucket.inuse.insert(addr.id, NodeEntry { addr: addr.addr, last_seen: Instant::now(), reachable });
+            debug!("dht routing: add route to bucket {:?}", addr);
+            return;
+        }
+
+        // Bucket full: upsert in backup, never downgrading reachability.
+        // Removing the old entry first prevents duplicates and merges the upgrade path.
+        let was_reachable = Self::backup_remove(bucket, &addr.id);
+        let effective = reachable || was_reachable.unwrap_or(false);
+        let queue = if effective { &mut bucket.reachable_backup } else { &mut bucket.unreachable_backup };
+        if queue.len() >= BACKUP_MAX { queue.pop_front(); }
+        queue.push_back((addr.id, addr.addr, Instant::now()));
+        debug!("dht routing: add route to backup {:?} reachable={}", addr, effective);
+    }
+
+    /// Remove a node from the backup queues.
+    /// Returns `Some(true)` if it was in `reachable_backup`,
+    /// `Some(false)` if in `unreachable_backup`, `None` if absent.
+    fn backup_remove(bucket: &mut Bucket, id: &NodeID) -> Option<bool> {
+        if let Some(pos) = bucket.unreachable_backup.iter().position(|(nid, _, _)| nid == id) {
+            bucket.unreachable_backup.remove(pos);
+            return Some(false);
+        }
+        if let Some(pos) = bucket.reachable_backup.iter().position(|(nid, _, _)| nid == id) {
+            bucket.reachable_backup.remove(pos);
+            return Some(true);
+        }
+        None
     }
 
     pub fn remove_route(&mut self, id: &NodeID) {
@@ -78,9 +125,27 @@ impl RoutingTable {
         let bucket = &mut self.bucket[prefix];
         bucket.inuse.remove(id);
         if bucket.inuse.len() < K {
-            if let Some((node, t)) = bucket.backup.pop_back() {
-                bucket.inuse.insert(node, t);
-                debug!("dht routing: add route from backup {:?}", node);
+            // Prefer a previously-reachable node over an untested one.
+            if let Some((node, addr, ts)) = bucket.reachable_backup.pop_back() {
+                bucket.inuse.insert(
+                    node,
+                    NodeEntry {
+                        addr,
+                        last_seen: ts,
+                        reachable: true,
+                    },
+                );
+                debug!("dht routing: promoted reachable backup {:?}", node);
+            } else if let Some((node, addr, ts)) = bucket.unreachable_backup.pop_back() {
+                bucket.inuse.insert(
+                    node,
+                    NodeEntry {
+                        addr,
+                        last_seen: ts,
+                        reachable: false,
+                    },
+                );
+                debug!("dht routing: promoted unreachable backup {:?}", node);
             }
         }
     }
@@ -127,12 +192,12 @@ impl RoutingTable {
 
             if add_nodes {
                 // only add nodes if this bucket may contains closer nodes
-                for (nid, (addr, _)) in bucket.inuse.iter() {
+                for (nid, entry) in bucket.inuse.iter() {
                     closest.insert(Dist {
                         dist: dist(id, nid),
                         addr: NodeAddr {
                             id: *nid,
-                            addr: *addr,
+                            addr: entry.addr,
                         },
                     });
                 }
@@ -362,7 +427,7 @@ mod test {
         let id = node_id(73);
         let mut rt = RoutingTable::new(id);
         for i in (0..=255).filter(|x| *x != 73) {
-            rt.add_route(node_addr(node_id(i)));
+            rt.add_route(node_addr(node_id(i)), false);
         }
 
         fn k_closest(rt: &mut RoutingTable, target: &NodeID, k: usize) -> Vec<u32> {
@@ -398,7 +463,7 @@ mod test {
         ]
         .map(|i| node_id(i));
         for id in &node_ids {
-            rt.add_route(node_addr(*id));
+            rt.add_route(node_addr(*id), false);
         }
 
         {
