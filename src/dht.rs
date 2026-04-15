@@ -500,37 +500,7 @@ impl DHT {
     /// get_peers queries peers of target across both IPv4 and IPv6.
     #[instrument(skip_all, fields(target = crate::helper::to_hex(&target)), ret)]
     pub async fn get_peers(self: &Arc<Self>, target: NodeID) -> Vec<SocketAddr> {
-        let timeout = time::Duration::from_secs(5);
-        let (ns4, ns6) = self.find_closest_node_to(target).await;
-        let ns: Vec<NodeAddr> = ns4.into_iter().chain(ns6).collect();
-        debug!("nearest nodes: {ns:?}");
-
-        use tokio::task::JoinSet;
-        let mut js = JoinSet::new();
-
-        for n in ns {
-            let cl = self.clone();
-            js.spawn(async move {
-                cl.get_peers_rpc(RpcAddr::id(n.id, n.addr), target, timeout)
-                    .await
-                    .map_err(|e| {
-                        debug!("dht get_peers from node {n:?} error {e}");
-                        e
-                    })
-            });
-        }
-
-        let mut ret = vec![];
-        for r in js.join_all().await {
-            if let Ok(resp) = r {
-                if let Some(ps) = resp.values {
-                    for addr in ps {
-                        ret.push(addr.into());
-                    }
-                }
-            }
-        }
-        ret
+        self.get_peers_iterative(target).await
     }
 
     /// Find the K closest nodes to `target` across both IPv4 and IPv6.
@@ -540,24 +510,24 @@ impl DHT {
     /// referrals from either family are fed into the correct candidate set,
     /// and the search terminates only when no family has unqueried candidates
     /// left in its top-K.
-    pub async fn find_closest_node_to(
-        self: &Arc<Self>,
-        target: NodeID,
-    ) -> (Vec<NodeAddr>, Vec<NodeAddr>) {
+    async fn get_peers_iterative(self: &Arc<Self>, target: NodeID) -> Vec<SocketAddr> {
         const K: usize = 8;
         const ALPHA: usize = 3;
         let timeout = time::Duration::from_secs(5);
 
         // Channel message: Ok((v4_referrals, v6_referrals)) on success, Err(id) on timeout.
         type Err = (SocketAddr, Option<NodeID>);
-        type Msg = Result<(Vec<NodeAddr>, Vec<NodeAddr>), Err>;
+        // v4 closer nodes, v6 closer nodes, peers
+        type Msg = Result<(Vec<NodeAddr>, Vec<NodeAddr>, Vec<SocketAddr>), Err>;
 
         // Spawns a FindNode RPC; splits the response into (v4, v6) candidate lists.
         // `target` and `timeout` are Copy and captured from the outer scope.
         let send_req = |client: Arc<DHT>, addr: RpcAddr<SocketAddr>, tx: mpsc::Sender<Msg>| {
             tokio::spawn(async move {
                 let node_id = addr.id;
-                match client.find_node_rpc(addr, target, timeout).await {
+
+                match client.get_peers_rpc(addr, target, timeout).await {
+                    //    match client.find_node_rpc(addr, target, timeout).await {
                     Ok(r) => {
                         let mut v4 = r.nodes.map_or(vec![], |n| {
                             n.0.into_iter()
@@ -588,8 +558,11 @@ impl DHT {
                                 })
                                 .collect()
                         });
-                        _ = tx.send(Ok((v4, v6))).await;
-                        // TODO we did not sort result
+
+                        let peers: Vec<SocketAddr> = r
+                            .values
+                            .map_or(vec![], |v| v.into_iter().map(|a| a.into()).collect());
+                        _ = tx.send(Ok((v4, v6, peers))).await;
                     }
                     Err(e) => {
                         debug!("find_closest_node: {addr:?} did not respond: {e}");
@@ -620,15 +593,16 @@ impl DHT {
             .send(Ok((
                 self.get_k_closest(target, K, false).await,
                 self.get_k_closest(target, K, true).await,
+                vec![],
             )))
             .await;
 
-        let mut nodes4 = vec![];
-        let mut nodes6 = vec![];
+        let mut peers = vec![];
         while let Some(r) = resp_rx.recv().await {
             in_flight -= 1;
             match r {
-                Ok((n4, n6)) => {
+                Ok((n4, n6, p)) => {
+                    peers.extend(p);
                     for n in n4 {
                         if matches!(node_state4.get(&n.id), None) {
                             node_state4.insert(n.id, NodeState::Seen);
@@ -714,12 +688,10 @@ impl DHT {
 
             if in_flight == 0 {
                 // we did not found any closer nodes
-                nodes4 = closest_nodes4.into_iter().map(|x| x.addr).collect();
-                nodes6 = closest_nodes6.into_iter().map(|x| x.addr).collect();
                 break;
             }
         }
-        (nodes4, nodes6)
+        peers
     }
 }
 

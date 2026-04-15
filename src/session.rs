@@ -128,7 +128,7 @@ impl Session {
                 }
                 while tasks.join_next().await.is_some() {}
                 // Populate both ipv4 and ipv6 routing tables
-                c.find_closest_node_to(opt.self_id).await;
+                c.get_peers(opt.self_id).await;
             });
 
             // tokio::spawn(async move {
