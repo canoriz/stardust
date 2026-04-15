@@ -52,7 +52,7 @@ async fn main() -> std::io::Result<()> {
         .unwrap();
     println!("find node {:?}", r);
 
-    let res = client.find_closest_node_to(id).await;
+    let res = client.get_peers(id).await;
     println!("find_closest {:?}", res);
 
     // Wrap it in a BufReader for efficient line-by-line reading.
@@ -100,7 +100,7 @@ async fn process_line_async(line: String, client: Arc<DHT>) -> String {
     };
 
     if cmd.starts_with("cl") {
-        let res = client.find_closest_node_to(id).await;
+        let res = client.get_peers(id).await;
         format!("{:?}", res)
     } else {
         let res = if cmd.starts_with("p") {

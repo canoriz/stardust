@@ -88,30 +88,71 @@ impl RoutingTable {
 
         // Slot available: insert directly.
         if bucket.inuse.len() < K {
-            bucket.inuse.insert(addr.id, NodeEntry { addr: addr.addr, last_seen: Instant::now(), reachable });
+            bucket.inuse.insert(
+                addr.id,
+                NodeEntry {
+                    addr: addr.addr,
+                    last_seen: Instant::now(),
+                    reachable,
+                },
+            );
             debug!("dht routing: add route to bucket {:?}", addr);
             return;
+        }
+
+        if reachable {
+            let replace = bucket.inuse.iter().filter(|(_, v)| !v.reachable).next();
+            if let Some((ur, _)) = replace {
+                let ur = ur.clone();
+                bucket.inuse.remove(&ur);
+                bucket.inuse.insert(
+                    addr.id,
+                    NodeEntry {
+                        addr: addr.addr,
+                        last_seen: Instant::now(),
+                        reachable,
+                    },
+                );
+                debug!("dht routing: add route to bucket {:?}", addr);
+            }
         }
 
         // Bucket full: upsert in backup, never downgrading reachability.
         // Removing the old entry first prevents duplicates and merges the upgrade path.
         let was_reachable = Self::backup_remove(bucket, &addr.id);
         let effective = reachable || was_reachable.unwrap_or(false);
-        let queue = if effective { &mut bucket.reachable_backup } else { &mut bucket.unreachable_backup };
-        if queue.len() >= BACKUP_MAX { queue.pop_front(); }
+        let queue = if effective {
+            &mut bucket.reachable_backup
+        } else {
+            &mut bucket.unreachable_backup
+        };
+        if queue.len() >= BACKUP_MAX {
+            queue.pop_front();
+        }
         queue.push_back((addr.id, addr.addr, Instant::now()));
-        debug!("dht routing: add route to backup {:?} reachable={}", addr, effective);
+        debug!(
+            "dht routing: add route to backup {:?} reachable={}",
+            addr, effective
+        );
     }
 
     /// Remove a node from the backup queues.
     /// Returns `Some(true)` if it was in `reachable_backup`,
     /// `Some(false)` if in `unreachable_backup`, `None` if absent.
     fn backup_remove(bucket: &mut Bucket, id: &NodeID) -> Option<bool> {
-        if let Some(pos) = bucket.unreachable_backup.iter().position(|(nid, _, _)| nid == id) {
+        if let Some(pos) = bucket
+            .unreachable_backup
+            .iter()
+            .position(|(nid, _, _)| nid == id)
+        {
             bucket.unreachable_backup.remove(pos);
             return Some(false);
         }
-        if let Some(pos) = bucket.reachable_backup.iter().position(|(nid, _, _)| nid == id) {
+        if let Some(pos) = bucket
+            .reachable_backup
+            .iter()
+            .position(|(nid, _, _)| nid == id)
+        {
             bucket.reachable_backup.remove(pos);
             return Some(true);
         }
