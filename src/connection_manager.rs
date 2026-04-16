@@ -355,7 +355,7 @@ async fn run_recv_stream<T>(
     T: AsyncRead + Unpin,
 {
     info!("in recv stream");
-    let report_interval = time::Duration::from_millis(100);
+    let report_interval = time::Duration::from_secs(1);
     let mut ticker = tokio::time::interval(report_interval);
     let addr = to_canonical_addr(conn.read_stream.peer_addr());
 
@@ -385,9 +385,11 @@ async fn run_recv_stream<T>(
                 conn.handle_ctrl_cmd(msg);
             }
             _ = ticker.tick() => {
-                // TODO: many ticks may come together, unfair
-                debug!("{addr} recv stream ticker tick");
-                conn.handle_report_tick();
+                if conn.received_blocks.is_none() {
+                    // if we have received blocks, manager will be notified by others
+                    debug!("{addr} recv stream ticker tick");
+                    conn.handle_report_tick();
+                }
             }
             r = RecvStream::recv_next(
                 &mut conn.read_stream,
