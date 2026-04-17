@@ -18,7 +18,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_writer(non_blocking)
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_ansi(false)
-        .with_span_events(FmtSpan::CLOSE | FmtSpan::ENTER)
+        .with_span_events(FmtSpan::CLOSE)
         .event_format(
             tracing_subscriber::fmt::format()
                 .with_file(true)

@@ -12,7 +12,6 @@ pub(crate) struct Bandwidth<const SLOT_SIZE: usize> {
     head: usize,
 
     rtt: RTT,
-    tendency: SlidingWindowRegression,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -70,7 +69,6 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
             circular: [Period::new(); SLOT_SIZE],
             head: 0,
 
-            tendency: SlidingWindowRegression::new(10),
             rtt: RTT::new(ALPHA, BETA),
         }
     }
@@ -116,50 +114,8 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
             self.circular[self.head] = p;
         }
 
-        info!("rtt: {rtt:?}");
         let rtt = rtt.unwrap_or(before_rtt);
-        let n_in_flight = n_in_flight.unwrap_or(2);
-
         self.circular[self.head].add(n_bytes, 1, rtt);
-        info!(
-            "tendency add sample {rtt:?}, period dur {:?}, elapsed {:?}",
-            self.circular[self.head].dur,
-            self.circular[self.head].since.elapsed()
-        );
-        self.tendency.add(n_in_flight as f64, rtt.as_secs_f64());
-    }
-
-    pub fn get_rtt_slope_and_correlation(&self) -> (f64, f64) {
-        self.tendency.get_results()
-    }
-
-    pub fn shrink_reset_slope(&mut self, n: usize) {
-        self.tendency.shrink_to(n);
-    }
-
-    pub fn get_rtt_n_points(&self) -> usize {
-        self.tendency.n_points()
-    }
-
-    pub fn get_optimum_in_flight(&self) -> usize {
-        // try to get the max in flight that
-        // rtt < 1.2 * min_rtt
-        let min_rtt = self
-            .tendency
-            .datapoints()
-            .iter()
-            .map(|(_, rtt)| *rtt)
-            .fold(f64::MAX / 2.0, |a, x| a.min(x));
-        self.tendency
-            .datapoints()
-            .iter()
-            .filter_map(|(n, rtt)| (*rtt < min_rtt * 1.2).then_some(*n))
-            .fold(0f64, |a, n| {
-                if n > a {
-                    dbg!(n);
-                }
-                n.max(a)
-            }) as usize
     }
 
     /// get average bandwidth in back_interval, and min rtt in that period

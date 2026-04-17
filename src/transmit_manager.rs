@@ -27,7 +27,7 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time;
 use tokio_util::sync::{CancellationToken, DropGuard as CancelDropGuard};
-use tracing::{debug, info, instrument, span, warn, Level};
+use tracing::{debug, info, instrument, span, trace, warn, Level};
 
 mod bandwidth_mode;
 mod inflight;
@@ -151,10 +151,6 @@ pub(crate) enum Msg {
     /// A message received from peer
     PeerMsg(PeerMsg),
     FlushError(FlushErr),
-
-    /// A peer reaches it's rtt limit, check if any
-    /// request are timeout
-    PeerTimeoutCheck(PeerAddr),
 
     RequestMetadata(oneshot::Sender<Option<Arc<Metadata>>>),
     DumpStatus(oneshot::Sender<TransmitDump>),
@@ -867,10 +863,6 @@ impl TransmitWorker {
                         }
                         TorrentState::Fetching(_) => {}
                     }
-
-                    self.self_handle
-                        .sender
-                        .send(Msg::PeerTimeoutCheck(peer_addr));
                 }
                 self.connecting_peers.remove(&peer_addr);
                 Ok(())
@@ -896,7 +888,6 @@ impl TransmitWorker {
             Msg::FlushError(_) => {
                 todo!()
             }
-            Msg::PeerTimeoutCheck(addr) => self.handle_peer_request_timeout(addr),
             Msg::PieceBufReady { index, buf } => self.handle_piecebuf_ready(index, buf),
             Msg::DumpStatus(sender) => {
                 self.handle_dump_status(sender);
@@ -1065,7 +1056,6 @@ impl TransmitWorker {
                 }
                 debug!("handled {count} piece messages");
                 self.handle_blocks_receieved(peer)
-                // todo!();
             }
             PeerMsg::DhtPort(addr, port) => self.handle_dht_port_msg(addr, port),
             PeerMsg::ExtendMetadata(pa, m) => {
@@ -1102,24 +1092,6 @@ impl TransmitWorker {
                 Ok(())
             }
         }
-    }
-
-    fn handle_peer_request_timeout(&mut self, peer: PeerAddr) -> io::Result<()> {
-        // call pick 0 to revoke timeout requests
-        self.pick_blocks_for_peer(&peer, 0);
-        if let Some(pc) = self.connected_peers.get(&peer) {
-            pc.conn.recv_stream_cmd(CtrlOfRecv::ReportStat);
-
-            // TODO: set a alarm at some clock instead of using tokio task?
-            let next_alarm_wait = pc.bw.get_rtt_4var() * 2 + time::Duration::from_millis(10);
-            let s = self.self_handle.sender.clone();
-            info!("check timeout for {peer:?}, next check after {next_alarm_wait:?}");
-            tokio::spawn(async move {
-                time::sleep(next_alarm_wait).await;
-                s.send(Msg::PeerTimeoutCheck(peer));
-            });
-        }
-        Ok(())
     }
 
     fn handle_announce(&mut self, addrs: Vec<SocketAddr>) {
@@ -1352,7 +1324,6 @@ impl TransmitWorker {
                         "{peer} change from ProbeBW to SlowDown mode because no smaller rtt after {:?}",
                         probe_rtt_interval,
                     );
-                    conn.bw.shrink_reset_slope(10);
                     conn.bw_mode = BandwidthMode::SlowDown {
                         last_piece_time: *last_piece_time,
                         inflight_target: 0,
@@ -1530,7 +1501,7 @@ impl TransmitWorker {
         recv_time: std::time::Instant,
     ) -> io::Result<()> {
         let queue_delay = recv_time.elapsed();
-        info!("recv {piece:?} from {peer:?}, queue_delay {queue_delay:?}");
+        debug!("recv {piece:?} from {peer:?}, queue_delay {queue_delay:?}");
 
         let req = Request {
             index: piece.index,
@@ -1565,7 +1536,7 @@ impl TransmitWorker {
         let inflight_when_sent = block_picker.get_inflight_when_sent(peer, &req);
         conn.bw
             .add_sample(piece.len as usize, rtt, inflight_when_sent);
-        info!(
+        trace!(
             "{peer} add bw sample {rtt:?}, inflight {} inflight when sent {inflight_when_sent:?}",
             conn.inflight.inflight()
         );
@@ -1576,7 +1547,7 @@ impl TransmitWorker {
             } else {
                 ('-', expected_recv_time - real_recv_time)
             };
-            info!(
+            trace!(
                 "{peer} piece timing {req:?} expected {expected_recv_time:?} real {real_recv_time:?} {sign}{delta:?}",
             );
         }
@@ -1584,19 +1555,16 @@ impl TransmitWorker {
         if let Some(rtt) = rtt {
             let mean = conn.bw.get_rtt();
             let sigma = conn.bw.get_var();
-            let m = (rtt.as_secs_f32() - mean.as_secs_f32()) / (sigma.as_secs_f32() + 0.000_0001);
-            debug!("{peer} rtt {rtt:?} mean {mean:?} var {sigma:?} {m} sigma");
 
             if rtt < conn.min_rtt {
                 conn.min_rtt = rtt;
                 conn.since_min_rtt = time::Instant::now();
-                info!("{peer} new min rtt = {:?}", conn.min_rtt);
+                trace!("{peer} new min rtt = {:?}", conn.min_rtt);
             }
         }
 
         let span2 = span!(Level::INFO, "span2");
         let _enter = span2.enter();
-        let mut switch_to_slowdown_due_to_slow_rtt = false;
         match &mut conn.bw_mode {
             BandwidthMode::Startup { .. } => {
                 if let Some(rtt) = rtt {
@@ -1609,32 +1577,10 @@ impl TransmitWorker {
                 probe_df,
                 ..
             } => {
-                info!("{peer} add rtt sample {rtt:?}, inflight when sent {inflight_when_sent:?}");
+                trace!("{peer} add rtt sample {rtt:?}, inflight when sent {inflight_when_sent:?}");
                 *last_piece_time = time::Instant::now();
                 if let Some(rtt) = rtt {
                     conn.bw.add_rtt(rtt);
-
-                    let sigma = conn.bw.get_var();
-                    let t_critical = get_t_critical_two_tail((*probe_df).max(1));
-                    let deviation = sigma
-                        .max(time::Duration::from_millis(10))
-                        .mul_f32(2.0 * t_critical);
-                    let threshold = conn.min_rtt + deviation;
-                    if rtt > threshold {
-                        *slow_count += 1;
-                        info!(
-                            "{peer} rtt {rtt:?} larger than min_rtt + deviation(2*t*sigma), min_rtt {:?} sigma {sigma:?} t_critical {:.3} deviation {deviation:?}, threshold {threshold:?}, slow_count {}",
-                            conn.min_rtt,
-                            t_critical,
-                            *slow_count,
-                        );
-                        if *slow_count > PROBE_TO_SLOWDOWN_SLOW_RTT_LIMIT {
-                            switch_to_slowdown_due_to_slow_rtt = true;
-                        }
-                    } else {
-                        *slow_count = 0;
-                    }
-                    *probe_df += 1;
                 }
             }
             BandwidthMode::SlowDown {
@@ -1652,26 +1598,6 @@ impl TransmitWorker {
             }
             BandwidthMode::Choked => {}
         };
-
-        // if switch_to_slowdown_due_to_slow_rtt {
-        //     conn.bw.shrink_reset_slope(10);
-        //     let probe_bdp_rtt =
-        //         (conn.min_rtt * 3 / 2).min(conn.min_rtt + time::Duration::from_millis(50));
-        //     let avg_rtt = conn.bw.get_rtt();
-        //     let (max_bw, _, _) = conn.bw.count_max_bw_and_min_rtt(10 * probe_bdp_rtt);
-        //     // let bdp = BandwidthMode::compute_probe_bw_capacity(probe_bdp_rtt, max_bw, 3);
-        //     // let slow_down_to = conn.inflight.inflight() / 2;
-        //     info!(
-        //         "{peer} change from ProbeBW to SlowDown mode because consecutive slow RTT count > {}, slow down to {}",
-        //         PROBE_TO_SLOWDOWN_SLOW_RTT_LIMIT, 1
-        //         // slow_down_to,
-        //     );
-        //     conn.bw_mode = BandwidthMode::SlowDown {
-        //         last_piece_time: time::Instant::now(),
-        //         // inflight_target: slow_down_to,
-        //         inflight_target: 0,
-        //     };
-        // }
 
         if !block_picker.want_block(req) {
             warn!(
@@ -1737,10 +1663,9 @@ impl TransmitWorker {
                         );
                     }
                 }
-                info!("piecebuf {index} not present err {e:?}");
+                trace!("piecebuf {index} not present err {e:?}");
             }
         }
-        debug!("return piece {req:?} to pool");
         Ok(())
     }
 

@@ -370,7 +370,6 @@ async fn run_recv_stream<T>(
     }
 
     loop {
-        info!("{addr} recv select loop begin");
         tokio::select! {
             biased;
             _ = cancel.cancelled() => {
@@ -410,7 +409,6 @@ async fn run_recv_stream<T>(
                 }
             }
         };
-        info!("{addr} recv select loop end");
     }
     let _ = done.send(());
     info!("{addr} done recv stream");
