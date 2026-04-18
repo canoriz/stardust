@@ -83,7 +83,6 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
     /// how many new bytes received
     /// if given rtt, use this rtt
     /// if not given, will use an average rtt
-    #[instrument(skip_all)]
     pub fn add_sample(
         &mut self,
         n_bytes: usize,
@@ -122,8 +121,16 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
     pub fn count_avg_bw_in(&self, back_interval: Duration) -> f32 {
         // ensure we consider at least one slot duration
         let back = back_interval.max(self.current_slot_duration());
-        let n_bytes = self.count_bytes_within_period(back).0;
-        n_bytes as f32 / back.as_secs_f32()
+
+        let map_f = |begin: Instant, _end: Instant, p: &Period| (p.bytes_count, begin);
+
+        let reduce_f = |acc: (usize, Instant), this: (usize, Instant)| -> (usize, Instant) {
+            (acc.0 + this.0, acc.1.min(this.1))
+        };
+        self.reduce_periods_within_interval(back, map_f, reduce_f)
+            .map_or(0.0, |(total_size, since)| {
+                (total_size as f32) / since.elapsed().as_secs_f32()
+            })
     }
 
     pub fn count_max_bw_and_min_rtt(&self, back_interval: Duration) -> (f32, Duration, Instant) {
@@ -299,16 +306,16 @@ mod test {
 
         bw.add_sample(10, Some(Duration::from_millis(40)), None); // slot 0
         bw.add_sample(5, Some(Duration::from_millis(40)), None); // slot 0
-        advance(Duration::from_millis(500)).await;
+        advance(Duration::from_millis(600)).await;
         bw.add_sample(10, Some(Duration::from_millis(40)), None); // slot 1
-        advance(Duration::from_millis(500)).await;
+        advance(Duration::from_millis(600)).await;
         bw.add_sample(20, Some(Duration::from_millis(40)), None); // slot 2
-        advance(Duration::from_millis(500)).await;
+        advance(Duration::from_millis(600)).await;
         bw.add_sample(30, Some(Duration::from_millis(40)), None); // slot 3
-        advance(Duration::from_millis(500)).await;
+        advance(Duration::from_millis(600)).await;
         bw.add_sample(30, Some(Duration::from_millis(40)), None); // slot 0
         assert_eq!(
-            bw.count_bytes_within_period(Duration::from_millis(1250)).0,
+            bw.count_bytes_within_period(Duration::from_millis(1550)).0,
             85
         );
     }

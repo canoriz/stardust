@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, instrument};
+use tracing::{debug, info, instrument, trace};
 
 use super::{
     BitField, BlockRange, BlockRequests, PeerAddr, PeerPieceDetail, PieceMap, PiecePicker,
@@ -190,7 +190,7 @@ impl PieceBlocks {
                             && (should_repick || repick_option.endgame)
                         {
                             if should_repick {
-                                debug!(
+                                trace!(
                                     "{peer} repick {req:?} because we are faster {:?}",
                                     requested
                                         .iter()
@@ -199,7 +199,7 @@ impl PieceBlocks {
                                 );
                             }
                             if repick_option.endgame {
-                                debug!("{peer} in endgame mode, repick {req:?}",);
+                                trace!("{peer} in endgame mode, repick {req:?}",);
                             }
                             count += 1;
                             requested
@@ -516,7 +516,6 @@ impl BlockPicker {
         }
     }
 
-    #[instrument(skip_all)]
     pub fn get_rtt(
         &self,
         peer: &PeerAddr,
@@ -548,7 +547,6 @@ impl BlockPicker {
         }
     }
 
-    #[instrument(skip_all)]
     pub fn get_inflight_when_sent(&self, peer: &PeerAddr, req: &Request) -> Option<usize> {
         if let Some(b) = self.get_block_status(req) {
             match b {
@@ -575,7 +573,6 @@ impl BlockPicker {
         }
     }
 
-    #[instrument(skip_all)]
     pub fn get_expected_response_time(
         &self,
         peer: &PeerAddr,
@@ -698,7 +695,7 @@ impl BlockPicker {
                         {
                             *remain -= n_picked;
                             let pb: Vec<_> = blks.iter(piece_size as u32).collect();
-                            debug!("pick piece {index} from peer {peer} (requesting), picked blks: {pb:?}");
+                            trace!("pick piece {index} from peer {peer} (requesting), picked blks: {pb:?}");
                             ret.push(blks);
                         }
                     }
@@ -787,7 +784,7 @@ impl BlockPicker {
                             ) {
                                 remain -= n_picked;
                                 let pb: Vec<_> = blks.iter(self.piece_size as u32).collect();
-                                debug!("pick piece {index} from peer {peer} (requested endgame), picked blks: {pb:?}");
+                                trace!("pick piece {index} from peer {peer} (requested endgame), picked blks: {pb:?}");
                                 ret.push(blks);
                             }
                         }
@@ -812,8 +809,8 @@ impl BlockPicker {
                     ) {
                         remain -= n_picked;
                         let pb: Vec<_> = blks.iter(self.piece_size as u32).collect();
-                        debug!("{peer} pick piece {index} (pick_next), inflight {n_in_flight}");
-                        debug!("{peer} (pick_next), picked blks: {pb:?}, repick_option: {repick_option:?}");
+                        trace!("{peer} pick piece {index} (pick_next), inflight {n_in_flight}");
+                        trace!("{peer} (pick_next), picked blks: {pb:?}, repick_option: {repick_option:?}");
                         ret.push(blks);
                     }
                 }
@@ -905,13 +902,16 @@ impl BlockPicker {
                 ) {
                     remain -= n_picked;
                     let pb: Vec<_> = blks.iter(self.piece_size as u32).collect();
-                    debug!(
+                    trace!(
                         "{peer} rush mode extra {} pick piece {} (pick_next), inflight {}",
-                        rush_mode, index, n_in_flight
+                        rush_mode,
+                        index,
+                        n_in_flight
                     );
-                    debug!(
+                    trace!(
                         "{peer} rush mode extra {} picked blks: {pb:?}, {:?}",
-                        rush_mode, blocks.block_map
+                        rush_mode,
+                        blocks.block_map
                     );
                     ret.push(blks);
                 }
@@ -929,13 +929,13 @@ impl BlockPicker {
                 endgame
             );
             for (index, blocks) in &self.receiving {
-                debug!(
+                trace!(
                     "{peer} rush mode, receiving piece {index}, blocks: {:?}",
                     blocks.block_map
                 );
             }
             for (index, blocks) in &self.requesting {
-                debug!(
+                trace!(
                     "{peer} rush mode {}, endgame {} requesting piece {index}, blocks: {:?}",
                     self.rush_mode(),
                     endgame,
@@ -1009,7 +1009,6 @@ impl BlockPicker {
     /// if a piece is fully received,
     /// revoked requests,
     /// )
-    #[instrument(skip_all)]
     pub fn receive_block(&mut self, req: Request) -> (Option<u32>, Vec<PeerAddr>) {
         if !self.check_block_validity(&req) {
             return (None, vec![]);
@@ -1097,7 +1096,6 @@ impl BlockPicker {
     }
 
     /// check if we want this block
-    #[instrument(skip_all)]
     pub fn want_block(&mut self, req: Request) -> bool {
         if !self.check_block_validity(&req) {
             println!("unwant because invalid {req:?}");

@@ -220,7 +220,17 @@ def parse_log_content(lines):
                     autos.append(data)
         except Exception: continue
 
-    return pd.DataFrame(samples), pd.DataFrame(autos), pd.DataFrame(states), pd.DataFrame(rtt_vars), pd.DataFrame(queue_delays), pd.DataFrame(rush_events)
+    def _df(rows, cols):
+        return pd.DataFrame(rows) if rows else pd.DataFrame(columns=cols)
+
+    return (
+        _df(samples,      ['dt', 'ts', 'peer', 'delay', 'inflight']),
+        _df(autos,        ['dt', 'ts', 'peer', 'bw', 'bw10', 'mode']),
+        _df(states,       ['dt', 'ts', 'peer', 'state']),
+        _df(rtt_vars,     ['dt', 'ts', 'peer', 'rtt', 'var']),
+        _df(queue_delays, ['dt', 'ts', 'peer', 'queue_delay']),
+        _df(rush_events,  ['dt', 'ts', 'peer', 'rush']),
+    )
 
 # --- 文件加载 ---
 cmd_file = None
@@ -248,11 +258,12 @@ if lines:
         st.stop()
 
     # 统计及选择 Peer
-    sample_counts = df_samples['peer'].value_counts().to_dict() if not df_samples.empty else {}
+    sample_counts = df_queue_delays['peer'].value_counts().to_dict() if not df_queue_delays.empty else {}
     peer_set_s = set(df_samples['peer'].unique()) if not df_samples.empty else set()
     peer_set_a = set(df_autos['peer'].unique()) if not df_autos.empty else set()
     peer_set_r = set(df_rtt_vars['peer'].unique()) if not df_rtt_vars.empty else set()
-    all_peers_list = sorted(list(peer_set_s.union(peer_set_a).union(peer_set_r)))
+    peer_set_q = set(df_queue_delays['peer'].unique()) if not df_queue_delays.empty else set()
+    all_peers_list = sorted(list(peer_set_s.union(peer_set_a).union(peer_set_r).union(peer_set_q)))
 
     peer_labels = [f"{p} (Blocks: {sample_counts.get(p, 0)})" for p in all_peers_list]
     peer_labels.sort(key=lambda x: int(re.search(r'Blocks: (\d+)', x).group(1)), reverse=True)

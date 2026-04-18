@@ -52,7 +52,8 @@ impl<T> Pool<T> {
 enum CowBuf<T> {
     // Option is always Some
     Owned(Option<T>),
-    Shared(Arc<T>),
+    // Option is always Some
+    Shared(Option<Arc<T>>),
 }
 
 impl<T> CowBuf<T> {
@@ -64,8 +65,8 @@ impl<T> CowBuf<T> {
         match self {
             CowBuf::Owned(b) => {
                 let s = Arc::new(b.take().unwrap());
-                *self = CowBuf::Shared(s.clone());
-                Self::Shared(s)
+                *self = CowBuf::Shared(Some(s.clone()));
+                Self::Shared(Some(s))
             }
             CowBuf::Shared(a) => CowBuf::Shared(a.clone()),
         }
@@ -77,7 +78,7 @@ impl<T> Deref for CowBuf<T> {
     fn deref(&self) -> &T {
         match self {
             CowBuf::Owned(b) => b.as_ref().unwrap(),
-            CowBuf::Shared(a) => a.as_ref(),
+            CowBuf::Shared(a) => a.as_ref().unwrap(),
         }
     }
 }
@@ -90,7 +91,12 @@ where
         match self {
             CowBuf::Owned(b) => b.as_mut().unwrap(),
             CowBuf::Shared(a) => {
-                *self = CowBuf::Owned(Some((**a).clone()));
+                let arc = a.take().unwrap();
+                let inner = match Arc::try_unwrap(arc) {
+                    Ok(owned) => owned,
+                    Err(arc) => (*arc).clone(),
+                };
+                *self = CowBuf::Owned(Some(inner));
                 self.deref_mut()
             }
         }
@@ -225,7 +231,7 @@ impl fmt::Debug for PieceBuf {
             .field("buf", &self.buf)
             .field("offset", &self.offset)
             .field("index", &self.index)
-            .field("touch", &self.touch)
+            .field("touch", &self.touch.elapsed())
             .field("state", &dirty)
             .finish()
     }
@@ -672,7 +678,7 @@ mod test {
 
         // Both variants point to the same Arc allocation.
         if let (CowBuf::Shared(a), CowBuf::Shared(b)) = (&cow, &shared) {
-            assert!(Arc::ptr_eq(a, b));
+            assert!(Arc::ptr_eq(a.as_ref().unwrap(), b.as_ref().unwrap()));
         } else {
             panic!("expected Shared after clone");
         }
@@ -685,7 +691,7 @@ mod test {
         let s2 = cow.clone(); // Shared → Shared (same Arc)
 
         if let (CowBuf::Shared(a), CowBuf::Shared(b)) = (&cow, &s2) {
-            assert!(Arc::ptr_eq(a, b));
+            assert!(Arc::ptr_eq(a.as_ref().unwrap(), b.as_ref().unwrap()));
         } else {
             panic!("expected Shared");
         }
@@ -705,6 +711,62 @@ mod test {
         assert!(matches!(shared, CowBuf::Shared(_)));
         assert_eq!(&**cow, &[1u8, 2, 3, 4]);
         assert_eq!(&**shared, &[1u8, 2, 3]);
+    }
+
+    /// When only one CowBuf holds the Arc (sole owner), `deref_mut` should
+    /// reclaim the allocation via `try_unwrap` instead of cloning.
+    #[test]
+    fn cowbuf_deref_mut_on_sole_shared_owner_reuses_allocation() {
+        let mut cow: CowBuf<Vec<u8>> = CowBuf::new(vec![1u8, 2, 3]);
+        // Transition to Shared, then drop the second handle so cow is the only owner.
+        let shared = cow.clone();
+        drop(shared);
+        // cow is Shared but with strong_count == 1.
+        assert!(matches!(cow, CowBuf::Shared(_)));
+
+        // Capture the Vec's internal buffer pointer from inside the Arc.
+        let buf_ptr = if let CowBuf::Shared(ref a) = cow {
+            a.as_ref().unwrap().as_ptr()
+        } else {
+            unreachable!()
+        };
+
+        use std::ops::DerefMut;
+        cow.deref_mut().push(4);
+
+        // Must become Owned.
+        assert!(matches!(cow, CowBuf::Owned(_)));
+        assert_eq!(&**cow, &[1u8, 2, 3, 4]);
+
+        // The inner Vec should use the *same* buffer (try_unwrap moved it, no clone).
+        if let CowBuf::Owned(ref b) = cow {
+            assert_eq!(
+                buf_ptr,
+                b.as_ref().unwrap().as_ptr(),
+                "expected try_unwrap to reuse the Vec buffer, but a new one was allocated"
+            );
+        }
+    }
+
+    /// When multiple CowBufs share the Arc (strong_count > 1), `deref_mut`
+    /// must clone the data so the other handles are unaffected.
+    #[test]
+    fn cowbuf_deref_mut_on_shared_with_multiple_owners_clones_data() {
+        let mut cow: CowBuf<Vec<u8>> = CowBuf::new(vec![10u8, 20, 30]);
+        let other = cow.clone(); // strong_count == 2
+
+        assert!(matches!(cow, CowBuf::Shared(_)));
+
+        use std::ops::DerefMut;
+        cow.deref_mut().push(40);
+
+        // cow is now a distinct Owned copy.
+        assert!(matches!(cow, CowBuf::Owned(_)));
+        assert_eq!(&**cow, &[10u8, 20, 30, 40]);
+
+        // `other` still sees the original unmodified data.
+        assert!(matches!(other, CowBuf::Shared(_)));
+        assert_eq!(&**other, &[10u8, 20, 30]);
     }
 
     #[test]
@@ -834,7 +896,7 @@ mod test {
             panic!("expected Shared");
         };
         // 3 owners: pb.buf, flush task, snapshot.
-        assert_eq!(Arc::strong_count(&snapshot), 3);
+        assert_eq!(Arc::strong_count(snapshot.as_ref().unwrap()), 3);
 
         // COW write — pb.buf detaches into a new Owned allocation.
         pb.as_mut()[..4].copy_from_slice(&[0xBB; 4]);
@@ -842,7 +904,7 @@ mod test {
 
         // pb.buf no longer holds the old Arc; 2 owners remain (flush task + snapshot).
         // (The flush task may have already finished and dropped its ref, leaving 1.)
-        let count = Arc::strong_count(&snapshot);
+        let count = Arc::strong_count(snapshot.as_ref().unwrap());
         assert!(
             count == 1 || count == 2,
             "expected 1–2 strong refs, got {count}"
@@ -850,10 +912,10 @@ mod test {
 
         // Wait for flush, then only snapshot holds the Arc.
         rx.await.unwrap().unwrap();
-        assert_eq!(Arc::strong_count(&snapshot), 1);
+        assert_eq!(Arc::strong_count(snapshot.as_ref().unwrap()), 1);
 
         // The original data is intact in the snapshot.
-        assert_eq!(snapshot.as_ref()[..4], [0xAA; 4]);
+        assert_eq!(snapshot.as_ref().unwrap()[..4], [0xAA; 4]);
     }
 
     #[tokio::test]

@@ -16,7 +16,7 @@ static BLOCK_BUF_POOL: LazyLock<Arc<BufferPool<BytesMut>>> =
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::sync::{CancellationToken, DropGuard};
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::buffer_pool::{BlockBuf, BufferPool, PooledBuf};
 use crate::picker::{BlockRequests, PieceState};
@@ -64,14 +64,13 @@ pub struct ReceivedPiece {
 
 #[derive(Debug)]
 pub struct ReceivedBlocks {
-    /// map of piece_index -> blocks of this piece
-    pub blocks: HashMap<u32, Vec<ReceivedPiece>>,
+    pub blocks: Vec<ReceivedPiece>,
 }
 
 impl ReceivedBlocks {
     pub fn new() -> Self {
         Self {
-            blocks: HashMap::new(),
+            blocks: Vec::new(),
         }
     }
 }
@@ -384,11 +383,8 @@ async fn run_recv_stream<T>(
                 conn.handle_ctrl_cmd(msg);
             }
             _ = ticker.tick() => {
-                if conn.received_blocks.is_none() {
-                    // if we have received blocks, manager will be notified by others
-                    debug!("{addr} recv stream ticker tick");
-                    conn.handle_report_tick();
-                }
+                debug!("{addr} recv stream ticker tick");
+                conn.handle_report_tick();
             }
             r = RecvStream::recv_next(
                 &mut conn.read_stream,
@@ -396,7 +392,8 @@ async fn run_recv_stream<T>(
                 &mut conn.transmit_handle,
                 addr,
             ) => {
-                info!("{addr} received {:?}", r);
+                trace!("{addr} received {:?}", r);
+                ticker.reset();
                 match r {
                     Ok((msg, block_buf)) => {
                         conn.handle_peer_msg(addr, msg, block_buf);
@@ -563,8 +560,6 @@ where
                     .as_mut()
                     .unwrap()
                     .blocks
-                    .entry(piece.index)
-                    .or_default()
                     .push(ReceivedPiece {
                         piece,
                         buf: block_buf.expect("Piece message must carry a block buffer"),
@@ -640,7 +635,7 @@ where
             }
             Some(msg) = conn.receiver.recv() => {
                 // TODO: maybe use buffer and Notify?
-                info!("{peer} send stream to send {msg:?}");
+                trace!("{peer} send stream to send {msg:?}");
                 if let Err(e) = conn.handle_cmd(msg).await {
                     info!("{peer} send stream handle cmd error {e}");
                     break;

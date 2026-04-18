@@ -708,7 +708,7 @@ impl TransmitWorker {
                 h.conn.send_stream_cmd(ConnMsg::RequestBlocks(reqs));
 
                 if pick_n > 0 {
-                    info!("really picked {picked_n} blocks");
+                    trace!("really picked {picked_n} blocks");
                     if picked_n < pick_n {
                         h.max_bw_unlimited = h.max_bw_unlimited.max({
                             // TODO: FIXME: optimize
@@ -1047,11 +1047,9 @@ impl TransmitWorker {
             PeerMsg::Pieces2(peer, receive_blks) => {
                 let mut count = 0;
                 if let Some(blks) = receive_blks {
-                    for (piece_index, p) in blks.blocks {
-                        for piece in p {
-                            count += 1;
-                            self.handle_piece_msg(&peer, piece.piece, piece.buf, piece.recv_time)?;
-                        }
+                    for piece in blks.blocks {
+                        count += 1;
+                        self.handle_piece_msg(&peer, piece.piece, piece.buf, piece.recv_time)?;
                     }
                 }
                 debug!("handled {count} piece messages");
@@ -1136,7 +1134,7 @@ impl TransmitWorker {
         }
     }
 
-    #[instrument(skip_all)]
+    #[instrument(skip_all, ret)]
     fn get_piecebuf(
         storage: &mut BufStorage,
         sender: mpsc::UnboundedSender<Msg>,
@@ -1532,7 +1530,6 @@ impl TransmitWorker {
             .get_mut(&to_canonical_addr(*peer))
             .expect("should exist");
         let rtt = block_picker.get_rtt(peer, &req, recv_time);
-        let expected_response_time = block_picker.get_expected_response_time(peer, &req);
         let inflight_when_sent = block_picker.get_inflight_when_sent(peer, &req);
         conn.bw
             .add_sample(piece.len as usize, rtt, inflight_when_sent);
@@ -1541,16 +1538,17 @@ impl TransmitWorker {
             conn.inflight.inflight()
         );
 
-        if let (Some(real_recv_time), Some(expected_recv_time)) = (rtt, expected_response_time) {
-            let (sign, delta) = if real_recv_time >= expected_recv_time {
-                ('+', real_recv_time - expected_recv_time)
-            } else {
-                ('-', expected_recv_time - real_recv_time)
-            };
-            trace!(
-                "{peer} piece timing {req:?} expected {expected_recv_time:?} real {real_recv_time:?} {sign}{delta:?}",
-            );
-        }
+        // let expected_response_time = block_picker.get_expected_response_time(peer, &req);
+        // if let (Some(real_recv_time), Some(expected_recv_time)) = (rtt, expected_response_time) {
+        //     let (sign, delta) = if real_recv_time >= expected_recv_time {
+        //         ('+', real_recv_time - expected_recv_time)
+        //     } else {
+        //         ('-', expected_recv_time - real_recv_time)
+        //     };
+        //     trace!(
+        //         "{peer} piece timing {req:?} expected {expected_recv_time:?} real {real_recv_time:?} {sign}{delta:?}",
+        //     );
+        // }
 
         if let Some(rtt) = rtt {
             let mean = conn.bw.get_rtt();
@@ -1563,8 +1561,6 @@ impl TransmitWorker {
             }
         }
 
-        let span2 = span!(Level::INFO, "span2");
-        let _enter = span2.enter();
         match &mut conn.bw_mode {
             BandwidthMode::Startup { .. } => {
                 if let Some(rtt) = rtt {
