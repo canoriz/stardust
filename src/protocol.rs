@@ -440,7 +440,7 @@ pub struct ConnInfo<'a> {
 }
 
 impl<T> BTStream<T> {
-    pub fn info(&self) -> ConnInfo {
+    pub fn info(&self) -> ConnInfo<'_> {
         ConnInfo {
             func_bits: &self.reserved,
             peer_id: &self.peer_id,
@@ -619,31 +619,184 @@ impl BTStream<Box<dyn Conn>> {
     }
 }
 
-pub(crate) struct WriteHandle<'a, T>
+/// Wraps any `AsyncWrite + Unpin` and makes `flush()` a no-op at the poll level.
+///
+/// Used by [`BufWrite`] so that individual `send_x` calls accumulate bytes into
+/// the underlying `BufWriter` without flushing at the end of each send.
+/// A single explicit [`BufWrite::flush`] drains the buffer once.
+struct NoFlush<T>(T);
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for NoFlush<T> {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        std::pin::Pin::new(&mut self.get_mut().0).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        // Intentional no-op: flush is deferred to BufWrite::flush().
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().0).poll_shutdown(cx)
+    }
+}
+
+/// A batched-write handle over [`WriteStream`] and [`BTStream`].
+///
+/// Obtain one via `buf_write()`. Call any number of `send_x`
+/// methods — each serialises the message into the underlying `BufWriter` without
+/// flushing at the end. Call [`BufWrite::flush`] when done to push buffered
+/// bytes to the socket.
+///
+/// # Panic
+/// Dropping a `BufWrite` without calling `flush()` panics, catching forgotten
+/// flushes immediately.
+pub struct BufWrite<'a, T>
 where
     T: AsyncWrite + Unpin,
 {
-    wr: &'a mut WriteStream<T>,
+    inner: &'a mut T,
+    extension_id: &'a HashMap<ExtensionType, u8>,
+    pex_peers: &'a mut HashMap<SocketAddr, Option<PexFlag>>,
     flushed: bool,
 }
 
-impl<T> Drop for WriteHandle<'_, T>
+impl<T> Drop for BufWrite<'_, T>
 where
     T: AsyncWrite + Unpin,
 {
     fn drop(&mut self) {
         if !self.flushed {
-            panic!("write handle not flushed but dropped")
+            panic!("BufWrite dropped without calling flush()");
         }
     }
 }
 
-impl<T> WriteHandle<'_, T>
+impl<T> BufWrite<'_, T>
 where
     T: AsyncWrite + Unpin,
 {
-    async fn flush(&mut self) -> io::Result<()> {
-        self.wr.inner.flush().await
+    /// Flush all buffered bytes to the socket.
+    pub async fn flush(&mut self) -> io::Result<()> {
+        self.flushed = true;
+        self.inner.flush().await
+    }
+
+    pub async fn send_keepalive(&mut self) -> io::Result<()> {
+        self.flushed = false;
+        send_keepalive(&mut NoFlush(&mut *self.inner)).await
+    }
+
+    pub async fn send_choke(&mut self) -> io::Result<()> {
+        self.flushed = false;
+        send_choke(&mut NoFlush(&mut *self.inner)).await
+    }
+
+    pub async fn send_unchoke(&mut self) -> io::Result<()> {
+        self.flushed = false;
+        send_unchoke(&mut NoFlush(&mut *self.inner)).await
+    }
+
+    pub async fn send_interested(&mut self) -> io::Result<()> {
+        self.flushed = false;
+        send_interested(&mut NoFlush(&mut *self.inner)).await
+    }
+
+    pub async fn send_notinterested(&mut self) -> io::Result<()> {
+        self.flushed = false;
+        send_notinterested(&mut NoFlush(&mut *self.inner)).await
+    }
+
+    pub async fn send_have(&mut self, index: u32) -> io::Result<()> {
+        self.flushed = false;
+        send_have(&mut NoFlush(&mut *self.inner), index).await
+    }
+
+    pub async fn send_bitfield(&mut self, b: &BitField) -> io::Result<()> {
+        self.flushed = false;
+        send_bitfield(&mut NoFlush(&mut *self.inner), b).await
+    }
+
+    pub async fn send_request(&mut self, index: u32, begin: u32, len: u32) -> io::Result<()> {
+        self.flushed = false;
+        send_request(&mut NoFlush(&mut *self.inner), index, begin, len).await
+    }
+
+    pub async fn send_piece(&mut self, index: u32, begin: u32, piece: &[u8]) -> io::Result<()> {
+        self.flushed = false;
+        send_piece(&mut NoFlush(&mut *self.inner), index, begin, piece).await
+    }
+
+    pub async fn send_cancel(&mut self, index: u32, begin: u32, len: u32) -> io::Result<()> {
+        self.flushed = false;
+        send_cancel(&mut NoFlush(&mut *self.inner), index, begin, len).await
+    }
+
+    pub async fn send_port(&mut self, port: u16) -> io::Result<()> {
+        self.flushed = false;
+        send_port(&mut NoFlush(&mut *self.inner), port).await
+    }
+
+    pub async fn send_reject(&mut self, index: u32, begin: u32, len: u32) -> io::Result<()> {
+        self.flushed = false;
+        send_reject(&mut NoFlush(&mut *self.inner), index, begin, len).await
+    }
+
+    pub async fn send_allowed_fast(&mut self, index: u32) -> io::Result<()> {
+        self.flushed = false;
+        send_allowed_fast(&mut NoFlush(&mut *self.inner), index).await
+    }
+
+    pub async fn send_suggest_piece(&mut self, index: u32) -> io::Result<()> {
+        self.flushed = false;
+        send_suggest_piece(&mut NoFlush(&mut *self.inner), index).await
+    }
+
+    pub async fn send_have_all(&mut self) -> io::Result<()> {
+        self.flushed = false;
+        send_have_all(&mut NoFlush(&mut *self.inner)).await
+    }
+
+    pub async fn send_have_none(&mut self) -> io::Result<()> {
+        self.flushed = false;
+        send_have_none(&mut NoFlush(&mut *self.inner)).await
+    }
+
+    pub async fn send_extend_metadata(&mut self, meta: ExtendedMetadata) -> io::Result<()> {
+        self.flushed = false;
+        send_extend_metadata(&mut NoFlush(&mut *self.inner), meta, self.extension_id).await
+    }
+
+    pub async fn send_extend_pex(
+        &mut self,
+        now_connected: &HashMap<SocketAddr, Option<PexFlag>>,
+    ) -> io::Result<()> {
+        self.flushed = false;
+        let (added, dropped) = make_added_and_dropped(now_connected, self.pex_peers);
+        match send_extend_pex(
+            &mut NoFlush(&mut *self.inner),
+            added.iter(),
+            dropped.iter(),
+            self.extension_id,
+        )
+        .await
+        {
+            Ok(_) => {
+                update_pex_map(self.pex_peers, &added, &dropped);
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -655,11 +808,35 @@ impl<T> WriteStream<T> {
 
 impl<T> WriteStream<T>
 where
-    T: AsyncRead + AsyncWrite + Unpin,
+    T: AsyncWrite + Unpin,
 {
-    fn write_handle(&mut self) -> WriteHandle<T> {
-        WriteHandle {
-            wr: self,
+    /// Obtain a [`BufWrite`] for batched writes.
+    ///
+    /// Send multiple messages via the handle's `send_x` methods without flushing
+    /// after each send. Call [`BufWrite::flush`] once when done.
+    pub fn buf_write(&mut self) -> BufWrite<'_, T> {
+        BufWrite {
+            inner: &mut self.inner,
+            extension_id: &self.extension_id,
+            pex_peers: &mut self.pex_peers,
+            flushed: false,
+        }
+    }
+}
+
+impl<T> BTStream<T>
+where
+    T: AsyncWrite + Unpin,
+{
+    /// Obtain a [`BufWrite`] for batched writes on `BTStream`.
+    ///
+    /// Send multiple messages via the handle's `send_x` methods without flushing
+    /// after each send. Call [`BufWrite::flush`] once when done.
+    pub fn buf_write(&mut self) -> BufWrite<'_, T> {
+        BufWrite {
+            inner: &mut self.inner,
+            extension_id: &self.extension_id,
+            pex_peers: &mut self.pex_peers,
             flushed: false,
         }
     }
@@ -3598,5 +3775,63 @@ pub mod tests {
         p1w.inner.flush().await.unwrap();
         p2r.recv_piece_body(&mut buf).await.unwrap();
         assert_eq!(&buf[..], &body[..]);
+    }
+
+    /// BufWrite batches multiple messages and delivers them all after a single flush().
+    #[tokio::test]
+    async fn buf_write_batches_messages() {
+        let ((_, mut p1w), (mut p2r, _)) = make_ends_split().await;
+        {
+            let mut bw = p1w.buf_write();
+            bw.send_choke().await.unwrap();
+            bw.send_unchoke().await.unwrap();
+            bw.send_interested().await.unwrap();
+            bw.flush().await.unwrap();
+        }
+        assert!(matches!(p2r.recv_msg().await.unwrap(), Message::Choke));
+        assert!(matches!(p2r.recv_msg().await.unwrap(), Message::Unchoke));
+        assert!(matches!(p2r.recv_msg().await.unwrap(), Message::Interested));
+    }
+
+    /// BufWrite::send_request sends multiple Request messages, all received after flush.
+    #[tokio::test]
+    async fn buf_write_send_requests() {
+        let ((_, mut p1w), (mut p2r, _)) = make_ends_split().await;
+        let reqs = [(1u32, 0u32, 16384u32), (1, 16384, 16384), (2, 0, 16384)];
+        {
+            let mut bw = p1w.buf_write();
+            for (index, begin, len) in reqs {
+                bw.send_request(index, begin, len).await.unwrap();
+            }
+            bw.flush().await.unwrap();
+        }
+        for (index, begin, len) in reqs {
+            let msg = p2r.recv_msg().await.unwrap();
+            assert!(
+                matches!(msg, Message::Request(Request { index: i, begin: b, len: l }) if i == index && b == begin && l == len),
+                "unexpected message {msg:?}"
+            );
+        }
+    }
+
+    /// BufWrite can be used multiple times sequentially on the same WriteStream.
+    #[tokio::test]
+    async fn buf_write_reusable() {
+        let ((_, mut p1w), (mut p2r, _)) = make_ends_split().await;
+
+        let mut bw = p1w.buf_write();
+        bw.send_have(10).await.unwrap();
+        bw.flush().await.unwrap();
+        drop(bw);
+
+        let mut bw2 = p1w.buf_write();
+        bw2.send_have(20).await.unwrap();
+        bw2.flush().await.unwrap();
+        drop(bw2);
+
+        let m1 = p2r.recv_msg().await.unwrap();
+        let m2 = p2r.recv_msg().await.unwrap();
+        assert!(matches!(m1, Message::Have(10)));
+        assert!(matches!(m2, Message::Have(20)));
     }
 }

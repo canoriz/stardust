@@ -69,9 +69,7 @@ pub struct ReceivedBlocks {
 
 impl ReceivedBlocks {
     pub fn new() -> Self {
-        Self {
-            blocks: Vec::new(),
-        }
+        Self { blocks: Vec::new() }
     }
 }
 
@@ -655,19 +653,14 @@ where
     async fn handle_cmd(&mut self, msg: CtrlOfSend) -> io::Result<()> {
         match msg {
             CtrlOfSend::RequestBlocks(reqs) => {
-                let mut count = 0;
                 let piece_size = reqs.piece_size;
+                let mut bw = self.write_stream.buf_write();
                 for rg in reqs.range.iter() {
                     for r in rg.iter(piece_size) {
-                        self.write_stream
-                            .send_request(r.index, r.begin, r.len)
-                            .await?;
-                        // count += 1;
-                        // if count % 10 == 0 {
-                        // time::sleep(time::Duration::from_millis(500)).await;
-                        // }
+                        bw.send_request(r.index, r.begin, r.len).await?;
                     }
                 }
+                bw.flush().await?;
             }
             CtrlOfSend::Have(i) => {
                 self.write_stream.send_have(i).await?;
