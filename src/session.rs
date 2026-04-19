@@ -76,8 +76,8 @@ impl Session {
             tokio::spawn(async move {
                 // Ping well-known public bootstrap nodes concurrently to seed the routing tables.
                 const BOOTSTRAP_NODES: &[&str] = &[
-                    "router.bittorrent.com:6881",
-                    "router.utorrent.com:6881",
+                    // "router.bittorrent.com:6881",
+                    // "router.utorrent.com:6881",
                     "[2408:820c:5b38:3400:4393:1139:435d:c909]:60416",
                     // "dht.transmissionbt.com:6881",
                     // "dht.libtorrent.org:25401",
@@ -285,7 +285,7 @@ where
     };
 
     let mut guard = conn.tasks.lock().unwrap();
-    if let Some(tm) = guard.get_mut(bt_conn.info().info_hash) {
+    if let Some(tm) = guard.get_mut(&bt_conn.info().info_hash) {
         tm.send_msg(crate::transmit_manager::Msg::NewPeer(Ok((
             bt_conn.to_dyn(),
             true,

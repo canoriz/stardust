@@ -10,7 +10,7 @@ use crate::connection_manager::{
 use crate::dht::DHT;
 use crate::metadata::{self, Magnet, Metadata};
 use crate::picker::{
-    BlockPicker, BlockPickerDump, BlockRequests, BlockStatus, PieceState, RarestPicker,
+    self, BlockPicker, BlockPickerDump, BlockRequests, BlockStatus, PieceState, RarestPicker,
 };
 use crate::protocol::{
     self, BTStream, BitField, Conn, ExtendedMetadata, ExtendedMsg, ExtendedPex, HandshakeOption,
@@ -804,7 +804,7 @@ impl TransmitWorker {
                     };
 
                     if let Some((piece_state, n)) = state {
-                        if cm.capability().contains(&protocol::Capability::Fast) {
+                        if cm.capability().have(protocol::Capability::Fast) {
                             match piece_state {
                                 PieceState::HaveAll => {
                                     cm.send_stream_cmd(CtrlOfSend::HaveAll);
@@ -820,12 +820,12 @@ impl TransmitWorker {
                             cm.send_stream_cmd(CtrlOfSend::BitField(piece_state.as_bitfield(n)));
                         }
                     } else {
-                        if cm.capability().contains(&protocol::Capability::Fast) {
+                        if cm.capability().have(protocol::Capability::Fast) {
                             cm.send_stream_cmd(CtrlOfSend::HaveNone);
                         }
                     }
 
-                    if cm.capability().contains(&protocol::Capability::DHT) {
+                    if cm.capability().have(protocol::Capability::DHT) {
                         if let Some(port) = self.handshake_opt.dht_port {
                             cm.send_stream_cmd(CtrlOfSend::DHTPort(port));
                         }
@@ -1083,7 +1083,7 @@ impl TransmitWorker {
             PeerMsg::Request(addr, req) => {
                 // TODO: optimize: handle can be passed so avoid map search overhead
                 if let Some(conn) = self.connected_peers.get_mut(&addr) {
-                    if conn.conn.capability().contains(&protocol::Capability::Fast) {
+                    if conn.conn.capability().have(protocol::Capability::Fast) {
                         conn.conn.send_stream_cmd(ConnMsg::Reject(req));
                     }
                 }
@@ -1431,6 +1431,11 @@ impl TransmitWorker {
                 // preventing accumulating too much partial downloaded pieces.
                 const MIN_IN_FLIGHT: usize = 5;
                 const MAX_IN_FLIGHT: usize = 500;
+                let max_in_flight = if conn.conn.info().reqq_limit > 0 {
+                    conn.conn.info().reqq_limit
+                } else {
+                    MAX_IN_FLIGHT
+                };
 
                 // TODO: OPTIMIZE: pre-calculate, do not calculate every time
                 let limit = {
@@ -1613,7 +1618,7 @@ impl TransmitWorker {
                 // TODO: remove pending requests if not sent
                 if let Some(conn) = self.connected_peers.get_mut(&addr) {
                     conn.inflight.cancel(req);
-                    if conn.conn.capability().contains(&protocol::Capability::Fast) {
+                    if conn.conn.capability().have(protocol::Capability::Fast) {
                         conn.conn.send_stream_cmd(ConnMsg::Cancel(req));
                     }
                 }
@@ -2032,7 +2037,9 @@ impl TransmitWorker {
         }
 
         for (_, h) in &mut self.connected_peers {
-            if h.conn.support_metadata_extension() && h.conn.metadata_size() > 0 {
+            if h.conn.capability().have(protocol::Capability::Metadata)
+                && h.conn.metadata_size() > 0
+            {
                 // TODO: adaptively set value of n
                 meta_buf.add_size_to_bucket(h.conn.metadata_size());
                 Self::fetching_metadata_from_peer(h, 2, meta_buf, now);

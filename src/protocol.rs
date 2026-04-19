@@ -206,6 +206,8 @@ pub struct BTStream<T> {
     // To be sent to upper layer.
     // Some implementations send Port and BitField messages between handshake and extend handshake.
     pending_recvs: Vec<Message>,
+
+    reqq_limit: usize,
 }
 
 impl<T> BTStream<T>
@@ -214,6 +216,10 @@ where
 {
     pub fn peer_addr(&self) -> SocketAddr {
         self.peer_addr
+    }
+
+    pub fn reqq_limit(&self) -> usize {
+        self.reqq_limit
     }
 
     pub fn to_dyn(self) -> BTStream<Box<dyn Conn>> {
@@ -228,6 +234,7 @@ where
             pex_peers: self.pex_peers,
             metadata_size: self.metadata_size,
             pending_recvs: self.pending_recvs,
+            reqq_limit: self.reqq_limit,
         }
     }
 }
@@ -412,6 +419,8 @@ pub struct WriteStream<T> {
     peer_id: [u8; 20],
     info_hash: [u8; 20],
     reserved: FuncBits,
+
+    reqq_limit: usize,
 }
 
 impl BTStream<net::TcpStream> {
@@ -425,41 +434,55 @@ impl BTStream<net::TcpStream> {
 // TODO: optimize, use xor flags, not a hashset
 pub type CapabilityMap = HashSet<Capability>;
 
-#[derive(Eq, Hash, PartialEq)]
-pub enum Capability {
-    DHT,
-    Fast,
-    Metadata,
-    Pex,
+#[derive(Copy, Clone, Eq, Hash, PartialEq)]
+pub struct Capability {
+    cap: u32,
 }
 
-pub struct ConnInfo<'a> {
-    pub func_bits: &'a FuncBits,
-    pub peer_id: &'a [u8; 20],
-    pub info_hash: &'a InfoHash,
+impl Capability {
+    pub const DHT: Self = Self { cap: 1 };
+    pub const Fast: Self = Self { cap: 1 << 1 };
+    pub const Metadata: Self = Self { cap: 1 << 2 };
+    pub const Pex: Self = Self { cap: 1 << 3 };
+
+    pub fn have(&self, cap: Capability) -> bool {
+        self.cap & cap.cap > 0
+    }
+}
+
+pub struct ConnInfo {
+    pub func_bits: FuncBits,
+    pub peer_id: [u8; 20],
+    pub info_hash: InfoHash,
+    pub metadata_size: usize,
+    pub capability: Capability,
+    pub reqq_limit: usize,
 }
 
 impl<T> BTStream<T> {
-    pub fn info(&self) -> ConnInfo<'_> {
+    pub fn info(&self) -> ConnInfo {
         ConnInfo {
-            func_bits: &self.reserved,
-            peer_id: &self.peer_id,
-            info_hash: &self.info_hash,
+            func_bits: self.reserved,
+            peer_id: self.peer_id,
+            info_hash: self.info_hash,
+            metadata_size: self.metadata_size,
+            capability: self.capability(),
+            reqq_limit: self.reqq_limit,
         }
     }
 
-    pub fn capability(&self) -> CapabilityMap {
-        let mut ret = CapabilityMap::new();
+    pub fn capability(&self) -> Capability {
+        let mut ret = Capability { cap: 0 };
         if self.reserved.have_dht() {
-            ret.insert(Capability::DHT);
+            ret.cap |= Capability::DHT.cap;
         }
         if self.reserved.have_fast() {
-            ret.insert(Capability::Fast);
+            ret.cap |= Capability::Fast.cap;
         }
         for id in self.extension_id.keys() {
             match id {
-                ExtensionType::Metadata => ret.insert(Capability::Metadata),
-                ExtensionType::Pex => ret.insert(Capability::Pex),
+                ExtensionType::Metadata => ret.cap |= Capability::Metadata.cap,
+                ExtensionType::Pex => ret.cap |= Capability::Pex.cap,
             };
         }
         ret
@@ -497,6 +520,7 @@ where
                 info_hash: self.info_hash,
                 reserved: self.reserved,
                 metadata_size: self.metadata_size,
+                reqq_limit: self.reqq_limit,
             },
         )
     }
@@ -522,6 +546,7 @@ where
             pex_peers: w.pex_peers,
             metadata_size: r.metadata_size,
             pending_recvs: r.pending_recvs,
+            reqq_limit: w.reqq_limit,
         })
     }
 
@@ -553,6 +578,7 @@ where
                 info_hash: self.info_hash,
                 reserved: self.reserved,
                 metadata_size: self.metadata_size,
+                reqq_limit: self.reqq_limit,
             },
         )
     }
@@ -582,6 +608,7 @@ impl BTStream<Box<dyn Conn>> {
                 info_hash: self.info_hash,
                 reserved: self.reserved,
                 metadata_size: self.metadata_size,
+                reqq_limit: self.reqq_limit,
             },
         )
     }
@@ -614,6 +641,7 @@ impl BTStream<Box<dyn Conn>> {
                 info_hash: self.info_hash,
                 reserved: self.reserved,
                 metadata_size: self.metadata_size,
+                reqq_limit: self.reqq_limit,
             },
         )
     }
@@ -804,6 +832,12 @@ impl<T> WriteStream<T> {
     pub fn peer_addr(&self) -> SocketAddr {
         self.peer_addr
     }
+
+    /// The request queue limit of this peer
+    /// in flight request should never exceed this limit
+    pub fn reqq_limit(&self) -> usize {
+        self.reqq_limit
+    }
 }
 
 impl<T> WriteStream<T>
@@ -946,6 +980,7 @@ where
             pex_peers: HashMap::new(),
             metadata_size: 0,
             pending_recvs: vec![],
+            reqq_limit: 0,
         };
 
         if reserved.have_extension() {
@@ -990,6 +1025,7 @@ where
                 .collect();
             s.metadata_size = exth.metadata_size.unwrap_or(0) as usize;
             s.pending_recvs = pending_recvs;
+            s.reqq_limit = exth.reqq.unwrap_or(0) as usize;
             return Ok(s);
         }
         Ok(s)
@@ -1053,6 +1089,7 @@ where
             pex_peers: HashMap::new(),
             metadata_size: 0,
             pending_recvs: vec![],
+            reqq_limit: 0,
         };
 
         let support_extension = reserved.have_extension();
@@ -1092,6 +1129,7 @@ where
                 .collect();
             s.metadata_size = exth.metadata_size.unwrap_or(0) as usize;
             s.pending_recvs = pending_recvs;
+            s.reqq_limit = exth.reqq.unwrap_or(0) as usize;
             return Ok(s);
         }
         Ok(s)
@@ -1635,7 +1673,7 @@ impl BitField {
     }
 
     pub fn set(&mut self, bit_index: u32, set: bool) {
-        if bit_index as usize > self.bitfield.len() * 8 {
+        if bit_index as usize >= self.bitfield.len() * 8 {
             self.resize(bit_index);
         }
         let u8_index = bit_index >> 3;
@@ -2967,6 +3005,7 @@ pub mod tests {
                     info_hash: [0; 20],
                     reserved: [0; 8].into(),
                     metadata_size: 0,
+                    reqq_limit: 0,
                 },
             )
         }

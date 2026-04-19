@@ -21,8 +21,8 @@ use tracing::{debug, info, trace, warn};
 use crate::buffer_pool::{BlockBuf, BufferPool, PooledBuf};
 use crate::picker::{BlockRequests, PieceState};
 use crate::protocol::{
-    self, BTStream, BitField, Capability, CapabilityMap, Conn, ExtendedMsg, Message, Piece,
-    ReadStream, RecvResult, Request, Split, WriteStream,
+    self, BTStream, BitField, Capability, CapabilityMap, Conn, ConnInfo, ExtendedMsg, Message,
+    Piece, ReadStream, RecvResult, Request, Split, WriteStream,
 };
 use crate::transmit_manager::Msg as TransmitMsg;
 use crate::transmit_manager::{PeerMsg, TransmitManagerHandle};
@@ -83,8 +83,7 @@ pub(crate) enum CtrlOfRecv {
 pub(crate) struct ConnectionManagerHandle {
     recv_stream: RecvStreamHandle,
     send_stream: SendStreamHandle,
-    capability: CapabilityMap,
-    metadata_size: usize,
+    conn_info: ConnInfo,
 }
 
 impl ConnectionManagerHandle {
@@ -92,25 +91,22 @@ impl ConnectionManagerHandle {
     where
         T: AsyncRead + AsyncWrite + Split + Unpin + Send + 'static,
     {
-        let capability = conn.capability();
-        let metadata_size = conn.metadata_size();
+        let conn_info = conn.info();
         let (read_stream, write_stream) = conn.split_buffered();
-        Self::from_splitted_buffered(read_stream, write_stream, trh, capability, metadata_size)
+        Self::from_splitted_buffered(read_stream, write_stream, trh, conn_info)
     }
 
     pub fn new_dyn(conn: BTStream<Box<dyn Conn>>, trh: TransmitManagerHandle) -> Self {
-        let capability = conn.capability();
-        let metadata_size = conn.metadata_size();
+        let conn_info = conn.info();
         let (read_stream, write_stream) = conn.split_buffered();
-        Self::from_splitted_buffered(read_stream, write_stream, trh, capability, metadata_size)
+        Self::from_splitted_buffered(read_stream, write_stream, trh, conn_info)
     }
 
     fn from_splitted_buffered<R, W>(
         read_stream: ReadStream<BufReader<R>>,
         write_stream: WriteStream<BufWriter<W>>,
         trh: TransmitManagerHandle,
-        capability: CapabilityMap,
-        metadata_size: usize,
+        conn_info: ConnInfo,
     ) -> Self
     where
         R: protocol::Reader,
@@ -187,8 +183,7 @@ impl ConnectionManagerHandle {
         Self {
             recv_stream: recv_stream_handle,
             send_stream: send_stream_handle,
-            capability,
-            metadata_size,
+            conn_info,
         }
     }
 
@@ -256,16 +251,16 @@ impl ConnectionManagerHandle {
         }
     }
 
-    pub fn support_metadata_extension(&self) -> bool {
-        self.capability.contains(&Capability::Metadata)
+    pub fn info(&self) -> &ConnInfo {
+        &self.conn_info
     }
 
-    pub fn capability(&self) -> &CapabilityMap {
-        &self.capability
+    pub fn capability(&self) -> Capability {
+        self.conn_info.capability
     }
 
     pub fn metadata_size(&self) -> usize {
-        self.metadata_size
+        self.conn_info.metadata_size
     }
 
     // pub fn request(&self, br: BlockRange) {
