@@ -82,7 +82,7 @@ impl Session {
                     // "dht.transmissionbt.com:6881",
                     // "dht.libtorrent.org:25401",
                 ];
-                let timeout = time::Duration::from_secs(5);
+                let timeout = time::Duration::from_secs(15);
                 let mut tasks = tokio::task::JoinSet::new();
                 for &node in BOOTSTRAP_NODES {
                     let cl = c.clone();

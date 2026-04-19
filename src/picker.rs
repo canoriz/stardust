@@ -140,6 +140,12 @@ pub trait PiecePicker {
     /// returns if we have this piece
     fn have(&self, index: u32) -> bool;
 
+    /// returns the availability of this piece, i.e. how many peers have this piece
+    /// TODO: maybe don't make this a trait method. Instead, we maintain our own counter
+    /// TODO: also, maybe change signature to
+    /// piece_availability(&self) -> Iterator<Item=(u32, usize)>
+    fn piece_availability(&self, index: u32) -> usize;
+
     /// returns have piece bitfield
     fn have_pieces(&self) -> &BitField;
 

@@ -605,7 +605,7 @@ impl BlockPicker {
         let working_set_size = self.receiving.len() + self.requesting.len();
         // swap IO is too frequent
         use crate::cache::simple_buffer::POOL_SIZE;
-        working_set_size > POOL_SIZE
+        working_set_size >= POOL_SIZE
     }
 
     /// Pick n blocks from peer, returns
@@ -1098,18 +1098,18 @@ impl BlockPicker {
     /// check if we want this block
     pub fn want_block(&mut self, req: Request) -> bool {
         if !self.check_block_validity(&req) {
-            println!("unwant because invalid {req:?}");
+            info!("unwant because invalid {req:?}");
             return false;
         }
 
         let index = req.index;
         if !self.selected(index) {
-            println!("unwant because {index} not selected");
+            info!("unwant because {index} not selected");
             return false;
         }
 
         if self.have(index) {
-            println!("unwant because have {index}");
+            info!("unwant because have {index}");
             return false;
         }
 
@@ -1120,7 +1120,7 @@ impl BlockPicker {
                     return true;
                 }
                 BlockStatus::Received => {
-                    println!("unwant because received");
+                    info!("unwant because received");
                     return false;
                 }
             }
@@ -1133,7 +1133,7 @@ impl BlockPicker {
                     return true;
                 }
                 BlockStatus::Received => {
-                    println!("unwant because received2");
+                    info!("unwant because received2");
                     return false;
                 }
                 _ => unreachable!(),
@@ -1143,6 +1143,11 @@ impl BlockPicker {
         // we selected, but we did not request it, or we mark this block as
         // not requested because of timeout
         return true;
+    }
+
+    /// returns the number of peers that have this piece.
+    pub fn piece_availability(&self, index: u32) -> usize {
+        self.piece_picker.piece_availability(index)
     }
 
     /// Are all selected pieces downloaded and verified?

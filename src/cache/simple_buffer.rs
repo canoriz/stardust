@@ -571,6 +571,22 @@ impl BufStorage {
         self.purge_by_size(POOL_SIZE);
     }
 
+    pub fn forget_piece(&mut self, p: PieceBuf) {
+        let mut guard = self.loading.lock().unwrap();
+
+        // assert check
+        // inserted piece should be from get_piece's on_ready
+        // and by that way, loading[piece_idx] should be PieceState::Returned
+        assert!(matches!(guard.remove(&p.index), Some(PieceState::Returned)));
+        info!("forget piece buffer {}", p.index());
+    }
+
+    pub fn remove_piece(&mut self, piece_idx: usize) {
+        if self.pieces.remove(&piece_idx).is_some() {
+            info!("remove piece buffer {piece_idx}");
+        }
+    }
+
     pub fn purge_by_time(&mut self, timeout: time::Duration) {
         self.pieces.retain(|_, v| v.touch.elapsed() > timeout)
     }
@@ -596,6 +612,8 @@ impl BufStorage {
                 self.pieces.remove(&i);
                 info!("purge clear piece {i}");
                 n_purge -= 1;
+            } else {
+                break;
             }
         }
 

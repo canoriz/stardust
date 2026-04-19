@@ -284,7 +284,7 @@ struct NotifyTransmitGuard {
 
 impl Drop for NotifyTransmitGuard {
     fn drop(&mut self) {
-        println!("both send and recv end of {} stopped", self.addr);
+        info!("both send and recv end of {} stopped", self.addr);
         self.transmit_handle
             .sender
             .send(TransmitMsg::PeerLeave(self.addr));
@@ -724,7 +724,7 @@ where
         if let Ok(ref mut mutex) = lock {
             *mutex.send_keepalive();
         } else {
-            println!("try_lock failed");
+            warn!("try_lock failed");
         }
     }
     fn sync_op(&mut self) {}

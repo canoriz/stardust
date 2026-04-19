@@ -1,6 +1,6 @@
-use tracing::{debug, trace};
+use tracing::trace;
 
-use super::{PeerAddr, PeerPieceDetail, PieceMap, PiecePicker, PieceState};
+use super::{PeerAddr, PeerPieceDetail, PiecePicker, PieceState};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::{math_helper::piece_total_and_last_size, picker::BitField};
@@ -246,6 +246,11 @@ impl PiecePicker for Picker {
         } else {
             None
         }
+    }
+
+    #[inline]
+    fn piece_availability(&self, index: u32) -> usize {
+        self.rarity.get(&index).cloned().unwrap_or(0) as usize
     }
 
     #[inline]

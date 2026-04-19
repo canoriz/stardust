@@ -10,7 +10,7 @@ use crate::connection_manager::{
 use crate::dht::DHT;
 use crate::metadata::{self, Magnet, Metadata};
 use crate::picker::{
-    self, BlockPicker, BlockPickerDump, BlockRequests, BlockStatus, PieceState, RarestPicker,
+    BlockPicker, BlockPickerDump, BlockRequests, BlockStatus, PieceState, RarestPicker,
 };
 use crate::protocol::{
     self, BTStream, BitField, Conn, ExtendedMetadata, ExtendedMsg, ExtendedPex, HandshakeOption,
@@ -670,21 +670,20 @@ impl TransmitWorker {
         }
     }
 
-    // fn pick_blocks_for_peer(&mut self, addr: &SocketAddr, n_blocks: usize) {
-    // Fn: n_blk_received, n_blk_in_flight -> n_this_time_pick
-    fn pick_blocks_for_peer(&mut self, addr: &SocketAddr, pick_n: usize) {
+    /// pick blocks for a peer, return the number of blocks picked
+    fn pick_blocks_for_peer(&mut self, addr: &SocketAddr, pick_n: usize) -> usize {
         if pick_n > 0 {
             warn!("pick {pick_n} blocks from {addr:?}");
         }
         let block_picker = match &mut self.torrent_state {
             TorrentState::Metadata(d) => &mut d.block_picker,
             TorrentState::Fetching(_) => {
-                return;
+                return 0;
             }
         };
 
         let mut revoked = HashMap::new();
-        if let Some(h) = self.connected_peers.get_mut(addr) {
+        let picked_n = if let Some(h) = self.connected_peers.get_mut(addr) {
             if h.state.peer_choke_status == ChokeStatus::Unchoked {
                 let n_in_flight = h.inflight.inflight();
                 let probe_bdp_rtt = compute_probe_bdp_rtt(h.min_rtt);
@@ -734,9 +733,23 @@ impl TransmitWorker {
                         }
                         h.app_limited = false;
                     }
+
+                    match h.bw_mode {
+                        BandwidthMode::ProbeBW {
+                            ref mut capacity, ..
+                        } => {
+                            *capacity = capacity.saturating_sub(picked_n);
+                        }
+                        _ => {}
+                    }
                 }
+                picked_n
+            } else {
+                0
             }
-        }
+        } else {
+            0
+        };
 
         for (peer, reqs) in revoked {
             for req in reqs {
@@ -746,6 +759,8 @@ impl TransmitWorker {
                 }
             }
         }
+
+        picked_n
     }
 
     fn handle_msg(&mut self, m: Msg) -> io::Result<()> {
@@ -882,6 +897,7 @@ impl TransmitWorker {
                     TorrentState::Fetching(_) => {}
                 }
                 self.connected_peers.remove(&to_canonical_addr(addr));
+                self.remove_unreachable_pieces_from_buf();
                 Ok(())
             }
             Msg::PeerMsg(pm) => self.handle_peer_msg(pm),
@@ -981,6 +997,10 @@ impl TransmitWorker {
                 );
                 // TODO: record the ?stable transmit rate/ i.e. how many packets is in flight
                 // so we can recover to max speed (hopefully) once they unchoked us
+                // TODO: shall we remove immediately, or wait for a while in case peer
+                // unchokes us again soon?
+                // TODO: NOTE: we did not category choke as unreachable peer
+                // self.remove_unreachable_pieces_from_buf();
                 Ok(())
             }
             PeerMsg::Unchoke(peer) => {
@@ -1134,6 +1154,20 @@ impl TransmitWorker {
         }
     }
 
+    fn remove_unreachable_pieces_from_buf(&mut self) {
+        let state = match &mut self.torrent_state {
+            TorrentState::Metadata(d) => d,
+            TorrentState::Fetching(_) => return,
+        };
+        // state.block_picker.piece_availability(index)
+        let n_pieces = state.block_picker.n_pieces();
+        for index in 0..n_pieces {
+            if state.block_picker.piece_availability(index as u32) == 0 {
+                state.storage.remove_piece(index);
+            }
+        }
+    }
+
     #[instrument(skip_all, ret)]
     fn get_piecebuf(
         storage: &mut BufStorage,
@@ -1163,9 +1197,7 @@ impl TransmitWorker {
         let on_err = move |_| {};
 
         match storage.get_piece(index, on_ready, Box::new(on_err)) {
-            Ok(p) => {
-                // return Ok(p);
-            }
+            Ok(_) => {}
             Err(GetPieceErr::InvalidPiece) => panic!("wrong index {}", index),
             Err(GetPieceErr::Returned) => panic!("already returned piece {}", index),
             Err(GetPieceErr::Loading) => {
@@ -1175,11 +1207,14 @@ impl TransmitWorker {
                 storage.add_piece(p);
             }
         }
+
+        // by this time, we should have inserted piecebuf(index) into storage
         Ok(storage.get_piece(index, |_| {}, Box::new(|_| {})).unwrap())
     }
 
     #[instrument(skip_all)]
     fn handle_blocks_receieved(&mut self, peer: PeerAddr) -> io::Result<()> {
+        let peer = to_canonical_addr(peer);
         info!("get BlockReceived from {peer}");
         // TODO: OPTIMIZE: return connection handle to reduce map search
         if !self.connected_peers.contains_key(&peer) {
@@ -1191,7 +1226,7 @@ impl TransmitWorker {
         }
         let conn = self
             .connected_peers
-            .get_mut(&to_canonical_addr(peer))
+            .get_mut(&peer)
             .expect("should exist");
 
         // For Probe mode BDP estimation, use a conservative RTT baseline under jitter:
@@ -1448,14 +1483,13 @@ impl TransmitWorker {
                 );
 
                 let n_to_pick = (*capacity)
-                    .min(MAX_IN_FLIGHT.saturating_sub(n_req_in_flight))
+                    .min(max_in_flight.saturating_sub(n_req_in_flight))
                     .min(limit.saturating_sub(n_req_in_flight))
                     .max(MIN_IN_FLIGHT.saturating_sub(n_req_in_flight));
                 info!(
                     "{peer} ProbeBW mode cycle {} capacity {} min rtt {:?} probe rtt {:?} avg bw {} avg_bw_10s {} max_bw {} req in flight {}",
                     cycle_index, *capacity, conn.min_rtt, probe_bdp_rtt, avg_bw, avg_bw_10s, max_bw, n_req_in_flight
                 );
-                *capacity = capacity.saturating_sub(n_to_pick);
                 n_to_pick
             }
             BandwidthMode::SlowDown {
@@ -1487,7 +1521,7 @@ impl TransmitWorker {
 
         if matches!(self.running_state, RunningState::Downloading) {
             if conn.state.peer_choke_status == ChokeStatus::Unchoked {
-                self.pick_blocks_for_peer(&peer, n_to_pick);
+                let really_picked = self.pick_blocks_for_peer(&peer, n_to_pick);
             }
         }
         Ok(())
@@ -1745,7 +1779,11 @@ impl TransmitWorker {
 
                 match &mut self.torrent_state {
                     TorrentState::Metadata(d) => {
-                        d.storage.add_piece(buf);
+                        if d.block_picker.piece_availability(index as u32) > 0 {
+                            d.storage.add_piece(buf);
+                        } else {
+                            d.storage.forget_piece(buf);
+                        }
                     }
                     TorrentState::Fetching(_) => {
                         info!("piece buf ready when fetching, maybe unreachable");
@@ -2120,7 +2158,7 @@ pub(crate) async fn run_transmit_worker(
         };
     }
     let _ = done.send(());
-    println!("transmit manager done");
+    info!("transmit manager done");
 }
 
 fn copy_to_piecebuf(piece: &Piece, data: &[u8], piecebuf: &mut PieceBuf) {
