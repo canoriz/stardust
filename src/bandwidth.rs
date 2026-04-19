@@ -129,7 +129,10 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
         };
         self.reduce_periods_within_interval(back, map_f, reduce_f)
             .map_or(0.0, |(total_size, since)| {
-                (total_size as f32) / since.elapsed().as_secs_f32()
+                // Use at least `back` as denominator: if the oldest included period started
+                // very recently (e.g. after a long gap), dividing by its tiny elapsed time
+                // would produce a spurious spike.
+                (total_size as f32) / since.elapsed().max(back).as_secs_f32()
             })
     }
 
