@@ -1,5 +1,4 @@
 use anyhow::Result;
-use tokio::time::{self, Duration};
 use tracing::info;
 use tracing_subscriber::fmt::format::FmtSpan;
 
@@ -83,13 +82,13 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
     session
         .do_work(&info_hash, async |tm| {
             // TODO: this is ugly though, only sender can clone
-            // tm.check().await;
-            tm.change_state(RunningCmd::Resume).await;
-            tm.wait_downloaded().await;
+            // let _ = tm.check().await;
+            let _ = tm.change_state(RunningCmd::Resume).await;
+            let _ = tm.wait_downloaded().await;
         })
         .await;
     if let Some(mut tm) = session.remove_torrent(&info_hash).await {
-        tm.wait_downloaded().await;
+        let _ = tm.wait_downloaded().await;
         info!("stopped");
     }
     info!("after");

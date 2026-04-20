@@ -10,10 +10,61 @@ use std::{
 };
 
 use super::{BackFile, MutexBackFile};
+use crate::protocol::Request;
 use bytes::BytesMut;
 use tokio::{sync::mpsc, time};
 use tracing::{info, warn};
 
+pub type PieceIndex = u32;
+pub type SubPieceIndex = u32;
+
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Ord, PartialOrd)]
+pub struct JointIndex(u64);
+impl std::fmt::Debug for JointIndex {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let piece_idx = self.index();
+        let sub_idx = self.sub_index();
+        f.debug_tuple("JointIndex")
+            .field(&format_args!("piece {piece_idx}, sub {sub_idx}"))
+            .finish()
+    }
+}
+
+impl JointIndex {
+    #[inline]
+    pub fn new(piece_idx: PieceIndex, in_piece_offset: SubPieceIndex) -> Self {
+        let sub_idx = in_piece_offset / SUB_PIECE_SIZE;
+        JointIndex((piece_idx as u64) << 32 | sub_idx as u64)
+    }
+
+    #[inline]
+    pub fn index(&self) -> PieceIndex {
+        (self.0 >> 32) as u32
+    }
+
+    #[inline]
+    pub fn sub_index(&self) -> SubPieceIndex {
+        self.0 as u32
+    }
+
+    #[inline]
+    /// in_piece_offset returns the starting byte offset of this sub-piece
+    /// within its piece
+    pub fn in_piece_offset(&self) -> usize {
+        (self.sub_index() * SUB_PIECE_SIZE) as usize
+    }
+}
+
+impl From<Request> for JointIndex {
+    #[inline]
+    fn from(req: Request) -> Self {
+        JointIndex::new(req.index, req.begin)
+    }
+}
+
+/// Must be a multiple of the BT block size (16 384 bytes) so that no block
+/// ever straddles a sub-piece boundary inside `copy_to_piecebuf`.
+pub const SUB_PIECE_SIZE: u32 = 1 * 1024 * 1024; // 1 MiB
 pub const POOL_SIZE: usize = 60;
 
 const FLUSHING: u32 = 0b1;
@@ -214,7 +265,7 @@ pub struct PieceBuf {
     /// always Some, except in drop
     buf: CowBuf<PooledBuf>,
     offset: usize,
-    index: usize,
+    index: JointIndex,
     touch: time::Instant,
     state: Arc<AtomicU32>,
     file: MutexBackFile,
@@ -283,7 +334,7 @@ impl Drop for PieceBuf {
             tokio::task::spawn_blocking(move || {
                 let r = flush_buf_force(buf, offset, s, f, true);
                 if let Err(e) = r {
-                    warn!("PieceBuf::Drop flush error index {index} {e:?}, data lost");
+                    warn!("PieceBuf::Drop flush error index {index:?} {e:?}, data lost");
                     on_err.unwrap()(e)
                 }
             });
@@ -292,7 +343,7 @@ impl Drop for PieceBuf {
 }
 
 impl PieceBuf {
-    pub fn index(&self) -> usize {
+    pub fn index(&self) -> JointIndex {
         self.index
     }
 
@@ -408,7 +459,7 @@ fn read_from_file(mut p: PieceBuf, file: MutexBackFile) -> io::Result<PieceBuf> 
 }
 
 pub struct BufStorage {
-    pieces: HashMap<usize, PieceBuf>,
+    pieces: HashMap<JointIndex, PieceBuf>,
 
     piece_size: usize,
     last_piece_size: usize,
@@ -418,7 +469,7 @@ pub struct BufStorage {
 
     /// currently loading pieces
     /// if piece is not present, add to loading list
-    loading: Arc<Mutex<HashMap<usize, PieceState>>>,
+    loading: Arc<Mutex<HashMap<JointIndex, PieceState>>>,
 
     /// BytesMut pool
     // TODO: another layer of global pool shared between many BufStorages
@@ -477,14 +528,14 @@ impl BufStorage {
         assert_eq!(c, n);
     }
 
-    /// get piecebuf from local buffer, if piecebuf in buffer, return it.
-    /// If not in buffer, returns None
-    pub fn get_buffered_piece(&mut self, piece_idx: usize) -> Option<&mut PieceBuf> {
+    /// get piecebuf from local cache, if piecebuf in cache, return it.
+    /// If not in cache, returns None
+    pub fn get_cached_piece(&mut self, piece_idx: JointIndex) -> Option<&mut PieceBuf> {
         self.pieces.get_mut(&piece_idx)
     }
 
     /// returns all buffered pieces
-    pub fn iter_buffered(&mut self) -> impl Iterator<Item = (&usize, &mut PieceBuf)> {
+    pub fn iter_buffered(&mut self) -> impl Iterator<Item = (&JointIndex, &mut PieceBuf)> {
         self.pieces.iter_mut()
     }
 
@@ -496,41 +547,46 @@ impl BufStorage {
     /// LOADING, only one of the on_ready will be called!
     pub fn get_piece<F>(
         &mut self,
-        piece_idx: usize,
+        index: JointIndex,
         on_ready: F,
         on_flush_err: Box<dyn ErrorCallback>,
     ) -> Result<&mut PieceBuf, GetPieceErr>
     where
         F: FnOnce(io::Result<PieceBuf>) + Send + 'static,
     {
-        let piece_idx = piece_idx as usize;
+        let piece_idx = index.index() as usize;
+        let in_piece_offset = index.in_piece_offset();
+        let this_piece_size = if piece_idx + 1 == self.piece_total {
+            self.last_piece_size
+        } else {
+            self.piece_size
+        };
         if piece_idx >= self.piece_total {
             return Err(GetPieceErr::InvalidPiece);
         }
-        if let Some(p) = self.pieces.get_mut(&piece_idx) {
+        if in_piece_offset >= this_piece_size {
+            return Err(GetPieceErr::InvalidPiece);
+        }
+        if let Some(p) = self.pieces.get_mut(&index) {
             p.touch = time::Instant::now();
             Ok(p)
         } else {
             let mut guard = self.loading.lock().unwrap();
-            match guard.get(&piece_idx) {
+            match guard.get(&index) {
                 Some(PieceState::Loading) => return Err(GetPieceErr::Loading),
                 Some(PieceState::Returned) => return Err(GetPieceErr::Returned),
                 None => {
-                    guard.insert(piece_idx, PieceState::Loading);
+                    guard.insert(index, PieceState::Loading);
                 }
             }
-            // This is the first request of piece_idx
-            let offset = piece_idx * self.piece_size;
-            let len = if piece_idx + 1 == self.piece_total {
-                self.last_piece_size as usize
-            } else {
-                self.piece_size as usize
-            };
+            // File offset of this sub-piece and its length within the piece
+            let offset = piece_idx * self.piece_size + in_piece_offset;
+            let len = (SUB_PIECE_SIZE as usize).min(this_piece_size - in_piece_offset);
 
             let p = PieceBuf {
                 buf: CowBuf::new(PooledBuf::new(self.pool.clone(), len)),
                 touch: time::Instant::now(),
-                index: piece_idx,
+                index,
                 offset,
                 state: Arc::new(AtomicU32::new(0)),
                 file: self.back_file.clone(),
@@ -542,14 +598,14 @@ impl BufStorage {
                 Ok(p) => {
                     let mut guard = loading_map.lock().unwrap();
                     let v = guard
-                        .get_mut(&piece_idx)
+                        .get_mut(&index)
                         .expect("file read done, corresponding piece_idx should exist in map");
                     *v = PieceState::Returned;
                     on_ready(Ok(p));
                 }
                 Err(e) => {
                     let mut guard = loading_map.lock().unwrap();
-                    guard.remove(&piece_idx);
+                    guard.remove(&index);
                     on_ready(Err(e));
                 }
             });
@@ -558,6 +614,7 @@ impl BufStorage {
     }
 
     pub fn add_piece(&mut self, p: PieceBuf) {
+        self.purge_by_size(POOL_SIZE - 1);
         {
             let mut guard = self.loading.lock().unwrap();
 
@@ -565,10 +622,9 @@ impl BufStorage {
             // inserted piece should be from get_piece's on_ready
             // and by that way, loading[piece_idx] should be PieceState::Returned
             assert!(matches!(guard.remove(&p.index), Some(PieceState::Returned)));
-            info!("insert piece buffer {}", p.index());
+            info!("insert piece buffer {:?}", p.index());
             self.pieces.insert(p.index, p);
         }
-        self.purge_by_size(POOL_SIZE);
     }
 
     pub fn forget_piece(&mut self, p: PieceBuf) {
@@ -578,12 +634,12 @@ impl BufStorage {
         // inserted piece should be from get_piece's on_ready
         // and by that way, loading[piece_idx] should be PieceState::Returned
         assert!(matches!(guard.remove(&p.index), Some(PieceState::Returned)));
-        info!("forget piece buffer {}", p.index());
+        info!("forget piece buffer {:?}", p.index());
     }
 
-    pub fn remove_piece(&mut self, piece_idx: usize) {
+    pub fn remove_piece(&mut self, piece_idx: JointIndex) {
         if self.pieces.remove(&piece_idx).is_some() {
-            info!("remove piece buffer {piece_idx}");
+            info!("remove piece buffer {:?}", piece_idx);
         }
     }
 
@@ -610,7 +666,7 @@ impl BufStorage {
         while n_purge > 0 {
             if let Some(cmp::Reverse((_, i))) = remove_pieces.pop() {
                 self.pieces.remove(&i);
-                info!("purge clear piece {i}");
+                info!("purge clear piece {i:?}");
                 n_purge -= 1;
             } else {
                 break;
@@ -627,7 +683,7 @@ impl BufStorage {
             }
             while n_purge > 0 {
                 if let Some(cmp::Reverse((_, i))) = remove_pieces.pop() {
-                    info!("purge dirty piece {i}");
+                    info!("purge dirty piece {i:?}");
                     self.pieces.remove(&i);
                     n_purge -= 1;
                 }
@@ -657,7 +713,8 @@ mod test {
     use tokio::time;
 
     use super::{
-        BackFile, CowBuf, FlushErr, MutexBackFile, PieceBuf, Pool, PooledBuf, DIRTY, FLUSHING,
+        read_from_file, BackFile, CowBuf, FlushErr, JointIndex, MutexBackFile, PieceBuf, Pool,
+        PooledBuf, DIRTY, FLUSHING,
     };
 
     fn void_file() -> MutexBackFile {
@@ -672,7 +729,7 @@ mod test {
         PieceBuf {
             buf: CowBuf::new(PooledBuf::new(pool, len)),
             offset: 0,
-            index: 0,
+            index: JointIndex::new(0, 0),
             touch: time::Instant::now(),
             state: Arc::new(AtomicU32::new(initial_state)),
             file: void_file(),
@@ -975,7 +1032,7 @@ mod test {
         let mut pb = PieceBuf {
             buf: CowBuf::new(PooledBuf::new(pool, 8)),
             offset: 0,
-            index: 0,
+            index: JointIndex::new(0, 0),
             touch: time::Instant::now(),
             state: Arc::new(AtomicU32::new(0)),
             file: file.clone(),
@@ -983,6 +1040,6 @@ mod test {
         };
         let _shared = pb.buf.clone(); // make Shared
                                       // read_from_file must panic when buf is Shared.
-        super::read_from_file(pb, file).unwrap();
+        read_from_file(pb, file).unwrap();
     }
 }

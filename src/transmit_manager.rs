@@ -1,20 +1,19 @@
 use crate::announce_manager::{self, AnnounceManagerHandle};
 use crate::backfile::{BackFile, NormalFile, VoidFile};
-use crate::bandwidth::{self, Bandwidth, RTT};
+use crate::bandwidth::Bandwidth;
 use crate::buffer_pool::BlockBuf;
-use crate::cache::simple_buffer::{BufStorage, FlushErr};
+use crate::cache::simple_buffer::{BufStorage, FlushErr, JointIndex, SUB_PIECE_SIZE};
 use crate::cache::simple_buffer::{GetPieceErr, PieceBuf};
 use crate::connection_manager::{
     ConnectionManagerHandle, CtrlOfRecv, CtrlOfSend, CtrlOfSend as ConnMsg, ReceivedBlocks,
 };
 use crate::dht::DHT;
+use crate::hasher::HashState;
 use crate::metadata::{self, Magnet, Metadata};
-use crate::picker::{
-    BlockPicker, BlockPickerDump, BlockRequests, BlockStatus, PieceState, RarestPicker,
-};
+use crate::picker::{BlockPicker, BlockPickerDump, PieceState, RarestPicker};
 use crate::protocol::{
-    self, BTStream, BitField, Conn, ExtendedMetadata, ExtendedMsg, ExtendedPex, HandshakeOption,
-    InfoHash, Piece, Request,
+    self, Conn, ExtendedMetadata, ExtendedMsg, ExtendedPex, HandshakeOption, InfoHash, Piece,
+    Request,
 };
 
 use serde::{Deserialize, Serialize};
@@ -27,7 +26,7 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time;
 use tokio_util::sync::{CancellationToken, DropGuard as CancelDropGuard};
-use tracing::{debug, info, instrument, span, trace, warn, Level};
+use tracing::{debug, error, info, instrument, span, trace, warn, Level};
 
 mod bandwidth_mode;
 mod inflight;
@@ -144,7 +143,7 @@ pub(crate) enum Msg {
     PeerLeave(PeerAddr),
 
     PieceBufReady {
-        index: usize,
+        index: JointIndex,
         buf: io::Result<PieceBuf>,
     },
 
@@ -322,7 +321,7 @@ enum RunningState {
     Seeding,
     Checking {
         prev_state: RunningCmd,
-        selected: BitField,
+        to_check: BTreeSet<u32>,
         checked: CheckState,
         #[serde(skip)]
         waiter: Vec<oneshot::Sender<bool>>,
@@ -464,6 +463,7 @@ pub struct Downloading {
 
     pub block_picker: BlockPicker,
     pub storage: BufStorage,
+    pub hasher: HashMap<u32, HashState<Sha1>>,
 }
 
 pub struct TransmitWorker {
@@ -495,7 +495,7 @@ pub struct TransmitWorker {
 
     /// received blocks waiting writing to piece buf once
     /// piece buf is ready
-    waiting_for_piecebuf: HashMap<u32, Vec<BlockWaitingBuf>>,
+    waiting_for_piecebuf: HashMap<JointIndex, Vec<BlockWaitingBuf>>,
 
     downloaded: watch::Sender<bool>,
 }
@@ -525,8 +525,9 @@ struct BlockWaitingBuf {
     piece: Piece,
     buf: BlockBuf,
 
-    /// if this piece is all_received
-    full_received: bool,
+    // whether this block completes a sub-piece
+    // e.g. a sub-piece will be complete after this block
+    sub_piece_complete: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -541,6 +542,13 @@ fn bw_look_back_window(probe_bdp_rtt: time::Duration) -> time::Duration {
 
 impl TransmitWorker {
     const DHT_TIMEOUT: time::Duration = time::Duration::from_secs(3);
+
+    fn broadcast_have(&self, index: u32) {
+        for (_, h) in self.connected_peers.iter() {
+            h.conn.send_stream_cmd(ConnMsg::Have(index));
+        }
+    }
+
     pub fn new(
         t: TorrentTask,
         id: [u8; 20],
@@ -613,6 +621,7 @@ impl TransmitWorker {
             metadata: m,
             block_picker,
             storage: buf_storage,
+            hasher: HashMap::new(),
         }
     }
 
@@ -815,7 +824,7 @@ impl TransmitWorker {
                         TorrentState::Metadata(d) => {
                             Some((d.block_picker.our_state(), d.block_picker.n_pieces()))
                         }
-                        TorrentState::Fetching(f) => None,
+                        TorrentState::Fetching(_) => None,
                     };
 
                     if let Some((piece_state, n)) = state {
@@ -897,7 +906,8 @@ impl TransmitWorker {
                     TorrentState::Fetching(_) => {}
                 }
                 self.connected_peers.remove(&to_canonical_addr(addr));
-                self.remove_unreachable_pieces_from_buf();
+                // TODO: FIXME
+                // self.remove_unreachable_pieces_from_buf();
                 Ok(())
             }
             Msg::PeerMsg(pm) => self.handle_peer_msg(pm),
@@ -1122,57 +1132,201 @@ impl TransmitWorker {
         // }
     }
 
-    fn verify_piece(p: &PieceBuf, metadata: &Metadata) -> bool {
-        use std::io::Write;
-        let target = &metadata.info.pieces[p.index() * 20..p.index() * 20 + 20];
-        let mut hasher = Sha1::new();
-        _ = hasher.write_all(p.as_ref());
-        let res: [u8; 20] = hasher.finalize().into();
+    fn verify_piece(index: usize, metadata: &Metadata, hasher: HashState<Sha1>) -> bool {
+        let target = &metadata.info.pieces[index * 20..index * 20 + 20];
+        let res: [u8; 20] = hasher.finalize().finalize().into();
         res == target
     }
 
-    /// called when a full piece received
-    /// return verify result of this piece
-    fn handle_full_piece_received(
-        p: &mut PieceBuf,
-        metadata: &Metadata,
-        connected_peers: &mut HashMap<PeerAddr, PeerConn>,
-        block_picker: &mut BlockPicker,
-    ) {
-        info!("piece {} full received, verifying...", p.index());
-        if Self::verify_piece(p, metadata) {
-            // flush error is not fatal
-            // we always catch drop error
-            p.flush(|_| {});
-            for (_, h) in connected_peers.iter() {
-                h.conn.send_stream_cmd(ConnMsg::Have(p.index() as u32));
-            }
-            block_picker.piece_verified(p.index() as u32, true);
-        } else {
-            info!("piece {} verify failed", p.index());
-            block_picker.piece_verified(p.index() as u32, false);
-        }
-    }
-
-    fn remove_unreachable_pieces_from_buf(&mut self) {
-        let state = match &mut self.torrent_state {
-            TorrentState::Metadata(d) => d,
-            TorrentState::Fetching(_) => return,
+    /// try to advance the hash state of a piece as much as possible
+    /// returns if full piece is hashed
+    fn advance_hash(&mut self, index: u32, schedule_load_next: bool) -> io::Result<bool> {
+        let Downloading {
+            block_picker,
+            storage,
+            hasher: piece_hasher,
+            ..
+        } = match self.torrent_state {
+            TorrentState::Metadata(ref mut d) => d,
+            TorrentState::Fetching(_) => panic!("should not receive piece before metadata"),
         };
-        // state.block_picker.piece_availability(index)
-        let n_pieces = state.block_picker.n_pieces();
-        for index in 0..n_pieces {
-            if state.block_picker.piece_availability(index as u32) == 0 {
-                state.storage.remove_piece(index);
+        let piece_size = block_picker.piece_size(index);
+
+        let hasher = piece_hasher
+            .entry(index)
+            .or_insert_with(|| HashState::new(Sha1::new()));
+
+        let total_sub_pieces =
+            (piece_size as usize + SUB_PIECE_SIZE as usize - 1) / SUB_PIECE_SIZE as usize;
+        let mut from_sub_pieces = hasher.next_offset() / SUB_PIECE_SIZE as usize;
+        while from_sub_pieces < total_sub_pieces {
+            let req = Request {
+                index,
+                begin: hasher.next_offset() as u32,
+                len: 0,
+            };
+            let ji = JointIndex::from(req);
+            if schedule_load_next {
+                match Self::get_piecebuf(storage, self.self_handle.sender.clone(), ji) {
+                    Ok(piecebuf) => {
+                        hasher.write(piecebuf)?;
+                        // flush error is not fatal
+                        // we always catch drop error
+                        piecebuf.flush(|_| {});
+                        from_sub_pieces += 1;
+                    }
+                    Err(GetPieceErr::InvalidPiece) => {
+                        error!("invalid piece {ji:?}");
+                        unreachable!("invalid piece index requested");
+                    }
+                    Err(e) => {
+                        trace!("piecebuf {index} not present err {e:?}");
+                        break;
+                    }
+                }
+            } else {
+                match Self::get_cached_piecebuf(storage, ji) {
+                    Some(piecebuf) => {
+                        hasher.write(piecebuf)?;
+                        // flush error is not fatal
+                        // we always catch drop error
+                        piecebuf.flush(|_| {});
+                        from_sub_pieces += 1;
+                    }
+                    None => {
+                        break;
+                    }
+                }
             }
+        }
+        info!(
+            "advance hash of piece {index} from sub piece {from_sub_pieces} / {total_sub_pieces}"
+        );
+        Ok(from_sub_pieces >= total_sub_pieces)
+    }
+
+    /// called when a full piece received
+    /// return verify result of the full piece
+    /// index: piece index
+    /// force_check: load pieces regardless of state of piece picker
+    /// used in file recheck, where piece picker may not be accurate, piece picker
+    fn handle_sub_piece_received(
+        &mut self,
+        index: u32,
+        force_check: bool,
+    ) -> io::Result<Option<bool>> {
+        info!("sub piece of {} received, hashing...", index);
+        let Downloading { block_picker, .. } = match self.torrent_state {
+            TorrentState::Metadata(ref mut d) => d,
+            TorrentState::Fetching(_) => panic!("should not receive piece before metadata"),
+        };
+        let schedule_load = force_check || block_picker.is_piece_wait_check(index);
+        let full_hashed = self.advance_hash(index, schedule_load)?;
+
+        if !full_hashed {
+            return Ok(None);
+        }
+
+        let Downloading {
+            metadata,
+            block_picker,
+            hasher: piece_hasher,
+            ..
+        } = match self.torrent_state {
+            TorrentState::Metadata(ref mut d) => d,
+            TorrentState::Fetching(_) => panic!("should not receive piece before metadata"),
+        };
+        let hasher = piece_hasher.remove(&index).unwrap();
+        if Self::verify_piece(index as usize, metadata, hasher) {
+            info!("piece {} verify pass", index);
+            block_picker.piece_verified(index as u32, true);
+            Ok(Some(true))
+        } else {
+            info!("piece {} verify failed", index);
+            block_picker.piece_verified(index as u32, false);
+            Ok(Some(false))
         }
     }
 
-    #[instrument(skip_all, ret)]
+    /// called when checking file and a piece is checked
+    fn handle_checkfile_on_piece_verified(&mut self, index: u32, passed: bool) -> io::Result<()> {
+        info!(
+            "piece {index} check {}",
+            if passed { "passed" } else { "failed" }
+        );
+        match &mut self.running_state {
+            RunningState::Checking {
+                prev_state,
+                to_check,
+                checked,
+                waiter,
+            } => {
+                let mut notify_waiter = |r: bool| {
+                    for w in waiter.drain(0..) {
+                        w.send(r);
+                    }
+                };
+                checked.check(index as usize, passed);
+                to_check.remove(&index);
+                if to_check.is_empty() {
+                    let r = checked.state.iter().all(|s| *s != CheckState::CORRUPT);
+                    notify_waiter(r);
+                    match prev_state {
+                        RunningCmd::Resume => {
+                            let Downloading { block_picker, .. } = match &mut self.torrent_state {
+                                TorrentState::Metadata(d) => d,
+                                TorrentState::Fetching(_) => {
+                                    unreachable!();
+                                }
+                            };
+                            if block_picker.is_finished() {
+                                self.running_state = RunningState::Seeding;
+                            } else {
+                                self.running_state = RunningState::Downloading;
+                            }
+                        }
+                        RunningCmd::Pause => {
+                            self.running_state = RunningState::Paused;
+                        }
+                        RunningCmd::Stop => {
+                            self.running_state = RunningState::Stopped;
+                        }
+                    }
+                } else {
+                    let next_piece = to_check.pop_first().unwrap();
+                    match self.handle_sub_piece_received(next_piece, true)? {
+                        Some(passed) => {
+                            // TODO: MAYBE FIXME: this is recursive, but mostly this will be a None
+                            self.handle_checkfile_on_piece_verified(next_piece, passed)?;
+                        }
+                        None => {}
+                    }
+                }
+                Ok(())
+            }
+            _ => unreachable!("called from not checking state"),
+        }
+    }
+
+    // fn remove_unreachable_pieces_from_buf(&mut self) {
+    //     let state = match &mut self.torrent_state {
+    //         TorrentState::Metadata(d) => d,
+    //         TorrentState::Fetching(_) => return,
+    //     };
+    //     // state.block_picker.piece_availability(index)
+    //     let n_pieces = state.block_picker.n_pieces();
+    //     for index in 0..n_pieces {
+    //         if state.block_picker.piece_availability(index as u32) == 0 {
+    //             state.storage.remove_piece(index);
+    //         }
+    //     }
+    // }
+
+    #[instrument(skip(storage, sender), ret)]
     fn get_piecebuf(
         storage: &mut BufStorage,
         sender: mpsc::UnboundedSender<Msg>,
-        index: usize,
+        index: JointIndex,
     ) -> Result<&mut PieceBuf, GetPieceErr> {
         let err_sender = sender.clone();
         let on_ready = move |p| {
@@ -1184,11 +1338,16 @@ impl TransmitWorker {
         storage.get_piece(index, on_ready, Box::new(on_err))
     }
 
+    #[instrument(skip(storage))]
+    fn get_cached_piecebuf(storage: &mut BufStorage, index: JointIndex) -> Option<&mut PieceBuf> {
+        storage.get_cached_piece(index)
+    }
+
     /// NOTE: CRITICAL: if concurrently get same index, only one of them may return
     /// others may block indefinitely
     async fn get_piecebuf_now<'a>(
         storage: &'a mut BufStorage,
-        index: usize,
+        index: JointIndex,
     ) -> io::Result<&'a mut PieceBuf> {
         let (tx, rx) = oneshot::channel();
         let on_ready = move |p| {
@@ -1198,8 +1357,8 @@ impl TransmitWorker {
 
         match storage.get_piece(index, on_ready, Box::new(on_err)) {
             Ok(_) => {}
-            Err(GetPieceErr::InvalidPiece) => panic!("wrong index {}", index),
-            Err(GetPieceErr::Returned) => panic!("already returned piece {}", index),
+            Err(GetPieceErr::InvalidPiece) => panic!("wrong index {:?}", index),
+            Err(GetPieceErr::Returned) => panic!("already returned piece {:?}", index),
             Err(GetPieceErr::Loading) => {
                 let p = rx.await.map_err(|_| {
                     io::Error::new(io::ErrorKind::Other, "get piecebuf_now oneshot recv error")
@@ -1224,10 +1383,7 @@ impl TransmitWorker {
                 self.connected_peers.keys()
             );
         }
-        let conn = self
-            .connected_peers
-            .get_mut(&peer)
-            .expect("should exist");
+        let conn = self.connected_peers.get_mut(&peer).expect("should exist");
 
         // For Probe mode BDP estimation, use a conservative RTT baseline under jitter:
         let probe_bdp_rtt = compute_probe_bdp_rtt(conn.min_rtt);
@@ -1645,7 +1801,7 @@ impl TransmitWorker {
             return Ok(());
         }
 
-        let (piece_received, peers_revoked) = block_picker.receive_block(req);
+        let (complete, peers_revoked) = block_picker.receive_block(req);
         for addr in peers_revoked {
             if addr != *peer {
                 // if this block come from peer we did not request, cancel old request
@@ -1659,20 +1815,20 @@ impl TransmitWorker {
             }
         }
 
-        match Self::get_piecebuf(
-            storage,
-            self.self_handle.sender.clone(),
-            piece.index as usize,
-        ) {
+        let ji = JointIndex::from(piece.to_request());
+        match Self::get_piecebuf(storage, self.self_handle.sender.clone(), ji) {
             Ok(piecebuf) => {
                 copy_to_piecebuf(&piece, &buf, piecebuf);
-                if let Some(_) = piece_received {
-                    Self::handle_full_piece_received(
-                        piecebuf,
-                        &metadata,
-                        &mut self.connected_peers,
-                        block_picker,
-                    );
+                piecebuf.flush(|_| {});
+                if complete.sub_piece {
+                    info!("sub piece {ji:?} piece received",);
+                    match self.handle_sub_piece_received(piece.index, false)? {
+                        Some(true) => {
+                            self.broadcast_have(ji.index() as u32);
+                        }
+                        Some(false) => {}
+                        None => {}
+                    }
                 }
             }
             Err(GetPieceErr::InvalidPiece) => {
@@ -1680,20 +1836,20 @@ impl TransmitWorker {
             }
             Err(e) => {
                 let index = piece.index;
-                let full_received = piece_received.is_some();
-                match self.waiting_for_piecebuf.get_mut(&index) {
+                let sub_piece_complete = complete.sub_piece;
+                match self.waiting_for_piecebuf.get_mut(&ji) {
                     Some(v) => v.push(BlockWaitingBuf {
                         piece,
                         buf,
-                        full_received,
+                        sub_piece_complete,
                     }),
                     None => {
                         self.waiting_for_piecebuf.insert(
-                            index,
+                            ji,
                             vec![BlockWaitingBuf {
                                 piece,
                                 buf,
-                                full_received,
+                                sub_piece_complete,
                             }],
                         );
                     }
@@ -1704,90 +1860,63 @@ impl TransmitWorker {
         Ok(())
     }
 
-    fn handle_piecebuf_ready(&mut self, index: usize, buf: io::Result<PieceBuf>) -> io::Result<()> {
-        let (block_picker, metadata) = match &mut self.torrent_state {
-            TorrentState::Metadata(d) => (&mut d.block_picker, &d.metadata),
+    fn handle_piecebuf_ready(
+        &mut self,
+        ji: JointIndex,
+        buf: io::Result<PieceBuf>,
+    ) -> io::Result<()> {
+        let Downloading { storage, .. } = match &mut self.torrent_state {
+            TorrentState::Metadata(d) => d,
             TorrentState::Fetching(_) => {
                 unreachable!();
             }
         };
         match buf {
             Ok(mut buf) => {
-                let pending = self.waiting_for_piecebuf.remove(&(index as u32));
+                let pending = self.waiting_for_piecebuf.remove(&ji);
+                let mut sub_piece_complete = false;
                 if let Some(ps) = pending {
-                    let mut full_received = false;
                     info!(
-                        "piecebuf {index} now ready, flushing {} blocks into it",
+                        "piecebuf {ji:?} now ready, flushing {} blocks into it",
                         ps.len()
                     );
+                    // full_received should be set at most once
                     for p in ps {
+                        assert!(!sub_piece_complete);
+                        sub_piece_complete |= p.sub_piece_complete;
                         // full_received should be set at most once
-                        assert!(!full_received);
                         copy_to_piecebuf(&p.piece, &p.buf, &mut buf);
-                        if p.full_received {
-                            full_received = true;
-                            info!("flush new ready piecebuf {index}");
-                            Self::handle_full_piece_received(
-                                &mut buf,
-                                &metadata,
-                                &mut self.connected_peers,
-                                block_picker,
-                            );
-                        }
                     }
                 }
 
-                match &mut self.running_state {
-                    RunningState::Checking {
-                        prev_state,
-                        selected,
-                        checked,
-                        waiter,
-                    } => {
-                        let mut notify_waiter = |r: bool| {
-                            for w in waiter.drain(0..) {
-                                w.send(r);
-                            }
-                        };
-                        let index = buf.index() as u32;
-                        if selected.get(index) && checked.get(index as usize) == CheckState::UNKNOWN
-                        {
-                            let r = Self::verify_piece(&buf, metadata);
-                            checked.check(index as usize, r);
-                            block_picker.set_have(index, r);
-
-                            assert!(checked.get(index as usize) != CheckState::UNKNOWN);
-                            if selected.count_ones() as usize == checked.known() {
-                                let r = checked.state.iter().all(|s| *s != CheckState::CORRUPT);
-                                notify_waiter(r);
-                                match prev_state {
-                                    RunningCmd::Resume => {
-                                        if block_picker.is_finished() {
-                                            self.running_state = RunningState::Seeding
-                                        } else {
-                                            self.running_state = RunningState::Downloading
-                                        }
-                                    }
-                                    RunningCmd::Pause => self.running_state = RunningState::Paused,
-                                    RunningCmd::Stop => self.running_state = RunningState::Stopped,
+                storage.add_piece(buf);
+                // TODO: remove immediate if that piece is no longer available among peers
+                // if block_picker.piece_availability(ji.index()) > 0 {
+                //     storage.add_piece(buf);
+                // } else {
+                //     // storage.forget_piece(buf);
+                // }
+                let is_checking = match &self.running_state {
+                    RunningState::Checking { .. } => true,
+                    _ => false,
+                };
+                if sub_piece_complete || is_checking {
+                    info!("sub piece {ji:?} piece loaded",);
+                    match self.handle_sub_piece_received(ji.index(), is_checking)? {
+                        Some(passed) => {
+                            if is_checking {
+                                // TODO: FIXME: if we verified to have a piece we previously not,
+                                // we should notify peers, sending them a HAVE
+                                // and only send HAVE if we have NOT sent them one before!
+                                self.handle_checkfile_on_piece_verified(ji.index(), passed)?;
+                                if passed {
+                                    self.broadcast_have(ji.index() as u32);
                                 }
+                            } else if passed {
+                                self.broadcast_have(ji.index() as u32);
                             }
                         }
-                    }
-                    _ => {}
-                }
-
-                match &mut self.torrent_state {
-                    TorrentState::Metadata(d) => {
-                        if d.block_picker.piece_availability(index as u32) > 0 {
-                            d.storage.add_piece(buf);
-                        } else {
-                            d.storage.forget_piece(buf);
-                        }
-                    }
-                    TorrentState::Fetching(_) => {
-                        info!("piece buf ready when fetching, maybe unreachable");
-                        unreachable!()
+                        None => {}
                     }
                 }
                 Ok(())
@@ -1884,43 +2013,36 @@ impl TransmitWorker {
         }
     }
 
-    fn handle_check_file(&mut self, sender: oneshot::Sender<bool>) {
-        let (block_picker, storage, metadata) = match &mut self.torrent_state {
-            TorrentState::Metadata(d) => (&mut d.block_picker, &mut d.storage, &d.metadata),
+    fn handle_check_file(&mut self, sender: oneshot::Sender<bool>) -> io::Result<()> {
+        let Downloading { block_picker, .. } = match &mut self.torrent_state {
+            TorrentState::Metadata(d) => d,
             TorrentState::Fetching(_) => {
                 info!("check file when fetching metadata, maybe unreachable");
-                sender.send(false);
-                return;
+                let _ = sender.send(false);
+                return Ok(());
             }
         };
-        let selected = block_picker.selected_pieces().clone();
-        let mut checked = CheckState::new(block_picker.n_pieces());
-        let total_pieces = block_picker.n_pieces();
-
-        // check pieces in buffer
-        for (i, piecebuf) in storage.iter_buffered() {
-            if selected.get(*i as u32) {
-                let r = Self::verify_piece(piecebuf, metadata);
-                checked.check(*i, r);
+        match &mut self.running_state {
+            RunningState::Checking { waiter, .. } => {
+                waiter.push(sender);
+                return Ok(());
             }
-        }
+            _ => (),
+        };
 
         // arrange for loading pieces not in buffer
-        for i in 0..total_pieces {
-            if selected.get(i as u32) && checked.get(i) == CheckState::UNKNOWN {
-                let res = Self::get_piecebuf(storage, self.self_handle.sender.clone(), i);
-                assert!(!res.is_ok())
-            }
-        }
-
-        if checked.known() == selected.count_ones() as usize {
-            info!("file check complete");
-            let _ = sender.send(true);
-        } else {
+        let mut selected = block_picker
+            .selected_pieces()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, selected)| selected.then(|| i as u32));
+        if let Some(first) = selected.next() {
+            info!("piece {first} scheduled for checking",);
             match &mut self.running_state {
-                RunningState::Checking { waiter, .. } => {
-                    waiter.push(sender);
+                RunningState::Checking { .. } => {
+                    unreachable!("should not be checking when handle check file")
                 }
+
                 s => {
                     let prev_state = match s {
                         RunningState::Downloading => RunningCmd::Resume,
@@ -1930,15 +2052,29 @@ impl TransmitWorker {
                         _ => unreachable!(),
                     };
                     let waiter = vec![sender];
-                    self.running_state = RunningState::Checking {
+                    let to_check = selected.collect::<BTreeSet<_>>();
+                    let checked = CheckState::new(block_picker.n_pieces());
+                    *s = RunningState::Checking {
                         prev_state,
                         checked,
-                        selected,
+                        to_check,
                         waiter,
                     };
                 }
             }
+            match self.handle_sub_piece_received(first, true)? {
+                Some(passed) => {
+                    self.handle_checkfile_on_piece_verified(first, passed)?;
+                }
+                None => {}
+            }
+        } else {
+            info!("no piece selected for checking, check file complete");
+            // TODO: MAYBE FIXME: we did not select any piece, but we return true here
+            let _ = sender.send(true);
+            return Ok(());
         }
+        Ok(())
     }
 
     fn handle_extend_metadata(&mut self, addr: PeerAddr, m: ExtendedMetadata) {
@@ -2162,8 +2298,17 @@ pub(crate) async fn run_transmit_worker(
 }
 
 fn copy_to_piecebuf(piece: &Piece, data: &[u8], piecebuf: &mut PieceBuf) {
-    let begin = piece.begin as usize;
-    let end = begin + piece.len as usize;
+    // `begin` is the byte offset of this block within its sub-piece buffer.
+    // SUB_PIECE_SIZE is a multiple of BLOCK_SIZE, so no block ever straddles
+    // a sub-piece boundary and `begin + data.len()` is always within bounds.
+    let begin = piece.begin as usize % SUB_PIECE_SIZE as usize;
+    let end = begin + data.len();
+    debug_assert!(
+        end <= piecebuf.as_ref().len(),
+        "copy_to_piecebuf: end {end} exceeds piecebuf len {} (begin={begin}, piece.len={})",
+        piecebuf.as_ref().len(),
+        piece.len,
+    );
     piecebuf.as_mut()[begin..end].copy_from_slice(data);
 }
 

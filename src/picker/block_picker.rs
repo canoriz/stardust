@@ -1,17 +1,17 @@
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, instrument, trace};
+use tracing::{info, trace};
 
 use super::{
     BitField, BlockRange, BlockRequests, PeerAddr, PeerPieceDetail, PieceMap, PiecePicker,
     PieceState,
 };
 use crate::{
-    bandwidth::RTT,
+    cache::simple_buffer::{JointIndex, SUB_PIECE_SIZE},
     math_helper::piece_total_and_last_size,
-    protocol::{Piece, Request},
+    protocol::Request,
 };
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap},
     time,
 };
 
@@ -94,11 +94,24 @@ struct PieceBlocks {
     received_count: usize,
 
     block_map: Vec<BlockStatus>,
+
+    /// sub pieces receive count
+    sub_receive_count: Vec<usize>,
 }
 
 impl PieceBlocks {
     fn is_all_received(&mut self) -> bool {
         self.received_count == self.block_map.len()
+    }
+
+    /// check if the sub piece of the "begin" is completed
+    fn is_sub_all_received(&mut self, begin: u32) -> bool {
+        let index = (begin / SUB_PIECE_SIZE) as usize;
+        // Convert the sub-piece byte range to block-index range.
+        let blocks_per_sub = (SUB_PIECE_SIZE as usize) / BLOCK_SIZE;
+        let from = index * blocks_per_sub;
+        let to = ((index + 1) * blocks_per_sub).min(self.block_map.len());
+        self.sub_receive_count[index] == to - from
     }
 
     fn is_all_not_requested(&self) -> bool {
@@ -311,11 +324,13 @@ impl PieceBlocks {
             BlockStatus::NotRequested { .. } => {
                 self.received_count += 1;
                 self.requested_or_received_count += 1;
+                self.sub_receive_count[(b_index * BLOCK_SIZE) / (SUB_PIECE_SIZE as usize)] += 1;
                 *b = BlockStatus::Received;
                 vec![]
             }
             BlockStatus::Requested { requested, .. } => {
                 self.received_count += 1;
+                self.sub_receive_count[(b_index * BLOCK_SIZE) / (SUB_PIECE_SIZE as usize)] += 1;
                 let ret = requested.keys().map(|x| *x).collect();
                 *b = BlockStatus::Received;
                 ret
@@ -451,6 +466,14 @@ pub struct BlockPicker {
     endgame: bool,
 }
 
+/// if some piece or sub piece is completed
+pub struct PieceComplete {
+    /// if piece completes
+    pub piece: bool,
+    /// if sub piece completes
+    pub sub_piece: bool,
+}
+
 impl BlockPicker {
     pub fn new(
         total_size: usize,
@@ -474,19 +497,25 @@ impl BlockPicker {
 
     #[inline]
     fn n_blocks_and_last_block_size(&self, index: u32) -> (usize, usize) {
-        let piece_size = if index as usize + 1 == self.n {
-            self.last_length
-        } else {
-            self.piece_size
-        };
+        let piece_size = self.piece_size(index);
         let n_blocks = (piece_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
         let last_block_size = BLOCK_SIZE - (n_blocks * BLOCK_SIZE - piece_size);
         (n_blocks, last_block_size)
     }
 
     #[inline]
+    pub fn piece_size(&self, index: u32) -> usize {
+        if index as usize + 1 == self.n {
+            self.last_length
+        } else {
+            self.piece_size
+        }
+    }
+
+    #[inline]
     fn piece_block_of(&self, index: u32) -> PieceBlocks {
         let (n_blocks, last_block_size) = self.n_blocks_and_last_block_size(index);
+        let sub_sz = SUB_PIECE_SIZE as usize;
         PieceBlocks {
             piece_index: index,
             last_block_size,
@@ -499,6 +528,7 @@ impl BlockPicker {
             ],
             requested_or_received_count: 0,
             received_count: 0,
+            sub_receive_count: vec![0; (n_blocks * BLOCK_SIZE + sub_sz - 1) / sub_sz],
         }
     }
 
@@ -1009,39 +1039,69 @@ impl BlockPicker {
     /// if a piece is fully received,
     /// revoked requests,
     /// )
-    pub fn receive_block(&mut self, req: Request) -> (Option<u32>, Vec<PeerAddr>) {
+    pub fn receive_block(&mut self, req: Request) -> (PieceComplete, Vec<PeerAddr>) {
+        let ji = JointIndex::from(req);
         if !self.check_block_validity(&req) {
-            return (None, vec![]);
+            return (
+                PieceComplete {
+                    piece: false,
+                    sub_piece: false,
+                },
+                vec![],
+            );
         }
 
-        let index = req.index;
-        if let Some(b) = self.receiving.get_mut(&index) {
+        if let Some(b) = self.requesting.get_mut(&ji.index()) {
             let r = b.receive(req);
-            (b.is_all_received().then(|| index), r)
-        } else if let Some(b) = self.requesting.get_mut(&index) {
-            let r = b.receive(req);
-            if b.is_all_received() {
-                let b = self.requesting.remove(&index).unwrap();
-                self.receiving.insert(index, b);
-                (Some(index), r)
+            if b.is_all_requested_or_received() {
+                let b = self.requesting.remove(&ji.index()).unwrap();
+                self.receiving.insert(ji.index(), b);
             } else {
-                if b.is_all_requested_or_received() {
-                    let b = self.requesting.remove(&index).unwrap();
-                    self.receiving.insert(index, b);
-                }
-                (None, r)
+                return (
+                    PieceComplete {
+                        piece: false,
+                        sub_piece: b.is_sub_all_received(req.begin),
+                    },
+                    r,
+                );
             }
-        } else if self.piece_picker.selected(index) && !self.piece_picker.have(index) {
-            let mut b = self.piece_block_of(index);
+        }
+
+        if let Some(b) = self.receiving.get_mut(&ji.index()) {
             let r = b.receive(req);
+            (
+                PieceComplete {
+                    piece: b.is_all_received(),
+                    sub_piece: b.is_sub_all_received(req.begin),
+                },
+                r,
+            )
+        } else if self.piece_picker.selected(ji.index()) && !self.piece_picker.have(ji.index()) {
+            let mut b = self.piece_block_of(ji.index());
+            let r = b.receive(req);
+            let sub_complete = b.is_sub_all_received(req.begin);
             // only receive one block must be partial requested
-            self.requesting.insert(index, b);
+            // TODO: FIXME: there should be no way that piece only have one block, huh?
+            // otherwise we may move that to received
+            self.requesting.insert(ji.index(), b);
             // notify piece_picker this piece is downloading
-            self.piece_picker.set_have(index, true);
-            (None, r)
+            self.piece_picker.set_have(ji.index(), true);
+            (
+                PieceComplete {
+                    piece: false,
+                    sub_piece: sub_complete,
+                },
+                r,
+            )
         } else {
             // blocks we didn't select or already have
-            (None, vec![])
+            (
+                PieceComplete {
+                    piece: false,
+                    sub_piece: false,
+                },
+                vec![],
+            )
         }
     }
 
@@ -1209,7 +1269,34 @@ impl BlockPicker {
     }
 
     pub fn peer_leave(&mut self, addr: &PeerAddr) {
+        // Revoke all blocks requested by this peer so they become available immediately.
+        let requested_peer = |p: &PeerAddr, _: &time::Instant| p == addr;
+        let mut revoked = HashMap::new();
+        for (i, b) in self.receiving.iter_mut() {
+            b.revoke_all_requested_if(requested_peer, &mut revoked);
+            if !b.is_all_requested_or_received() {
+                self.requesting.insert(*i, b.clone());
+            }
+        }
+        self.receiving
+            .retain(|_, b| b.is_all_requested_or_received());
+        for (i, b) in self.requesting.iter_mut() {
+            b.revoke_all_requested_if(requested_peer, &mut revoked);
+            if b.is_all_not_requested() {
+                self.piece_picker.set_have(*i, false);
+            }
+        }
+        self.requesting.retain(|_, b| !b.is_all_not_requested());
         self.piece_picker.peer_leave(addr);
+    }
+
+    /// Returns true if this piece is in the receiving set (all blocks requested or some received,
+    /// waiting for completion or hash verification).
+    pub fn is_piece_wait_check(&mut self, index: u32) -> bool {
+        self.receiving
+            .get_mut(&index)
+            .map(|b| b.is_all_received())
+            .unwrap_or(false)
     }
 
     pub fn peer_choke(&mut self, peer: &PeerAddr) {
@@ -1317,6 +1404,7 @@ mod test {
                 };
                 50
             ],
+            sub_receive_count: vec![0],
         };
 
         {
@@ -1462,6 +1550,7 @@ mod test {
                     revoked: HashMap::new(),
                 },
             ],
+            sub_receive_count: vec![0],
         };
         {
             let picked = b.pick(
@@ -1526,6 +1615,7 @@ mod test {
                     revoked: HashMap::new(),
                 },
             ],
+            sub_receive_count: vec![0],
         };
         {
             let picked = b.pick(
@@ -1781,6 +1871,7 @@ mod test {
                 )]),
                 revoked: HashMap::new(),
             }],
+            sub_receive_count: vec![0],
         };
 
         let picked = b.pick(
@@ -1820,6 +1911,7 @@ mod test {
                 )]),
                 revoked: HashMap::new(),
             }],
+            sub_receive_count: vec![0],
         };
 
         let picked = b.pick(
@@ -1859,6 +1951,7 @@ mod test {
                 )]),
                 revoked: HashMap::new(),
             }],
+            sub_receive_count: vec![0],
         };
 
         let picked = b.pick(
@@ -1903,6 +1996,7 @@ mod test {
                 )]),
                 revoked: HashMap::new(),
             }],
+            sub_receive_count: vec![0],
         };
 
         let picked = b.pick(
@@ -2248,6 +2342,7 @@ mod test {
                         };
                         32
                     ],
+                    sub_receive_count: vec![0],
                 },
             );
         }

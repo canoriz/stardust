@@ -16,6 +16,7 @@ pub(crate) mod session;
 pub(crate) mod torrent_manager;
 pub(crate) mod transmit_manager;
 
+mod hasher;
 mod helper;
 
 pub use protocol::{Reunite, Split};

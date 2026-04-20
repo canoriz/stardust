@@ -1785,6 +1785,16 @@ pub struct Piece {
     pub buf: Option<BytesMut>,
 }
 
+impl Piece {
+    pub fn to_request(&self) -> Request {
+        Request {
+            index: self.index,
+            begin: self.begin,
+            len: self.len,
+        }
+    }
+}
+
 #[derive(Eq, PartialEq)]
 pub struct PieceHeader {
     pub index: u32,
