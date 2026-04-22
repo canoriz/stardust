@@ -633,8 +633,12 @@ impl TransmitWorker {
     //     self
     // }
     fn pick_blocks_for_all_peers(&mut self, n_blocks: usize) {
-        let block_picker = match &mut self.torrent_state {
-            TorrentState::Metadata(d) => &mut d.block_picker,
+        let Downloading {
+            block_picker,
+            storage,
+            ..
+        } = match &mut self.torrent_state {
+            TorrentState::Metadata(d) => d,
             TorrentState::Fetching(_) => {
                 return;
             }
@@ -655,6 +659,7 @@ impl TransmitWorker {
                     avg_bw,
                     h.min_rtt,
                     &mut revoked,
+                    storage.vacant_count(),
                 );
                 for rg in reqs.range.iter() {
                     for req in rg.iter(reqs.piece_size) {
@@ -680,8 +685,12 @@ impl TransmitWorker {
         if pick_n > 0 {
             warn!("pick {pick_n} blocks from {addr:?}");
         }
-        let block_picker = match &mut self.torrent_state {
-            TorrentState::Metadata(d) => &mut d.block_picker,
+        let Downloading {
+            block_picker,
+            storage,
+            ..
+        } = match &mut self.torrent_state {
+            TorrentState::Metadata(d) => d,
             TorrentState::Fetching(_) => {
                 return 0;
             }
@@ -701,6 +710,7 @@ impl TransmitWorker {
                     avg_bw,
                     h.min_rtt,
                     &mut revoked,
+                    storage.vacant_count(),
                 );
                 for rg in reqs.range.iter() {
                     for req in rg.iter(reqs.piece_size) {
@@ -1205,7 +1215,7 @@ impl TransmitWorker {
             TorrentState::Metadata(ref mut d) => d,
             TorrentState::Fetching(_) => panic!("should not receive piece before metadata"),
         };
-        let schedule_load = force_check || block_picker.is_sub_piece_wait_check(index);
+        let schedule_load = force_check || block_picker.is_piece_wait_check(index);
         let full_hashed = self.advance_hash(index, schedule_load)?;
 
         if !full_hashed {
@@ -1369,6 +1379,12 @@ impl TransmitWorker {
             );
         }
         let conn = self.connected_peers.get_mut(&peer).expect("should exist");
+        let Downloading { storage, .. } = match &mut self.torrent_state {
+            TorrentState::Metadata(d) => d,
+            TorrentState::Fetching(_) => {
+                return Ok(());
+            }
+        };
 
         // For Probe mode BDP estimation, use a conservative RTT baseline under jitter:
         let probe_bdp_rtt = compute_probe_bdp_rtt(conn.min_rtt);
@@ -1691,8 +1707,12 @@ impl TransmitWorker {
             conn.inflight.receive(req);
         }
 
-        let (block_picker, metadata, storage) = match &mut self.torrent_state {
-            TorrentState::Metadata(d) => (&mut d.block_picker, &d.metadata, &mut d.storage),
+        let Downloading {
+            block_picker,
+            storage,
+            ..
+        } = match &mut self.torrent_state {
+            TorrentState::Metadata(d) => d,
             TorrentState::Fetching(_) => {
                 info!(
                     "receive PIECE msg {} {} {} block index {} before having metadata",
@@ -1804,9 +1824,9 @@ impl TransmitWorker {
         match Self::get_piecebuf(storage, self.self_handle.sender.clone(), ji) {
             Ok(piecebuf) => {
                 copy_to_piecebuf(&piece, &buf, piecebuf);
-                piecebuf.flush(|_| {});
                 if complete.sub_piece {
                     info!("sub piece {ji:?} piece received",);
+                    piecebuf.flush(|_| {}); // TODO: FIXME: handle all flush error?
                     match self.handle_sub_piece_received(piece.index, false)? {
                         Some(true) => {
                             self.broadcast_have(ji.index() as u32);
@@ -1824,10 +1844,8 @@ impl TransmitWorker {
                 match self.waiting_for_piecebuf.get_mut(&ji) {
                     Some(v) => v.push(BlockWaitingBuf { piece, buf }),
                     None => {
-                        self.waiting_for_piecebuf.insert(
-                            ji,
-                            vec![BlockWaitingBuf { piece, buf }],
-                        );
+                        self.waiting_for_piecebuf
+                            .insert(ji, vec![BlockWaitingBuf { piece, buf }]);
                     }
                 }
                 trace!("piecebuf {index} not present err {e:?}");
@@ -1875,7 +1893,7 @@ impl TransmitWorker {
                     RunningState::Checking { .. } => true,
                     _ => false,
                 };
-                let is_piece_wait_check = block_picker.is_sub_piece_wait_check(ji.index());
+                let is_piece_wait_check = block_picker.is_piece_wait_check(ji.index());
                 if is_checking || is_piece_wait_check {
                     info!("sub piece {ji:?} piece loaded",);
                     match self.handle_sub_piece_received(ji.index(), is_checking)? {

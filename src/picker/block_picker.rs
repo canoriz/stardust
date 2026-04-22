@@ -6,7 +6,7 @@ use super::{
     PieceState,
 };
 use crate::{
-    cache::simple_buffer::{JointIndex, SUB_PIECE_SIZE},
+    cache::simple_buffer::{JointIndex, POOL_SIZE, SUB_PIECE_SIZE},
     math_helper::piece_total_and_last_size,
     protocol::Request,
 };
@@ -624,20 +624,6 @@ impl BlockPicker {
         }
     }
 
-    fn rush_mode(&self) -> bool {
-        let working_set_size = self.receiving.len() + self.requesting.len();
-        // swap IO is too frequent
-        const WORKING_SET_LIMIT: usize = 30;
-        working_set_size > WORKING_SET_LIMIT
-    }
-
-    fn strict_rush_mode(&self) -> bool {
-        let working_set_size = self.receiving.len() + self.requesting.len();
-        // swap IO is too frequent
-        use crate::cache::simple_buffer::POOL_SIZE;
-        working_set_size >= POOL_SIZE
-    }
-
     /// Pick n blocks from peer, returns
     /// (
     ///  picked blocks,
@@ -652,20 +638,21 @@ impl BlockPicker {
         avg_speed: f32,
         rtt: time::Duration,
         revoked: &mut HashMap<PeerAddr, Vec<Request>>,
+        n_cache_vacant: usize,
     ) -> (BlockRequests, usize) {
         if self.prev_time_check.elapsed() >= time::Duration::from_secs(1) {
             self.revoke_unrespond(revoked);
             self.prev_time_check = time::Instant::now();
         }
 
-        let rush_mode = self.rush_mode();
+        let rush_mode = n_cache_vacant < POOL_SIZE / 2;
         let endgame = self.update_endgame();
         let repick_option = if endgame {
             RepickOption {
                 repick_limit: 1,
                 endgame: true,
             }
-        } else if self.rush_mode() {
+        } else if rush_mode {
             RepickOption {
                 repick_limit: 7, // TODO: set a proper repick limit
                 endgame: false,
@@ -676,7 +663,7 @@ impl BlockPicker {
                 endgame: false,
             }
         };
-        info!("{peer} endgame {endgame}, rush {}", self.rush_mode());
+        info!("{peer} endgame {endgame}, rush {}", rush_mode);
 
         let mut remain = n;
         let peer_status = if let Some(h) = self.piece_picker.peer_detail(peer) {
@@ -916,8 +903,8 @@ impl BlockPicker {
         //         );
         //     }
         // }
-        while remain > 0 && !self.strict_rush_mode() {
-            let rush_mode = self.rush_mode();
+        let strict_rush_mode = n_cache_vacant == 0;
+        while remain > 0 && !strict_rush_mode {
             if let Some(index) = self.piece_picker.pick_next(peer) {
                 assert!(!endgame);
                 let mut blocks = self.piece_block_of(index);
@@ -952,11 +939,10 @@ impl BlockPicker {
             }
             info!("remain 3 {remain}");
         }
-        if (self.rush_mode() || endgame) && remain > 0 {
+        if (rush_mode || endgame) && remain > 0 {
             info!(
                 "{peer} rush mode {} endgame {} causing less picking, remain {remain}",
-                self.rush_mode(),
-                endgame
+                rush_mode, endgame
             );
             for (index, blocks) in &self.receiving {
                 trace!(
@@ -967,7 +953,7 @@ impl BlockPicker {
             for (index, blocks) in &self.requesting {
                 trace!(
                     "{peer} rush mode {}, endgame {} requesting piece {index}, blocks: {:?}",
-                    self.rush_mode(),
+                    rush_mode,
                     endgame,
                     blocks.block_map,
                 );
@@ -1292,7 +1278,7 @@ impl BlockPicker {
 
     /// Returns true if this piece is in the receiving set (all blocks requested or some received,
     /// waiting for completion or hash verification).
-    pub fn is_sub_piece_wait_check(&self, index: u32) -> bool {
+    pub fn is_piece_wait_check(&self, index: u32) -> bool {
         self.receiving
             .get(&index)
             .map(|b| b.is_all_received())
@@ -1776,6 +1762,7 @@ mod test {
                 BLOCK_SIZE as f32,
                 time::Duration::ZERO,
                 &mut revoked,
+                POOL_SIZE,
             );
             let exp = BlockRequests {
                 piece_size: PIECE_SIZE as u32,
@@ -1820,6 +1807,7 @@ mod test {
                 BLOCK_SIZE as f32,
                 time::Duration::ZERO,
                 &mut revoked,
+                POOL_SIZE,
             );
             let exp = BlockRequests {
                 piece_size: PIECE_SIZE as u32,
@@ -1850,6 +1838,7 @@ mod test {
                 BLOCK_SIZE as f32,
                 time::Duration::ZERO,
                 &mut revoked,
+                POOL_SIZE,
             );
             let exp = BlockRequests {
                 piece_size: PIECE_SIZE as u32,
@@ -2090,6 +2079,7 @@ mod test {
                 BLOCK_SIZE as f32,
                 time::Duration::from_millis(100),
                 &mut revoked,
+                POOL_SIZE,
             );
         }
 
@@ -2129,6 +2119,7 @@ mod test {
                 BLOCK_SIZE as f32,
                 time::Duration::from_millis(100),
                 &mut revoked,
+                POOL_SIZE,
             );
         }
         let elapsed = start.elapsed();
@@ -2167,6 +2158,7 @@ mod test {
             BLOCK_SIZE as f32,
             time::Duration::from_millis(100),
             &mut revoked,
+            POOL_SIZE,
         );
         eprintln!(
             "perf_pick_blocks_with_picks setup: {} requesting, {} receiving",
@@ -2186,6 +2178,7 @@ mod test {
                 BLOCK_SIZE as f32,
                 time::Duration::from_millis(100),
                 &mut revoked,
+                POOL_SIZE,
             );
         }
         let elapsed_n0 = start.elapsed();
@@ -2206,6 +2199,7 @@ mod test {
                 BLOCK_SIZE as f32,
                 time::Duration::from_millis(100),
                 &mut revoked,
+                POOL_SIZE,
             );
             // Simulate receiving work: receive 1 block for every pick
             // (balance pick and receive to maintain steady-state)
@@ -2252,6 +2246,7 @@ mod test {
                 BLOCK_SIZE as f32,
                 time::Duration::from_millis(100),
                 &mut revoked,
+                POOL_SIZE,
             );
         }
 
@@ -2305,6 +2300,7 @@ mod test {
                 BLOCK_SIZE as f32,
                 time::Duration::from_millis(100),
                 &mut revoked,
+                POOL_SIZE,
             );
         }
         eprintln!(

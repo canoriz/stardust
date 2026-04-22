@@ -366,9 +366,9 @@ impl PieceBuf {
         // 00 -> 00 and return
         // 01 -> 01 flushing in progress and no further change, return
         // 10 -> 01 dirty, flushing not in progress, start one
-        // 11 -> 11 dirty, flushing in progress, not more flush, return
+        // 11 -> 11 dirty, flushing in progress, no more flush, return
 
-        // we have the &mut, only we can caange flushing bit from 0 to 1.
+        // we have the &mut, only we can change flushing bit from 0 to 1.
         // If parallel flushing working, flushing bit may change from 1 to 0,
         // dirty bit may change from 0 to 1
 
@@ -643,10 +643,6 @@ impl BufStorage {
         }
     }
 
-    pub fn purge_by_time(&mut self, timeout: time::Duration) {
-        self.pieces.retain(|_, v| v.touch.elapsed() > timeout)
-    }
-
     pub fn purge_by_size(&mut self, keep: usize) {
         if self.pieces.len() <= keep {
             return;
@@ -674,7 +670,9 @@ impl BufStorage {
         }
 
         if n_purge > 0 {
-            // now we remove dirty pieces
+            warn!(
+                "purge_by_size: cannot purge {n_purge} sub pieces; all remaining are DIRTY/FLUSHING"
+            );
             for (k, v) in self.pieces.iter() {
                 remove_pieces.push(cmp::Reverse((v.touch, *k)));
                 if remove_pieces.len() > n_purge {
@@ -683,12 +681,33 @@ impl BufStorage {
             }
             while n_purge > 0 {
                 if let Some(cmp::Reverse((_, i))) = remove_pieces.pop() {
-                    info!("purge dirty piece {i:?}");
-                    self.pieces.remove(&i);
+                    info!("purge flush dirty piece {i:?}");
+                    // IMPORTANT: we really can't remove them because they are dirty
+                    // if we remove them, though they will be flushed, but we may read
+                    // stale data subsequently.
+                    self.pieces.get_mut(&i).unwrap().flush(|_| {});
                     n_purge -= 1;
+                    // can't remove it because it's dirty, we flush them
+                    // TODO: FIXME: will we flush multiple times?
+                } else {
+                    break;
                 }
             }
         }
+    }
+
+    pub fn vacant_count(&self) -> usize {
+        // TODO: optimize by maintaining a separate counter for dirty pieces
+        // so we don't need to iterate all pieces here
+        let n_clear = self.pieces.iter().filter(|(_, v)| !v.is_dirty()).count();
+
+        // Count in-flight `get_piece()` reads too: they already allocated a
+        // buffer from the pool but are not in `self.pieces` yet.
+        let n_loading = self.loading.lock().unwrap().len();
+        let used = self.pieces.len() + n_loading;
+
+        let n_remain = POOL_SIZE.saturating_sub(used);
+        n_clear + n_remain
     }
 }
 

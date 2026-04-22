@@ -78,7 +78,7 @@ impl Session {
                 const BOOTSTRAP_NODES: &[&str] = &[
                     // "router.bittorrent.com:6881",
                     // "router.utorrent.com:6881",
-                    "[2408:820c:5b38:3400:4393:1139:435d:c909]:60416",
+                    "[2408:820c:5b38:1c0:ba6d:9133:2cac:b62b]:60416",
                     // "dht.transmissionbt.com:6881",
                     // "dht.libtorrent.org:25401",
                 ];
