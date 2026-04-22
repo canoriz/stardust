@@ -100,13 +100,13 @@ struct PieceBlocks {
 }
 
 impl PieceBlocks {
-    fn is_all_received(&mut self) -> bool {
+    fn is_all_received(&self) -> bool {
         self.received_count == self.block_map.len()
     }
 
-    /// check if the sub piece of the "begin" is completed
-    fn is_sub_all_received(&mut self, begin: u32) -> bool {
-        let index = (begin / SUB_PIECE_SIZE) as usize;
+    /// check if the sub piece of the "in_piece_offset" is completed
+    fn is_sub_all_received(&self, in_piece_offset: u32) -> bool {
+        let index = (in_piece_offset / SUB_PIECE_SIZE) as usize;
         // Convert the sub-piece byte range to block-index range.
         let blocks_per_sub = (SUB_PIECE_SIZE as usize) / BLOCK_SIZE;
         let from = index * blocks_per_sub;
@@ -1292,9 +1292,9 @@ impl BlockPicker {
 
     /// Returns true if this piece is in the receiving set (all blocks requested or some received,
     /// waiting for completion or hash verification).
-    pub fn is_piece_wait_check(&mut self, index: u32) -> bool {
+    pub fn is_sub_piece_wait_check(&self, index: u32) -> bool {
         self.receiving
-            .get_mut(&index)
+            .get(&index)
             .map(|b| b.is_all_received())
             .unwrap_or(false)
     }
@@ -1355,6 +1355,23 @@ impl BlockPicker {
         self.piece_picker.have(index)
             && !self.receiving.contains_key(&index)
             && !self.requesting.contains_key(&index)
+    }
+
+    /// returns if we have this sub-piece
+    pub fn have_sub(&self, ji: JointIndex) -> bool {
+        let index = ji.index();
+        if self.have(index) {
+            return true;
+        }
+        self.requesting
+            .get(&index)
+            .map(|b| b.is_sub_all_received(ji.in_piece_offset() as u32))
+            .unwrap_or(false)
+            || self
+                .receiving
+                .get(&index)
+                .map(|b| b.is_sub_all_received(ji.in_piece_offset() as u32))
+                .unwrap_or(false)
     }
 
     /// set we have this piece

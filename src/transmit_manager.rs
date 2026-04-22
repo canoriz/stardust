@@ -524,10 +524,6 @@ pub struct TransmitWorker {
 struct BlockWaitingBuf {
     piece: Piece,
     buf: BlockBuf,
-
-    // whether this block completes a sub-piece
-    // e.g. a sub-piece will be complete after this block
-    sub_piece_complete: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1166,7 +1162,7 @@ impl TransmitWorker {
                 len: 0,
             };
             let ji = JointIndex::from(req);
-            if schedule_load_next {
+            if block_picker.have_sub(ji) || schedule_load_next {
                 match Self::get_piecebuf(storage, self.self_handle.sender.clone(), ji) {
                     Ok(piecebuf) => {
                         hasher.write(piecebuf)?;
@@ -1185,18 +1181,7 @@ impl TransmitWorker {
                     }
                 }
             } else {
-                match Self::get_cached_piecebuf(storage, ji) {
-                    Some(piecebuf) => {
-                        hasher.write(piecebuf)?;
-                        // flush error is not fatal
-                        // we always catch drop error
-                        piecebuf.flush(|_| {});
-                        from_sub_pieces += 1;
-                    }
-                    None => {
-                        break;
-                    }
-                }
+                break;
             }
         }
         info!(
@@ -1220,7 +1205,7 @@ impl TransmitWorker {
             TorrentState::Metadata(ref mut d) => d,
             TorrentState::Fetching(_) => panic!("should not receive piece before metadata"),
         };
-        let schedule_load = force_check || block_picker.is_piece_wait_check(index);
+        let schedule_load = force_check || block_picker.is_sub_piece_wait_check(index);
         let full_hashed = self.advance_hash(index, schedule_load)?;
 
         if !full_hashed {
@@ -1836,21 +1821,12 @@ impl TransmitWorker {
             }
             Err(e) => {
                 let index = piece.index;
-                let sub_piece_complete = complete.sub_piece;
                 match self.waiting_for_piecebuf.get_mut(&ji) {
-                    Some(v) => v.push(BlockWaitingBuf {
-                        piece,
-                        buf,
-                        sub_piece_complete,
-                    }),
+                    Some(v) => v.push(BlockWaitingBuf { piece, buf }),
                     None => {
                         self.waiting_for_piecebuf.insert(
                             ji,
-                            vec![BlockWaitingBuf {
-                                piece,
-                                buf,
-                                sub_piece_complete,
-                            }],
+                            vec![BlockWaitingBuf { piece, buf }],
                         );
                     }
                 }
@@ -1865,7 +1841,11 @@ impl TransmitWorker {
         ji: JointIndex,
         buf: io::Result<PieceBuf>,
     ) -> io::Result<()> {
-        let Downloading { storage, .. } = match &mut self.torrent_state {
+        let Downloading {
+            storage,
+            block_picker,
+            ..
+        } = match &mut self.torrent_state {
             TorrentState::Metadata(d) => d,
             TorrentState::Fetching(_) => {
                 unreachable!();
@@ -1874,17 +1854,12 @@ impl TransmitWorker {
         match buf {
             Ok(mut buf) => {
                 let pending = self.waiting_for_piecebuf.remove(&ji);
-                let mut sub_piece_complete = false;
                 if let Some(ps) = pending {
                     info!(
                         "piecebuf {ji:?} now ready, flushing {} blocks into it",
                         ps.len()
                     );
-                    // full_received should be set at most once
                     for p in ps {
-                        assert!(!sub_piece_complete);
-                        sub_piece_complete |= p.sub_piece_complete;
-                        // full_received should be set at most once
                         copy_to_piecebuf(&p.piece, &p.buf, &mut buf);
                     }
                 }
@@ -1900,7 +1875,8 @@ impl TransmitWorker {
                     RunningState::Checking { .. } => true,
                     _ => false,
                 };
-                if sub_piece_complete || is_checking {
+                let is_piece_wait_check = block_picker.is_sub_piece_wait_check(ji.index());
+                if is_checking || is_piece_wait_check {
                     info!("sub piece {ji:?} piece loaded",);
                     match self.handle_sub_piece_received(ji.index(), is_checking)? {
                         Some(passed) => {
