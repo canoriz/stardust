@@ -2,8 +2,8 @@ use crate::announce_manager::{self, AnnounceManagerHandle};
 use crate::backfile::{BackFile, NormalFile, VoidFile};
 use crate::bandwidth::Bandwidth;
 use crate::buffer_pool::BlockBuf;
-use crate::cache::simple_buffer::{BufStorage, FlushErr, JointIndex, SUB_PIECE_SIZE};
-use crate::cache::simple_buffer::{GetPieceErr, PieceBuf};
+use crate::cache::cache_manager::{CacheManagerHandle, GlobalPieceKey, PieceLease};
+use crate::cache::simple_buffer::{FlushErr, JointIndex, PieceBuf, SUB_PIECE_SIZE};
 use crate::connection_manager::{
     ConnectionManagerHandle, CtrlOfRecv, CtrlOfSend, CtrlOfSend as ConnMsg, ReceivedBlocks,
 };
@@ -16,6 +16,7 @@ use crate::protocol::{
     Request,
 };
 
+use futures::future::Join;
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -144,7 +145,7 @@ pub(crate) enum Msg {
 
     PieceBufReady {
         index: JointIndex,
-        buf: io::Result<PieceBuf>,
+        buf: io::Result<PieceLease>,
     },
 
     /// A message received from peer
@@ -239,6 +240,7 @@ impl TransmitManager {
         cmd_receiver: mpsc::UnboundedReceiver<Msg>,
         dht_client: Option<Arc<DHT>>,
         announce_manager: AnnounceManagerHandle,
+        cache_handle: CacheManagerHandle,
     ) -> Self {
         let worker = TransmitWorker::new(
             t,
@@ -248,6 +250,7 @@ impl TransmitManager {
             announce_manager,
             cmd_sender,
             cmd_receiver,
+            cache_handle,
         );
         let cancel_transmit = CancellationToken::new();
         let (done_transmit, done_transmit_rx) = oneshot::channel::<()>();
@@ -462,7 +465,7 @@ pub struct Downloading {
     pub metadata: Arc<Metadata>,
 
     pub block_picker: BlockPicker,
-    pub storage: BufStorage,
+    pub cache_handle: CacheManagerHandle,
     pub hasher: HashMap<u32, HashState<Sha1>>,
 }
 
@@ -495,9 +498,12 @@ pub struct TransmitWorker {
 
     /// received blocks waiting writing to piece buf once
     /// piece buf is ready
-    waiting_for_piecebuf: HashMap<JointIndex, Vec<BlockWaitingBuf>>,
+    waiting_for_piecebuf: HashMap<JointIndex, PieceWaitState>,
 
     downloaded: watch::Sender<bool>,
+
+    /// Handle to the global CacheManager actor.
+    cache_handle: CacheManagerHandle,
 }
 
 // impl std::fmt::Debug for TransmitWorker {
@@ -524,6 +530,14 @@ pub struct TransmitWorker {
 struct BlockWaitingBuf {
     piece: Piece,
     buf: BlockBuf,
+}
+
+struct PieceWaitState {
+    blocks: Vec<BlockWaitingBuf>,
+    /// Whether GetPiece has already been sent to CacheManager for this sub-piece.
+    requested: bool,
+    /// Whether the sub-piece is complete (all blocks received).
+    sub_piece_complete: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -553,11 +567,16 @@ impl TransmitWorker {
         announce_manager: AnnounceManagerHandle,
         cmd_sender: mpsc::UnboundedSender<Msg>,
         cmd_receiver: mpsc::UnboundedReceiver<Msg>,
+        cache_handle: CacheManagerHandle,
     ) -> Self {
         let (info_hash, state) = match t {
             TorrentTask::Torrent(m) => {
                 let info_hash = m.info_hash;
-                let state = TorrentState::Metadata(Self::metadata_into_downloading(m));
+                let state = TorrentState::Metadata(Self::metadata_into_downloading(
+                    m,
+                    &cache_handle,
+                    cmd_sender.clone(),
+                ));
                 (info_hash, state)
             }
             TorrentTask::Magnet(m) => {
@@ -591,10 +610,15 @@ impl TransmitWorker {
             waiting_for_piecebuf: HashMap::new(),
             downloaded,
             running_state: RunningState::Stopped,
+            cache_handle,
         }
     }
 
-    fn metadata_into_downloading(m: Metadata) -> Downloading {
+    fn metadata_into_downloading(
+        m: Metadata,
+        cache_handle: &CacheManagerHandle,
+        error_sender: mpsc::UnboundedSender<Msg>,
+    ) -> Downloading {
         let m = Arc::new(m);
         let piece_size = m.regular_piece_size() as u32;
         let total_length = m.len();
@@ -610,13 +634,22 @@ impl TransmitWorker {
             block_picker.select(i as u32, true);
         }
 
-        let back_file = BackFile::new::<NormalFile>().metadata(m.clone()).build();
-        let buf_storage = BufStorage::new(total_length, m.regular_piece_size(), back_file);
+        let back_file = Arc::new(std::sync::Mutex::new(
+            // TODO: maybe only send metadata to cache manager, and let cache manager create back file when needed?
+            BackFile::new::<NormalFile>().metadata(m.clone()).build(),
+        ));
+        cache_handle.register_torrent(
+            m.info_hash,
+            m.regular_piece_size(),
+            total_length,
+            back_file,
+            error_sender,
+        );
 
         Downloading {
             metadata: m,
             block_picker,
-            storage: buf_storage,
+            cache_handle: cache_handle.clone(),
             hasher: HashMap::new(),
         }
     }
@@ -633,11 +666,7 @@ impl TransmitWorker {
     //     self
     // }
     fn pick_blocks_for_all_peers(&mut self, n_blocks: usize) {
-        let Downloading {
-            block_picker,
-            storage,
-            ..
-        } = match &mut self.torrent_state {
+        let Downloading { block_picker, .. } = match &mut self.torrent_state {
             TorrentState::Metadata(d) => d,
             TorrentState::Fetching(_) => {
                 return;
@@ -659,7 +688,7 @@ impl TransmitWorker {
                     avg_bw,
                     h.min_rtt,
                     &mut revoked,
-                    storage.vacant_count(),
+                    self.cache_handle.vacant_count(),
                 );
                 for rg in reqs.range.iter() {
                     for req in rg.iter(reqs.piece_size) {
@@ -685,11 +714,7 @@ impl TransmitWorker {
         if pick_n > 0 {
             warn!("pick {pick_n} blocks from {addr:?}");
         }
-        let Downloading {
-            block_picker,
-            storage,
-            ..
-        } = match &mut self.torrent_state {
+        let Downloading { block_picker, .. } = match &mut self.torrent_state {
             TorrentState::Metadata(d) => d,
             TorrentState::Fetching(_) => {
                 return 0;
@@ -710,7 +735,7 @@ impl TransmitWorker {
                     avg_bw,
                     h.min_rtt,
                     &mut revoked,
-                    storage.vacant_count(),
+                    self.cache_handle.vacant_count(),
                 );
                 for rg in reqs.range.iter() {
                     for req in rg.iter(reqs.piece_size) {
@@ -1144,16 +1169,21 @@ impl TransmitWorker {
         res == target
     }
 
-    /// try to advance the hash state of a piece as much as possible
-    /// returns if full piece is hashed
-    fn advance_hash(&mut self, index: u32, schedule_load_next: bool) -> io::Result<bool> {
+    /// Hash a single sub-piece into the piece hasher.
+    /// Returns true if all sub-pieces for this piece have now been hashed.
+    fn advance_hash(
+        &mut self,
+        ji: JointIndex,
+        piecebuf: &mut PieceLease,
+        force_check: bool,
+    ) -> io::Result<bool> {
+        let index = ji.index();
         let Downloading {
             block_picker,
-            storage,
             hasher: piece_hasher,
             ..
-        } = match self.torrent_state {
-            TorrentState::Metadata(ref mut d) => d,
+        } = match &mut self.torrent_state {
+            TorrentState::Metadata(d) => d,
             TorrentState::Fetching(_) => panic!("should not receive piece before metadata"),
         };
         let piece_size = block_picker.piece_size(index);
@@ -1162,61 +1192,58 @@ impl TransmitWorker {
             .entry(index)
             .or_insert_with(|| HashState::new(Sha1::new()));
 
+        let req = Request {
+            index,
+            begin: hasher.next_offset() as u32,
+            len: 0,
+        };
+        let next_to_hash = JointIndex::from(req);
+        if ji == next_to_hash && (block_picker.have_sub(ji) || force_check) {
+            info!("write to hasher: {ji:?}");
+            hasher.write(&piecebuf)?;
+            piecebuf.flush(|_| {});
+        }
+
         let total_sub_pieces =
             (piece_size as usize + SUB_PIECE_SIZE as usize - 1) / SUB_PIECE_SIZE as usize;
-        let mut from_sub_pieces = hasher.next_offset() / SUB_PIECE_SIZE as usize;
-        while from_sub_pieces < total_sub_pieces {
-            let req = Request {
-                index,
-                begin: hasher.next_offset() as u32,
-                len: 0,
+        let next_sub_piece =
+            (hasher.next_offset() + SUB_PIECE_SIZE as usize - 1) / SUB_PIECE_SIZE as usize;
+        if next_sub_piece < total_sub_pieces {
+            let next_ji = {
+                let req = Request {
+                    index,
+                    begin: hasher.next_offset() as u32,
+                    len: 0,
+                };
+                JointIndex::from(req)
             };
-            let ji = JointIndex::from(req);
-            if block_picker.have_sub(ji) || schedule_load_next {
-                match Self::get_piecebuf(storage, self.self_handle.sender.clone(), ji) {
-                    Ok(piecebuf) => {
-                        hasher.write(piecebuf)?;
-                        // flush error is not fatal
-                        // we always catch drop error
-                        piecebuf.flush(|_| {});
-                        from_sub_pieces += 1;
-                    }
-                    Err(GetPieceErr::InvalidPiece) => {
-                        error!("invalid piece {ji:?}");
-                        unreachable!("invalid piece index requested");
-                    }
-                    Err(e) => {
-                        trace!("piecebuf {index} not present err {e:?}");
-                        break;
-                    }
-                }
-            } else {
-                break;
+            if block_picker.have_sub(next_ji) || force_check {
+                let key = GlobalPieceKey {
+                    info_hash: self.info_hash,
+                    index: next_ji,
+                };
+                self.cache_handle
+                    .send_get_piece(key, self.self_handle.sender.clone());
             }
         }
-        info!(
-            "advance hash of piece {index} from sub piece {from_sub_pieces} / {total_sub_pieces}"
-        );
-        Ok(from_sub_pieces >= total_sub_pieces)
+        info!("advance hash of piece {index} from sub piece {next_sub_piece} / {total_sub_pieces}");
+        Ok(next_sub_piece >= total_sub_pieces)
     }
 
     /// called when a full piece received
     /// return verify result of the full piece
     /// index: piece index
+    /// piecebuf: the piece buffer, should be exactly the size of the sub-piece
     /// force_check: load pieces regardless of state of piece picker
     /// used in file recheck, where piece picker may not be accurate, piece picker
     fn handle_sub_piece_received(
         &mut self,
-        index: u32,
+        ji: JointIndex,
+        piecebuf: &mut PieceLease,
         force_check: bool,
     ) -> io::Result<Option<bool>> {
-        info!("sub piece of {} received, hashing...", index);
-        let Downloading { block_picker, .. } = match self.torrent_state {
-            TorrentState::Metadata(ref mut d) => d,
-            TorrentState::Fetching(_) => panic!("should not receive piece before metadata"),
-        };
-        let schedule_load = force_check || block_picker.is_piece_wait_check(index);
-        let full_hashed = self.advance_hash(index, schedule_load)?;
+        info!("sub piece of {:?} received, hashing...", ji);
+        let full_hashed = self.advance_hash(ji, piecebuf, force_check)?;
 
         if !full_hashed {
             return Ok(None);
@@ -1231,14 +1258,14 @@ impl TransmitWorker {
             TorrentState::Metadata(ref mut d) => d,
             TorrentState::Fetching(_) => panic!("should not receive piece before metadata"),
         };
-        let hasher = piece_hasher.remove(&index).unwrap();
-        if Self::verify_piece(index as usize, metadata, hasher) {
-            info!("piece {} verify pass", index);
-            block_picker.piece_verified(index as u32, true);
+        let hasher = piece_hasher.remove(&ji.index()).unwrap();
+        if Self::verify_piece(ji.index() as usize, metadata, hasher) {
+            info!("piece {} verify pass", ji.index());
+            block_picker.piece_verified(ji.index() as u32, true);
             Ok(Some(true))
         } else {
-            info!("piece {} verify failed", index);
-            block_picker.piece_verified(index as u32, false);
+            info!("piece {} verify failed", ji.index());
+            block_picker.piece_verified(ji.index() as u32, false);
             Ok(Some(false))
         }
     }
@@ -1288,14 +1315,15 @@ impl TransmitWorker {
                         }
                     }
                 } else {
+                    // load next piece to check
                     let next_piece = to_check.pop_first().unwrap();
-                    match self.handle_sub_piece_received(next_piece, true)? {
-                        Some(passed) => {
-                            // TODO: MAYBE FIXME: this is recursive, but mostly this will be a None
-                            self.handle_checkfile_on_piece_verified(next_piece, passed)?;
-                        }
-                        None => {}
-                    }
+                    self.cache_handle.send_get_piece(
+                        GlobalPieceKey {
+                            info_hash: self.info_hash,
+                            index: JointIndex::new(next_piece, 0),
+                        },
+                        self.self_handle.sender.clone(),
+                    );
                 }
                 Ok(())
             }
@@ -1317,55 +1345,6 @@ impl TransmitWorker {
     //     }
     // }
 
-    #[instrument(skip(storage, sender), ret)]
-    fn get_piecebuf(
-        storage: &mut BufStorage,
-        sender: mpsc::UnboundedSender<Msg>,
-        index: JointIndex,
-    ) -> Result<&mut PieceBuf, GetPieceErr> {
-        let err_sender = sender.clone();
-        let on_ready = move |p| {
-            _ = sender.send(Msg::PieceBufReady { index, buf: p });
-        };
-        let on_err = move |e| {
-            _ = err_sender.send(Msg::FlushError(e));
-        };
-        storage.get_piece(index, on_ready, Box::new(on_err))
-    }
-
-    #[instrument(skip(storage))]
-    fn get_cached_piecebuf(storage: &mut BufStorage, index: JointIndex) -> Option<&mut PieceBuf> {
-        storage.get_cached_piece(index)
-    }
-
-    /// NOTE: CRITICAL: if concurrently get same index, only one of them may return
-    /// others may block indefinitely
-    async fn get_piecebuf_now<'a>(
-        storage: &'a mut BufStorage,
-        index: JointIndex,
-    ) -> io::Result<&'a mut PieceBuf> {
-        let (tx, rx) = oneshot::channel();
-        let on_ready = move |p| {
-            _ = tx.send(p);
-        };
-        let on_err = move |_| {};
-
-        match storage.get_piece(index, on_ready, Box::new(on_err)) {
-            Ok(_) => {}
-            Err(GetPieceErr::InvalidPiece) => panic!("wrong index {:?}", index),
-            Err(GetPieceErr::Returned) => panic!("already returned piece {:?}", index),
-            Err(GetPieceErr::Loading) => {
-                let p = rx.await.map_err(|_| {
-                    io::Error::new(io::ErrorKind::Other, "get piecebuf_now oneshot recv error")
-                })??;
-                storage.add_piece(p);
-            }
-        }
-
-        // by this time, we should have inserted piecebuf(index) into storage
-        Ok(storage.get_piece(index, |_| {}, Box::new(|_| {})).unwrap())
-    }
-
     #[instrument(skip_all)]
     fn handle_blocks_receieved(&mut self, peer: PeerAddr) -> io::Result<()> {
         let peer = to_canonical_addr(peer);
@@ -1379,12 +1358,12 @@ impl TransmitWorker {
             );
         }
         let conn = self.connected_peers.get_mut(&peer).expect("should exist");
-        let Downloading { storage, .. } = match &mut self.torrent_state {
-            TorrentState::Metadata(d) => d,
+        match &self.torrent_state {
             TorrentState::Fetching(_) => {
                 return Ok(());
             }
-        };
+            TorrentState::Metadata(_) => {}
+        }
 
         // For Probe mode BDP estimation, use a conservative RTT baseline under jitter:
         let probe_bdp_rtt = compute_probe_bdp_rtt(conn.min_rtt);
@@ -1707,11 +1686,7 @@ impl TransmitWorker {
             conn.inflight.receive(req);
         }
 
-        let Downloading {
-            block_picker,
-            storage,
-            ..
-        } = match &mut self.torrent_state {
+        let Downloading { block_picker, .. } = match &mut self.torrent_state {
             TorrentState::Metadata(d) => d,
             TorrentState::Fetching(_) => {
                 info!(
@@ -1821,34 +1796,27 @@ impl TransmitWorker {
         }
 
         let ji = JointIndex::from(piece.to_request());
-        match Self::get_piecebuf(storage, self.self_handle.sender.clone(), ji) {
-            Ok(piecebuf) => {
-                copy_to_piecebuf(&piece, &buf, piecebuf);
-                if complete.sub_piece {
-                    info!("sub piece {ji:?} piece received",);
-                    piecebuf.flush(|_| {}); // TODO: FIXME: handle all flush error?
-                    match self.handle_sub_piece_received(piece.index, false)? {
-                        Some(true) => {
-                            self.broadcast_have(ji.index() as u32);
-                        }
-                        Some(false) => {}
-                        None => {}
-                    }
-                }
+        {
+            let state = self
+                .waiting_for_piecebuf
+                .entry(ji)
+                .or_insert_with(|| PieceWaitState {
+                    blocks: Vec::new(),
+                    requested: false,
+                    sub_piece_complete: false,
+                });
+            state.blocks.push(BlockWaitingBuf { piece, buf });
+            if complete.sub_piece {
+                state.sub_piece_complete = true;
             }
-            Err(GetPieceErr::InvalidPiece) => {
-                info!("invalid piece {piece:?}");
-            }
-            Err(e) => {
-                let index = piece.index;
-                match self.waiting_for_piecebuf.get_mut(&ji) {
-                    Some(v) => v.push(BlockWaitingBuf { piece, buf }),
-                    None => {
-                        self.waiting_for_piecebuf
-                            .insert(ji, vec![BlockWaitingBuf { piece, buf }]);
-                    }
-                }
-                trace!("piecebuf {index} not present err {e:?}");
+            if !state.requested {
+                let key = GlobalPieceKey {
+                    info_hash: self.info_hash,
+                    index: ji,
+                };
+                self.cache_handle
+                    .send_get_piece(key, self.self_handle.sender.clone());
+                state.requested = true;
             }
         }
         Ok(())
@@ -1857,32 +1825,31 @@ impl TransmitWorker {
     fn handle_piecebuf_ready(
         &mut self,
         ji: JointIndex,
-        buf: io::Result<PieceBuf>,
+        buf: io::Result<PieceLease>,
     ) -> io::Result<()> {
-        let Downloading {
-            storage,
-            block_picker,
-            ..
-        } = match &mut self.torrent_state {
+        let Downloading { block_picker, .. } = match &mut self.torrent_state {
             TorrentState::Metadata(d) => d,
             TorrentState::Fetching(_) => {
                 unreachable!();
             }
         };
         match buf {
-            Ok(mut buf) => {
+            Ok(mut lease) => {
                 let pending = self.waiting_for_piecebuf.remove(&ji);
+                let sub_piece_complete = pending
+                    .as_ref()
+                    .map(|s| s.sub_piece_complete)
+                    .unwrap_or(false);
                 if let Some(ps) = pending {
                     info!(
                         "piecebuf {ji:?} now ready, flushing {} blocks into it",
-                        ps.len()
+                        ps.blocks.len()
                     );
-                    for p in ps {
-                        copy_to_piecebuf(&p.piece, &p.buf, &mut buf);
+                    for p in ps.blocks {
+                        copy_to_piecebuf(&p.piece, &p.buf, &mut lease);
                     }
                 }
 
-                storage.add_piece(buf);
                 // TODO: remove immediate if that piece is no longer available among peers
                 // if block_picker.piece_availability(ji.index()) > 0 {
                 //     storage.add_piece(buf);
@@ -1893,10 +1860,9 @@ impl TransmitWorker {
                     RunningState::Checking { .. } => true,
                     _ => false,
                 };
-                let is_piece_wait_check = block_picker.is_piece_wait_check(ji.index());
-                if is_checking || is_piece_wait_check {
+                if is_checking || block_picker.have_sub(ji) {
                     info!("sub piece {ji:?} piece loaded",);
-                    match self.handle_sub_piece_received(ji.index(), is_checking)? {
+                    match self.handle_sub_piece_received(ji, &mut lease, is_checking)? {
                         Some(passed) => {
                             if is_checking {
                                 // TODO: FIXME: if we verified to have a piece we previously not,
@@ -1918,6 +1884,7 @@ impl TransmitWorker {
             Err(e) => {
                 // TODO: why that's error
                 // shall we reload?
+                // TODO: what to do about the remaing waiting blocks?
                 return Err(e);
             }
         }
@@ -2056,12 +2023,13 @@ impl TransmitWorker {
                     };
                 }
             }
-            match self.handle_sub_piece_received(first, true)? {
-                Some(passed) => {
-                    self.handle_checkfile_on_piece_verified(first, passed)?;
-                }
-                None => {}
-            }
+            self.cache_handle.send_get_piece(
+                GlobalPieceKey {
+                    info_hash: self.info_hash,
+                    index: JointIndex::new(first, 0),
+                },
+                self.self_handle.sender.clone(),
+            );
         } else {
             info!("no piece selected for checking, check file complete");
             // TODO: MAYBE FIXME: we did not select any piece, but we return true here
@@ -2122,7 +2090,11 @@ impl TransmitWorker {
             } => match &mut self.torrent_state {
                 TorrentState::Fetching(f) => {
                     if let Some(m) = f.receive_metadata_part(piece, data, total_size) {
-                        let mut downloading = Self::metadata_into_downloading(m);
+                        let mut downloading = Self::metadata_into_downloading(
+                            m,
+                            &self.cache_handle,
+                            self.self_handle.sender.clone(),
+                        );
                         let piece_picker = &mut downloading.block_picker;
                         for (addr, pc) in &mut self.connected_peers {
                             if let Some(mut ps) = pc.bitmap.take() {
@@ -2291,7 +2263,8 @@ pub(crate) async fn run_transmit_worker(
     info!("transmit manager done");
 }
 
-fn copy_to_piecebuf(piece: &Piece, data: &[u8], piecebuf: &mut PieceBuf) {
+/// copy data to a sub-piece buffer
+fn copy_to_piecebuf(piece: &Piece, data: &[u8], piecebuf: &mut [u8]) {
     // `begin` is the byte offset of this block within its sub-piece buffer.
     // SUB_PIECE_SIZE is a multiple of BLOCK_SIZE, so no block ever straddles
     // a sub-piece boundary and `begin + data.len()` is always within bounds.
@@ -2303,7 +2276,7 @@ fn copy_to_piecebuf(piece: &Piece, data: &[u8], piecebuf: &mut PieceBuf) {
         piecebuf.as_ref().len(),
         piece.len,
     );
-    piecebuf.as_mut()[begin..end].copy_from_slice(data);
+    piecebuf[begin..end].copy_from_slice(data);
 }
 
 fn run_dht(transmit: &mut TransmitWorker) {

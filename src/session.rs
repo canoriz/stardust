@@ -11,6 +11,7 @@ use tokio::sync::oneshot;
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{info, warn};
 
+use crate::cache::cache_manager::{CacheManager, CacheManagerHandle};
 use crate::dht::{self, DHT};
 use crate::metadata::Magnet;
 use crate::protocol::{AcceptOpt, BTStream, HandshakeOption, InfoHash};
@@ -24,6 +25,7 @@ pub struct Session {
     tasks: Arc<Mutex<HashMap<InfoHash, TorrentManagerHandle>>>,
     port: u16,
     dht_client: Option<Arc<DHT>>,
+    cache_handle: CacheManagerHandle,
 
     _cancel: DropGuard,
 }
@@ -145,11 +147,17 @@ impl Session {
             None
         };
 
+        // TODO: cache manager should take cancellation token
+        let (cache_manager, cache_handle) = CacheManager::new();
+        // TODO: maybe let new to start the task, not manually spawn here
+        tokio::spawn(cache_manager.run());
+
         Self {
             self_id: opt.self_id,
             tasks,
             port: opt.port,
             dht_client,
+            cache_handle,
             _cancel: cancel.drop_guard(),
         }
     }
@@ -164,7 +172,7 @@ impl Session {
         };
 
         let mut tm =
-            TorrentManagerHandle::new(job, self.self_id, self.port, self.dht_client.clone());
+            TorrentManagerHandle::new(job, self.self_id, self.port, self.dht_client.clone(), self.cache_handle.clone());
 
         for addr in announce_list {
             tm.send_announce_msg(announce_manager::Msg::AddUrl(addr));

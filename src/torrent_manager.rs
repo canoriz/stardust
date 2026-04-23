@@ -1,6 +1,7 @@
 use std::io;
 use std::sync::Arc;
 
+use crate::cache::cache_manager::CacheManagerHandle;
 use crate::announce_manager::{self, AnnounceManagerHandle};
 use crate::dht::DHT;
 use crate::transmit_manager::{self, TorrentTask, TransmitDump, TransmitManager};
@@ -16,7 +17,7 @@ pub struct TorrentManagerHandle {
 }
 
 impl TorrentManagerHandle {
-    pub fn new(t: TorrentTask, self_id: [u8; 20], port: u16, dht_client: Option<Arc<DHT>>) -> Self {
+    pub fn new(t: TorrentTask, self_id: [u8; 20], port: u16, dht_client: Option<Arc<DHT>>, cache_handle: CacheManagerHandle) -> Self {
         let (tx, rx) = mpsc::unbounded_channel::<transmit_manager::Msg>();
 
         let info_hash = match &t {
@@ -25,7 +26,7 @@ impl TorrentManagerHandle {
         };
 
         let am = AnnounceManagerHandle::new(self_id, port, info_hash, tx.clone());
-        let tm = TransmitManager::new(t, self_id, port, tx.clone(), rx, dht_client, am);
+        let tm = TransmitManager::new(t, self_id, port, tx.clone(), rx, dht_client, am, cache_handle);
 
         Self {
             sender: TransmitManagerSender(tx),

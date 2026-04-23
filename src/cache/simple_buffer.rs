@@ -1,6 +1,5 @@
 use std::{
-    cmp,
-    collections::{BinaryHeap, HashMap, VecDeque},
+    collections::VecDeque,
     fmt, io,
     ops::{Deref, DerefMut},
     sync::{
@@ -9,11 +8,11 @@ use std::{
     },
 };
 
-use super::{BackFile, MutexBackFile};
+use super::MutexBackFile;
 use crate::protocol::Request;
 use bytes::BytesMut;
-use tokio::{sync::mpsc, time};
-use tracing::{info, warn};
+use tokio::time;
+use tracing::warn;
 
 pub type PieceIndex = u32;
 pub type SubPieceIndex = u32;
@@ -72,26 +71,26 @@ const DIRTY: u32 = 0b10;
 const DROPPING: u32 = 0b100;
 
 /// A pool of objects
-struct Pool<T> {
+pub(crate) struct Pool<T> {
     limit: usize,
     pool: VecDeque<T>,
 }
 
 impl<T> Pool<T> {
-    fn new(limit: usize) -> Self {
+    pub(crate) fn new(limit: usize) -> Self {
         Self {
             limit,
             pool: VecDeque::with_capacity(limit),
         }
     }
 
-    fn put(&mut self, t: T) {
+    pub(crate) fn put(&mut self, t: T) {
         if self.pool.len() < self.limit {
             self.pool.push_back(t)
         }
     }
 
-    fn get(&mut self) -> Option<T> {
+    pub(crate) fn get(&mut self) -> Option<T> {
         self.pool.pop_front()
     }
 }
@@ -357,6 +356,10 @@ impl PieceBuf {
         (s & FLUSHING) > 0
     }
 
+    pub fn access_time(&self) -> time::Instant {
+        self.touch
+    }
+
     pub fn flush<F>(&mut self, result_callback: F)
     where
         F: FnOnce(Result<(), FlushErr>) + Send + 'static,
@@ -395,6 +398,27 @@ impl PieceBuf {
             }
             0b11 => {}
             _ => unreachable!(),
+        }
+    }
+
+    /// Allocate a new PieceBuf with the given parameters.
+    /// Used by `CacheManager` to create pieces for file loading.
+    pub(crate) fn alloc(
+        pool: &Arc<Mutex<Pool<BytesMut>>>,
+        index: JointIndex,
+        offset: usize,
+        len: usize,
+        file: MutexBackFile,
+        on_error: Box<dyn ErrorCallback>,
+    ) -> Self {
+        PieceBuf {
+            buf: CowBuf::new(PooledBuf::new(pool.clone(), len)),
+            touch: time::Instant::now(),
+            index,
+            offset,
+            state: Arc::new(AtomicU32::new(0)),
+            file,
+            on_error: Some(on_error),
         }
     }
 }
@@ -447,7 +471,7 @@ where
     }
 }
 
-fn read_from_file(mut p: PieceBuf, file: MutexBackFile) -> io::Result<PieceBuf> {
+pub(crate) fn read_from_file(mut p: PieceBuf, file: MutexBackFile) -> io::Result<PieceBuf> {
     // change p, but don't set p to be dirty
     let mut_but_clear = match &mut p.buf {
         CowBuf::Owned(b) => b.as_mut().unwrap(),
@@ -456,269 +480,6 @@ fn read_from_file(mut p: PieceBuf, file: MutexBackFile) -> io::Result<PieceBuf> 
     let mut f = file.lock().unwrap();
     f.read_exact_at(p.offset, mut_but_clear)?;
     Ok(p)
-}
-
-pub struct BufStorage {
-    pieces: HashMap<JointIndex, PieceBuf>,
-
-    piece_size: usize,
-    last_piece_size: usize,
-    piece_total: usize,
-
-    back_file: MutexBackFile,
-
-    /// currently loading pieces
-    /// if piece is not present, add to loading list
-    loading: Arc<Mutex<HashMap<JointIndex, PieceState>>>,
-
-    /// BytesMut pool
-    // TODO: another layer of global pool shared between many BufStorages
-    pool: Arc<Mutex<Pool<BytesMut>>>,
-}
-
-#[derive(Debug)]
-pub enum GetPieceErr {
-    InvalidPiece,
-    Loading,
-    Returned,
-}
-
-enum PieceState {
-    Loading,
-    Returned,
-}
-
-impl BufStorage {
-    pub fn new(total_length: usize, piece_size: usize, back_file: BackFile) -> Self {
-        let (piece_total, last_piece_size) = piece_total_and_last_size(total_length, piece_size);
-        Self {
-            pieces: HashMap::new(),
-            back_file: Arc::new(Mutex::new(back_file)),
-
-            piece_size,
-            last_piece_size,
-            piece_total,
-
-            loading: Arc::new(Mutex::new(HashMap::new())),
-            pool: Arc::new(Mutex::new(Pool::new(POOL_SIZE))),
-        }
-    }
-
-    pub async fn shutdown(mut self) {
-        let n = self.pieces.len();
-        let (tx, mut rx) = mpsc::channel(n);
-        for (_, piece) in self.pieces.iter_mut() {
-            let ti = tx.clone();
-            piece.flush(move |r| {
-                ti.try_send(r)
-                    .expect("allocated exact n slots, should not send fail")
-            });
-        }
-
-        // Drop the original sender so rx.recv() terminates once all
-        // spawn_blocking flush tasks drop their clones.
-        drop(tx);
-        let mut c = 0;
-        while let Some(r) = rx.recv().await {
-            c += 1;
-            if let Err(e) = r {
-                warn!("shutdown flush error {e:?}, data lost");
-            }
-        }
-        assert_eq!(c, n);
-    }
-
-    /// get piecebuf from local cache, if piecebuf in cache, return it.
-    /// If not in cache, returns None
-    pub fn get_cached_piece(&mut self, piece_idx: JointIndex) -> Option<&mut PieceBuf> {
-        self.pieces.get_mut(&piece_idx)
-    }
-
-    /// returns all buffered pieces
-    pub fn iter_buffered(&mut self) -> impl Iterator<Item = (&JointIndex, &mut PieceBuf)> {
-        self.pieces.iter_mut()
-    }
-
-    /// If piece is in storage, the piece is returned.
-    /// If piece is not in storage, Err will return and
-    /// `on_ready` callback will be called then piece is ready
-    /// in storage.
-    /// NOTE: if multiple get_piece to same piece_idx are all
-    /// LOADING, only one of the on_ready will be called!
-    pub fn get_piece<F>(
-        &mut self,
-        index: JointIndex,
-        on_ready: F,
-        on_flush_err: Box<dyn ErrorCallback>,
-    ) -> Result<&mut PieceBuf, GetPieceErr>
-    where
-        F: FnOnce(io::Result<PieceBuf>) + Send + 'static,
-    {
-        let piece_idx = index.index() as usize;
-        let in_piece_offset = index.in_piece_offset();
-        let this_piece_size = if piece_idx + 1 == self.piece_total {
-            self.last_piece_size
-        } else {
-            self.piece_size
-        };
-        if piece_idx >= self.piece_total {
-            return Err(GetPieceErr::InvalidPiece);
-        }
-        if in_piece_offset >= this_piece_size {
-            return Err(GetPieceErr::InvalidPiece);
-        }
-        if let Some(p) = self.pieces.get_mut(&index) {
-            p.touch = time::Instant::now();
-            Ok(p)
-        } else {
-            let mut guard = self.loading.lock().unwrap();
-            match guard.get(&index) {
-                Some(PieceState::Loading) => return Err(GetPieceErr::Loading),
-                Some(PieceState::Returned) => return Err(GetPieceErr::Returned),
-                None => {
-                    guard.insert(index, PieceState::Loading);
-                }
-            }
-            // File offset of this sub-piece and its length within the piece
-            let offset = piece_idx * self.piece_size + in_piece_offset;
-            let len = (SUB_PIECE_SIZE as usize).min(this_piece_size - in_piece_offset);
-
-            let p = PieceBuf {
-                buf: CowBuf::new(PooledBuf::new(self.pool.clone(), len)),
-                touch: time::Instant::now(),
-                index,
-                offset,
-                state: Arc::new(AtomicU32::new(0)),
-                file: self.back_file.clone(),
-                on_error: Some(on_flush_err),
-            };
-            let f = self.back_file.clone();
-            let loading_map = self.loading.clone();
-            tokio::task::spawn_blocking(move || match read_from_file(p, f) {
-                Ok(p) => {
-                    let mut guard = loading_map.lock().unwrap();
-                    let v = guard
-                        .get_mut(&index)
-                        .expect("file read done, corresponding piece_idx should exist in map");
-                    *v = PieceState::Returned;
-                    on_ready(Ok(p));
-                }
-                Err(e) => {
-                    let mut guard = loading_map.lock().unwrap();
-                    guard.remove(&index);
-                    on_ready(Err(e));
-                }
-            });
-            Err(GetPieceErr::Loading)
-        }
-    }
-
-    pub fn add_piece(&mut self, p: PieceBuf) {
-        self.purge_by_size(POOL_SIZE - 1);
-        {
-            let mut guard = self.loading.lock().unwrap();
-
-            // assert check
-            // inserted piece should be from get_piece's on_ready
-            // and by that way, loading[piece_idx] should be PieceState::Returned
-            assert!(matches!(guard.remove(&p.index), Some(PieceState::Returned)));
-            info!("insert piece buffer {:?}", p.index());
-            self.pieces.insert(p.index, p);
-        }
-    }
-
-    pub fn forget_piece(&mut self, p: PieceBuf) {
-        let mut guard = self.loading.lock().unwrap();
-
-        // assert check
-        // inserted piece should be from get_piece's on_ready
-        // and by that way, loading[piece_idx] should be PieceState::Returned
-        assert!(matches!(guard.remove(&p.index), Some(PieceState::Returned)));
-        info!("forget piece buffer {:?}", p.index());
-    }
-
-    pub fn remove_piece(&mut self, piece_idx: JointIndex) {
-        if self.pieces.remove(&piece_idx).is_some() {
-            info!("remove piece buffer {:?}", piece_idx);
-        }
-    }
-
-    pub fn purge_by_size(&mut self, keep: usize) {
-        if self.pieces.len() <= keep {
-            return;
-        }
-
-        // TODO: OPTIMIZE
-        let mut n_purge = self.pieces.len() - keep;
-
-        let mut remove_pieces = BinaryHeap::new();
-
-        for (k, v) in self.pieces.iter().filter(|(_, v)| !v.is_dirty()) {
-            remove_pieces.push(cmp::Reverse((v.touch, *k)));
-            if remove_pieces.len() > n_purge {
-                remove_pieces.pop();
-            }
-        }
-        while n_purge > 0 {
-            if let Some(cmp::Reverse((_, i))) = remove_pieces.pop() {
-                self.pieces.remove(&i);
-                info!("purge clear piece {i:?}");
-                n_purge -= 1;
-            } else {
-                break;
-            }
-        }
-
-        if n_purge > 0 {
-            warn!(
-                "purge_by_size: cannot purge {n_purge} sub pieces; all remaining are DIRTY/FLUSHING"
-            );
-            for (k, v) in self.pieces.iter() {
-                remove_pieces.push(cmp::Reverse((v.touch, *k)));
-                if remove_pieces.len() > n_purge {
-                    remove_pieces.pop();
-                }
-            }
-            while n_purge > 0 {
-                if let Some(cmp::Reverse((_, i))) = remove_pieces.pop() {
-                    info!("purge flush dirty piece {i:?}");
-                    // IMPORTANT: we really can't remove them because they are dirty
-                    // if we remove them, though they will be flushed, but we may read
-                    // stale data subsequently.
-                    self.pieces.get_mut(&i).unwrap().flush(|_| {});
-                    n_purge -= 1;
-                    // can't remove it because it's dirty, we flush them
-                    // TODO: FIXME: will we flush multiple times?
-                } else {
-                    break;
-                }
-            }
-        }
-    }
-
-    pub fn vacant_count(&self) -> usize {
-        // TODO: optimize by maintaining a separate counter for dirty pieces
-        // so we don't need to iterate all pieces here
-        let n_clear = self.pieces.iter().filter(|(_, v)| !v.is_dirty()).count();
-
-        // Count in-flight `get_piece()` reads too: they already allocated a
-        // buffer from the pool but are not in `self.pieces` yet.
-        let n_loading = self.loading.lock().unwrap().len();
-        let used = self.pieces.len() + n_loading;
-
-        let n_remain = POOL_SIZE.saturating_sub(used);
-        n_clear + n_remain
-    }
-}
-
-fn piece_total_and_last_size(total_length: usize, piece_size: usize) -> (usize, usize) {
-    let n_full_piece = total_length / piece_size;
-    let full_piece_total_size = n_full_piece * piece_size;
-    if full_piece_total_size == total_length {
-        (n_full_piece, piece_size)
-    } else {
-        (n_full_piece + 1, (total_length - full_piece_total_size))
-    }
 }
 
 #[cfg(test)]
@@ -732,9 +493,10 @@ mod test {
     use tokio::time;
 
     use super::{
-        read_from_file, BackFile, CowBuf, FlushErr, JointIndex, MutexBackFile, PieceBuf, Pool,
-        PooledBuf, DIRTY, FLUSHING,
+        read_from_file, CowBuf, FlushErr, JointIndex, MutexBackFile, PieceBuf, Pool, PooledBuf,
+        DIRTY, FLUSHING,
     };
+    use crate::backfile::BackFile;
 
     fn void_file() -> MutexBackFile {
         Arc::new(Mutex::new(BackFile::new::<VoidFile>().build()))
