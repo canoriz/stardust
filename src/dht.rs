@@ -249,6 +249,14 @@ impl Drop for TransactionGuard {
     }
 }
 
+pub type AnnounceToken = Vec<u8>;
+
+#[derive(Debug)]
+pub struct GetPeersResult {
+    pub peers: Vec<SocketAddr>,
+    pub closest: Vec<(RpcAddr<SocketAddr>, Option<AnnounceToken>)>,
+}
+
 impl DHT {
     pub fn new(id: NodeID, port: u16, version: String) -> Self {
         let (tx, rx) = mpsc::channel(2048);
@@ -333,7 +341,7 @@ impl DHT {
         })
     }
 
-    #[instrument(skip_all, fields(krpc_inner = ?krpc_inner, timeout), ret)]
+    #[instrument(skip_all, fields(to = ?addr.id, krpc_inner = ?krpc_inner, timeout), ret)]
     async fn do_rpc_req<A>(
         &self,
         addr: RpcAddr<A>,
@@ -499,7 +507,7 @@ impl DHT {
 
     /// get_peers queries peers of target across both IPv4 and IPv6.
     #[instrument(skip_all, fields(target = crate::helper::to_hex(&target)), ret)]
-    pub async fn get_peers(self: &Arc<Self>, target: NodeID) -> Vec<SocketAddr> {
+    pub async fn get_peers(self: &Arc<Self>, target: NodeID) -> GetPeersResult {
         self.get_peers_iterative(target).await
     }
 
@@ -510,15 +518,22 @@ impl DHT {
     /// referrals from either family are fed into the correct candidate set,
     /// and the search terminates only when no family has unqueried candidates
     /// left in its top-K.
-    async fn get_peers_iterative(self: &Arc<Self>, target: NodeID) -> Vec<SocketAddr> {
+    async fn get_peers_iterative(self: &Arc<Self>, target: NodeID) -> GetPeersResult {
         const K: usize = 8;
-        const ALPHA: usize = 3;
+        const ALPHA: usize = 5;
         let timeout = time::Duration::from_secs(5);
 
         // Channel message: Ok((v4_referrals, v6_referrals)) on success, Err(id) on timeout.
         type Err = (SocketAddr, Option<NodeID>);
-        // v4 closer nodes, v6 closer nodes, peers
-        type Msg = Result<(Vec<NodeAddr>, Vec<NodeAddr>, Vec<SocketAddr>), Err>;
+        struct NodeResp {
+            id: RpcAddr<SocketAddr>,
+            v4_closest: Vec<NodeAddr>,
+            v6_closest: Vec<NodeAddr>,
+            peers: Vec<SocketAddr>,
+            token: Option<Vec<u8>>,
+        }
+        // v4 closer nodes, v6 closer nodes, peers, optional (responder_addr, token)
+        type Msg = Result<NodeResp, Err>;
 
         // Spawns a FindNode RPC; splits the response into (v4, v6) candidate lists.
         // `target` and `timeout` are Copy and captured from the outer scope.
@@ -562,7 +577,15 @@ impl DHT {
                         let peers: Vec<SocketAddr> = r
                             .values
                             .map_or(vec![], |v| v.into_iter().map(|a| a.into()).collect());
-                        _ = tx.send(Ok((v4, v6, peers))).await;
+                        _ = tx
+                            .send(Ok(NodeResp {
+                                id: addr,
+                                v4_closest: v4,
+                                v6_closest: v6,
+                                peers,
+                                token: r.token.map(|t| t.into_vec()),
+                            }))
+                            .await;
                     }
                     Err(e) => {
                         debug!("find_closest_node: {addr:?} did not respond: {e}");
@@ -574,9 +597,10 @@ impl DHT {
 
         #[derive(Debug, Eq, PartialEq)]
         enum NodeState {
-            Seen,    // candidate discovered, not yet queried
-            Queried, // query in flight or completed
-            Dead,    // did not respond
+            Seen,                   // candidate discovered, not yet queried
+            Querying,               // query in flight, no response yet
+            Queried(AnnounceToken), // query in flight or completed
+            Dead,                   // did not respond
         }
 
         use routing::Dist;
@@ -590,18 +614,27 @@ impl DHT {
         // in_flight tracks responses still pending; start at 1 for the initial seed message.
         let mut in_flight: usize = 1;
         _ = resp_tx
-            .send(Ok((
-                self.get_k_closest(target, K, false).await,
-                self.get_k_closest(target, K, true).await,
-                vec![],
-            )))
+            .send(Ok(NodeResp {
+                // the first "response" is synthetic, so we can put anything in it
+                id: RpcAddr::no_id(SocketAddr::from(([0, 0, 0, 0], 0))),
+                v4_closest: self.get_k_closest(target, K, false).await,
+                v6_closest: self.get_k_closest(target, K, true).await,
+                peers: vec![],
+                token: None,
+            }))
             .await;
 
         let mut peers = vec![];
         while let Some(r) = resp_rx.recv().await {
             in_flight -= 1;
             match r {
-                Ok((n4, n6, p)) => {
+                Ok(NodeResp {
+                    id,
+                    v4_closest: n4,
+                    v6_closest: n6,
+                    peers: p,
+                    token,
+                }) => {
                     peers.extend(p);
                     for n in n4 {
                         if matches!(node_state4.get(&n.id), None) {
@@ -627,16 +660,26 @@ impl DHT {
                             }
                         }
                     }
+                    if let (Some(token), Some(nid)) = (token, id.id) {
+                        match id.addr {
+                            SocketAddr::V4(_) => {
+                                node_state4.insert(nid, NodeState::Queried(token.clone()))
+                            }
+                            SocketAddr::V6(_) => {
+                                node_state6.insert(nid, NodeState::Queried(token.clone()))
+                            }
+                        };
+                    }
                 }
                 Err((addr, id)) => {
                     debug!("receive response from {id:?} error");
                     if let Some(id) = id {
                         if addr.is_ipv4() {
                             node_state4.insert(id, NodeState::Dead);
-                            closest_nodes4.retain(|x| x.addr.id != id);
+                            closest_nodes4.retain(|Dist { addr, .. }| addr.id != id);
                         } else {
                             node_state6.insert(id, NodeState::Dead);
-                            closest_nodes6.retain(|x| x.addr.id != id);
+                            closest_nodes6.retain(|Dist { addr, .. }| addr.id != id);
                         }
                     }
                 }
@@ -647,7 +690,7 @@ impl DHT {
             for Dist { addr, .. } in closest_nodes4.iter() {
                 match node_state4.get(&addr.id) {
                     Some(NodeState::Seen) | None => {
-                        node_state4.insert(addr.id, NodeState::Queried);
+                        node_state4.insert(addr.id, NodeState::Querying);
                         send_req(
                             self.clone(),
                             RpcAddr::id(addr.id, addr.addr),
@@ -659,7 +702,7 @@ impl DHT {
                             break;
                         }
                     }
-                    Some(NodeState::Queried) => {}
+                    Some(NodeState::Querying | NodeState::Queried(_)) => {}
                     Some(NodeState::Dead) => unreachable!("dead node in closest_nodes4"),
                 }
             }
@@ -669,7 +712,7 @@ impl DHT {
             for Dist { addr, .. } in closest_nodes6.iter() {
                 match node_state6.get(&addr.id) {
                     Some(NodeState::Seen) | None => {
-                        node_state6.insert(addr.id, NodeState::Queried);
+                        node_state6.insert(addr.id, NodeState::Querying);
                         send_req(
                             self.clone(),
                             RpcAddr::id(addr.id, addr.addr),
@@ -681,7 +724,7 @@ impl DHT {
                             break;
                         }
                     }
-                    Some(NodeState::Queried) => {}
+                    Some(NodeState::Querying | NodeState::Queried(_)) => {}
                     Some(NodeState::Dead) => unreachable!("dead node in closest_nodes6"),
                 }
             }
@@ -691,7 +734,29 @@ impl DHT {
                 break;
             }
         }
-        peers
+        let closest4 = closest_nodes4.iter().map(|Dist { addr, .. }| {
+            (
+                RpcAddr::id(addr.id, addr.addr),
+                match node_state4.get(&addr.id) {
+                    Some(NodeState::Queried(token)) => Some(token.clone()),
+                    _ => None,
+                },
+            )
+        });
+        let closest6 = closest_nodes6.iter().map(|Dist { addr, .. }| {
+            (
+                RpcAddr::id(addr.id, addr.addr),
+                match node_state6.get(&addr.id) {
+                    Some(NodeState::Queried(token)) => Some(token.clone()),
+                    _ => None,
+                },
+            )
+        });
+
+        GetPeersResult {
+            peers,
+            closest: closest4.chain(closest6).collect(),
+        }
     }
 }
 

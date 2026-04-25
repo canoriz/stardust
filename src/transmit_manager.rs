@@ -2282,12 +2282,15 @@ fn copy_to_piecebuf(piece: &Piece, data: &[u8], piecebuf: &mut [u8]) {
 fn run_dht(transmit: &mut TransmitWorker) {
     if let Some(c) = &transmit.dht_client {
         let cl = c.clone();
+        // TODO: why port field is an option
+        let listen_port = transmit.handshake_opt.port.unwrap_or(0);
         tokio::spawn(dht_get_peers(
             cl,
             transmit.id,
             transmit.info_hash,
             transmit.handshake_opt.clone(),
             transmit.self_handle.clone(),
+            listen_port,
         ));
     }
 }
@@ -2298,12 +2301,33 @@ async fn dht_get_peers(
     target: [u8; 20],
     handshake_opt: HandshakeOption,
     tmh: TransmitManagerHandle,
+    listen_port: u16,
 ) {
-    let addrs = client.get_peers(target).await;
-    for a in addrs {
+    let result = client.get_peers(target).await;
+    for a in result.peers {
         tmh.sender.send(Msg::NewDiscoveredPeer {
             addr: a,
             from: PeerFrom::DHT,
+        });
+    }
+    // Announce ourselves to the closest nodes that issued us a token.
+    let announce_timeout = time::Duration::from_secs(5);
+    for (node, token) in result
+        .closest
+        .into_iter()
+        .filter_map(|(node, token)| token.map(|t| (node, t)))
+    {
+        let c = client.clone();
+        tokio::spawn(async move {
+            c.announce_peer_rpc(
+                node.clone(),
+                target,
+                listen_port,
+                false,
+                &token,
+                announce_timeout,
+            )
+            .await
         });
     }
 }
