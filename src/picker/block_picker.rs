@@ -1114,7 +1114,17 @@ impl BlockPicker {
         for (index, blocks) in self.requesting.iter_mut() {
             blocks.revoke_all_requested_if(no_response, revoked);
             if blocks.is_all_not_requested() {
-                self.piece_picker.set_have(*index, false);
+                let has_revoked_history = blocks.block_map.iter().any(|s| {
+                    if let BlockStatus::NotRequested { revoked } = s {
+                        // TODO: optimize, do not loop over block_map, store a revoked_count
+                        !revoked.is_empty()
+                    } else {
+                        false
+                    }
+                });
+                if !has_revoked_history {
+                    self.piece_picker.set_have(*index, false);
+                }
             }
         }
         self.requesting.retain(|_, b| {
