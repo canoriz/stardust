@@ -12,11 +12,10 @@ use crate::hasher::HashState;
 use crate::metadata::{self, Magnet, Metadata};
 use crate::picker::{BlockPicker, BlockPickerDump, PieceState, RarestPicker};
 use crate::protocol::{
-    self, Conn, ExtendedMetadata, ExtendedMsg, ExtendedPex, HandshakeOption, InfoHash, Piece,
-    Request,
+    self, Capability, Conn, ExtendedMetadata, ExtendedMsg, ExtendedPex, HandshakeOption, InfoHash,
+    PexFlag, Piece, Request,
 };
 
-use futures::future::Join;
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -184,6 +183,8 @@ struct PeerStatus {
 
 struct PeerConn {
     conn: ConnectionManagerHandle,
+    /// PEX state: peers we have already advertised to this peer.
+    pex_known_peers: HashMap<SocketAddr, Option<PexFlag>>,
     state: PeerStatus,
     bitmap: Option<PieceState>,
     bw: Bandwidth<50>,
@@ -891,6 +892,7 @@ impl TransmitWorker {
                         peer_addr,
                         PeerConn {
                             conn: cm,
+                            pex_known_peers: HashMap::new(),
                             state: PeerStatus {
                                 our_choke_status: ChokeStatus::Unknown,
                                 our_interest_status: InterestStatus::Unknown,
@@ -2234,6 +2236,7 @@ pub(crate) async fn run_transmit_worker(
 ) {
     let mut ticker = tokio::time::interval(time::Duration::from_millis(1000));
     let mut dht_ticker = tokio::time::interval(time::Duration::from_secs(60));
+    let mut pex_ticker = tokio::time::interval(time::Duration::from_secs(30));
     loop {
         // TODO: lets use notify?
         tokio::select! {
@@ -2248,6 +2251,10 @@ pub(crate) async fn run_transmit_worker(
             _ = dht_ticker.tick() => {
                 info!("dht ticker tick");
                 run_dht(&mut transmit);
+            }
+            _ = pex_ticker.tick() => {
+                info!("pex ticker tick");
+                run_pex(&mut transmit);
             }
             _ = ticker.tick() => {
                 // transmit.pick_blocks_for_all_peers(2);
@@ -2292,6 +2299,47 @@ fn run_dht(transmit: &mut TransmitWorker) {
             transmit.self_handle.clone(),
             listen_port,
         ));
+    }
+}
+
+fn run_pex(transmit: &mut TransmitWorker) {
+    // Build the current set of advertised addresses once (all connected peers, correct listen port).
+    let now_peers: HashMap<SocketAddr, Option<PexFlag>> = transmit
+        .connected_peers
+        .iter()
+        .filter_map(|(addr, conn)| {
+            let advertised = if conn.conn.info().is_income {
+                conn.conn
+                    .info()
+                    .peer_listen_port
+                    .map(|port| SocketAddr::new(addr.ip(), port))
+            } else {
+                Some(*addr)
+            };
+            // TODO: FIXME: set correct Pex flags
+            advertised.map(|a| (a, None))
+        })
+        .collect();
+
+    for (peer_addr, conn) in transmit
+        .connected_peers
+        .iter_mut()
+        .filter(|(_, conn)| conn.conn.capability().have(Capability::Pex))
+    {
+        let conn_info = conn.conn.info();
+        let peer_self = if conn_info.is_income {
+            conn_info
+                .peer_listen_port
+                .map(|port| SocketAddr::new(peer_addr.ip(), port))
+                .unwrap_or(*peer_addr)
+        } else {
+            *peer_addr
+        };
+        if let Some(pex_msg) = protocol::pex_delta(peer_self, &now_peers, &mut conn.pex_known_peers)
+        {
+            conn.conn
+                .send_stream_cmd(CtrlOfSend::Extend(ExtendedMsg::Pex(pex_msg)));
+        }
     }
 }
 

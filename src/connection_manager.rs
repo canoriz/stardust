@@ -666,8 +666,8 @@ where
             CtrlOfSend::Extend(ExtendedMsg::Handshake(_)) => {
                 unreachable!("handshake should not be sent after connection established")
             }
-            CtrlOfSend::Extend(ExtendedMsg::Pex(_)) => {
-                todo!("send pex not implemented");
+            CtrlOfSend::Extend(ExtendedMsg::Pex(pex)) => {
+                self.write_stream.send_extend_pex(&pex).await?;
             }
             CtrlOfSend::Extend(ExtendedMsg::Unknown(code)) => {
                 warn!("try to send unknown extended message with code {code}");

@@ -199,15 +199,14 @@ pub struct BTStream<T> {
     // TODO: maybe add a torrent hash Arc<>
     // torrent_hash: [u8; 20],
 
-    // what this peer knows about our connected peers
-    pex_peers: HashMap<SocketAddr, Option<PexFlag>>,
-
     // Received messages during handshake phase (after handshake and before extend handshake).
     // To be sent to upper layer.
     // Some implementations send Port and BitField messages between handshake and extend handshake.
     pending_recvs: Vec<Message>,
 
     reqq_limit: usize,
+    peer_listen_port: Option<u16>,
+    is_income: bool,
 }
 
 impl<T> BTStream<T>
@@ -231,10 +230,11 @@ where
             reserved: self.reserved,
             peer_id: self.peer_id,
             info_hash: self.info_hash,
-            pex_peers: self.pex_peers,
             metadata_size: self.metadata_size,
             pending_recvs: self.pending_recvs,
             reqq_limit: self.reqq_limit,
+            peer_listen_port: self.peer_listen_port,
+            is_income: self.is_income,
         }
     }
 }
@@ -308,29 +308,12 @@ impl BTStream<Box<dyn Conn>> {
         send_have_none(&mut self.inner).await
     }
 
-    pub async fn send_extend_pex(
-        &mut self,
-        now_connected: &HashMap<SocketAddr, Option<PexFlag>>,
-    ) -> io::Result<()> {
-        let (added, dropped) = make_added_and_dropped(now_connected, &self.pex_peers);
-        match send_extend_pex(
-            &mut self.inner,
-            added.iter(),
-            dropped.iter(),
-            &self.extension_id,
-        )
-        .await
-        {
-            Ok(_) => {
-                update_pex_map(&mut self.pex_peers, &added, &dropped);
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
-    }
-
     pub async fn send_extend_metadata(&mut self, meta: ExtendedMetadata) -> io::Result<()> {
         send_extend_metadata(&mut self.inner, meta, &self.extension_id).await
+    }
+
+    pub async fn send_extend_pex(&mut self, pex: &ExtendedPex) -> io::Result<()> {
+        send_extend_pex(&mut self.inner, pex, &self.extension_id).await
     }
 }
 
@@ -362,6 +345,7 @@ pub struct ReadStream<T> {
     reserved: FuncBits,
 
     pending_recvs: Vec<Message>,
+    is_income: bool,
 }
 
 #[derive(Debug)]
@@ -413,14 +397,12 @@ pub struct WriteStream<T> {
 
     metadata_size: usize,
 
-    // what this peer knows about our connected peers
-    pex_peers: HashMap<SocketAddr, Option<PexFlag>>,
-
     peer_id: [u8; 20],
     info_hash: [u8; 20],
     reserved: FuncBits,
 
     reqq_limit: usize,
+    is_income: bool,
 }
 
 impl BTStream<net::TcpStream> {
@@ -457,6 +439,8 @@ pub struct ConnInfo {
     pub metadata_size: usize,
     pub capability: Capability,
     pub reqq_limit: usize,
+    pub is_income: bool,
+    pub peer_listen_port: Option<u16>,
 }
 
 impl<T> BTStream<T> {
@@ -468,6 +452,8 @@ impl<T> BTStream<T> {
             metadata_size: self.metadata_size,
             capability: self.capability(),
             reqq_limit: self.reqq_limit,
+            is_income: self.is_income,
+            peer_listen_port: self.peer_listen_port,
         }
     }
 
@@ -510,17 +496,18 @@ where
                 reserved: self.reserved,
                 metadata_size: self.metadata_size,
                 pending_recvs: self.pending_recvs,
+                is_income: self.is_income,
             },
             WriteStream {
                 inner: write_end,
                 peer_addr,
                 extension_id: self.extension_id,
-                pex_peers: self.pex_peers,
                 peer_id: self.peer_id,
                 info_hash: self.info_hash,
                 reserved: self.reserved,
                 metadata_size: self.metadata_size,
                 reqq_limit: self.reqq_limit,
+                is_income: self.is_income,
             },
         )
     }
@@ -543,10 +530,11 @@ where
             reserved: r.reserved,
             peer_id: r.peer_id,
             info_hash: r.info_hash,
-            pex_peers: w.pex_peers,
             metadata_size: r.metadata_size,
             pending_recvs: r.pending_recvs,
             reqq_limit: w.reqq_limit,
+            peer_listen_port: None,
+            is_income: r.is_income,
         })
     }
 
@@ -568,17 +556,18 @@ where
                 reserved: self.reserved,
                 metadata_size: self.metadata_size,
                 pending_recvs: self.pending_recvs,
+                is_income: self.is_income,
             },
             WriteStream {
                 inner: BufWriter::with_capacity(WRITEBUF_CAP, write_end),
                 peer_addr,
                 extension_id: self.extension_id,
-                pex_peers: self.pex_peers,
                 peer_id: self.peer_id,
                 info_hash: self.info_hash,
                 reserved: self.reserved,
                 metadata_size: self.metadata_size,
                 reqq_limit: self.reqq_limit,
+                is_income: self.is_income,
             },
         )
     }
@@ -598,17 +587,18 @@ impl BTStream<Box<dyn Conn>> {
                 reserved: self.reserved,
                 metadata_size: self.metadata_size,
                 pending_recvs: self.pending_recvs,
+                is_income: self.is_income,
             },
             WriteStream {
                 inner: write_end,
                 peer_addr,
                 extension_id: self.extension_id,
-                pex_peers: self.pex_peers,
                 peer_id: self.peer_id,
                 info_hash: self.info_hash,
                 reserved: self.reserved,
                 metadata_size: self.metadata_size,
                 reqq_limit: self.reqq_limit,
+                is_income: self.is_income,
             },
         )
     }
@@ -631,17 +621,18 @@ impl BTStream<Box<dyn Conn>> {
                 reserved: self.reserved,
                 metadata_size: self.metadata_size,
                 pending_recvs: self.pending_recvs,
+                is_income: self.is_income,
             },
             WriteStream {
                 inner: BufWriter::with_capacity(32768, write_end),
                 peer_addr,
                 extension_id: self.extension_id,
-                pex_peers: self.pex_peers,
                 peer_id: self.peer_id,
                 info_hash: self.info_hash,
                 reserved: self.reserved,
                 metadata_size: self.metadata_size,
                 reqq_limit: self.reqq_limit,
+                is_income: self.is_income,
             },
         )
     }
@@ -695,7 +686,6 @@ where
 {
     inner: &'a mut T,
     extension_id: &'a HashMap<ExtensionType, u8>,
-    pex_peers: &'a mut HashMap<SocketAddr, Option<PexFlag>>,
     flushed: bool,
 }
 
@@ -804,28 +794,6 @@ where
         self.flushed = false;
         send_extend_metadata(&mut NoFlush(&mut *self.inner), meta, self.extension_id).await
     }
-
-    pub async fn send_extend_pex(
-        &mut self,
-        now_connected: &HashMap<SocketAddr, Option<PexFlag>>,
-    ) -> io::Result<()> {
-        self.flushed = false;
-        let (added, dropped) = make_added_and_dropped(now_connected, self.pex_peers);
-        match send_extend_pex(
-            &mut NoFlush(&mut *self.inner),
-            added.iter(),
-            dropped.iter(),
-            self.extension_id,
-        )
-        .await
-        {
-            Ok(_) => {
-                update_pex_map(self.pex_peers, &added, &dropped);
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
-    }
 }
 
 impl<T> WriteStream<T> {
@@ -852,7 +820,6 @@ where
         BufWrite {
             inner: &mut self.inner,
             extension_id: &self.extension_id,
-            pex_peers: &mut self.pex_peers,
             flushed: false,
         }
     }
@@ -870,7 +837,6 @@ where
         BufWrite {
             inner: &mut self.inner,
             extension_id: &self.extension_id,
-            pex_peers: &mut self.pex_peers,
             flushed: false,
         }
     }
@@ -977,10 +943,11 @@ where
             peer_id: peer_handshake.client_id,
             info_hash,
             reserved,
-            pex_peers: HashMap::new(),
             metadata_size: 0,
             pending_recvs: vec![],
             reqq_limit: 0,
+            peer_listen_port: None,
+            is_income: false,
         };
 
         if reserved.have_extension() {
@@ -1024,6 +991,7 @@ where
                 .filter(|(_, id)| *id != 0)
                 .collect();
             s.metadata_size = exth.metadata_size.unwrap_or(0) as usize;
+            s.peer_listen_port = exth.p;
             s.pending_recvs = pending_recvs;
             s.reqq_limit = exth.reqq.unwrap_or(0) as usize;
             return Ok(s);
@@ -1086,10 +1054,11 @@ where
             peer_id: peer_handshake.client_id,
             info_hash: peer_info_hash,
             reserved,
-            pex_peers: HashMap::new(),
             metadata_size: 0,
             pending_recvs: vec![],
             reqq_limit: 0,
+            peer_listen_port: None,
+            is_income: true,
         };
 
         let support_extension = reserved.have_extension();
@@ -1128,6 +1097,7 @@ where
                 .filter(|(_, id)| *id != 0)
                 .collect();
             s.metadata_size = exth.metadata_size.unwrap_or(0) as usize;
+            s.peer_listen_port = exth.p;
             s.pending_recvs = pending_recvs;
             s.reqq_limit = exth.reqq.unwrap_or(0) as usize;
             return Ok(s);
@@ -1199,32 +1169,16 @@ where
         send_have_none(&mut self.inner).await
     }
 
-    pub async fn send_extend_pex(
-        &mut self,
-        now_connected: &HashMap<SocketAddr, Option<PexFlag>>,
-    ) -> io::Result<()> {
-        let (added, dropped) = make_added_and_dropped(now_connected, &self.pex_peers);
-        match send_extend_pex(
-            &mut self.inner,
-            added.iter(),
-            dropped.iter(),
-            &self.extension_id,
-        )
-        .await
-        {
-            Ok(_) => {
-                update_pex_map(&mut self.pex_peers, &added, &dropped);
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
-    }
-
     pub async fn send_extend_metadata(&mut self, meta: ExtendedMetadata) -> io::Result<()> {
         send_extend_metadata(&mut self.inner, meta, &self.extension_id).await
     }
+
+    pub async fn send_extend_pex(&mut self, pex: &ExtendedPex) -> io::Result<()> {
+        send_extend_pex(&mut self.inner, pex, &self.extension_id).await
+    }
 }
 
+/// returns added and dropped peers, and update pex_map to now_connected
 fn make_added_and_dropped(
     now_connected: &HashMap<SocketAddr, Option<PexFlag>>,
     old_connected: &HashMap<SocketAddr, Option<PexFlag>>,
@@ -1252,8 +1206,8 @@ fn make_added_and_dropped(
 
 fn update_pex_map(
     pex_map: &mut HashMap<SocketAddr, Option<PexFlag>>,
-    added: &Vec<(SocketAddr, Option<PexFlag>)>,
-    dropped: &Vec<SocketAddr>,
+    added: &[(SocketAddr, Option<PexFlag>)],
+    dropped: &[SocketAddr],
 ) {
     for (ip, pex) in added {
         pex_map.insert(*ip, *pex);
@@ -1261,6 +1215,43 @@ fn update_pex_map(
     for ip in dropped {
         pex_map.remove(ip);
     }
+}
+
+/// Compute a PEX delta for one peer.
+///
+/// `peer_addr` is the peer's own advertised address — it is excluded from `now_peers`
+/// so we never advertise a peer to itself. `old_peers` tracks what we have already
+/// told this peer; it is updated in place as a side effect.
+///
+/// Returns `None` when there is nothing new to send.
+pub(crate) fn pex_delta(
+    peer_addr: SocketAddr,
+    now_peers: &HashMap<SocketAddr, Option<PexFlag>>,
+    old_peers: &mut HashMap<SocketAddr, Option<PexFlag>>,
+) -> Option<ExtendedPex> {
+    const MAX_PEERS: usize = 200;
+    let added: Vec<_> = now_peers
+        .iter()
+        .filter(|(a, _)| **a != peer_addr && !old_peers.contains_key(*a))
+        .take(MAX_PEERS)
+        .map(|(a, f)| (*a, *f))
+        .collect();
+    let dropped: Vec<_> = old_peers
+        .iter()
+        .filter(|(a, _)| !now_peers.contains_key(*a))
+        .take(MAX_PEERS)
+        .map(|(a, _)| *a)
+        .collect();
+    if added.is_empty() && dropped.is_empty() {
+        return None;
+    }
+    update_pex_map(old_peers, &added, &dropped);
+    Some(ExtendedPex {
+        added: added.iter().filter(|(a, _)| a.is_ipv4()).cloned().collect(),
+        added6: added.iter().filter(|(a, _)| a.is_ipv6()).cloned().collect(),
+        dropped: dropped.iter().filter(|a| a.is_ipv4()).copied().collect(),
+        dropped6: dropped.iter().filter(|a| a.is_ipv6()).copied().collect(),
+    })
 }
 
 // TODO: write returns 0 means EOF, should return error
@@ -1332,29 +1323,12 @@ where
         send_have_none(&mut self.inner).await
     }
 
-    pub async fn send_extend_pex(
-        &mut self,
-        now_connected: &HashMap<SocketAddr, Option<PexFlag>>,
-    ) -> io::Result<()> {
-        let (added, dropped) = make_added_and_dropped(now_connected, &self.pex_peers);
-        match send_extend_pex(
-            &mut self.inner,
-            added.iter(),
-            dropped.iter(),
-            &self.extension_id,
-        )
-        .await
-        {
-            Ok(_) => {
-                update_pex_map(&mut self.pex_peers, &added, &dropped);
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
-    }
-
     pub async fn send_extend_metadata(&mut self, meta: ExtendedMetadata) -> io::Result<()> {
         send_extend_metadata(&mut self.inner, meta, &self.extension_id).await
+    }
+
+    pub async fn send_extend_pex(&mut self, pex: &ExtendedPex) -> io::Result<()> {
+        send_extend_pex(&mut self.inner, pex, &self.extension_id).await
     }
 }
 
@@ -2201,8 +2175,7 @@ async fn send_extend_metadata<T: AsyncWrite + Unpin>(
 
 async fn send_extend_pex<T: AsyncWrite + Unpin>(
     handle: &mut T,
-    added: impl Iterator<Item = &(SocketAddr, Option<PexFlag>)>,
-    dropped: impl Iterator<Item = &SocketAddr>,
+    pex: &ExtendedPex,
     extend_idmap: &HashMap<ExtensionType, u8>,
 ) -> io::Result<()> {
     let extension_id = if let Some(id) = extend_idmap.get(&ExtensionType::Pex) {
@@ -2221,7 +2194,7 @@ async fn send_extend_pex<T: AsyncWrite + Unpin>(
     let mut added6f_bin = empty_bytestring();
     let mut dropped_bin = empty_bytestring();
     let mut dropped6_bin = empty_bytestring();
-    for (a, f) in added {
+    for (a, f) in pex.added.iter().chain(pex.added6.iter()) {
         match a {
             SocketAddr::V4(v4) => {
                 added_bin.extend_from_slice(&v4.ip().octets());
@@ -2241,8 +2214,7 @@ async fn send_extend_pex<T: AsyncWrite + Unpin>(
             }
         }
     }
-
-    for a in dropped {
+    for a in pex.dropped.iter().chain(pex.dropped6.iter()) {
         match a {
             SocketAddr::V4(v4) => {
                 dropped_bin.extend_from_slice(&v4.ip().octets());
@@ -3005,17 +2977,18 @@ pub mod tests {
                     reserved: [0; 8].into(),
                     metadata_size: 0,
                     pending_recvs: self.pending_recvs,
+                    is_income: false,
                 },
                 WriteStream {
                     inner: write_end,
                     peer_addr: DEFAULT_ADDR,
                     extension_id: self.extension_id,
-                    pex_peers: HashMap::new(),
                     peer_id: [0; 20],
                     info_hash: [0; 20],
                     reserved: [0; 8].into(),
                     metadata_size: 0,
                     reqq_limit: 0,
+                    is_income: false,
                 },
             )
         }
@@ -3516,16 +3489,20 @@ pub mod tests {
 
     #[tokio::test]
     async fn extend_pex() {
+        // Dummy address not present in any peer map — used to satisfy the exclude parameter.
+        let no_self: SocketAddr = "0.0.0.0:0".parse().unwrap();
+
         let (mut peer1, mut peer2) = make_ends().await;
-        let initial: Vec<_> = vec![
+        let initial: Vec<(SocketAddr, Option<PexFlag>)> = vec![
             ("1.2.3.4:1234".parse().unwrap(), Some(PexFlag(1))),
             ("[::9]:1234".parse().unwrap(), Some(PexFlag(2))),
         ];
+        let initial_map: HashMap<SocketAddr, Option<PexFlag>> = initial.iter().cloned().collect();
+        let mut pex_peers: HashMap<SocketAddr, Option<PexFlag>> = HashMap::new();
 
-        peer1
-            .send_extend_pex(&HashMap::from_iter(initial.clone().into_iter()))
-            .await
-            .expect("should send ok");
+        // -- first send: initial set, all entries are "added" --
+        let msg = pex_delta(no_self, &initial_map, &mut pex_peers).unwrap();
+        peer1.send_extend_pex(&msg).await.expect("should send ok");
         let hdr = peer2.recv_msg().await.unwrap();
         let extend_recv = extract_enum!(hdr, Message::Extended);
         let pex_msg = extract_enum!(extend_recv, ExtendedMsg::Pex);
@@ -3539,15 +3516,14 @@ pub mod tests {
             }
         );
 
-        let then: Vec<_> = vec![
+        // -- second send: swap 1.2.3.4 for 4.3.2.1, keep [::9] --
+        let then: Vec<(SocketAddr, Option<PexFlag>)> = vec![
             ("4.3.2.1:1234".parse().unwrap(), Some(PexFlag(1))),
             ("[::9]:1234".parse().unwrap(), Some(PexFlag(2))),
         ];
-
-        peer1
-            .send_extend_pex(&HashMap::from_iter(then.clone().into_iter()))
-            .await
-            .expect("should send ok");
+        let then_map: HashMap<SocketAddr, Option<PexFlag>> = then.iter().cloned().collect();
+        let msg = pex_delta(no_self, &then_map, &mut pex_peers).unwrap();
+        peer1.send_extend_pex(&msg).await.expect("should send ok");
         let hdr = peer2.recv_msg().await.unwrap();
         let extend_recv = extract_enum!(hdr, Message::Extended);
         let pex_msg = extract_enum!(extend_recv, ExtendedMsg::Pex);
@@ -3561,10 +3537,11 @@ pub mod tests {
             }
         );
 
+        // -- WriteStream variant: first send --
         let ((_, mut p1w), (mut p2r, _)) = make_ends_split().await;
-        p1w.send_extend_pex(&HashMap::from_iter(initial.clone().into_iter()))
-            .await
-            .expect("should send ok");
+        let mut p1w_pex_peers: HashMap<SocketAddr, Option<PexFlag>> = HashMap::new();
+        let msg = pex_delta(no_self, &initial_map, &mut p1w_pex_peers).unwrap();
+        p1w.send_extend_pex(&msg).await.expect("should send ok");
         let hdr = p2r.recv_msg().await.unwrap();
         let extend_recv = extract_enum!(hdr, Message::Extended);
         let pex_msg = extract_enum!(extend_recv, ExtendedMsg::Pex);
