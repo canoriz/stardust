@@ -79,14 +79,12 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    session
-        .do_work(&info_hash, async |tm| {
-            // TODO: this is ugly though, only sender can clone
-            // let _ = tm.check().await;
-            let _ = tm.change_state(RunningCmd::Resume).await;
-            let _ = tm.wait_downloaded().await;
-        })
-        .await;
+    let mut tmh = session.transmit_handle_of(&info_hash).await?;
+    let finished = tmh.check()?.wait().await?;
+    if !finished {
+        let _ = tmh.change_state(RunningCmd::Resume).await;
+        let _ = tmh.wait_downloaded().await;
+    }
     if let Some(mut tm) = session.remove_torrent(&info_hash).await {
         let _ = tm.wait_downloaded().await;
         info!("stopped");

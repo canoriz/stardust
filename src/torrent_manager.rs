@@ -1,8 +1,8 @@
 use std::io;
 use std::sync::Arc;
 
-use crate::cache::cache_manager::CacheManagerHandle;
 use crate::announce_manager::{self, AnnounceManagerHandle};
+use crate::cache::cache_manager::CacheManagerHandle;
 use crate::dht::DHT;
 use crate::transmit_manager::{self, TorrentTask, TransmitDump, TransmitManager};
 use tokio::sync::{mpsc, oneshot};
@@ -17,7 +17,13 @@ pub struct TorrentManagerHandle {
 }
 
 impl TorrentManagerHandle {
-    pub fn new(t: TorrentTask, self_id: [u8; 20], port: u16, dht_client: Option<Arc<DHT>>, cache_handle: CacheManagerHandle) -> Self {
+    pub fn new(
+        t: TorrentTask,
+        self_id: [u8; 20],
+        port: u16,
+        dht_client: Option<Arc<DHT>>,
+        cache_handle: CacheManagerHandle,
+    ) -> Self {
         let (tx, rx) = mpsc::unbounded_channel::<transmit_manager::Msg>();
 
         let info_hash = match &t {
@@ -26,7 +32,16 @@ impl TorrentManagerHandle {
         };
 
         let am = AnnounceManagerHandle::new(self_id, port, info_hash, tx.clone());
-        let tm = TransmitManager::new(t, self_id, port, tx.clone(), rx, dht_client, am, cache_handle);
+        let tm = TransmitManager::new(
+            t,
+            self_id,
+            port,
+            tx.clone(),
+            rx,
+            dht_client,
+            am,
+            cache_handle,
+        );
 
         Self {
             sender: TransmitManagerSender(tx),
@@ -101,19 +116,14 @@ impl TransmitManagerSender {
         })
     }
 
-    pub async fn check(&mut self) -> io::Result<bool> {
+    pub fn check(&mut self) -> io::Result<ForceCheck> {
         let (tx, rx) = oneshot::channel();
         self.0
             .send(transmit_manager::Msg::CheckFile(tx))
             .map_err(|e| {
                 io::Error::new(io::ErrorKind::Other, format!("check send msg error: {}", e))
             })?;
-        rx.await.map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!("check oneshot recv error: {}", e),
-            )
-        })
+        Ok(ForceCheck { rx })
     }
 
     pub async fn dump_progress(&mut self) -> io::Result<TransmitDump> {
@@ -150,5 +160,17 @@ impl TransmitManagerSender {
                 format!("load progress oneshot recv error: {}", e),
             )
         })
+    }
+}
+
+pub struct ForceCheck {
+    rx: oneshot::Receiver<bool>,
+}
+
+impl ForceCheck {
+    pub async fn wait(self) -> io::Result<bool> {
+        self.rx
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("force check error: {}", e)))
     }
 }

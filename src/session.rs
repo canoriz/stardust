@@ -171,8 +171,13 @@ impl Session {
             None
         };
 
-        let mut tm =
-            TorrentManagerHandle::new(job, self.self_id, self.port, self.dht_client.clone(), self.cache_handle.clone());
+        let mut tm = TorrentManagerHandle::new(
+            job,
+            self.self_id,
+            self.port,
+            self.dht_client.clone(),
+            self.cache_handle.clone(),
+        );
 
         for addr in announce_list {
             tm.send_announce_msg(announce_manager::Msg::AddUrl(addr));
@@ -189,19 +194,37 @@ impl Session {
         self.tasks.lock().unwrap().remove(info_hash)
     }
 
-    pub async fn do_work<F>(&mut self, info_hash: &InfoHash, work: F)
+    pub async fn do_work<F, R>(&mut self, info_hash: &InfoHash, work: F) -> io::Result<R>
     where
-        F: AsyncFnOnce(&mut TransmitManagerSender),
+        F: AsyncFnOnce(&mut TransmitManagerSender) -> R,
     {
         let mut sender = {
             let mut guard = self.tasks.lock().unwrap();
             if let Some(tm) = guard.get_mut(info_hash) {
                 tm.sender.clone()
             } else {
-                return;
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "torrent task not found for given info hash",
+                ));
             }
         };
-        work(&mut sender).await
+        Ok(work(&mut sender).await)
+    }
+
+    pub async fn transmit_handle_of(
+        &mut self,
+        info_hash: &InfoHash,
+    ) -> io::Result<TransmitManagerSender> {
+        let mut guard = self.tasks.lock().unwrap();
+        if let Some(tm) = guard.get_mut(info_hash) {
+            Ok(tm.sender.clone())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "torrent task not found for given info hash",
+            ))
+        }
     }
 }
 
