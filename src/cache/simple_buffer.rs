@@ -63,7 +63,7 @@ impl From<Request> for JointIndex {
 
 /// Must be a multiple of the BT block size (16 384 bytes) so that no block
 /// ever straddles a sub-piece boundary inside `copy_to_piecebuf`.
-pub const SUB_PIECE_SIZE: u32 = 1 * 1024 * 1024; // 1 MiB
+pub const SUB_PIECE_SIZE: u32 = 512 * 1024; // 512 KiB
 pub const POOL_SIZE: usize = 60;
 
 const FLUSHING: u32 = 0b1;

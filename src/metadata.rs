@@ -1,4 +1,5 @@
 pub use bt_bencode::ByteString;
+use bt_bencode::RawValue;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
@@ -16,6 +17,7 @@ pub use magnet::Magnet;
 #[derive(Debug, Clone)]
 pub struct Metadata {
     pub info: Info,
+    pub raw_info: RawValue, // raw, byte-format info, for sending metadata to peers
     pub info_hash: [u8; 20],
 
     pub len: usize,
@@ -58,7 +60,7 @@ impl Metadata {
 
     pub fn verify_info_hash(&self) -> io::Result<bool> {
         let mut hasher = Sha1::new();
-        bt_bencode::to_writer(&mut hasher, &self.info)?;
+        hasher.update(self.raw_info.get());
         let info_hash: [u8; 20] = hasher.finalize().into();
         Ok(info_hash == self.info_hash)
     }
@@ -71,7 +73,8 @@ pub struct FileMetadata {
     #[serde(rename = "announce-list")]
     announce_list: Option<Vec<Vec<String>>>,
 
-    info: Info,
+    #[serde(serialize_with = "serialize_raw_only")]
+    info: InfoWithRaw,
 
     #[serde(skip)]
     info_hash: [u8; 20],
@@ -101,21 +104,44 @@ pub struct Info {
     pub raw: Vec<u8>,
 }
 
-impl Info {
+fn serialize_raw_only<S>(i: &InfoWithRaw, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    i.raw.serialize(serializer)
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(try_from = "RawValue")]
+pub struct InfoWithRaw {
+    info: Info,
+    raw: RawValue,
+}
+
+impl TryFrom<RawValue> for InfoWithRaw {
+    type Error = &'static str; // TODO: better printable error type
+    fn try_from(raw: RawValue) -> Result<Self, Self::Error> {
+        let info: Info = bt_bencode::from_slice(raw.get()).map_err(|_| "invalid info RawValue")?;
+        Ok(Self { info, raw })
+    }
+}
+
+impl InfoWithRaw {
     pub fn to_metadata(self, info_hash: [u8; 20]) -> Metadata {
-        let (len, files) = match &self.len_or_files {
+        let info = &self.info;
+        let (len, files) = match &info.len_or_files {
             LenFiles::Length(l) => (
                 *l,
                 vec![File {
                     length: *l,
-                    path: vec![self.name.clone()],
+                    path: vec![info.name.clone()],
                 }],
             ),
             LenFiles::Files(fs) => (
                 fs.iter().map(|f| f.length).sum(),
                 fs.iter()
                     .map(|sub| {
-                        let mut path = vec![self.name.clone()];
+                        let mut path = vec![info.name.clone()];
                         path.extend_from_slice(&sub.path);
                         File {
                             length: sub.length,
@@ -126,7 +152,8 @@ impl Info {
             ),
         };
         Metadata {
-            info: self,
+            info: self.info,
+            raw_info: self.raw,
             info_hash: info_hash,
             comment: None,
             created_by: None,
@@ -150,7 +177,7 @@ impl FileMetadata {
     pub fn load<T: AsRef<[u8]>>(input: T) -> io::Result<Self> {
         let mut torrent: FileMetadata = bt_bencode::from_slice(input.as_ref())?;
         let mut hasher = Sha1::new();
-        bt_bencode::to_writer(&mut hasher, &torrent.info)?;
+        hasher.update(torrent.info.raw.get());
         torrent.info_hash = hasher.finalize().into();
         Ok(torrent)
     }

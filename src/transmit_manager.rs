@@ -2059,14 +2059,7 @@ impl TransmitWorker {
                 }
                 TorrentState::Metadata(m) => {
                     let reject = ExtendedMsg::Metadata(ExtendedMetadata::Reject { piece });
-                    let metadata = match bt_bencode::to_vec(&m.metadata.info) {
-                        Ok(m) => m,
-                        Err(e) => {
-                            info!("respond metadata bt-bencode failed {e}");
-                            _ = c.conn.send_stream_cmd(ConnMsg::Extend(reject));
-                            return;
-                        }
-                    };
+                    let metadata = m.metadata.raw_info.get();
 
                     let begin = (piece as usize) * 16384;
                     let end = (piece as usize + 1) * 16384;
@@ -2219,8 +2212,8 @@ impl TransmitWorker {
 }
 
 fn check_received_metadata(mbuf: &mut MetadataBuffer, info_hash: [u8; 20]) -> io::Result<Metadata> {
-    use crate::metadata::Info;
-    let info: Info = bt_bencode::from_slice(&mbuf.metadata)?;
+    use crate::metadata::InfoWithRaw;
+    let info: InfoWithRaw = bt_bencode::from_slice(&mbuf.metadata)?;
     let meta = info.to_metadata(info_hash);
     if let Ok(true) = meta.verify_info_hash() {
         Ok(meta)

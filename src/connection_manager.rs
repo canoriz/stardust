@@ -635,6 +635,7 @@ impl<T> SendStream<T>
 where
     T: AsyncWrite + Unpin,
 {
+    // TODO: FIXME: this async write need to be cancel safe also
     async fn handle_cmd(&mut self, msg: CtrlOfSend) -> io::Result<()> {
         match msg {
             CtrlOfSend::RequestBlocks(reqs) => {

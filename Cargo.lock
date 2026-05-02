@@ -130,7 +130,7 @@ dependencies = [
 [[package]]
 name = "bt_bencode"
 version = "0.8.2"
-source = "git+https://github.com/canoriz/bt_bencode?rev=88f34d4#88f34d406357546a8c75cb261ce8ed63bd66f9c9"
+source = "git+https://github.com/canoriz/bt_bencode?rev=bddf897#bddf897805d0a7d8fad4275c6db0abaeb9da4e0b"
 dependencies = [
  "itoa",
  "serde",

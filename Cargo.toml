@@ -8,7 +8,7 @@ edition = "2021"
 [dependencies]
 anyhow = "1"
 bon = "3.8.1"
-bt_bencode = { git = "https://github.com/canoriz/bt_bencode", rev = "88f34d4", features = [
+bt_bencode = { git = "https://github.com/canoriz/bt_bencode", rev = "bddf897", features = [
     "raw_value",
 ] }
 bytes = "1.10.1"
