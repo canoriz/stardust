@@ -413,9 +413,6 @@ impl BTStream<net::TcpStream> {
     }
 }
 
-// TODO: optimize, use xor flags, not a hashset
-pub type CapabilityMap = HashSet<Capability>;
-
 #[derive(Copy, Clone, Eq, Hash, PartialEq)]
 pub struct Capability {
     cap: u32,

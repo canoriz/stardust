@@ -21,17 +21,11 @@ use tracing::{debug, info, trace, warn};
 use crate::buffer_pool::{BlockBuf, BufferPool, PooledBuf};
 use crate::picker::{BlockRequests, PieceState};
 use crate::protocol::{
-    self, BTStream, BitField, Capability, CapabilityMap, Conn, ConnInfo, ExtendedMsg, Message,
-    Piece, ReadStream, RecvResult, Request, Split, WriteStream,
+    self, BTStream, BitField, Capability, Conn, ConnInfo, ExtendedMsg, Message, Piece, ReadStream,
+    RecvResult, Request, Split, WriteStream,
 };
 use crate::transmit_manager::Msg as TransmitMsg;
 use crate::transmit_manager::{PeerMsg, TransmitManagerHandle};
-
-#[derive(Debug)]
-pub(crate) enum WakeUpOption {
-    TimeUp(time::Duration),
-    NBlock(usize),
-}
 
 #[derive(Debug)]
 pub(crate) enum CtrlOfSend {
@@ -46,10 +40,6 @@ pub(crate) enum CtrlOfSend {
     BitField(BitField),
     HaveAll,
     HaveNone,
-
-    // SendBlocks(BlockRange),
-    SetWakeUp(WakeUpOption),
-    ResetWakeUp(WakeUpOption),
 }
 
 #[derive(Debug)]
@@ -698,8 +688,6 @@ where
             CtrlOfSend::HaveNone => {
                 self.write_stream.send_have_none().await?;
             }
-            CtrlOfSend::SetWakeUp(wake_up_option) => todo!("setwakeup not implemented"),
-            CtrlOfSend::ResetWakeUp(wake_up_option) => todo!("resetwakeup not implemented"),
         }
         Ok(())
     }
