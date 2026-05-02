@@ -271,6 +271,7 @@ impl CacheManager {
         }
     }
 
+    // TODO: if too many get_piece requests, make a queue and only read when there are available cache slots
     fn handle_get_piece(&mut self, key: GlobalPieceKey, sender: mpsc::UnboundedSender<TmMsg>) {
         match self.cache.get_mut(&key) {
             Some(CacheEntry::Loaded(piece @ Some(_))) => {
@@ -454,7 +455,11 @@ impl CacheManager {
                 "purge_by_size: cannot purge {n_purge} sub pieces; all remaining are DIRTY/FLUSHING"
             );
             for time_key in self.cache.iter().filter_map(|(k, v)| match v {
-                CacheEntry::Loaded(Some(p)) => Some((p.access_time(), *k)),
+                CacheEntry::Loaded(Some(p))
+                    if p.access_time().elapsed() > std::time::Duration::from_millis(500) =>
+                {
+                    Some((p.access_time(), *k))
+                }
                 _ => None,
             }) {
                 to_evict.insert(time_key);
