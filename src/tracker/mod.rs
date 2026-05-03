@@ -1,222 +1,18 @@
-pub use bt_bencode::ByteString;
-use bt_bencode::RawValue;
+use core::fmt;
+use std::{
+    future::Future,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::LazyLock,
+};
+
+use bt_bencode::ByteString;
 use reqwest::Client;
-use serde::de::{self, Visitor};
-use serde::{Deserialize, Serialize};
-use sha1::{Digest, Sha1};
-use std::fmt;
-use std::future::Future;
-use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::LazyLock;
+use serde::{
+    de::{self, Visitor},
+    Deserialize, Serialize,
+};
 use thiserror::Error;
 use tracing::warn;
-
-mod magnet;
-pub use magnet::Magnet;
-
-// Metadata is a universal structure
-#[derive(Debug, Clone)]
-pub struct Metadata {
-    pub info: Info,
-    pub raw_info: RawValue, // raw, byte-format info, for sending metadata to peers
-    pub info_hash: [u8; 20],
-
-    pub len: usize,
-
-    pub files: Vec<File>,
-    pub comment: Option<String>,
-    pub created_by: Option<String>,
-    pub creation_date: Option<u64>,
-}
-
-impl Metadata {
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    pub fn files(&self) -> &Vec<File> {
-        &self.files
-    }
-
-    pub fn regular_piece_size(&self) -> usize {
-        self.info.piece_length as usize
-    }
-
-    pub fn total_pieces(&self) -> usize {
-        (self.len() + self.regular_piece_size() - 1) / self.regular_piece_size()
-    }
-
-    pub fn piece_size_of(&self, index: u32) -> usize {
-        assert!((index as usize) < self.total_pieces());
-        let n_full_piece = self.len() / self.regular_piece_size();
-        let full_piece_total_size = n_full_piece * self.regular_piece_size();
-        if (index as usize) < n_full_piece {
-            self.regular_piece_size()
-        } else {
-            assert_eq!((index as usize), self.total_pieces() - 1);
-            assert_eq!(n_full_piece + 1, self.total_pieces());
-            self.len() - full_piece_total_size
-        }
-    }
-
-    pub fn verify_info_hash(&self) -> io::Result<bool> {
-        let mut hasher = Sha1::new();
-        hasher.update(self.raw_info.get());
-        let info_hash: [u8; 20] = hasher.finalize().into();
-        Ok(info_hash == self.info_hash)
-    }
-}
-
-// FileMetadata is raw data from .torrent file
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct FileMetadata {
-    announce: Option<String>,
-    #[serde(rename = "announce-list")]
-    announce_list: Option<Vec<Vec<String>>>,
-
-    #[serde(serialize_with = "serialize_raw_only")]
-    info: InfoWithRaw,
-
-    #[serde(skip)]
-    info_hash: [u8; 20],
-
-    comment: Option<String>,
-    #[serde(rename = "created by")]
-    created_by: Option<String>,
-    #[serde(rename = "creation date")]
-    creation_date: Option<u64>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct Info {
-    // TODO: FIXME: need RawValue to support unknown field, for
-    // example:
-    // pub private: u8,
-    // and also support original torrent have a non-alphabetical order
-    pub name: String,
-    #[serde(rename = "piece length")]
-    pub piece_length: u32,
-    pub pieces: ByteString,
-    #[serde(flatten)]
-    len_or_files: LenFiles,
-
-    // raw, byte-format info, for sending metadata to peers
-    #[serde(skip)]
-    pub raw: Vec<u8>,
-}
-
-fn serialize_raw_only<S>(i: &InfoWithRaw, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    i.raw.serialize(serializer)
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(try_from = "RawValue")]
-pub struct InfoWithRaw {
-    info: Info,
-    raw: RawValue,
-}
-
-impl TryFrom<RawValue> for InfoWithRaw {
-    type Error = &'static str; // TODO: better printable error type
-    fn try_from(raw: RawValue) -> Result<Self, Self::Error> {
-        let info: Info = bt_bencode::from_slice(raw.get()).map_err(|_| "invalid info RawValue")?;
-        Ok(Self { info, raw })
-    }
-}
-
-impl InfoWithRaw {
-    pub fn to_metadata(self, info_hash: [u8; 20]) -> Metadata {
-        let info = &self.info;
-        let (len, files) = match &info.len_or_files {
-            LenFiles::Length(l) => (
-                *l,
-                vec![File {
-                    length: *l,
-                    path: vec![info.name.clone()],
-                }],
-            ),
-            LenFiles::Files(fs) => (
-                fs.iter().map(|f| f.length).sum(),
-                fs.iter()
-                    .map(|sub| {
-                        let mut path = vec![info.name.clone()];
-                        path.extend_from_slice(&sub.path);
-                        File {
-                            length: sub.length,
-                            path,
-                        }
-                    })
-                    .collect(),
-            ),
-        };
-        Metadata {
-            info: self.info,
-            raw_info: self.raw,
-            info_hash: info_hash,
-            comment: None,
-            created_by: None,
-            creation_date: None,
-            len,
-            files,
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-enum LenFiles {
-    #[serde(rename = "length")]
-    Length(usize),
-
-    #[serde(rename = "files")]
-    Files(Vec<File>),
-}
-
-impl FileMetadata {
-    pub fn load<T: AsRef<[u8]>>(input: T) -> io::Result<Self> {
-        let mut torrent: FileMetadata = bt_bencode::from_slice(input.as_ref())?;
-        let mut hasher = Sha1::new();
-        hasher.update(torrent.info.raw.get());
-        torrent.info_hash = hasher.finalize().into();
-        Ok(torrent)
-    }
-
-    /// convert FileMetadata to Metadata and announce list
-    pub fn to_metadata(self) -> (Metadata, Vec<Vec<String>>) {
-        let m = self.info.to_metadata(self.info_hash);
-        (
-            Metadata {
-                comment: self.comment,
-                created_by: self.created_by,
-                creation_date: self.creation_date,
-                ..m
-            },
-            if let Some(li) = self.announce_list {
-                li
-            } else if let Some(a) = self.announce {
-                vec![vec![a]]
-            } else {
-                vec![vec![]]
-            },
-        )
-    }
-}
-
-pub trait ToMetadata {
-    fn to_metadata(self) -> FileMetadata;
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct File {
-    pub length: usize,
-
-    // TODO: many sub path are same, e.g. a sub directory containing many files
-    // use a more effeicient structure
-    pub path: Vec<String>,
-}
 
 #[derive(Debug, Clone)]
 pub struct TrackerGet {
@@ -541,36 +337,8 @@ async fn announce_one(
     }
 }
 
-#[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    #[ignore]
-    async fn test_real_torrent() {
-        let torrent_f = include_bytes!("../ubuntu-24.10-desktop-amd64.iso.torrent");
-        let torrent = FileMetadata::load(torrent_f).unwrap();
-        let (metadata, announce_list) = torrent.to_metadata();
-
-        let announce_req = TrackerGet {
-            peer_id: *b"-ZS0405-qwerasdfzxcv",
-            uploaded: 0,
-            port: 35515,
-            downloaded: 0,
-            left: 0,
-            ip: None,
-        };
-
-        let z = Announcer::announce_tier(
-            AnnounceType::V4,
-            &announce_req,
-            &metadata.info_hash,
-            announce_list[0][0].clone(),
-        )
-        .await
-        .unwrap();
-        dbg!(z);
-    }
 
     #[test]
     fn test_compact_peers_two_peers() {
@@ -676,56 +444,31 @@ mod tests {
         );
     }
 
-    // #[test]
-    // fn test_enum() {
-    //     let serialized = serde_json::to_string(&Metadata {
-    //         announce: "afasg".into(),
-    //         info: Info {
-    //             name: "namename".to_string(),
-    //             piece_length: 1245,
-    //             pieces: vec!["123".into(), "456".into()],
-    //             len_or_files: LenFiles::Length(5),
-    //         },
-    //     })
-    //     .unwrap();
-    //     println!("serialized = {}", serialized);
+    #[tokio::test]
+    #[ignore]
+    async fn test_real_torrent() {
+        use crate::metadata::{FileMetadata, Metadata};
+        let torrent_f = include_bytes!("../../ubuntu-24.10-desktop-amd64.iso.torrent");
+        let torrent = FileMetadata::load(torrent_f).unwrap();
+        let (metadata, announce_list) = torrent.to_metadata();
 
-    //     let deserialized: Metadata = serde_json::from_str(&serialized).unwrap();
-    //     println!("deserialized = {:?}", deserialized);
+        let announce_req = TrackerGet {
+            peer_id: *b"-ZS0405-qwerasdfzxcv",
+            uploaded: 0,
+            port: 35515,
+            downloaded: 0,
+            left: 0,
+            ip: None,
+        };
 
-    //     let serialized = serde_json::to_string(&Metadata {
-    //         announce: "afasg".into(),
-    //         info: Info {
-    //             name: "namename".to_string(),
-    //             piece_length: 1245,
-    //             pieces: vec!["123".into(), "456".into()],
-    //             len_or_files: LenFiles::Files(vec![File {
-    //                 length: 124,
-    //                 path: "fakg".to_string(),
-    //             }]),
-    //         },
-    //     })
-    //     .unwrap();
-    //     println!("serialized = {}", serialized);
-
-    //     let deserialized: Metadata = serde_json::from_str(&serialized).unwrap();
-    //     println!("deserialized = {:?}", deserialized);
-
-    //     let serialized = bt_bencode::to_vec(&Metadata {
-    //         announce: "afasg".into(),
-    //         info: Info {
-    //             name: "namename".to_string(),
-    //             piece_length: 1245,
-    //             pieces: vec!["123".into(), "456".into()],
-    //             len_or_files: LenFiles::Files(vec![File {
-    //                 length: 124,
-    //                 path: "fakg".to_string(),
-    //             }]),
-    //         },
-    //     })
-    //     .unwrap();
-    //     // println!("serialized = {:x?}", serialized);
-    //     let deserialized: Metadata = bt_bencode::from_slice(&serialized).unwrap();
-    //     println!("deserialized = {:?}", deserialized);
-    // }
+        let z = Announcer::announce_tier(
+            AnnounceType::V4,
+            &announce_req,
+            &metadata.info_hash,
+            announce_list[0][0].clone(),
+        )
+        .await
+        .unwrap();
+        dbg!(z);
+    }
 }

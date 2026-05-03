@@ -15,6 +15,7 @@ use crate::protocol::{
     self, Capability, Conn, ExtendedMetadata, ExtendedMsg, ExtendedPex, HandshakeOption, InfoHash,
     PexFlag, Piece, Request,
 };
+use crate::tracker;
 
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
@@ -132,7 +133,7 @@ pub type NewPeerConn = (protocol::BTStream<Box<dyn Conn>>, bool);
 #[derive(Debug)]
 #[non_exhaustive]
 pub(crate) enum Msg {
-    AnnounceFinish(Result<metadata::AnnounceResp, metadata::AnnounceError>),
+    AnnounceFinish(Result<tracker::AnnounceResp, tracker::AnnounceError>),
     AnnounceMsg(announce_manager::Msg),
 
     NewPeer(Result<NewPeerConn, SocketAddr>),

@@ -1,4 +1,4 @@
-use crate::metadata::{self, AnnounceResult, AnnounceType, Metadata, TrackerGet};
+use crate::tracker::{self, AnnounceResult, AnnounceType, TrackerGet};
 use crate::transmit_manager;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -52,7 +52,7 @@ impl AnnounceManagerHandle {
             done_tx,
         ));
         #[cfg(not(feature = "mock_delay"))]
-        tokio::spawn(run_announce_manager::<metadata::Announcer>(
+        tokio::spawn(run_announce_manager::<tracker::Announcer>(
             manager,
             info_hash,
             cancel.clone(),
@@ -150,7 +150,7 @@ async fn run_announce_manager<A>(
     cancel: CancellationToken,
     done: oneshot::Sender<()>,
 ) where
-    A: metadata::Announce + 'static,
+    A: tracker::Announce + 'static,
 {
     // async fn start_worker<'a, A>(&mut self, tg: &TrackerGet<'a>, m: &Metadata)
     // where
@@ -248,20 +248,20 @@ async fn run_announce_manager<A>(
 }
 
 struct FakeAnnouncer {}
-impl metadata::Announce for FakeAnnouncer {
+impl tracker::Announce for FakeAnnouncer {
     async fn announce_tier(
-        _net_type: metadata::AnnounceType,
+        _net_type: tracker::AnnounceType,
         _req: &TrackerGet,
         _torrent: &[u8; 20],
         _url: String,
-    ) -> metadata::AnnounceResult {
+    ) -> tracker::AnnounceResult {
         // return Err(metadata::AnnounceError::ClientErr(
         //     metadata::ClientErr::Ipv4Err,
         // ));
-        Ok(metadata::AnnounceResp {
+        Ok(tracker::AnnounceResp {
             interval: 1800,
             peers: vec![
-                metadata::Peer {
+                tracker::Peer {
                     peer_id: Some("1384".into()),
                     addr: std::net::SocketAddr::new(
                         std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
@@ -296,7 +296,7 @@ async fn announce_task<A>(
     id: [u8; 20],
     port: u16,
 ) where
-    A: metadata::Announce,
+    A: tracker::Announce,
 {
     let tg = TrackerGet {
         peer_id: id,
