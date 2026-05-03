@@ -824,18 +824,13 @@ impl TransmitWorker {
                 // );
                 // TODO
                 info!("announce finish, get peers {:?}", a.peers);
-                for p in a.peers {
-                    use std::str::FromStr;
-                    if let Ok(ip) = std::net::IpAddr::from_str(&p.ip) {
-                        // TODO: store peers in a map, if cannot connect this time
-                        // try re-connect later
-                        // TODO: if we already connected to a lot of active peers,
-                        // maybe store available peers in a pool, connect to them when
-                        // running out of peers
-                        let addr = SocketAddr::new(ip, p.port);
-                        let addr = to_canonical_addr(addr);
-                        self.handle_new_discovered_peer(addr);
-                    }
+                for p in a.peers.into_iter().chain(a.peers6) {
+                    // TODO: store peers in a map, if cannot connect this time
+                    // try re-connect later
+                    // TODO: if we already connected to a lot of active peers,
+                    // maybe store available peers in a pool, connect to them when
+                    // running out of peers
+                    self.handle_new_discovered_peer(to_canonical_addr(p.addr));
                 }
                 Ok(())
             }

@@ -623,6 +623,7 @@ where
                     info!("{peer} send stream handle cmd error {e}");
                     break;
                 }
+                interval.reset();
             }
         };
     }

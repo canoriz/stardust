@@ -262,9 +262,11 @@ impl metadata::Announce for FakeAnnouncer {
             interval: 1800,
             peers: vec![
                 metadata::Peer {
-                    peer_id: "1384".into(),
-                    ip: "127.0.0.1".into(),
-                    port: 51774,
+                    peer_id: Some("1384".into()),
+                    addr: std::net::SocketAddr::new(
+                        std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+                        51774,
+                    ),
                 },
                 // metadata::Peer {
                 //     peer_id: "1384".into(),
@@ -272,6 +274,7 @@ impl metadata::Announce for FakeAnnouncer {
                 //     port: 35516,
                 // },
             ],
+            peers6: vec![],
         })
     }
 }

@@ -1,11 +1,13 @@
 pub use bt_bencode::ByteString;
 use bt_bencode::RawValue;
 use reqwest::Client;
+use serde::de::{self, Visitor};
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
+use std::fmt;
 use std::future::Future;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::LazyLock;
 use thiserror::Error;
 use tracing::warn;
@@ -244,9 +246,11 @@ impl TrackerGet {
             percent_encoding_str(&"uploaded", &self.uploaded.to_string()),
             percent_encoding_str(&"downloaded", &self.downloaded.to_string()),
             percent_encoding_str(&"left", &self.left.to_string()),
+            percent_encoding_str(&"compact", &"1"),
         ]
         .join("&");
         if let Some(ref ip) = self.ip {
+            query += "&";
             query += &percent_encoding_str(&"ip", &ip.to_string());
         }
 
@@ -265,15 +269,161 @@ enum TrackerResp {
 #[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq)]
 pub struct AnnounceResp {
     pub interval: u32,
+    #[serde(deserialize_with = "deserialize_peers")]
     pub peers: Vec<Peer>,
+    /// Compact IPv6 peers (BEP7): 18 bytes each — 16-byte IPv6 address + 2-byte port, big-endian.
+    /// Absent in most responses; defaults to an empty vec.
+    #[serde(default, deserialize_with = "deserialize_peers6")]
+    pub peers6: Vec<Peer>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq)]
+/// Deserialize `peers` from either:
+/// - compact format: a bencode byte string, 6 bytes per peer (4 IP + 2 port, big-endian)
+/// - dict format: a bencode list of dicts with `peer id`, `ip`, `port` keys
+fn deserialize_peers<'de, D>(deserializer: D) -> Result<Vec<Peer>, D::Error>
+where
+    D: de::Deserializer<'de>,
+{
+    struct PeersVisitor;
+
+    impl<'de> Visitor<'de> for PeersVisitor {
+        type Value = Vec<Peer>;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("compact peer bytes or list of peer dicts")
+        }
+
+        // Compact format: tracker sends peers as a raw byte string.
+        // bt_bencode delivers bencode byte strings via visit_bytes / visit_byte_buf.
+        fn visit_bytes<E: de::Error>(self, v: &[u8]) -> Result<Self::Value, E> {
+            parse_compact_peers(v).map_err(de::Error::custom)
+        }
+
+        fn visit_byte_buf<E: de::Error>(self, v: Vec<u8>) -> Result<Self::Value, E> {
+            parse_compact_peers(&v).map_err(de::Error::custom)
+        }
+
+        // Dict-list format: tracker sends peers as a list of dicts.
+        fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let mut peers = Vec::new();
+            while let Some(p) = seq.next_element::<Peer>()? {
+                peers.push(p);
+            }
+            Ok(peers)
+        }
+    }
+
+    deserializer.deserialize_any(PeersVisitor)
+}
+
+fn parse_compact_peers(data: &[u8]) -> Result<Vec<Peer>, &'static str> {
+    if data.len() % 6 != 0 {
+        return Err("compact peers length must be a multiple of 6");
+    }
+    Ok(data
+        .chunks_exact(6)
+        .map(|chunk| {
+            let ip = Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
+            let port = u16::from_be_bytes([chunk[4], chunk[5]]);
+            Peer {
+                peer_id: None,
+                addr: SocketAddr::new(IpAddr::V4(ip), port),
+            }
+        })
+        .collect())
+}
+
+/// Deserialize `peers6` from a compact byte string: 18 bytes per peer
+/// (16-byte IPv6 address + 2-byte port, big-endian).
+fn deserialize_peers6<'de, D>(deserializer: D) -> Result<Vec<Peer>, D::Error>
+where
+    D: de::Deserializer<'de>,
+{
+    struct Peers6Visitor;
+
+    impl<'de> Visitor<'de> for Peers6Visitor {
+        type Value = Vec<Peer>;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("compact IPv6 peer bytes (18 bytes per peer)")
+        }
+
+        fn visit_bytes<E: de::Error>(self, v: &[u8]) -> Result<Self::Value, E> {
+            parse_compact_peers6(v).map_err(de::Error::custom)
+        }
+
+        fn visit_byte_buf<E: de::Error>(self, v: Vec<u8>) -> Result<Self::Value, E> {
+            parse_compact_peers6(&v).map_err(de::Error::custom)
+        }
+    }
+
+    deserializer.deserialize_any(Peers6Visitor)
+}
+
+fn parse_compact_peers6(data: &[u8]) -> Result<Vec<Peer>, &'static str> {
+    if data.len() % 18 != 0 {
+        return Err("compact peers6 length must be a multiple of 18");
+    }
+    Ok(data
+        .chunks_exact(18)
+        .map(|chunk| {
+            let addr: [u8; 16] = chunk[..16].try_into().unwrap();
+            let ip = Ipv6Addr::from(addr);
+            let port = u16::from_be_bytes([chunk[16], chunk[17]]);
+            Peer {
+                peer_id: None,
+                addr: SocketAddr::new(IpAddr::V6(ip), port),
+            }
+        })
+        .collect())
+}
+
+#[derive(Serialize, Debug, Clone, Eq, PartialEq)]
 pub struct Peer {
-    #[serde(rename = "peer id")]
-    pub peer_id: ByteString,
-    pub ip: String,
-    pub port: u16,
+    pub peer_id: Option<ByteString>,
+    pub addr: SocketAddr,
+}
+
+impl<'de> de::Deserialize<'de> for Peer {
+    fn deserialize<D: de::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct PeerVisitor;
+        impl<'de> Visitor<'de> for PeerVisitor {
+            type Value = Peer;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("peer dict with ip and port fields")
+            }
+            fn visit_map<A: de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut peer_id: Option<ByteString> = None;
+                let mut ip: Option<IpAddr> = None;
+                let mut port: Option<u16> = None;
+                while let Some(key) = map.next_key::<ByteString>()? {
+                    match key.as_ref() {
+                        b"peer id" => peer_id = Some(map.next_value()?),
+                        b"ip" => {
+                            let s = map.next_value::<ByteString>()?;
+                            ip = Some(
+                                std::str::from_utf8(s.as_ref())
+                                    .map_err(de::Error::custom)?
+                                    .parse()
+                                    .map_err(de::Error::custom)?,
+                            );
+                        }
+                        b"port" => port = Some(map.next_value()?),
+                        _ => {
+                            let _ = map.next_value::<de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                let ip = ip.ok_or_else(|| de::Error::missing_field("ip"))?;
+                let port = port.ok_or_else(|| de::Error::missing_field("port"))?;
+                Ok(Peer {
+                    peer_id,
+                    addr: SocketAddr::new(ip, port),
+                })
+            }
+        }
+        deserializer.deserialize_map(PeerVisitor)
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
@@ -423,12 +573,95 @@ mod tests {
     }
 
     #[test]
+    fn test_compact_peers_two_peers() {
+        // BEP23 compact format: 6 bytes per peer (4 IP + 2 port, big-endian)
+        // peers: 1.2.3.4:256 and 192.168.0.1:6881
+        let compact: &[u8] = &[1, 2, 3, 4, 1, 0, 192, 168, 0, 1, 26, 225];
+        // bencode: d8:intervali1800e5:peers12:<compact bytes>e
+        let mut encoded = b"d8:intervali1800e5:peers12:".to_vec();
+        encoded.extend_from_slice(compact);
+        encoded.push(b'e');
+
+        let decoded = bt_bencode::from_slice::<AnnounceResp>(&encoded).unwrap();
+        assert_eq!(decoded.interval, 1800);
+        assert_eq!(decoded.peers.len(), 2);
+        assert_eq!(
+            decoded.peers[0].addr,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 256)
+        );
+        assert_eq!(
+            decoded.peers[1].addr,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 0, 1)), 6881)
+        );
+        assert_eq!(decoded.peers6.len(), 0);
+    }
+
+    #[test]
+    fn test_compact_peers6() {
+        // BEP7 compact IPv6 format: 18 bytes per peer (16 IP + 2 port, big-endian)
+        // peer: ::1 (loopback) on port 6881
+        let mut ipv6_bytes = [0u8; 18];
+        ipv6_bytes[15] = 1; // ::1
+        ipv6_bytes[16] = 0x1A;
+        ipv6_bytes[17] = 0xE1; // 6881
+
+        // bencode: d8:intervali1800e5:peers0:6:peers618:<bytes>e
+        let mut encoded = b"d8:intervali1800e5:peers0:6:peers618:".to_vec();
+        encoded.extend_from_slice(&ipv6_bytes);
+        encoded.push(b'e');
+
+        let decoded = bt_bencode::from_slice::<AnnounceResp>(&encoded).unwrap();
+        assert_eq!(decoded.interval, 1800);
+        assert_eq!(decoded.peers.len(), 0);
+        assert_eq!(decoded.peers6.len(), 1);
+        assert_eq!(
+            decoded.peers6[0].addr,
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)), 6881)
+        );
+    }
+
+    #[test]
+    fn test_dict_peers() {
+        // BEP3 dict-list format still works — use to_vec to get valid bencode
+        use bt_bencode::Value;
+        use std::collections::BTreeMap;
+
+        let mut peer = BTreeMap::new();
+        peer.insert(
+            ByteString::from("peer id"),
+            Value::ByteStr(ByteString::from("xxxx")),
+        );
+        peer.insert(
+            ByteString::from("ip"),
+            Value::ByteStr(ByteString::from("127.0.0.1")),
+        );
+        peer.insert(ByteString::from("port"), Value::from(8080u32));
+
+        let mut resp = BTreeMap::new();
+        resp.insert(ByteString::from("interval"), Value::from(1800u32));
+        resp.insert(
+            ByteString::from("peers"),
+            Value::List(vec![Value::Dict(peer)]),
+        );
+        let encoded = bt_bencode::to_vec(&Value::Dict(resp)).unwrap();
+
+        let decoded = bt_bencode::from_slice::<AnnounceResp>(&encoded).unwrap();
+        assert_eq!(decoded.interval, 1800);
+        assert_eq!(decoded.peers.len(), 1);
+        assert_eq!(
+            decoded.peers[0].addr,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080)
+        );
+    }
+
+    #[test]
     // some trackers return empty peers dict, not empty peer list, test if we can decode it correctly
     fn test_deserialize_empty_announce_list() {
         let resp = *b"d8:intervali1800e5:peersdee";
         let r0 = bt_bencode::to_vec(&TrackerResp::Success(AnnounceResp {
             interval: 1800,
             peers: vec![],
+            peers6: vec![],
         }))
         .unwrap();
         println!("r0 = {:?}", String::from_utf8(r0));
@@ -438,6 +671,7 @@ mod tests {
             TrackerResp::Success(AnnounceResp {
                 interval: 1800,
                 peers: vec![],
+                peers6: vec![],
             })
         );
     }
