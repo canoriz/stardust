@@ -47,11 +47,11 @@ unexpected_cfgs = { level = "warn", check-cfg = [
 
 [[bin]]
 name = "main"
-path = "src/main.rs"
+path = "src/bin/main.rs"
 
 [[bin]]
 name = "dht-client"
-path = "src/dht-client/main.rs"
+path = "src/bin/tools/dht_client.rs"
 
 [lib]
 path = "src/lib.rs"

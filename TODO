@@ -5,17 +5,13 @@ download/seed control system
 file implementation (mmap)
 compact announce
 udp announce
-ipv6 announce
-ipv6 ipv4 dual stack
 announce list
 only select a part of files of a torrent (and handle only chosen a part of block)
 
 2
-PEX
 lt_extension
 fast_extension
 obfuscation (encryption)
-DHT
 upnp and nat-pmp
 
 3
@@ -23,6 +19,10 @@ uTP (micro transmission protocol)
 
 4
 self implement bencode
+
+5
+unified trait for file and cache manager:
+windows use copy, linux use move BlockBuf and flush by writev, reduce copy by one
 
 
 compact announce
