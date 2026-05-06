@@ -2212,7 +2212,7 @@ impl TransmitWorker {
                 }
                 TorrentState::Metadata(m) => {
                     let reject = ExtendedMsg::Metadata(ExtendedMetadata::Reject { piece });
-                    let metadata = m.metadata.raw_info.get();
+                    let metadata = &m.metadata.raw_info;
 
                     let begin = (piece as usize) * 16384;
                     let end = (piece as usize + 1) * 16384;

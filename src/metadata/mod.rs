@@ -11,7 +11,7 @@ pub use magnet::Magnet;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Metadata {
     pub info: Info,
-    pub raw_info: RawValue, // raw, byte-format info, for sending metadata to peers
+    pub raw_info: Vec<u8>, // raw, byte-format info, for sending metadata to peers
     pub info_hash: [u8; 20],
 
     pub len: usize,
@@ -54,7 +54,7 @@ impl Metadata {
 
     pub fn verify_info_hash(&self) -> io::Result<bool> {
         let mut hasher = Sha1::new();
-        hasher.update(self.raw_info.get());
+        hasher.update(&self.raw_info);
         let info_hash: [u8; 20] = hasher.finalize().into();
         Ok(info_hash == self.info_hash)
     }
@@ -102,21 +102,25 @@ fn serialize_raw_only<S>(i: &InfoWithRaw, serializer: S) -> Result<S::Ok, S::Err
 where
     S: serde::Serializer,
 {
-    i.raw.serialize(serializer)
+    // TODO: OPTIMIZE: add a ref version of RawValue
+    RawValue::from_slice(&i.raw).serialize(serializer)
 }
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(try_from = "RawValue")]
 pub struct InfoWithRaw {
     info: Info,
-    raw: RawValue,
+    raw: Vec<u8>,
 }
 
 impl TryFrom<RawValue> for InfoWithRaw {
     type Error = &'static str; // TODO: better printable error type
     fn try_from(raw: RawValue) -> Result<Self, Self::Error> {
         let info: Info = bt_bencode::from_slice(raw.get()).map_err(|_| "invalid info RawValue")?;
-        Ok(Self { info, raw })
+        Ok(Self {
+            info,
+            raw: raw.into_inner(),
+        })
     }
 }
 
@@ -148,7 +152,7 @@ impl InfoWithRaw {
         Metadata {
             info: self.info,
             raw_info: self.raw,
-            info_hash: info_hash,
+            info_hash,
             comment: None,
             created_by: None,
             creation_date: None,
@@ -171,7 +175,7 @@ impl FileMetadata {
     pub fn load<T: AsRef<[u8]>>(input: T) -> io::Result<Self> {
         let mut torrent: FileMetadata = bt_bencode::from_slice(input.as_ref())?;
         let mut hasher = Sha1::new();
-        hasher.update(torrent.info.raw.get());
+        hasher.update(&torrent.info.raw);
         torrent.info_hash = hasher.finalize().into();
         Ok(torrent)
     }

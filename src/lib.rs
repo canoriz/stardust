@@ -20,3 +20,4 @@ mod hasher;
 mod helper;
 
 pub use protocol::{Reunite, Split};
+pub use session::{Session, SessionDump, SessionOpt};

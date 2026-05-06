@@ -269,6 +269,17 @@ impl PiecePicker for Picker {
     fn have(&self, index: u32) -> bool {
         self.have.get(index)
     }
+
+    fn load(&mut self, piece_map: crate::picker::PieceMap) {
+        // TODO: maybe don't use a custom implementation, but
+        // let BitField know the size
+        for (i, s) in piece_map.selected.iter().enumerate().take(self.n) {
+            self.select(i as u32, s);
+        }
+        for (i, h) in piece_map.have.iter().enumerate().take(self.n) {
+            self.set_have(i as u32, h);
+        }
+    }
 }
 
 #[cfg(test)]
