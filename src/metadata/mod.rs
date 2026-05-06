@@ -8,7 +8,7 @@ mod magnet;
 pub use magnet::Magnet;
 
 // Metadata is a universal structure
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Metadata {
     pub info: Info,
     pub raw_info: RawValue, // raw, byte-format info, for sending metadata to peers

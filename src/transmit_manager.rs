@@ -153,8 +153,6 @@ pub(crate) enum Msg {
     FlushError(FlushErr),
 
     RequestMetadata(oneshot::Sender<Option<Arc<Metadata>>>),
-    DumpStatus(oneshot::Sender<TransmitDump>),
-    LoadProgress(TransmitDump, oneshot::Sender<()>),
     CheckFile(oneshot::Sender<bool>),
     ChangeState(RunningCmd, oneshot::Sender<()>),
     WaitDownloaded(oneshot::Sender<watch::Receiver<bool>>),
@@ -230,7 +228,7 @@ pub(crate) struct TransmitManagerHandle {
 
 pub(crate) struct TransmitManager {
     cancel: CancelDropGuard,
-    worker_stop: oneshot::Receiver<()>,
+    worker_stop: oneshot::Receiver<TransmitDump>,
 }
 
 impl TransmitManager {
@@ -255,7 +253,7 @@ impl TransmitManager {
             cache_handle,
         );
         let cancel_transmit = CancellationToken::new();
-        let (done_transmit, done_transmit_rx) = oneshot::channel::<()>();
+        let (done_transmit, done_transmit_rx) = oneshot::channel();
         tokio::spawn(run_transmit_worker(
             worker,
             cancel_transmit.clone(),
@@ -267,10 +265,57 @@ impl TransmitManager {
         }
     }
 
-    pub async fn stop_wait(self) {
+    pub async fn stop_wait(self) -> io::Result<TransmitDump> {
         // TODO: dump status
         self.cancel.disarm().cancel();
-        _ = self.worker_stop.await;
+        self.worker_stop
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "worker stop channel closed"))
+    }
+
+    /// Restore a `TransmitManager` directly from a `TransmitDump`.
+    ///
+    /// Unlike constructing via `new` + sending `LoadProgress`, this builds the
+    /// `TransmitWorker` state inline without any message round-trip.
+    pub fn from_dump(
+        dump: TransmitDump,
+        id: [u8; 20],
+        port: u16,
+        cmd_sender: mpsc::UnboundedSender<Msg>,
+        cmd_receiver: mpsc::UnboundedReceiver<Msg>,
+        dht_client: Option<Arc<DHT>>,
+        announce_manager: AnnounceManagerHandle,
+        cache_handle: CacheManagerHandle,
+    ) -> Self {
+        let peers = dump.peers.clone();
+        let worker = TransmitWorker::from_dump(
+            dump,
+            id,
+            port,
+            dht_client,
+            announce_manager,
+            cmd_sender.clone(),
+            cmd_receiver,
+            cache_handle,
+        );
+        let cancel_transmit = CancellationToken::new();
+        let (dump_tx, dump_rx) = oneshot::channel();
+        tokio::spawn(run_transmit_worker(
+            worker,
+            cancel_transmit.clone(),
+            dump_tx,
+        ));
+        // Kick off reconnection to all peers that were alive at dump time.
+        for peer in peers {
+            let _ = cmd_sender.send(Msg::NewDiscoveredPeer {
+                addr: to_canonical_addr(peer),
+                from: PeerFrom::Tracker,
+            });
+        }
+        Self {
+            cancel: cancel_transmit.drop_guard(),
+            worker_stop: dump_rx,
+        }
     }
 }
 
@@ -281,7 +326,7 @@ pub enum TorrentState {
 
 type CheckResult = u8;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct CheckState {
     state: Vec<CheckResult>,
     known: usize,
@@ -318,14 +363,19 @@ impl CheckState {
     }
 }
 
-#[derive(Serialize, Deserialize)]
-enum RunningState {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum StableState {
     Downloading,
     Paused,  // maintains connection but do not download
     Stopped, // all stopped
     Seeding,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+enum RunningState {
+    StableState(StableState),
     Checking {
-        prev_state: RunningCmd,
+        prev_state: StableState,
         to_check: BTreeSet<u32>,
         checked: CheckState,
         #[serde(skip)]
@@ -333,16 +383,67 @@ enum RunningState {
     }, // checking local file
 }
 
+impl From<RunningState> for RunningStateDump {
+    fn from(state: RunningState) -> Self {
+        match state {
+            RunningState::StableState(s) => RunningStateDump::StableState(s),
+            RunningState::Checking {
+                prev_state,
+                to_check,
+                checked,
+                ..
+            } => RunningStateDump::Checking {
+                prev_state,
+                to_check,
+                checked,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum RunningStateDump {
+    StableState(StableState),
+    Checking {
+        prev_state: StableState,
+        to_check: BTreeSet<u32>,
+        checked: CheckState,
+    }, // checking local file
+}
+
+impl From<RunningStateDump> for RunningState {
+    fn from(dump: RunningStateDump) -> Self {
+        match dump {
+            RunningStateDump::StableState(s) => RunningState::StableState(s),
+            RunningStateDump::Checking {
+                prev_state,
+                to_check,
+                checked,
+            } => RunningState::Checking {
+                prev_state,
+                to_check,
+                checked,
+                waiter: Vec::new(),
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RunningCmd {
     Resume,
     Pause,
     Stop,
+    Check,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TorrentStateDump {
-    Metadata(BlockPickerDump),
+    Metadata {
+        metadata: metadata::Metadata,
+        picker: BlockPickerDump,
+        // TODO: do we need to store hash state here?
+    },
     Fetching(FetchingMetadata),
 }
 
@@ -498,6 +599,10 @@ pub struct TransmitWorker {
     connected_peers: HashMap<PeerAddr, PeerConn>,
     connecting_peers: HashSet<PeerAddr>,
 
+    // TODO: support tier
+    /// Announce URLs that have been registered with the announce manager.
+    announce_urls: Vec<String>,
+
     /// received blocks waiting writing to piece buf once
     /// piece buf is ready
     waiting_for_piecebuf: HashMap<JointIndex, PieceWaitState>,
@@ -546,10 +651,43 @@ struct PieceWaitState {
 pub struct TransmitDump {
     pub state: TorrentStateDump,
     pub peers: Vec<SocketAddr>,
+    /// Announce tracker URLs that were registered for this torrent.
+    #[serde(default)]
+    pub announce_urls: Vec<String>,
+    /// The running state at the time of the dump (Resume/Pause/Stop).
+    pub running_state: RunningStateDump,
+}
+
+impl TransmitDump {
+    pub fn info_hash(&self) -> [u8; 20] {
+        match &self.state {
+            TorrentStateDump::Metadata { metadata, .. } => metadata.info_hash,
+            TorrentStateDump::Fetching(f) => f.magnet.info_hash,
+        }
+    }
 }
 
 fn bw_look_back_window(probe_bdp_rtt: time::Duration) -> time::Duration {
     (10 * probe_bdp_rtt).max(time::Duration::from_millis(1500))
+}
+
+impl TransmitWorker {
+    fn handle_dump_status(self) -> TransmitDump {
+        let peers: Vec<_> = self.connected_peers.keys().cloned().collect();
+        let state = match self.torrent_state {
+            TorrentState::Metadata(mut d) => TorrentStateDump::Metadata {
+                metadata: d.metadata.as_ref().clone(),
+                picker: d.block_picker.dump(),
+            },
+            TorrentState::Fetching(f) => TorrentStateDump::Fetching(f.clone()),
+        };
+        TransmitDump {
+            peers,
+            state,
+            announce_urls: self.announce_urls.clone(),
+            running_state: self.running_state.into(),
+        }
+    }
 }
 
 impl TransmitWorker {
@@ -558,6 +696,60 @@ impl TransmitWorker {
     fn broadcast_have(&self, index: u32) {
         for (_, h) in self.connected_peers.iter() {
             h.conn.send_stream_cmd(ConnMsg::Have(index));
+        }
+    }
+
+    /// Build a `TransmitWorker` directly from a `TransmitDump`, restoring
+    /// block-picker state and announce URLs without any message round-trip.
+    pub fn from_dump(
+        dump: TransmitDump,
+        id: [u8; 20],
+        port: u16,
+        dht_client: Option<Arc<DHT>>,
+        announce_manager: AnnounceManagerHandle,
+        cmd_sender: mpsc::UnboundedSender<Msg>,
+        cmd_receiver: mpsc::UnboundedReceiver<Msg>,
+        cache_handle: CacheManagerHandle,
+    ) -> Self {
+        let (info_hash, torrent_state) = match dump.state {
+            TorrentStateDump::Metadata { metadata, picker } => {
+                let info_hash = metadata.info_hash;
+                let mut downloading =
+                    Self::metadata_into_downloading(metadata, &cache_handle, cmd_sender.clone());
+                downloading.block_picker.load_progress(picker);
+                (info_hash, TorrentState::Metadata(downloading))
+            }
+            TorrentStateDump::Fetching(f) => {
+                let info_hash = f.magnet.info_hash;
+                (info_hash, TorrentState::Fetching(f))
+            }
+        };
+        // Re-register announce URLs with the announce manager.
+        if !dump.announce_urls.is_empty() {
+            announce_manager.send(announce_manager::Msg::AddUrl(dump.announce_urls.clone()));
+        }
+        let opt = HandshakeOption::builder()
+            .client_id(id)
+            .port(port)
+            .dht_port(dht_client.as_ref().map(|c| c.port()))
+            .build();
+        let downloaded = watch::channel(false).0;
+        Self {
+            id,
+            info_hash,
+            handshake_opt: opt,
+            dht_client,
+            announce_manager,
+            torrent_state,
+            receiver: cmd_receiver,
+            self_handle: TransmitManagerHandle { sender: cmd_sender },
+            connected_peers: HashMap::new(),
+            connecting_peers: HashSet::new(),
+            announce_urls: dump.announce_urls,
+            waiting_for_piecebuf: HashMap::new(),
+            downloaded,
+            running_state: dump.running_state.into(),
+            cache_handle,
         }
     }
 
@@ -609,9 +801,10 @@ impl TransmitWorker {
             // announce_tx: None,
             connected_peers: HashMap::new(),
             connecting_peers: HashSet::new(),
+            announce_urls: Vec::new(),
             waiting_for_piecebuf: HashMap::new(),
             downloaded,
-            running_state: RunningState::Stopped,
+            running_state: RunningState::StableState(StableState::Stopped),
             cache_handle,
         }
     }
@@ -813,6 +1006,9 @@ impl TransmitWorker {
                 Ok(())
             }
             Msg::AnnounceMsg(m) => {
+                if let announce_manager::Msg::AddUrl(ref urls) = m {
+                    self.announce_urls.extend(urls.iter().cloned());
+                }
                 self.announce_manager.send(m);
                 Ok(())
             }
@@ -856,7 +1052,7 @@ impl TransmitWorker {
                     };
 
                     if let Some((piece_state, n)) = state {
-                        if cm.capability().have(protocol::Capability::Fast) {
+                        if cm.capability().have(protocol::Capability::FAST) {
                             match piece_state {
                                 PieceState::HaveAll => {
                                     cm.send_stream_cmd(CtrlOfSend::HaveAll);
@@ -872,7 +1068,7 @@ impl TransmitWorker {
                             cm.send_stream_cmd(CtrlOfSend::BitField(piece_state.as_bitfield(n)));
                         }
                     } else {
-                        if cm.capability().have(protocol::Capability::Fast) {
+                        if cm.capability().have(protocol::Capability::FAST) {
                             cm.send_stream_cmd(CtrlOfSend::HaveNone);
                         }
                     }
@@ -944,16 +1140,8 @@ impl TransmitWorker {
                 todo!()
             }
             Msg::PieceBufReady { index, buf } => self.handle_piecebuf_ready(index, buf),
-            Msg::DumpStatus(sender) => {
-                self.handle_dump_status(sender);
-                Ok(())
-            }
             Msg::RequestMetadata(sender) => {
                 self.handle_request_metadata(sender);
-                Ok(())
-            }
-            Msg::LoadProgress(dump, sender) => {
-                self.handle_load_progress(dump, sender);
                 Ok(())
             }
             Msg::CheckFile(sender) => {
@@ -964,15 +1152,16 @@ impl TransmitWorker {
                 // TODO: FIXME: should pause announce task as well
                 match cmd {
                     RunningCmd::Resume => {
-                        self.running_state = RunningState::Downloading;
+                        self.running_state = RunningState::StableState(StableState::Downloading);
                         self.pick_blocks_for_all_peers(10);
                     }
                     RunningCmd::Pause => {
-                        self.running_state = RunningState::Paused;
+                        self.running_state = RunningState::StableState(StableState::Paused);
                     }
                     RunningCmd::Stop => {
-                        self.running_state = RunningState::Stopped;
+                        self.running_state = RunningState::StableState(StableState::Stopped);
                     }
+                    RunningCmd::Check => todo!(),
                 }
                 _ = sender.send(());
                 Ok(())
@@ -1142,7 +1331,7 @@ impl TransmitWorker {
             PeerMsg::Request(addr, req) => {
                 // TODO: optimize: handle can be passed so avoid map search overhead
                 if let Some(conn) = self.connected_peers.get_mut(&addr) {
-                    if conn.conn.capability().have(protocol::Capability::Fast) {
+                    if conn.conn.capability().have(protocol::Capability::FAST) {
                         conn.conn.send_stream_cmd(ConnMsg::Reject(req));
                     }
                 }
@@ -1292,7 +1481,7 @@ impl TransmitWorker {
                     let r = checked.state.iter().all(|s| *s != CheckState::CORRUPT);
                     notify_waiter(r);
                     match prev_state {
-                        RunningCmd::Resume => {
+                        StableState::Downloading | StableState::Seeding => {
                             let Downloading { block_picker, .. } = match &mut self.torrent_state {
                                 TorrentState::Metadata(d) => d,
                                 TorrentState::Fetching(_) => {
@@ -1300,16 +1489,18 @@ impl TransmitWorker {
                                 }
                             };
                             if block_picker.is_finished() {
-                                self.running_state = RunningState::Seeding;
+                                self.running_state =
+                                    RunningState::StableState(StableState::Seeding);
                             } else {
-                                self.running_state = RunningState::Downloading;
+                                self.running_state =
+                                    RunningState::StableState(StableState::Downloading);
                             }
                         }
-                        RunningCmd::Pause => {
-                            self.running_state = RunningState::Paused;
+                        StableState::Paused => {
+                            self.running_state = RunningState::StableState(StableState::Paused);
                         }
-                        RunningCmd::Stop => {
-                            self.running_state = RunningState::Stopped;
+                        StableState::Stopped => {
+                            self.running_state = RunningState::StableState(StableState::Stopped);
                         }
                     }
                 } else {
@@ -1653,7 +1844,10 @@ impl TransmitWorker {
             BandwidthMode::Choked => 0,
         };
 
-        if matches!(self.running_state, RunningState::Downloading) {
+        if matches!(
+            self.running_state,
+            RunningState::StableState(StableState::Downloading)
+        ) {
             if conn.state.peer_choke_status == ChokeStatus::Unchoked {
                 let really_picked = self.pick_blocks_for_peer(&peer, n_to_pick);
             }
@@ -1786,7 +1980,7 @@ impl TransmitWorker {
                 // TODO: remove pending requests if not sent
                 if let Some(conn) = self.connected_peers.get_mut(&addr) {
                     conn.inflight.cancel(req);
-                    if conn.conn.capability().have(protocol::Capability::Fast) {
+                    if conn.conn.capability().have(protocol::Capability::FAST) {
                         conn.conn.send_stream_cmd(ConnMsg::Cancel(req));
                     }
                 }
@@ -1901,46 +2095,12 @@ impl TransmitWorker {
         }
     }
 
-    fn handle_dump_status(&mut self, sender: oneshot::Sender<TransmitDump>) {
-        // TODO: dump announce
-        let peers: Vec<_> = self.connected_peers.keys().cloned().collect();
-        let state = match &mut self.torrent_state {
-            TorrentState::Metadata(d) => TorrentStateDump::Metadata(d.block_picker.dump()),
-            TorrentState::Fetching(f) => TorrentStateDump::Fetching(f.clone()),
-        };
-        let dump = TransmitDump { peers, state };
-        _ = sender.send(dump);
-    }
-
     fn handle_request_metadata(&mut self, sender: oneshot::Sender<Option<Arc<Metadata>>>) {
         let metadata = match &mut self.torrent_state {
             TorrentState::Metadata(d) => Some(d.metadata.clone()),
             TorrentState::Fetching(_) => None,
         };
         _ = sender.send(metadata);
-    }
-
-    fn handle_load_progress(&mut self, progress: TransmitDump, sender: oneshot::Sender<()>) {
-        // TODO: dump announce
-        match progress.state {
-            TorrentStateDump::Metadata(block_picker_dump) => match &mut self.torrent_state {
-                TorrentState::Metadata(d) => {
-                    d.block_picker.load_progress(block_picker_dump);
-                }
-                TorrentState::Fetching(_) => {
-                    info!("load progress when fetching metadata, maybe unreachable");
-                    todo!()
-                }
-            },
-            TorrentStateDump::Fetching(f) => {
-                self.torrent_state = TorrentState::Fetching(f);
-            }
-        }
-
-        for p in progress.peers {
-            self.handle_new_discovered_peer(to_canonical_addr(p));
-        }
-        _ = sender.send(());
     }
 
     fn is_downloaded(&mut self) -> bool {
@@ -2004,10 +2164,7 @@ impl TransmitWorker {
 
                 s => {
                     let prev_state = match s {
-                        RunningState::Downloading => RunningCmd::Resume,
-                        RunningState::Paused => RunningCmd::Pause,
-                        RunningState::Stopped => RunningCmd::Stop,
-                        RunningState::Seeding => RunningCmd::Resume,
+                        RunningState::StableState(st) => st.clone(),
                         _ => unreachable!(),
                     };
                     let waiter = vec![sender];
@@ -2168,7 +2325,7 @@ impl TransmitWorker {
         }
 
         for (_, h) in &mut self.connected_peers {
-            if h.conn.capability().have(protocol::Capability::Metadata)
+            if h.conn.capability().have(protocol::Capability::METADATA)
                 && h.conn.metadata_size() > 0
             {
                 // TODO: adaptively set value of n
@@ -2221,7 +2378,7 @@ fn check_received_metadata(mbuf: &mut MetadataBuffer, info_hash: [u8; 20]) -> io
 pub(crate) async fn run_transmit_worker(
     mut transmit: TransmitWorker,
     cancel: CancellationToken,
-    done: oneshot::Sender<()>,
+    done: oneshot::Sender<TransmitDump>,
 ) {
     let mut ticker = tokio::time::interval(time::Duration::from_millis(1000));
     let mut dht_ticker = tokio::time::interval(time::Duration::from_secs(60));
@@ -2255,8 +2412,9 @@ pub(crate) async fn run_transmit_worker(
             }
         };
     }
-    let _ = done.send(());
-    info!("transmit manager done");
+    info!("dump transmit manager of {:?}", transmit.info_hash);
+    let dump = transmit.handle_dump_status();
+    let _ = done.send(dump);
 }
 
 /// copy data to a sub-piece buffer
@@ -2267,9 +2425,9 @@ fn copy_to_piecebuf(piece: &Piece, data: &[u8], piecebuf: &mut [u8]) {
     let begin = piece.begin as usize % SUB_PIECE_SIZE as usize;
     let end = begin + data.len();
     debug_assert!(
-        end <= piecebuf.as_ref().len(),
+        end <= piecebuf.len(),
         "copy_to_piecebuf: end {end} exceeds piecebuf len {} (begin={begin}, piece.len={})",
-        piecebuf.as_ref().len(),
+        piecebuf.len(),
         piece.len,
     );
     piecebuf[begin..end].copy_from_slice(data);
@@ -2313,7 +2471,7 @@ fn run_pex(transmit: &mut TransmitWorker) {
     for (peer_addr, conn) in transmit
         .connected_peers
         .iter_mut()
-        .filter(|(_, conn)| conn.conn.capability().have(Capability::Pex))
+        .filter(|(_, conn)| conn.conn.capability().have(Capability::PEX))
     {
         let conn_info = conn.conn.info();
         let peer_self = if conn_info.is_income {
@@ -2425,6 +2583,8 @@ mod tests {
                 IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
                 6881,
             )],
+            announce_urls: vec![],
+            running_state: RunningStateDump::StableState(StableState::Downloading),
         };
 
         let ser = serde_json::to_string(&dump).expect("serialize dump");

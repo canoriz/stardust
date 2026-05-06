@@ -107,6 +107,11 @@ where
             }
             Ok(peers)
         }
+
+        // Some trackers send an empty dict `de` instead of an empty list `le` for no peers.
+        fn visit_map<A: de::MapAccess<'de>>(self, _map: A) -> Result<Self::Value, A::Error> {
+            Ok(vec![])
+        }
     }
 
     deserializer.deserialize_any(PeersVisitor)
@@ -424,7 +429,7 @@ mod tests {
 
     #[test]
     // some trackers return empty peers dict, not empty peer list, test if we can decode it correctly
-    fn test_deserialize_empty_announce_list() {
+    fn test_deserialize_empty_announce_dict() {
         let resp = *b"d8:intervali1800e5:peersdee";
         let r0 = bt_bencode::to_vec(&TrackerResp::Success(AnnounceResp {
             interval: 1800,

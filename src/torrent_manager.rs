@@ -66,8 +66,40 @@ impl TorrentManagerHandle {
         self.sender.wait_downloaded().await
     }
 
-    pub async fn stop_wait(self) {
-        self.transmit_manager.stop_wait().await;
+    pub async fn stop_wait(self) -> io::Result<TransmitDump> {
+        self.transmit_manager.stop_wait().await
+    }
+
+    /// Restore a `TorrentManagerHandle` directly from a `TransmitDump`.
+    ///
+    /// Block-picker state, announce URLs, and previous peers are all restored
+    /// inline — no message round-trip needed.
+    pub fn restore_from_dump(
+        dump: TransmitDump,
+        self_id: [u8; 20],
+        port: u16,
+        dht_client: Option<Arc<DHT>>,
+        cache_handle: CacheManagerHandle,
+    ) -> Self {
+        let (tx, rx) = mpsc::unbounded_channel::<transmit_manager::Msg>();
+
+        let info_hash = dump.info_hash();
+        let am = AnnounceManagerHandle::new(self_id, port, info_hash, tx.clone());
+        let tm = TransmitManager::from_dump(
+            dump,
+            self_id,
+            port,
+            tx.clone(),
+            rx,
+            dht_client,
+            am,
+            cache_handle,
+        );
+
+        Self {
+            sender: TransmitManagerSender(tx),
+            transmit_manager: tm,
+        }
     }
 }
 
@@ -124,42 +156,6 @@ impl TransmitManagerSender {
                 io::Error::new(io::ErrorKind::Other, format!("check send msg error: {}", e))
             })?;
         Ok(ForceCheck { rx })
-    }
-
-    pub async fn dump_progress(&mut self) -> io::Result<TransmitDump> {
-        let (tx, rx) = oneshot::channel();
-        self.0
-            .send(transmit_manager::Msg::DumpStatus(tx))
-            .map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("dump status send msg error: {}", e),
-                )
-            })?;
-        rx.await.map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!("dump status oneshot recv error: {}", e),
-            )
-        })
-    }
-
-    pub async fn load_progress(&mut self, progress: TransmitDump) -> io::Result<()> {
-        let (tx, rx) = oneshot::channel();
-        self.0
-            .send(transmit_manager::Msg::LoadProgress(progress, tx))
-            .map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("load status send msg error: {}", e),
-                )
-            })?;
-        rx.await.map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!("load progress oneshot recv error: {}", e),
-            )
-        })
     }
 }
 

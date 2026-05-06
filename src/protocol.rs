@@ -420,9 +420,9 @@ pub struct Capability {
 
 impl Capability {
     pub const DHT: Self = Self { cap: 1 };
-    pub const Fast: Self = Self { cap: 1 << 1 };
-    pub const Metadata: Self = Self { cap: 1 << 2 };
-    pub const Pex: Self = Self { cap: 1 << 3 };
+    pub const FAST: Self = Self { cap: 1 << 1 };
+    pub const METADATA: Self = Self { cap: 1 << 2 };
+    pub const PEX: Self = Self { cap: 1 << 3 };
 
     pub fn have(&self, cap: Capability) -> bool {
         self.cap & cap.cap > 0
@@ -460,12 +460,12 @@ impl<T> BTStream<T> {
             ret.cap |= Capability::DHT.cap;
         }
         if self.reserved.have_fast() {
-            ret.cap |= Capability::Fast.cap;
+            ret.cap |= Capability::FAST.cap;
         }
         for id in self.extension_id.keys() {
             match id {
-                ExtensionType::Metadata => ret.cap |= Capability::Metadata.cap,
-                ExtensionType::Pex => ret.cap |= Capability::Pex.cap,
+                ExtensionType::Metadata => ret.cap |= Capability::METADATA.cap,
+                ExtensionType::Pex => ret.cap |= Capability::PEX.cap,
             };
         }
         ret

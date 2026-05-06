@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::{io, time};
 
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::lookup_host;
 use tokio::net::TcpListener;
@@ -16,8 +17,16 @@ use crate::dht::{self, DHT};
 use crate::metadata::Magnet;
 use crate::protocol::{AcceptOpt, BTStream, HandshakeOption, InfoHash};
 use crate::torrent_manager::{TorrentManagerHandle, TransmitManagerSender};
-use crate::transmit_manager::{RunningCmd, TorrentTask};
+use crate::transmit_manager::{
+    RunningCmd, RunningStateDump, StableState, TorrentTask, TransmitDump,
+};
 use crate::{announce_manager, Reunite, Split};
+
+/// A snapshot of every active torrent task in the session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionDump {
+    pub torrents: Vec<TransmitDump>,
+}
 
 pub struct Session {
     self_id: [u8; 20], // TODO: use randomized self_id
@@ -27,6 +36,9 @@ pub struct Session {
     dht_client: Option<Arc<DHT>>,
     cache_handle: CacheManagerHandle,
 
+    // TODO: do we really need cancel and drop guard both? maybe just one of them is enough?
+    /// Token shared with the listener; kept so `shutdown` can cancel explicitly.
+    cancel: CancellationToken,
     _cancel: DropGuard,
 }
 
@@ -158,12 +170,13 @@ impl Session {
             port: opt.port,
             dht_client,
             cache_handle,
+            cancel: cancel.clone(),
             _cancel: cancel.drop_guard(),
         }
     }
 
     /// add new torrent
-    pub async fn add_torrent(&mut self, job: TorrentTask, announce_list: Vec<Vec<String>>) {
+    pub async fn add_torrent(&self, job: TorrentTask, announce_list: Vec<Vec<String>>) {
         let info_hash = job.info_hash();
         let trackers = if let TorrentTask::Magnet(Magnet { tr, .. }) = &job {
             tr.clone()
@@ -189,12 +202,61 @@ impl Session {
         self.tasks.lock().unwrap().insert(info_hash, tm);
     }
 
+    /// Dump progress of every active torrent task.
+    pub async fn dump(self) -> SessionDump {
+        let handles: Vec<_> = {
+            let mut guard = self.tasks.lock().unwrap();
+            guard.drain().map(|(_, h)| h).collect()
+        };
+        let mut torrents = Vec::with_capacity(handles.len());
+        for tm in handles {
+            match tm.stop_wait().await {
+                Ok(d) => torrents.push(d),
+                Err(e) => {
+                    info!("dump torrent error: {}", e);
+                }
+            }
+        }
+        SessionDump { torrents }
+    }
+
+    /// Restore a `Session` from a previously obtained `SessionDump`.
+    ///
+    /// Each torrent task is recreated inline — block-picker state, announce
+    /// URLs, and previously connected peers are all restored without a
+    /// message round-trip.  Torrents that were actively downloading or seeding
+    /// are resumed; paused/stopped ones remain in their previous state.
+    pub fn restore_from_dump(dump: SessionDump, opt: SessionOpt) -> Self {
+        let session = Self::new(opt);
+        for torrent_dump in dump.torrents {
+            let info_hash = torrent_dump.info_hash();
+            let tm = TorrentManagerHandle::restore_from_dump(
+                torrent_dump,
+                session.self_id,
+                session.port,
+                session.dht_client.clone(),
+                session.cache_handle.clone(),
+            );
+            session.tasks.lock().unwrap().insert(info_hash, tm);
+        }
+        session
+    }
+
+    /// Dump all torrent tasks then cancel the session (listener + DHT).
+    ///
+    /// Returns the dump so the caller can persist it and later pass it to
+    /// `restore_from_dump`.
+    pub async fn shutdown(self) -> SessionDump {
+        self.cancel.cancel();
+        self.dump().await
+    }
+
     /// remove torrent by info_hash
-    pub async fn remove_torrent(&mut self, info_hash: &InfoHash) -> Option<TorrentManagerHandle> {
+    pub async fn remove_torrent(&self, info_hash: &InfoHash) -> Option<TorrentManagerHandle> {
         self.tasks.lock().unwrap().remove(info_hash)
     }
 
-    pub async fn do_work<F, R>(&mut self, info_hash: &InfoHash, work: F) -> io::Result<R>
+    pub async fn do_work<F, R>(&self, info_hash: &InfoHash, work: F) -> io::Result<R>
     where
         F: AsyncFnOnce(&mut TransmitManagerSender) -> R,
     {
@@ -213,7 +275,7 @@ impl Session {
     }
 
     pub async fn transmit_handle_of(
-        &mut self,
+        &self,
         info_hash: &InfoHash,
     ) -> io::Result<TransmitManagerSender> {
         let mut guard = self.tasks.lock().unwrap();
@@ -252,9 +314,11 @@ async fn run_listener(l: Listener, port: u16) -> std::io::Result<()> {
                     self_id: l.self_id,
                     tasks: l.tasks.clone(),
                 };
-                if let Err(e) = handle_income_connection(ic).await {
-                    info!("handle income connection error {e}");
-                }
+                tokio::spawn(async move {
+                    if let Err(e) = handle_income_connection(ic).await {
+                        info!("handle income connection error {e}");
+                    }
+                });
             }
         }
     }
