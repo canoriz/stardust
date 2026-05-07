@@ -2412,7 +2412,7 @@ pub(crate) async fn run_transmit_worker(
             }
         };
     }
-    info!("dump transmit manager of {:?}", transmit.info_hash);
+    info!("dump transmit manager of {:02x?}", transmit.info_hash);
     let dump = transmit.handle_dump_status();
     let _ = done.send(dump);
 }

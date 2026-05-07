@@ -122,6 +122,33 @@ impl PieceBlocks {
         self.requested_or_received_count == self.block_map.len()
     }
 
+    /// Reset all Requested blocks to NotRequested, updating bookkeeping.
+    /// Returns true if any block was changed.
+    /// Used on session restore: after loading a dump, `requested` maps inside
+    /// Requested variants are empty (skipped by serde), so we must treat those
+    /// blocks as not yet requested.
+    fn reset_requested_blocks(&mut self) -> bool {
+        let mut changed = false;
+        for block in self.block_map.iter_mut() {
+            if matches!(block, BlockStatus::Requested { .. }) {
+                *block = BlockStatus::NotRequested {
+                    revoked: HashMap::new(),
+                };
+                self.requested_or_received_count -= 1;
+                changed = true;
+            }
+        }
+        if changed {
+            // Recompute frontier: how many leading blocks are all Received
+            self.all_request_or_received_before = self
+                .block_map
+                .iter()
+                .take_while(|b| matches!(b, BlockStatus::Received))
+                .count();
+        }
+        changed
+    }
+
     /// Try to pick n blocks, return blocks and how many blocks picked.
     /// If in endgame mode, take a duplicate request limit, we want blocks
     /// requested count is evenly distributed, e.g. A and B block are both
@@ -1227,16 +1254,49 @@ impl BlockPicker {
         self.requesting = dump.requesting;
         self.piece_picker.load(dump.piece_map);
         self.no_response_timeout = dump.no_response_timeout;
+
+        // Normalize Requested → NotRequested: after restore the `requested`
+        // maps are empty (serde-skipped), so no peer is tracked for those
+        // blocks. Reset them so they will be re-requested from scratch.
+        // Pieces in `receiving` that regain NotRequested blocks are moved
+        // back to `requesting` so the pick loop can reach them.
+        let mut to_move: Vec<u32> = Vec::new();
+        for (&idx, piece) in self.receiving.iter_mut() {
+            if piece.reset_requested_blocks() {
+                to_move.push(idx);
+            }
+        }
+        for idx in to_move {
+            let piece = self.receiving.remove(&idx).unwrap();
+            self.requesting.insert(idx, piece);
+        }
+        for piece in self.requesting.values_mut() {
+            piece.reset_requested_blocks();
+        }
+
+        // Pieces with zero received and zero requested have no progress at all.
+        // Remove them from `requesting` so they won't block the pick loop.
+        // They will be picked again via piece_picker's pick_next as peers reconnect.
+        let mut to_return: Vec<u32> = Vec::new();
+        for (&idx, piece) in self.requesting.iter() {
+            if piece.is_all_not_requested() {
+                to_return.push(idx);
+            }
+        }
+        for idx in to_return {
+            self.requesting.remove(&idx);
+            self.piece_picker.set_have(idx, false);
+        }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockPickerDump {
     // pieces whose blocks are not all requested
-    pub requesting: BTreeMap<PieceIndex, PieceBlocks>,
+    requesting: BTreeMap<PieceIndex, PieceBlocks>,
 
     // pieces whose blocks that all requested and waiting receiving
-    pub receiving: BTreeMap<PieceIndex, PieceBlocks>,
+    receiving: BTreeMap<PieceIndex, PieceBlocks>,
 
     pub piece_map: PieceMap,
 

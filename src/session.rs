@@ -274,18 +274,12 @@ impl Session {
         Ok(work(&mut sender).await)
     }
 
-    pub async fn transmit_handle_of(
-        &self,
-        info_hash: &InfoHash,
-    ) -> io::Result<TransmitManagerSender> {
+    pub async fn transmit_handle_of(&self, info_hash: &InfoHash) -> Option<TransmitManagerSender> {
         let mut guard = self.tasks.lock().unwrap();
         if let Some(tm) = guard.get_mut(info_hash) {
-            Ok(tm.sender.clone())
+            Some(tm.sender.clone())
         } else {
-            Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "torrent task not found for given info hash",
-            ))
+            None
         }
     }
 }
