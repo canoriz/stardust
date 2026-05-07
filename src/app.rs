@@ -10,10 +10,15 @@ pub async fn add_mock_torrent(session: &crate::session::Session) -> [u8; 20] {
     let torrent = metadata::FileMetadata::load(torrent_f).unwrap();
     let (metadata, _announce_list) = torrent.to_metadata();
     let info_hash = metadata.info_hash;
-    if session.transmit_handle_of(&info_hash).await.is_none() {
-        session
-            .add_torrent(TorrentTask::Torrent(metadata), vec![vec!["1".into()]])
-            .await;
+    match session.transmit_handle_of(&info_hash).await {
+        Some(mut t) => {
+            let _wait_check_finish = t.check().unwrap();
+        }
+        None => {
+            session
+                .add_torrent(TorrentTask::Torrent(metadata), vec![vec!["1".into()]])
+                .await;
+        }
     }
     info_hash
 }

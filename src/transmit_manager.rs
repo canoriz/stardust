@@ -327,10 +327,11 @@ pub enum TorrentState {
 type CheckResult = u8;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct CheckState {
+pub struct CheckState {
     state: Vec<CheckResult>,
     known: usize,
 }
+
 impl CheckState {
     const UNKNOWN: CheckResult = 0;
     const VERIFIED: CheckResult = 1;
@@ -724,6 +725,19 @@ impl TransmitWorker {
                 (info_hash, TorrentState::Fetching(f))
             }
         };
+        if let RunningStateDump::Checking { to_check, .. } = &dump.running_state {
+            // If we were checking at dump time, we should re-check on restore to rebuild the in-memory check state.
+            info!("dump is in checking state, start in stopped state and trigger re-check");
+            if let Some(next_piece) = to_check.first() {
+                cache_handle.send_get_piece(
+                    GlobalPieceKey {
+                        info_hash,
+                        index: JointIndex::new(*next_piece, 0),
+                    },
+                    cmd_sender.clone(),
+                );
+            }
+        }
         // Re-register announce URLs with the announce manager.
         if !dump.announce_urls.is_empty() {
             announce_manager.send(announce_manager::Msg::AddUrl(dump.announce_urls.clone()));
@@ -1505,7 +1519,7 @@ impl TransmitWorker {
                     }
                 } else {
                     // load next piece to check
-                    let next_piece = to_check.pop_first().unwrap();
+                    let next_piece = *to_check.first().unwrap();
                     self.cache_handle.send_get_piece(
                         GlobalPieceKey {
                             info_hash: self.info_hash,
@@ -2168,7 +2182,9 @@ impl TransmitWorker {
                         _ => unreachable!(),
                     };
                     let waiter = vec![sender];
-                    let to_check = selected.collect::<BTreeSet<_>>();
+                    let to_check = selected
+                        .chain(std::iter::once(first))
+                        .collect::<BTreeSet<_>>();
                     let checked = CheckState::new(block_picker.n_pieces());
                     *s = RunningState::Checking {
                         prev_state,
