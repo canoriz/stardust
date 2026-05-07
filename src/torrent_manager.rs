@@ -157,6 +157,24 @@ impl TransmitManagerSender {
             })?;
         Ok(ForceCheck { rx })
     }
+
+    pub async fn query_status(&mut self) -> io::Result<transmit_manager::TorrentRuntimeStatus> {
+        let (tx, rx) = oneshot::channel();
+        self.0
+            .send(transmit_manager::Msg::QueryStatus(tx))
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("query status send msg error: {}", e),
+                )
+            })?;
+        rx.await.map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("query status oneshot recv error: {}", e),
+            )
+        })
+    }
 }
 
 pub struct ForceCheck {

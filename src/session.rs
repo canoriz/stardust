@@ -18,7 +18,7 @@ use crate::metadata::Magnet;
 use crate::protocol::{AcceptOpt, BTStream, HandshakeOption, InfoHash};
 use crate::torrent_manager::{TorrentManagerHandle, TransmitManagerSender};
 use crate::transmit_manager::{
-    RunningCmd, RunningStateDump, StableState, TorrentTask, TransmitDump,
+    RunningCmd, RunningStateDump, StableState, TorrentRuntimeStatus, TorrentTask, TransmitDump,
 };
 use crate::{announce_manager, Reunite, Split};
 
@@ -281,6 +281,28 @@ impl Session {
         } else {
             None
         }
+    }
+
+    pub fn list_torrents(&self) -> Vec<InfoHash> {
+        self.tasks.lock().unwrap().keys().cloned().collect()
+    }
+
+    pub async fn get_torrent_status(
+        &self,
+        info_hash: &InfoHash,
+    ) -> io::Result<TorrentRuntimeStatus> {
+        let mut sender = {
+            let mut guard = self.tasks.lock().unwrap();
+            if let Some(tm) = guard.get_mut(info_hash) {
+                tm.sender.clone()
+            } else {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "torrent task not found for given info hash",
+                ));
+            }
+        };
+        sender.query_status().await
     }
 }
 

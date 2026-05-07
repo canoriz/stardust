@@ -153,9 +153,19 @@ pub(crate) enum Msg {
     FlushError(FlushErr),
 
     RequestMetadata(oneshot::Sender<Option<Arc<Metadata>>>),
+    QueryStatus(oneshot::Sender<TorrentRuntimeStatus>),
     CheckFile(oneshot::Sender<bool>),
     ChangeState(RunningCmd, oneshot::Sender<()>),
     WaitDownloaded(oneshot::Sender<watch::Receiver<bool>>),
+}
+
+#[derive(Debug, Clone)]
+pub struct TorrentRuntimeStatus {
+    pub info_hash: [u8; 20],
+    pub process: f64,
+    pub bandwidth_bps: f64,
+    pub selected: Vec<u32>,
+    pub have: Vec<u32>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1158,6 +1168,10 @@ impl TransmitWorker {
                 self.handle_request_metadata(sender);
                 Ok(())
             }
+            Msg::QueryStatus(sender) => {
+                let _ = sender.send(self.runtime_status());
+                Ok(())
+            }
             Msg::CheckFile(sender) => {
                 self.handle_check_file(sender);
                 Ok(())
@@ -1184,6 +1198,55 @@ impl TransmitWorker {
                 _ = sender.send(self.downloaded.subscribe());
                 Ok(())
             }
+        }
+    }
+
+    fn runtime_status(&self) -> TorrentRuntimeStatus {
+        let (process, selected, have) = match &self.torrent_state {
+            TorrentState::Metadata(Downloading {
+                metadata,
+                block_picker,
+                ..
+            }) => {
+                let total = metadata.len();
+                let selected: Vec<u32> = block_picker
+                    .selected_pieces()
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, sel)| sel.then_some(i as u32))
+                    .collect();
+                let have: Vec<u32> = (0..block_picker.n_pieces())
+                    .filter_map(|i| block_picker.have(i as u32).then_some(i as u32))
+                    .collect();
+
+                let process = if total == 0 {
+                    0.0
+                } else {
+                    let mut done: usize = 0;
+                    for i in 0..block_picker.n_pieces() {
+                        if block_picker.have(i as u32) {
+                            done += block_picker.piece_size(i as u32);
+                        }
+                    }
+                    done as f64 / total as f64
+                };
+                (process, selected, have)
+            }
+            TorrentState::Fetching(_) => (0.0, Vec::new(), Vec::new()),
+        };
+
+        let bandwidth_bps = self
+            .connected_peers
+            .values()
+            .map(|p| p.bw.count_avg_bw_in(time::Duration::from_secs(2)) as f64)
+            .sum();
+
+        TorrentRuntimeStatus {
+            info_hash: self.info_hash,
+            process,
+            bandwidth_bps,
+            selected,
+            have,
         }
     }
 

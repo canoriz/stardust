@@ -7,6 +7,7 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1"
+axum = "0.8"
 bon = "3.8.1"
 clap = { version = "4", features = ["derive"] }
 bt_bencode = { git = "https://github.com/canoriz/bt_bencode", rev = "b6b64a9", features = [
