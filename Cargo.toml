@@ -33,6 +33,8 @@ tokio-util = "0.7.15"
 tracing = { version = "0.1.41", features = ["release_max_level_debug"] }
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+eframe = "0.34.2"
+rfd = "0.15"
 
 # [patch."https://github.com/canoriz/bt_bencode"]
 # bt_bencode = { path = "./bt_bencode" }
@@ -54,6 +56,10 @@ path = "src/bin/main.rs"
 [[bin]]
 name = "dht-client"
 path = "src/bin/tools/dht_client.rs"
+
+[[bin]]
+name = "gui"
+path = "src/bin/gui.rs"
 
 [lib]
 path = "src/lib.rs"

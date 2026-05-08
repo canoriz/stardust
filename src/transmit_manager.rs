@@ -166,6 +166,7 @@ pub struct TorrentRuntimeStatus {
     pub bandwidth_bps: f64,
     pub selected: Vec<u32>,
     pub have: Vec<u32>,
+    pub state: RunningStateDump,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -340,22 +341,27 @@ type CheckResult = u8;
 pub struct CheckState {
     state: Vec<CheckResult>,
     known: usize,
+    total_check: usize,
 }
 
 impl CheckState {
-    const UNKNOWN: CheckResult = 0;
-    const VERIFIED: CheckResult = 1;
-    const CORRUPT: CheckResult = 2;
+    pub const UNKNOWN: CheckResult = 0;
+    pub const VERIFIED: CheckResult = 1;
+    pub const CORRUPT: CheckResult = 2;
+    pub const NOT_SELECTED: CheckResult = 3;
 
-    fn new(n: usize) -> Self {
-        Self {
-            state: vec![Self::UNKNOWN; n],
-            known: 0,
+    fn new(n_pieces: usize, to_check: &BTreeSet<u32>) -> Self {
+        let mut state = vec![Self::NOT_SELECTED; n_pieces];
+        for &i in to_check {
+            if (i as usize) < n_pieces {
+                state[i as usize] = Self::UNKNOWN;
+            }
         }
-    }
-
-    fn get(&self, i: usize) -> CheckResult {
-        self.state[i]
+        Self {
+            state,
+            known: 0,
+            total_check: to_check.len(),
+        }
     }
 
     fn check(&mut self, index: usize, ok: bool) {
@@ -369,8 +375,19 @@ impl CheckState {
         }
     }
 
-    fn known(&self) -> usize {
+    pub fn get_state(&self) -> &[CheckResult] {
+        &self.state
+    }
+
+    /// The number of pieces that have been checked so far.
+    pub fn checked_count(&self) -> usize {
         self.known
+    }
+
+    /// The total number of pieces that need to be checked (pieces SELECTED).
+    /// Including checked and not checked pieces.
+    pub fn total_checking_pieces(&self) -> usize {
+        self.total_check
     }
 }
 
@@ -392,6 +409,26 @@ enum RunningState {
         #[serde(skip)]
         waiter: Vec<oneshot::Sender<bool>>,
     }, // checking local file
+}
+
+impl RunningState {
+    /// Dump current state to RunningStateDump, a little bit expensive
+    /// if don't need RunningState anymore, consider using [RunningStateDump::from]
+    pub fn dump(&self) -> RunningStateDump {
+        match self {
+            RunningState::StableState(s) => RunningStateDump::StableState(s.clone()),
+            RunningState::Checking {
+                prev_state,
+                to_check,
+                checked,
+                ..
+            } => RunningStateDump::Checking {
+                prev_state: prev_state.clone(),
+                to_check: to_check.clone(),
+                checked: checked.clone(),
+            },
+        }
+    }
 }
 
 impl From<RunningState> for RunningStateDump {
@@ -1247,6 +1284,7 @@ impl TransmitWorker {
             bandwidth_bps,
             selected,
             have,
+            state: self.running_state.dump(),
         }
     }
 
@@ -1568,6 +1606,7 @@ impl TransmitWorker {
                             if block_picker.is_finished() {
                                 self.running_state =
                                     RunningState::StableState(StableState::Seeding);
+                                self.downloaded.send(true);
                             } else {
                                 self.running_state =
                                     RunningState::StableState(StableState::Downloading);
@@ -2143,6 +2182,11 @@ impl TransmitWorker {
                                 }
                             } else if passed {
                                 self.broadcast_have(ji.index() as u32);
+                                if self.is_downloaded() {
+                                    self.running_state =
+                                        RunningState::StableState(StableState::Seeding);
+                                    self.downloaded.send(true);
+                                }
                             }
                         }
                         None => {}
@@ -2248,7 +2292,7 @@ impl TransmitWorker {
                     let to_check = selected
                         .chain(std::iter::once(first))
                         .collect::<BTreeSet<_>>();
-                    let checked = CheckState::new(block_picker.n_pieces());
+                    let checked = CheckState::new(block_picker.n_pieces(), &to_check);
                     *s = RunningState::Checking {
                         prev_state,
                         checked,
@@ -2468,10 +2512,6 @@ pub(crate) async fn run_transmit_worker(
             Some(msg) = transmit.receiver.recv() => {
                 // debug!("transmit manager received msg {msg:?}");
                 transmit.handle_msg(msg); // TODO: handle result
-                if transmit.is_downloaded() {
-                    transmit.downloaded.send(true);
-                    break;
-                }
             }
             _ = dht_ticker.tick() => {
                 info!("dht ticker tick");

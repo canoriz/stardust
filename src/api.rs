@@ -39,6 +39,7 @@ use tracing::info;
 use crate::metadata::{FileMetadata, Magnet};
 use crate::session::Session;
 use crate::transmit_manager::{RunningCmd, TorrentTask};
+pub use crate::transmit_manager::{CheckState, RunningStateDump, StableState};
 
 // ── request types ────────────────────────────────────────────────────────────
 
@@ -106,6 +107,7 @@ pub enum RpcResponse {
         bandwidth_bps: f64,
         selected: Vec<u32>,
         have: Vec<u32>,
+        state: RunningStateDump,
     },
     /// HTTP accepted Shutdown and queued it for async processing.
     ShutdownAccepted,
@@ -311,6 +313,7 @@ pub async fn handle_rpc(session: &Session, req: RpcRequest) -> (RpcResponse, boo
                         bandwidth_bps: st.bandwidth_bps,
                         selected: st.selected,
                         have: st.have,
+                        state: st.state,
                     },
                     Err(e) => RpcResponse::err(e),
                 },
@@ -372,7 +375,7 @@ async fn do_change_state(
 
 #[cfg(test)]
 mod tests {
-    use super::{RpcRequest, RpcResponse, TorrentSource};
+    use super::{RpcRequest, RpcResponse, RunningStateDump, StableState, TorrentSource};
 
     #[test]
     fn request_deserialize_add_torrent_doc_example() {
@@ -451,11 +454,12 @@ mod tests {
             bandwidth_bps: 12345.0,
             selected: vec![0, 2],
             have: vec![0],
+            state: RunningStateDump::StableState(StableState::Downloading),
         })
         .expect("serialize torrent status");
         assert_eq!(
             status,
-            r#"{"torrent_status":{"info_hash":"001122","process":0.42,"bandwidth_bps":12345.0,"selected":[0,2],"have":[0]}}"#
+            r#"{"torrent_status":{"info_hash":"001122","process":0.42,"bandwidth_bps":12345.0,"selected":[0,2],"have":[0],"state":{"StableState":"Downloading"}}}"#
         );
     }
 
