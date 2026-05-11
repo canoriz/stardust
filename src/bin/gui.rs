@@ -428,10 +428,17 @@ async fn refresh_rows(session: &Session, shared: &Arc<Mutex<Vec<TorrentRow>>>) {
 // ── entry point ───────────────────────────────────────────────────────────────
 
 fn main() {
+    let (non_blocking, _guard) = tracing_appender::non_blocking(std::io::stdout());
     tracing_subscriber::fmt()
+        .with_writer(non_blocking)
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_ansi(false)
         .with_span_events(FmtSpan::CLOSE)
+        .event_format(
+            tracing_subscriber::fmt::format()
+                .with_file(true)
+                .with_line_number(true),
+        )
         .init();
 
     let shared: Arc<Mutex<Vec<TorrentRow>>> = Arc::new(Mutex::new(Vec::new()));

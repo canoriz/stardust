@@ -35,6 +35,7 @@ tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 eframe = "0.34.2"
 rfd = "0.15"
+nix = { version = "0.31.2", features = ["fs"] }
 
 # [patch."https://github.com/canoriz/bt_bencode"]
 # bt_bencode = { path = "./bt_bencode" }

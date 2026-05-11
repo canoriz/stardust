@@ -98,8 +98,16 @@ impl Access for NormalFile {
     }
 
     fn write_all_at(&mut self, buf: &[u8], offset: usize) -> Result<()> {
+        use nix::fcntl::{self, posix_fadvise};
         warn!("write_all begin at offset {offset} len {}", buf.len());
         let r = self.file.write_all_at(buf, offset as u64);
+        posix_fadvise(
+            self.file.as_fd(),
+            offset as i64,
+            buf.len() as i64,
+            fcntl::PosixFadviseAdvice::POSIX_FADV_DONTNEED,
+        )
+        .unwrap_or_else(|e| warn!("posix_fadvise error: {e:?}"));
         warn!("write_all end at offset {offset} len {}", buf.len());
         r
     }

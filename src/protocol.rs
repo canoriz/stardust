@@ -2824,12 +2824,15 @@ async fn recv_handshake<T: AsyncRead + Unpin>(handle: &mut T) -> io::Result<(Inf
             io::ErrorKind::InvalidData,
             "invalid handshake pstrlen",
         ));
-        todo!();
     }
     let mut header = [0u8; 19];
     handle.read_exact(&mut header).await?;
     if header != *b"BitTorrent protocol" {
-        todo!();
+        warn!("invalid handshake header {header:?}");
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid handshake header, maybe encrypted",
+        ));
     }
     let mut reserved = FuncBits::default();
     let mut info_hash = [0u8; 20];
