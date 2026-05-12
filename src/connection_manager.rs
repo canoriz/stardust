@@ -16,7 +16,7 @@ static BLOCK_BUF_POOL: LazyLock<Arc<BufferPool<BytesMut>>> =
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::sync::{CancellationToken, DropGuard};
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, info, instrument, trace, warn};
 
 use crate::buffer_pool::{BlockBuf, BufferPool, PooledBuf};
 use crate::picker::{BlockRequests, PieceState};
@@ -732,15 +732,19 @@ where
 }
 */
 
+#[instrument(skip_all, fields(peer = %peer))]
 fn handle_extended_msg(
     peer: &SocketAddr,
     tmh: &mut TransmitManagerHandle,
     extended: protocol::ExtendedMsg,
 ) -> io::Result<()> {
     match extended {
-        ExtendedMsg::Handshake(hs) => todo!(),
+        ExtendedMsg::Handshake(hs) => {
+            warn!("received unexpected handshake extended message {hs:?}, maybe a protocol error");
+            Ok(())
+        }
         ExtendedMsg::Pex(pex) => {
-            info!("received pex from {peer}, {pex:?}");
+            info!("received pex from, {pex:?}");
             _ = tmh
                 .sender
                 .send(TransmitMsg::PeerMsg(PeerMsg::ExtendPex(*peer, pex)));

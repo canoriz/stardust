@@ -1645,7 +1645,7 @@ impl BitField {
 
     pub fn set(&mut self, bit_index: u32, set: bool) {
         if bit_index as usize >= self.bitfield.len() * 8 {
-            self.resize(bit_index);
+            self.resize(bit_index + 1);
         }
         let u8_index = bit_index >> 3;
         let bit_offset = 7 - (bit_index % 8);
