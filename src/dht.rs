@@ -27,6 +27,14 @@ use routing::dist;
 
 pub type NodeID = [u8; 20];
 
+/// Snapshot of all nodes known to the DHT routing tables at shutdown time.
+/// On restore every node is inserted as unreachable so the DHT re-probes it.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DhtDump {
+    /// (node_id, addr) pairs from the IPv4/IPv6 routing table.
+    pub nodes: Vec<(NodeID, SocketAddr)>,
+}
+
 pub struct DHT {
     id: NodeID,
     port: u16,
@@ -281,6 +289,41 @@ impl DHT {
         self.port
     }
 
+    /// Dump all nodes from both routing tables.
+    /// Returns immediately; the result is fetched from the server task via a oneshot.
+    pub async fn dump_nodes(&self) -> DhtDump {
+        let (tx, rx) = oneshot::channel();
+        if self.tx.send(Req::DumpNodes { tx }).await.is_err() {
+            return DhtDump::default();
+        }
+        rx.await.unwrap_or_default()
+    }
+
+    /// Seed the routing tables with nodes from a previous session dump.
+    /// All nodes are added as unreachable so the DHT re-probes them before
+    /// promoting them to the active `inuse` set.
+    pub fn seed_from_dump(&self, dump: &DhtDump) {
+        let tx = self.tx.clone();
+        let nodes: Vec<NodeAddr> = dump
+            .nodes
+            .iter()
+            .map(|(id, addr)| NodeAddr {
+                id: *id,
+                addr: *addr,
+            })
+            .collect();
+        tokio::spawn(async move {
+            for node in nodes {
+                _ = tx
+                    .send(Req::AddRoute {
+                        addr: node,
+                        reachable: false,
+                    })
+                    .await;
+            }
+        });
+    }
+
     /// Run a dual-stack ipv6 socket listening port.
     /// This socket can receive ipv4 packets from a
     /// v4 mapped v6 address.
@@ -402,8 +445,8 @@ impl DHT {
         }
     }
 
-    /// get k closest nodes to id
-    async fn get_k_closest(&self, id: NodeID, k: usize, ipv6: bool) -> Vec<NodeAddr> {
+    /// get k closest nodes to id from our local routing table
+    async fn get_k_closest_local(&self, id: NodeID, k: usize, ipv6: bool) -> Vec<NodeAddr> {
         let (tx, rx) = oneshot::channel();
 
         async fn wait_result(
@@ -617,8 +660,8 @@ impl DHT {
             .send(Ok(NodeResp {
                 // the first "response" is synthetic, so we can put anything in it
                 id: RpcAddr::no_id(SocketAddr::from(([0, 0, 0, 0], 0))),
-                v4_closest: self.get_k_closest(target, K, false).await,
-                v6_closest: self.get_k_closest(target, K, true).await,
+                v4_closest: self.get_k_closest_local(target, K, false).await,
+                v6_closest: self.get_k_closest_local(target, K, true).await,
                 peers: vec![],
                 token: None,
             }))
@@ -775,6 +818,13 @@ enum Req {
         addr: SocketAddr,
         krpc: KRPC,
     },
+    DumpNodes {
+        tx: oneshot::Sender<DhtDump>,
+    },
+    AddRoute {
+        addr: NodeAddr,
+        reachable: bool,
+    },
 }
 
 type TransactionMap = HashMap<Vec<u8>, oneshot::Sender<io::Result<Resp>>>;
@@ -865,6 +915,20 @@ impl Server {
                     self.route4.get_k_closest_nodes(&id, k, &mut nodes);
                 }
                 _ = tx.send(nodes);
+            }
+            Req::DumpNodes { tx } => {
+                let mut nodes = self.route4.all_nodes();
+                nodes.extend(self.route6.all_nodes());
+                let dump = DhtDump { nodes };
+                _ = tx.send(dump);
+            }
+            Req::AddRoute { addr, reachable } => {
+                let ipv6 = is_ipv6(addr.addr);
+                if ipv6 {
+                    self.route6.add_route(addr, reachable);
+                } else {
+                    self.route4.add_route(addr, reachable);
+                }
             }
         }
     }

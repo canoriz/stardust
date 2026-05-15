@@ -68,11 +68,25 @@ impl RoutingTable {
         }
     }
 
-    /// Add or update a node in the routing table.
-    ///
-    /// `reachable` should be `true` only if this node just replied to one of
-    /// our outgoing requests (proving two-way reachability).  For nodes we
-    /// learned about passively (incoming requests, third-party referrals) pass
+    /// Collect every node currently tracked (inuse + both backup queues).
+    /// Returns `(node_id, socket_addr)` pairs; all will be added as unreachable
+    /// on restore so the DHT re-probes them.
+    pub fn all_nodes(&self) -> Vec<(NodeID, SocketAddr)> {
+        let mut out = Vec::new();
+        for bucket in &self.bucket {
+            for (id, entry) in &bucket.inuse {
+                out.push((*id, entry.addr));
+            }
+            for (id, addr, _) in &bucket.reachable_backup {
+                out.push((*id, *addr));
+            }
+            for (id, addr, _) in &bucket.unreachable_backup {
+                out.push((*id, *addr));
+            }
+        }
+        out
+    }
+
     /// `false`.
     pub fn add_route(&mut self, addr: NodeAddr, reachable: bool) {
         let prefix = common_bits(&self.id, &addr.id) as usize;
@@ -197,69 +211,77 @@ impl RoutingTable {
         // target ^ N.id = (target ^ self.id) ^ (self.id ^ N.id)
         // Because (self.id ^ N.id) is in bucket i, (self.id ^ N.id) has i leading 0 bits
         // the possible range of (target ^ N.id) can be determined
-        // t = (target ^ N.id)
-        // t ^ (self.id ^ N.id) will range in
-        // bits
-        // 0   1   .. i   i+1        i+2  i+3  i+4 ..  159
-        // -----------------------------------------------
-        // t0  t1  .. ti  t_(i+1)^1  0    0    0   ..  0
-        // -----------------------------------------------
-        // to
-        // t0  t1  .. ti  t_(i+1)^1  1    1    1   ..  1
+        // t = (target ^ self.id)
+        // target ^ N.id = t ^ (self.id ^ N.id) will range in
+        // (all bit indices are 0-based from MSB)
+        // bit:  0     1    ..  i-1      i        i+1  i+2  ..  159
+        // -------------------------------------------------------
+        // min:  t[0]  t[1] .. t[i-1]   t[i]^1    0    0   ..  0
+        // -------------------------------------------------------
+        // max:  t[0]  t[1] .. t[i-1]   t[i]^1    1    1   ..  1
+        //
+        // t[0..i-1] are fixed (same as in t) because d[0..i-1]=0.
+        // t[i]^1 is fixed because we are at bucket[i], all node in bucket[i]
+        // must haved[i]=1 (the first differing bit), otherwise they would not be in this bucket.
+        // bits i+1..159 are free (d[i+1..159] can be anything).
         let t = dist(id, &self.id);
         let mut closest: BTreeSet<Dist> = BTreeSet::new();
 
-        let find_closer = |j: i32, bucket: &Bucket, closest: &mut BTreeSet<Dist>| {
-            // mask_upper = (1 << j) - 1
-            // mask_lower = ~mask_upper
-            let mask_upper = j_ending_ones(j); // 00011111 j ones;
-            let mask_lower = bitwise_not(mask_upper); // 11100000 j zeros
-            let xor_mask = j_one_only(j);
-            // upper = (t ^ xor_mask) | mask_upper
-            // lower = (t ^ xor_mask) & mask_lower;
-            use core::ops::{BitAnd, BitXor};
-            let tmp = bitwise_op(t, xor_mask, u8::bitxor);
-            // let upper = bitwise_op(tmp, mask_upper, u8::bitor);
-            let lower = bitwise_op(tmp, mask_lower, u8::bitand);
+        let find_closer =
+            |common_prefix_with_self: usize, bucket: &Bucket, closest: &mut BTreeSet<Dist>| {
+                let j = (BUCKET_MAX - common_prefix_with_self) as i32;
+                // For bucket[i], nodes have d = dist(node, self.id) where d[0..i-1]=0 and d[i]=1.
+                // So target XOR node = t XOR d, where:
+                //   xor_mask  = bit i from MSB (= shift_left_by(j), since j-1 from LSB = bit i from MSB)
+                //   upper_mask = bits i+1..159 from MSB (the unconstrained bits, j-1 ones from LSB)
+                //   lower_mask = bits 0..i from MSB (the i+1 constrained bits)
+                //
+                //   lower = (t ^ xor_mask) & lower_mask = [t[0..i-1], t[i]^1, 0..0]
+                //   upper = (t ^ xor_mask) | upper_mask = [t[0..i-1], t[i]^1, 1..1]
+                let xor_mask = one_at_j_bit_only(j - 1); // bit i from MSB
+                let upper_mask = j_ending_ones(j - 1); // bits i+1..159 from MSB
+                let lower_mask = bitwise_not(upper_mask); // bits 0..i from MSB
+                use core::ops::{BitAnd, BitXor};
+                let tmp = bitwise_op(t, xor_mask, u8::bitxor);
+                let lower = bitwise_op(tmp, lower_mask, u8::bitand);
+                // let upper = bitwise_op(tmp, upper_mask, u8::bitor);
 
-            let add_nodes = if let Some(Dist { dist, .. }) = closest.last() {
-                // only add nodes closest have less than k node inside
-                // of if this bucket's possible minimum distance is lesser
-                // than closest have.
-                lower < *dist || closest.len() < k
-            } else {
-                true
+                let add_nodes = if let Some(Dist { dist, .. }) = closest.last() {
+                    // only add nodes when closest have less than k node inside
+                    // or
+                    // if this bucket's possible minimum distance is lesser
+                    // than closest have.
+                    lower < *dist || closest.len() < k
+                } else {
+                    true
+                };
+
+                if add_nodes {
+                    // only add nodes if this bucket may contains closer nodes
+                    for (nid, entry) in bucket.inuse.iter() {
+                        closest.insert(Dist {
+                            dist: dist(id, nid),
+                            addr: NodeAddr {
+                                id: *nid,
+                                addr: entry.addr,
+                            },
+                        });
+                    }
+                    while closest.len() > k {
+                        closest.pop_last();
+                    }
+                }
             };
-
-            if add_nodes {
-                // only add nodes if this bucket may contains closer nodes
-                for (nid, entry) in bucket.inuse.iter() {
-                    closest.insert(Dist {
-                        dist: dist(id, nid),
-                        addr: NodeAddr {
-                            id: *nid,
-                            addr: entry.addr,
-                        },
-                    });
-                }
-                while closest.len() > k {
-                    closest.pop_last();
-                }
-            }
-        };
 
         let prefix = common_bits(&self.id, &id) as usize;
 
         // iterating from bucket [prefix] to END
-        for (mut i, bucket) in self.bucket[prefix..BUCKET_MAX].iter().enumerate() {
-            i = i + prefix; // bucket i
-            let j = BUCKET_MAX - i;
-            find_closer(j as i32, bucket, &mut closest);
+        for (i, bucket) in self.bucket[prefix..BUCKET_MAX].iter().enumerate() {
+            find_closer(i + prefix, bucket, &mut closest);
         }
         // then iterating from prefix down to 0
-        for (i, bucket) in self.bucket[..prefix].iter().enumerate() {
-            let j = BUCKET_MAX - i;
-            find_closer(j as i32, bucket, &mut closest);
+        for (i, bucket) in self.bucket[..prefix].iter().enumerate().rev() {
+            find_closer(i, bucket, &mut closest);
         }
         *nodes = closest.into_iter().map(|Dist { addr, .. }| addr).collect()
     }
@@ -305,14 +327,14 @@ fn j_ending_ones(mut j: i32) -> [u8; 20] {
     ret
 }
 
-/// simulating 1 << j;
-fn j_one_only(mut j: i32) -> [u8; 20] {
+/// place a 1 at bit j (0-based from LSB)
+fn one_at_j_bit_only(mut j: i32) -> [u8; 20] {
     let mut ret = [0u8; 20];
     for n in ret.iter_mut().rev() {
         match j {
-            ..=0 => break,
-            1..=8 => {
-                *n = 1 << (j - 1);
+            ..0 => break,
+            0..8 => {
+                *n = 1 << j;
                 j -= 8;
             }
             _ => j -= 8,
@@ -392,21 +414,21 @@ mod test {
 
     #[test]
     fn test_j_one_only() {
-        let a = j_one_only(0);
+        let a = one_at_j_bit_only(0);
         let exp = [
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
         ];
         assert_eq!(a, exp);
 
-        let a = j_one_only(27);
+        let a = one_at_j_bit_only(27);
         let exp = [
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x08, 0x00, 0x00, 0x00,
         ];
         assert_eq!(a, exp);
 
-        let a = j_one_only(160);
+        let a = one_at_j_bit_only(159);
         let exp = [
             0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00,

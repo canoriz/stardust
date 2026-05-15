@@ -13,7 +13,7 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{info, warn};
 
 use crate::cache::cache_manager::{CacheManager, CacheManagerHandle};
-use crate::dht::{self, DHT};
+use crate::dht::{self, DhtDump, DHT};
 use crate::metadata::Magnet;
 use crate::protocol::{AcceptOpt, BTStream, HandshakeOption, InfoHash};
 use crate::torrent_manager::{TorrentManagerHandle, TransmitManagerSender};
@@ -26,6 +26,8 @@ use crate::{announce_manager, Reunite, Split};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionDump {
     pub torrents: Vec<TransmitDump>,
+    #[serde(default)]
+    pub dht_nodes: Option<DhtDump>,
 }
 
 pub struct Session {
@@ -49,6 +51,8 @@ pub struct SessionOpt {
 
     // TODO: support uTP and dht in same port
     dht_port: Option<u16>,
+
+    previous: Option<SessionDump>,
 }
 
 impl Session {
@@ -64,28 +68,17 @@ impl Session {
         };
         tokio::spawn(run_listener(l, opt.port));
 
+        // TODO: cache manager should take cancellation token
+        let (cache_manager, cache_handle) = CacheManager::new();
+        // TODO: maybe let new to start the task, not manually spawn here
+        tokio::spawn(cache_manager.run());
+
         // TODO: clients connect to us who prefers uTP will be rejected by our DHT handler
         // and not trying to connect with TCP
         // support dual protocol on DHT port, or choose a different dht/tcp port
         let dht_client = if let Some(dht_port) = opt.dht_port {
             let dht_client = Arc::new(DHT::new(opt.self_id, dht_port, "ST01".into()));
             let c = dht_client.clone();
-
-            // TODO: optimize: maybe wait dht bootstrap done then return session
-            // TODO: share dht network between sessions?
-            // tokio::spawn(async move {
-            //     _ = c
-            //         .ping_rpc(
-            //             dht::RpcAddr::NoID(
-            //                 "[240e:b8f:5c11:9f00:560d:1feb:27b8:741]:60981"
-            //                     .parse()
-            //                     .unwrap(),
-            //             ),
-            //             time::Duration::from_secs(5),
-            //         )
-            //         .await;
-            //     c.find_closest_node_to(opt.self_id, true).await;
-            // });
 
             tokio::spawn(async move {
                 // Ping well-known public bootstrap nodes concurrently to seed the routing tables.
@@ -145,26 +138,12 @@ impl Session {
                 c.get_peers(opt.self_id).await;
             });
 
-            // tokio::spawn(async move {
-            //     _ = c
-            //         .ping_rpc(
-            //             dht::RpcAddr::NoID("[::1]:51774".parse().unwrap()),
-            //             time::Duration::from_secs(5),
-            //         )
-            //         .await;
-            //     c.find_closest_node_to(opt.self_id, true).await;
-            // });
             Some(dht_client)
         } else {
             None
         };
 
-        // TODO: cache manager should take cancellation token
-        let (cache_manager, cache_handle) = CacheManager::new();
-        // TODO: maybe let new to start the task, not manually spawn here
-        tokio::spawn(cache_manager.run());
-
-        Self {
+        let s = Self {
             self_id: opt.self_id,
             tasks,
             port: opt.port,
@@ -172,6 +151,12 @@ impl Session {
             cache_handle,
             cancel: cancel.clone(),
             _cancel: cancel.drop_guard(),
+        };
+
+        if let Some(previous_session) = opt.previous {
+            s.restore_from_dump(previous_session)
+        } else {
+            s
         }
     }
 
@@ -204,6 +189,11 @@ impl Session {
 
     /// Dump progress of every active torrent task.
     pub async fn dump(self) -> SessionDump {
+        let dht_nodes = if let Some(ref dht) = self.dht_client {
+            Some(dht.dump_nodes().await)
+        } else {
+            None
+        };
         let handles: Vec<_> = {
             let mut guard = self.tasks.lock().unwrap();
             guard.drain().map(|(_, h)| h).collect()
@@ -217,7 +207,10 @@ impl Session {
                 }
             }
         }
-        SessionDump { torrents }
+        SessionDump {
+            torrents,
+            dht_nodes,
+        }
     }
 
     /// Restore a `Session` from a previously obtained `SessionDump`.
@@ -226,20 +219,24 @@ impl Session {
     /// URLs, and previously connected peers are all restored without a
     /// message round-trip.  Torrents that were actively downloading or seeding
     /// are resumed; paused/stopped ones remain in their previous state.
-    pub fn restore_from_dump(dump: SessionDump, opt: SessionOpt) -> Self {
-        let session = Self::new(opt);
+    /// The shared parts (listener, cache manager) are already restored, now restoring
+    /// dht routes and torrent tasks.
+    fn restore_from_dump(self, dump: SessionDump) -> Self {
+        if let (Some(dht), Some(ref nodes)) = (self.dht_client.as_ref(), &dump.dht_nodes) {
+            dht.seed_from_dump(nodes);
+        }
         for torrent_dump in dump.torrents {
             let info_hash = torrent_dump.info_hash();
             let tm = TorrentManagerHandle::restore_from_dump(
                 torrent_dump,
-                session.self_id,
-                session.port,
-                session.dht_client.clone(),
-                session.cache_handle.clone(),
+                self.self_id,
+                self.port,
+                self.dht_client.clone(),
+                self.cache_handle.clone(),
             );
-            session.tasks.lock().unwrap().insert(info_hash, tm);
+            self.tasks.lock().unwrap().insert(info_hash, tm);
         }
-        session
+        self
     }
 
     /// Dump all torrent tasks then cancel the session (listener + DHT).

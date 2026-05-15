@@ -12,7 +12,7 @@
 //!   - a `CancellationToken`       (GUI window close → backend shutdown)
 
 use eframe::egui;
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc as std_mpsc, Arc, Mutex};
 use std::thread;
 use tokio::sync::mpsc as async_mpsc;
 use tokio::sync::oneshot;
@@ -58,6 +58,8 @@ impl Default for TorrentRow {
 struct GuiApp {
     cmd_tx: async_mpsc::UnboundedSender<RpcRequest>,
     shared: Arc<Mutex<Vec<TorrentRow>>>,
+    /// Receives a `()` from the ctrl-c listener task; triggers a graceful close.
+    ctrl_c_rx: std_mpsc::Receiver<()>,
 
     // Add-torrent dialog state
     show_add: bool,
@@ -70,10 +72,12 @@ impl GuiApp {
     fn new(
         cmd_tx: async_mpsc::UnboundedSender<RpcRequest>,
         shared: Arc<Mutex<Vec<TorrentRow>>>,
+        ctrl_c_rx: std_mpsc::Receiver<()>,
     ) -> Self {
         Self {
             cmd_tx,
             shared,
+            ctrl_c_rx,
             show_add: false,
             add_input: String::new(),
             file_rx: None,
@@ -86,6 +90,11 @@ impl eframe::App for GuiApp {
         let ctx = ui.ctx().clone();
         // Trigger a repaint every 500 ms so speed / progress stay fresh.
         ctx.request_repaint_after(std::time::Duration::from_millis(500));
+
+        // If the ctrl-c listener task fired, close the viewport gracefully.
+        if self.ctrl_c_rx.try_recv().is_ok() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
 
         // ── top toolbar ──────────────────────────────────────────────────────
         egui::Panel::top("toolbar").show_inside(ui, |ui| {
@@ -324,12 +333,24 @@ async fn backend_main(
     mut cmd_rx: async_mpsc::UnboundedReceiver<RpcRequest>,
     shared: Arc<Mutex<Vec<TorrentRow>>>,
     shutdown: CancellationToken,
+    gui_ctrl_c_tx: std_mpsc::Sender<()>,
 ) {
+    // Dedicated task: waits for ctrl-c, then notifies both the GUI and the
+    // backend select loop so both sides shut down gracefully.
+    {
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                tracing::info!("ctrl-c received — notifying GUI and backend");
+                let _ = gui_ctrl_c_tx.send(());
+                shutdown.cancel();
+            }
+        });
+    }
     let opt = SessionOpt::builder()
         .self_id(SELF_ID)
         .port(TCP_PORT)
-        .maybe_dht_port(Some(DHT_PORT))
-        .build();
+        .maybe_dht_port(Some(DHT_PORT));
 
     let session = {
         let path = std::path::Path::new(SESSION_FILE);
@@ -338,20 +359,21 @@ async fn backend_main(
                 Ok(data) => match serde_json::from_str::<SessionDump>(&data) {
                     Ok(dump) => {
                         tracing::info!("restoring session from {SESSION_FILE}");
-                        Session::restore_from_dump(dump, opt)
+                        let opt = opt.previous(dump);
+                        Session::new(opt.build())
                     }
                     Err(e) => {
                         tracing::warn!("failed to parse {SESSION_FILE}: {e} — starting fresh");
-                        Session::new(opt)
+                        Session::new(opt.build())
                     }
                 },
                 Err(e) => {
                     tracing::warn!("failed to read {SESSION_FILE}: {e} — starting fresh");
-                    Session::new(opt)
+                    Session::new(opt.build())
                 }
             }
         } else {
-            Session::new(opt)
+            Session::new(opt.build())
         }
     };
 
@@ -444,6 +466,8 @@ fn main() {
     let shared: Arc<Mutex<Vec<TorrentRow>>> = Arc::new(Mutex::new(Vec::new()));
     let (cmd_tx, cmd_rx) = async_mpsc::unbounded_channel::<RpcRequest>();
     let shutdown = CancellationToken::new();
+    // Channel for the ctrl-c task to signal the GUI to close its viewport.
+    let (gui_ctrl_c_tx, gui_ctrl_c_rx) = std_mpsc::channel::<()>();
 
     // Launch the tokio backend on a dedicated OS thread.
     let backend_handle = {
@@ -454,7 +478,7 @@ fn main() {
                 .enable_all()
                 .build()
                 .expect("failed to build tokio runtime");
-            rt.block_on(backend_main(cmd_rx, shared, shutdown));
+            rt.block_on(backend_main(cmd_rx, shared, shutdown, gui_ctrl_c_tx));
         })
     };
 
@@ -469,7 +493,7 @@ fn main() {
     if let Err(e) = eframe::run_native(
         "Stardust",
         options,
-        Box::new(move |_cc| Ok(Box::new(GuiApp::new(cmd_tx, shared)))),
+        Box::new(move |_cc| Ok(Box::new(GuiApp::new(cmd_tx, shared, gui_ctrl_c_rx)))),
     ) {
         eprintln!("eframe error: {e}");
     }
@@ -480,4 +504,5 @@ fn main() {
     if let Err(e) = backend_handle.join() {
         eprintln!("backend thread panicked: {e:?}");
     }
+    println!("Goodbye!");
 }

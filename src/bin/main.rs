@@ -48,17 +48,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let opt = SessionOpt::builder()
         .self_id(SELF_ID)
         .port(args.port)
-        .maybe_dht_port(args.dht_port)
-        .build();
+        .maybe_dht_port(args.dht_port);
 
     let session = match &args.session {
         Some(path) if path.exists() => {
             let data = std::fs::read_to_string(path)?;
             let dump: SessionDump = serde_json::from_str(&data)?;
+            let opt = opt.previous(dump);
             tracing::info!("restoring session from {}", path.display());
-            Session::restore_from_dump(dump, opt)
+            Session::new(opt.build())
         }
-        _ => Session::new(opt),
+        _ => Session::new(opt.build()),
     };
 
     #[cfg(feature = "mock_delay")]
@@ -69,7 +69,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<stardust::api::ApiCommand>();
 
     // Start the API server in the background.
-    tokio::spawn(stardust::api::serve(args.api_port, cmd_tx, shutdown.clone()));
+    tokio::spawn(stardust::api::serve(
+        args.api_port,
+        cmd_tx,
+        shutdown.clone(),
+    ));
 
     // Main loop owns session and processes forwarded API commands.
     loop {
