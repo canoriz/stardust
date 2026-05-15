@@ -1,3 +1,4 @@
+use bon::Builder;
 use bt_bencode::ByteString;
 use bt_bencode::Value as BtValue;
 use derivative::Derivative;
@@ -11,6 +12,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time;
+use tokio::net::lookup_host;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::{CancellationToken, DropGuard};
@@ -35,10 +37,23 @@ pub struct DhtDump {
     pub nodes: Vec<(NodeID, SocketAddr)>,
 }
 
+/// Per-bootstrap-node tracking state for on-demand ping logic.
+struct BootstrapNodeState {
+    /// Number of ping attempts to this node.
+    attempt_v4: u32,
+    attempt_v6: u32,
+    /// When the last ping attempt was sent (for rate-limiting).
+    last_v4_ping_attempt: Option<time::Instant>,
+    last_v6_ping_attempt: Option<time::Instant>,
+}
+
 pub struct DHT {
     id: NodeID,
     port: u16,
     version: String,
+
+    // bootstrap nodes: domain -> state
+    bootstrap_nodes: Mutex<HashMap<String, BootstrapNodeState>>,
 
     tid: AtomicU64,
 
@@ -265,22 +280,49 @@ pub struct GetPeersResult {
     pub closest: Vec<(RpcAddr<SocketAddr>, Option<AnnounceToken>)>,
 }
 
+#[derive(Builder)]
+pub struct DHTOption {
+    id: NodeID,
+    port: u16,
+    version: String,
+
+    #[builder(default)]
+    bootstrap_nodes: Vec<String>,
+}
+
 impl DHT {
-    pub fn new(id: NodeID, port: u16, version: String) -> Self {
+    pub fn new(opt: DHTOption) -> Self {
         let (tx, rx) = mpsc::channel(2048);
         let tmap = Arc::new(Mutex::new(HashMap::new()));
         let cancel_token = CancellationToken::new();
 
-        if let Err(e) = DHT::run_ipv6(id, port, rx, tmap.clone(), cancel_token.clone()) {
+        if let Err(e) = DHT::run_ipv6(opt.id, opt.port, rx, tmap.clone(), cancel_token.clone()) {
             warn!("dht start v6 server error {e}");
         }
+
+        let bootstrap_nodes = opt
+            .bootstrap_nodes
+            .into_iter()
+            .map(|node| {
+                (
+                    node,
+                    BootstrapNodeState {
+                        attempt_v4: 0,
+                        attempt_v6: 0,
+                        last_v4_ping_attempt: None,
+                        last_v6_ping_attempt: None,
+                    },
+                )
+            })
+            .collect();
         Self {
-            id,
-            port,
-            version,
+            id: opt.id,
+            port: opt.port,
+            version: opt.version,
             tx,
             tid: 0.into(),
             tmap,
+            bootstrap_nodes: Mutex::new(bootstrap_nodes),
             _cancel_token: cancel_token.drop_guard(),
         }
     }
@@ -300,10 +342,8 @@ impl DHT {
     }
 
     /// Seed the routing tables with nodes from a previous session dump.
-    /// All nodes are added as unreachable so the DHT re-probes them before
-    /// promoting them to the active `inuse` set.
-    pub fn seed_from_dump(&self, dump: &DhtDump) {
-        let tx = self.tx.clone();
+    /// Send a get_peer to each nodes
+    pub fn seed_from_dump(self: &Arc<Self>, dump: &DhtDump) {
         let nodes: Vec<NodeAddr> = dump
             .nodes
             .iter()
@@ -312,16 +352,19 @@ impl DHT {
                 addr: *addr,
             })
             .collect();
-        tokio::spawn(async move {
-            for node in nodes {
-                _ = tx
-                    .send(Req::AddRoute {
-                        addr: node,
-                        reachable: false,
-                    })
+        let self_id = self.id;
+        for node in nodes {
+            let dht = self.clone();
+            tokio::spawn(async move {
+                let _ = dht
+                    .get_peers_rpc(
+                        RpcAddr::id(node.id, node.addr),
+                        self_id,
+                        time::Duration::from_secs(10),
+                    )
                     .await;
-            }
-        });
+            });
+        }
     }
 
     /// Run a dual-stack ipv6 socket listening port.
@@ -446,7 +489,12 @@ impl DHT {
     }
 
     /// get k closest nodes to id from our local routing table
-    async fn get_k_closest_local(&self, id: NodeID, k: usize, ipv6: bool) -> Vec<NodeAddr> {
+    async fn get_k_closest_local(
+        self: &Arc<Self>,
+        id: NodeID,
+        k: usize,
+        ipv6: bool,
+    ) -> Vec<NodeAddr> {
         let (tx, rx) = oneshot::channel();
 
         async fn wait_result(
@@ -460,7 +508,7 @@ impl DHT {
             }
         }
 
-        let mut nodes = {
+        let nodes = {
             _ = self.tx.send(Req::GetClosestNodes { ipv6, id, k, tx }).await;
             match wait_result(rx).await {
                 Ok(r) => r,
@@ -472,8 +520,87 @@ impl DHT {
             }
         };
 
-        nodes.sort_by_cached_key(|n| dist(&id, &n.id));
+        if nodes.len() < k {
+            self.ping_bootstrap_node(ipv6, id);
+        }
         nodes
+    }
+
+    /// send bootstrap nodes a GetPeer request for target
+    fn ping_bootstrap_node(self: &Arc<Self>, ipv6: bool, target: NodeID) {
+        /// Stop bootstrapping a node after this many successful pings.
+        const MAX_SUCCESS: u32 = 3;
+        /// Minimum interval between ping attempts to the same bootstrap node.
+        const MIN_INTERVAL: time::Duration = time::Duration::from_secs(1);
+
+        let mut guard = self.bootstrap_nodes.lock().unwrap();
+        let now = time::Instant::now();
+
+        // Pick the first eligible candidate for the requested IP family.
+        // "Eligible" means: under the attempt cap and not rate-limited.
+        let mut candidates = guard.iter_mut().filter(|(_, state)| {
+            let (attempt, last) = if ipv6 {
+                (state.attempt_v6, state.last_v6_ping_attempt)
+            } else {
+                (state.attempt_v4, state.last_v4_ping_attempt)
+            };
+            attempt < MAX_SUCCESS && last.map_or(true, |t| now.duration_since(t) >= MIN_INTERVAL)
+        });
+
+        if let Some((node, state)) = candidates.next() {
+            let query_node = node.clone();
+            let cl = self.clone();
+            if ipv6 {
+                state.attempt_v6 += 1;
+                state.last_v6_ping_attempt = Some(now);
+            } else {
+                state.attempt_v4 += 1;
+                state.last_v4_ping_attempt = Some(now);
+            }
+            tokio::spawn(async move {
+                // Try candidates in order. Stop at the first node that has a
+                // matching address family and accepts a ping.
+                let addrs = match lookup_host(&query_node).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!("dht bootstrap resolve {} failed: {}", query_node, e);
+                        cl.ping_bootstrap_node(ipv6, target);
+                        return;
+                    }
+                };
+
+                let mut addr = None;
+                for a in addrs {
+                    match a {
+                        SocketAddr::V4(_) if !ipv6 => addr = Some(a),
+                        SocketAddr::V6(v) => match v.ip().to_ipv4_mapped() {
+                            Some(_) if !ipv6 => addr = Some(a),
+                            None if ipv6 => addr = Some(a),
+                            _ => {}
+                        },
+                        _ => {}
+                    }
+                }
+
+                let ping_addr = match addr {
+                    Some(a) => a,
+                    None => {
+                        debug!(
+                            "dht bootstrap: no {} address for {}, trying next node",
+                            if ipv6 { "IPv6" } else { "IPv4" },
+                            query_node
+                        );
+                        cl.ping_bootstrap_node(ipv6, target);
+                        return;
+                    }
+                };
+
+                debug!("nodes not enough, ping bootstrap node {}", query_node);
+                _ = cl
+                    .get_peers_rpc(RpcAddr::no_id(ping_addr), target, time::Duration::from_secs(3))
+                    .await;
+            });
+        }
     }
 
     pub async fn ping_rpc<A>(
@@ -821,10 +948,6 @@ enum Req {
     DumpNodes {
         tx: oneshot::Sender<DhtDump>,
     },
-    AddRoute {
-        addr: NodeAddr,
-        reachable: bool,
-    },
 }
 
 type TransactionMap = HashMap<Vec<u8>, oneshot::Sender<io::Result<Resp>>>;
@@ -921,14 +1044,6 @@ impl Server {
                 nodes.extend(self.route6.all_nodes());
                 let dump = DhtDump { nodes };
                 _ = tx.send(dump);
-            }
-            Req::AddRoute { addr, reachable } => {
-                let ipv6 = is_ipv6(addr.addr);
-                if ipv6 {
-                    self.route6.add_route(addr, reachable);
-                } else {
-                    self.route4.add_route(addr, reachable);
-                }
             }
         }
     }

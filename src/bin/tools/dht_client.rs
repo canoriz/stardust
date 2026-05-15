@@ -1,7 +1,7 @@
 use core::time;
 use std::{sync::Arc, time::Duration};
 
-use stardust::dht::{NodeID, RpcAddr, DHT};
+use stardust::dht::{DHTOption, NodeID, RpcAddr, DHT};
 use tokio::{
     io::{stdin, stdout, AsyncBufReadExt, AsyncWriteExt, BufReader},
     time::timeout,
@@ -30,30 +30,13 @@ async fn main() -> std::io::Result<()> {
     //     0xbb, 0x73, 0xfa, 0x11, 0x7e,
     // ];
 
-    let client = Arc::new(DHT::new(id, 49999, "ST01".into()));
-    let r = timeout(
-        time::Duration::from_millis(5000),
-        client.ping_rpc(
-            RpcAddr::no_id("[240e:b8f:5c68:8400:4c07:3e69:7b5a:741]:59999"),
-            time::Duration::from_secs(4),
-        ),
-    )
-    .await
-    .unwrap();
-    println!("ping {:?}", r);
-
-    let r = client
-        .find_node_rpc(
-            RpcAddr::no_id("[240e:b8f:5c68:8400:4c07:3e69:7b5a:741]:59999"),
-            id,
-            time::Duration::from_secs(4),
-        )
-        .await
-        .unwrap();
-    println!("find node {:?}", r);
-
-    let res = client.get_peers(id).await;
-    println!("find_closest {:?}", res);
+    let dht_opt = DHTOption::builder()
+        .id(id)
+        .port(49999)
+        .version("ST01".into())
+        .bootstrap_nodes(vec!["[2408:820c:5b38:1c0:ba6d:9133:2cac:b62b]:60416".into()])
+        .build();
+    let client = Arc::new(DHT::new(dht_opt));
 
     // Wrap it in a BufReader for efficient line-by-line reading.
     let mut reader = BufReader::new(stdin()).lines();

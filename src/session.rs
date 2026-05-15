@@ -13,7 +13,7 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{info, warn};
 
 use crate::cache::cache_manager::{CacheManager, CacheManagerHandle};
-use crate::dht::{self, DhtDump, DHT};
+use crate::dht::{self, DHTOption, DhtDump, DHT};
 use crate::metadata::Magnet;
 use crate::protocol::{AcceptOpt, BTStream, HandshakeOption, InfoHash};
 use crate::torrent_manager::{TorrentManagerHandle, TransmitManagerSender};
@@ -77,68 +77,19 @@ impl Session {
         // and not trying to connect with TCP
         // support dual protocol on DHT port, or choose a different dht/tcp port
         let dht_client = if let Some(dht_port) = opt.dht_port {
-            let dht_client = Arc::new(DHT::new(opt.self_id, dht_port, "ST01".into()));
-            let c = dht_client.clone();
-
-            tokio::spawn(async move {
-                // Ping well-known public bootstrap nodes concurrently to seed the routing tables.
-                const BOOTSTRAP_NODES: &[&str] = &[
-                    // "router.bittorrent.com:6881",
-                    // "router.utorrent.com:6881",
-                    "[2408:820c:5b38:1c0:ba6d:9133:2cac:b62b]:60416",
-                    // "dht.transmissionbt.com:6881",
-                    // "dht.libtorrent.org:25401",
-                ];
-                let timeout = time::Duration::from_secs(15);
-                let mut tasks = tokio::task::JoinSet::new();
-                for &node in BOOTSTRAP_NODES {
-                    let cl = c.clone();
-                    tasks.spawn(async move {
-                        // Try both families explicitly: one IPv4 and one IPv6 per hostname.
-                        let addrs = match lookup_host(node).await {
-                            Ok(v) => v,
-                            Err(e) => {
-                                warn!("dht bootstrap resolve {} failed: {}", node, e);
-                                return;
-                            }
-                        };
-
-                        let mut v4 = None;
-                        let mut v6 = None;
-                        for addr in addrs {
-                            match addr {
-                                SocketAddr::V4(_) if v4.is_none() => v4 = Some(addr),
-                                SocketAddr::V6(v)
-                                    if v.ip().to_ipv4_mapped().is_none() && v6.is_none() =>
-                                {
-                                    v6 = Some(SocketAddr::V6(v))
-                                }
-                                _ => {}
-                            }
-                            if v4.is_some() && v6.is_some() {
-                                break;
-                            }
-                        }
-
-                        if let Some(addr) = v4 {
-                            if let Err(e) = cl.ping_rpc(dht::RpcAddr::no_id(addr), timeout).await {
-                                warn!("dht bootstrap v4 ping {} failed: {}", addr, e);
-                            }
-                        }
-
-                        if let Some(addr) = v6 {
-                            if let Err(e) = cl.ping_rpc(dht::RpcAddr::no_id(addr), timeout).await {
-                                warn!("dht bootstrap v6 ping {} failed: {}", addr, e);
-                            }
-                        }
-                    });
-                }
-                while tasks.join_next().await.is_some() {}
-                // Populate both ipv4 and ipv6 routing tables
-                c.get_peers(opt.self_id).await;
-            });
-
-            Some(dht_client)
+            let dht_opt = DHTOption::builder()
+                .id(opt.self_id)
+                .port(dht_port)
+                .version("ST01".into())
+                .bootstrap_nodes(vec![
+                    // "router.bittorrent.com:6881".into(),
+                    // "router.utorrent.com:6881".into(),
+                    "[2408:820c:5b38:440:eef2:2ba6:d8be:5f31]:53866".into(),
+                    // "dht.transmissionbt.com:6881".into(),
+                    // "dht.libtorrent.org:25401".into(),
+                ])
+                .build();
+            Some(Arc::new(DHT::new(dht_opt)))
         } else {
             None
         };

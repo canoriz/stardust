@@ -219,9 +219,9 @@ impl eframe::App for GuiApp {
 
                         // ── data rows ──
                         for row in &rows {
-                            // Abbreviated info hash (first 16 hex chars)
-                            let short = row.info_hash.get(..16).unwrap_or(&row.info_hash);
-                            ui.monospace(egui::RichText::new(short).color(egui::Color32::GRAY));
+                            ui.monospace(
+                                egui::RichText::new(&row.info_hash).color(egui::Color32::GRAY),
+                            );
 
                             // Progress bar
                             let pct = row.progress as f32;

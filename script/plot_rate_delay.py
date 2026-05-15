@@ -54,40 +54,40 @@ def fit_distributions(delays):
 def parse_log_content(lines):
     # 正则1: 原始采样 (add sample)
     sample_re = re.compile(
-        r"src/transmit_manager\.rs:\d+:\s+(?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+)\s+add bw sample Some\((?P<delay>[\d.]+)(?P<unit>ns|us|µs|ms|s)\), inflight [\d.]+ inflight when sent Some\((?P<inflight>\d+)\)"
+        r"stardust::transmit_manager:\s+(?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+)\s+add bw sample Some\((?P<delay>[\d.]+)(?P<unit>ns|us|µs|ms|s)\), inflight [\d.]+ inflight when sent Some\((?P<inflight>\d+)\)"
     )
     # Regex for different modes
     # ProbeBW
     probe_re = re.compile(
-        r"stardust::transmit_manager: src/transmit_manager\.rs:\d+: (?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+) ProbeBW mode cycle (?P<cycle>\d+) capacity (?P<capacity>\d+) min rtt (?P<min_rtt>[\d.]+)ms probe rtt (?P<probe_rtt>[\d.]+)ms avg bw (?P<bw>[\d.]+) avg_bw_10s (?P<bw10>[\d.]+) max_bw (?P<max_bw>[\d.]+) req in flight (?P<req_if>\d+)"
+        r"stardust::transmit_manager:\s+(?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+)\s+ProbeBW mode cycle (?P<cycle>\d+) capacity (?P<capacity>\d+) min rtt (?P<min_rtt>[\d.]+)ms probe rtt (?P<probe_rtt>[\d.]+)ms avg bw (?P<bw>[\d.]+) avg_bw_10s (?P<bw10>[\d.]+) max_bw (?P<max_bw>[\d.]+) req in flight (?P<req_if>\d+)"
     )
     # Startup
     startup_re = re.compile(
-        r"stardust::transmit_manager: src/transmit_manager\.rs:\d+: (?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+) in (?P<mode>Startup) mode, cwnd (?P<cwnd>\d+), inflight (?P<inflight>\d+) prev max bw (?P<prev_max_bw>[\d.]+), avg-bw (?P<bw>[\d.]+) avg_bw_10s (?P<bw10>[\d.]+) new max bw (?P<max_bw>[\d.]+), limit count (?P<limit_count>\d+)"
+        r"stardust::transmit_manager:\s+(?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+)\s+in (?P<mode>Startup) mode, cwnd (?P<cwnd>\d+), inflight (?P<inflight>\d+) prev max bw (?P<prev_max_bw>[\d.]+), avg-bw (?P<bw>[\d.]+) avg_bw_10s (?P<bw10>[\d.]+) new max bw (?P<max_bw>[\d.]+), limit count (?P<limit_count>\d+)"
     )
     # Slowdown
     slowdown_re = re.compile(
-        r"stardust::transmit_manager: src/transmit_manager\.rs:\d+: (?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+) (?P<mode>Slowdown) mode min rtt (?P<min_rtt>[\d.]+)(ms|µs|us|s|ns) avg bw (?P<bw>[\d.]+) avg_bw_10s (?P<bw10>[\d.]+) req in flight (?P<req_if>\d+)"
+        r"stardust::transmit_manager:\s+(?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+)\s+(?P<mode>Slowdown) mode min rtt (?P<min_rtt>[\d.]+)(ms|µs|us|s|ns) avg bw (?P<bw>[\d.]+) avg_bw_10s (?P<bw10>[\d.]+) req in flight (?P<req_if>\d+)"
     )
     # ProbeRTT
     probe_rtt_re = re.compile(
-        r"stardust::transmit_manager: src/transmit_manager\.rs:\d+: (?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+) (?P<mode>ProbeRTT) mode min rtt (?P<min_rtt>[\d.]+)(ms|µs|us|s|ns) avg bw (?P<bw>[\d.]+) avg_bw_10s (?P<bw10>[\d.]+) inflight_target (?P<inflight_target>\d+) req in flight (?P<req_if>\d+)"
+        r"stardust::transmit_manager:\s+(?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+)\s+(?P<mode>ProbeRTT) mode min rtt (?P<min_rtt>[\d.]+)(ms|µs|us|s|ns) avg bw (?P<bw>[\d.]+) avg_bw_10s (?P<bw10>[\d.]+) inflight_target (?P<inflight_target>\d+) req in flight (?P<req_if>\d+)"
     )
     # 状态转换
     change_re = re.compile(
-        r"src/transmit_manager\.rs:\d+:\s+(?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+)\s+change from \w+ to (?P<target_mode>\w+) mode"
+        r"stardust::transmit_manager:\s+(?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+)\s+change from \w+ to (?P<target_mode>\w+) mode"
     )
     # RTT & Variance
     rtt_var_re = re.compile(
-        r"src/transmit_manager\.rs:\d+:\s+(?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+)\s+rtt\s+(?P<rtt>[\d.]+)(?P<rtt_unit>ns|us|µs|ms|s)\s+var\s+(?P<var>[\d.]+)(?P<var_unit>ns|us|µs|ms|s)"
+        r"stardust::transmit_manager:\s+(?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+)\s+rtt\s+(?P<rtt>[\d.]+)(?P<rtt_unit>ns|us|µs|ms|s)\s+var\s+(?P<var>[\d.]+)(?P<var_unit>ns|us|µs|ms|s)"
     )
     # queue_delay
     queue_delay_re = re.compile(
-        r"src/transmit_manager\.rs:\d+:\s+recv Piece.*from (?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+),\s+queue_delay\s+(?P<val>[\d.]+)(?P<unit>ns|us|µs|ms|s)"
+        r"stardust::transmit_manager:\s+recv Piece.*from (?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+),\s+queue_delay\s+(?P<val>[\d.]+)(?P<unit>ns|us|µs|ms|s)"
     )
     # rush mode (from block_picker: "{peer} endgame {bool}, rush {bool}")
     rush_re = re.compile(
-        r"block_picker\.rs:\d+:\s+(?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+)\s+endgame (?:true|false), rush (?P<rush>true|false)"
+        r"stardust::picker::block_picker:\s+(?P<ip_port>\[?[a-fA-F0-9:.]+\]?:\d+)\s+endgame (?:true|false), rush (?P<rush>true|false)"
     )
 
     # --- 核心解析逻辑 ---
@@ -212,8 +212,10 @@ def parse_log_content(lines):
                         data['max_bw'] = float(match.group('max_bw')) / 1024.0
 
                     if mode in ["ProbeBW", "Slowdown", "ProbeRTT"]:
-                        data['min_rtt'] = float(match.group('min_rtt'))
-                        data['req_if'] = int(match.group('req_if'))
+                        if 'min_rtt' in match.groupdict() and match.group('min_rtt') is not None:
+                            data['min_rtt'] = float(match.group('min_rtt'))
+                        if 'req_if' in match.groupdict() and match.group('req_if') is not None:
+                            data['req_if'] = int(match.group('req_if'))
                     if mode == "ProbeBW" and 'probe_rtt' in match.groupdict() and match.group('probe_rtt'):
                         data['probe_rtt'] = float(match.group('probe_rtt'))
 
@@ -440,8 +442,9 @@ if lines:
 
         # 图 7: Min RTT
         ax7 = fig2.add_subplot(3, 2, 3)
-        if not sub_auto.empty:
-            ax7.plot(sub_auto['dt'], sub_auto['min_rtt'], color='#d62728')
+        if not sub_auto.empty and 'min_rtt' in sub_auto.columns:
+            _rtt_valid = sub_auto.dropna(subset=['min_rtt'])
+            ax7.plot(_rtt_valid['dt'], _rtt_valid['min_rtt'], color='#d62728')
         ax7.set_title("7. Logged Min RTT Trend"); ax7.set_ylabel("ms"); ax7.grid(True, alpha=0.3)
 
         # 图 8: 平滑 RTT (新增)
@@ -449,8 +452,9 @@ if lines:
         if not sub_df.empty:
             ax8.plot(sub_df['dt'], sub_df['delay'], color='gray', alpha=0.2, label='Raw Delay')
             ax8.plot(sub_df['dt'], sub_df['srtt'], color='#9467bd', linewidth=2, label='Smoothed RTT')
-            if not sub_auto.empty:
-                ax8.step(sub_auto['dt'], sub_auto['min_rtt'], where='post', color='#d62728', linestyle=':', alpha=0.7, label='Base Min RTT')
+            if not sub_auto.empty and 'min_rtt' in sub_auto.columns:
+                rtt_data = sub_auto.dropna(subset=['min_rtt'])
+                ax8.step(rtt_data['dt'], rtt_data['min_rtt'], where='post', color='#d62728', linestyle=':', alpha=0.7, label='Base Min RTT')
         ax8.set_title(f"8. Calculated Smoothed RTT (α={alpha})"); ax8.set_ylabel("ms"); ax8.legend(); ax8.grid(True, alpha=0.3)
 
         # 图 9: 状态转换 (新增)
@@ -699,6 +703,9 @@ if lines:
         c2.metric("计算峰值速率", f"{sub_df['rate'].max():.2f} KB/s")
     if not sub_auto.empty:
         c3.metric("日志 Avg BW", f"{sub_auto['bw'].iloc[-1]:.2f} KB/s")
-        c4.metric("最新 Min RTT", f"{sub_auto['min_rtt'].iloc[-1]} ms")
+        if 'min_rtt' in sub_auto.columns:
+            rtt_series = sub_auto['min_rtt'].dropna()
+            if not rtt_series.empty:
+                c4.metric("最新 Min RTT", f"{rtt_series.iloc[-1]} ms")
 else:
     st.info("👋 请上传 Stardust 日志文件开始分析。")
