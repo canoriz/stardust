@@ -156,6 +156,20 @@ where
         fn visit_byte_buf<E: de::Error>(self, v: Vec<u8>) -> Result<Self::Value, E> {
             parse_compact_peers6(&v).map_err(de::Error::custom)
         }
+
+        // Dict-list format: tracker sends peers as a list of dicts.
+        fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let mut peers = Vec::new();
+            while let Some(p) = seq.next_element::<Peer>()? {
+                peers.push(p);
+            }
+            Ok(peers)
+        }
+
+        // Some trackers send an empty dict `de` instead of an empty list `le` for no peers.
+        fn visit_map<A: de::MapAccess<'de>>(self, _map: A) -> Result<Self::Value, A::Error> {
+            Ok(vec![])
+        }
     }
 
     deserializer.deserialize_any(Peers6Visitor)
@@ -394,8 +408,56 @@ mod tests {
     }
 
     #[test]
-    fn test_dict_peers() {
-        // BEP3 dict-list format still works — use to_vec to get valid bencode
+    fn test_list_peers6() {
+        // BEP7 non-compact format for peers6: a list of dicts with "ip" (IPv6 string) and "port".
+        use bt_bencode::Value;
+        use std::collections::BTreeMap;
+
+        let mut peer = BTreeMap::new();
+        peer.insert(
+            ByteString::from("ip"),
+            Value::ByteStr(ByteString::from("2001:db8::1")),
+        );
+        peer.insert(ByteString::from("port"), Value::from(6881u32));
+
+        let mut resp = BTreeMap::new();
+        resp.insert(ByteString::from("interval"), Value::from(1800u32));
+        resp.insert(
+            ByteString::from("peers"),
+            Value::ByteStr(ByteString::from("")),
+        );
+        resp.insert(
+            ByteString::from("peers6"),
+            Value::List(vec![Value::Dict(peer)]),
+        );
+        let encoded = bt_bencode::to_vec(&Value::Dict(resp)).unwrap();
+
+        let decoded = bt_bencode::from_slice::<AnnounceResp>(&encoded).unwrap();
+        assert_eq!(decoded.interval, 1800);
+        assert_eq!(decoded.peers.len(), 0);
+        assert_eq!(decoded.peers6.len(), 1);
+        assert_eq!(
+            decoded.peers6[0].addr,
+            SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+                6881
+            )
+        );
+    }
+
+    #[test]
+    fn test_deserialize_empty_peers6_dict_quirk() {
+        // Some trackers send an empty dict `de` instead of an empty list `le` for peers6.
+        let resp = b"d8:intervali1800e5:peers0:6:peers6dee";
+        let decoded = bt_bencode::from_slice::<AnnounceResp>(resp).unwrap();
+        assert_eq!(decoded.interval, 1800);
+        assert_eq!(decoded.peers.len(), 0);
+        assert_eq!(decoded.peers6.len(), 0);
+    }
+
+    #[test]
+    fn test_list_peers() {
+        // BEP3 non-compact format: peers as a list of dicts with "peer id", "ip", "port"
         use bt_bencode::Value;
         use std::collections::BTreeMap;
 
@@ -429,7 +491,7 @@ mod tests {
 
     #[test]
     // some trackers return empty peers dict, not empty peer list, test if we can decode it correctly
-    fn test_deserialize_empty_announce_dict() {
+    fn test_deserialize_empty_peers_dict_quirk() {
         let resp = *b"d8:intervali1800e5:peersdee";
         let r0 = bt_bencode::to_vec(&TrackerResp::Success(AnnounceResp {
             interval: 1800,
@@ -452,7 +514,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_real_torrent() {
-        use crate::metadata::{FileMetadata, Metadata};
+        use crate::metadata::FileMetadata;
         let torrent_f = include_bytes!("../../ubuntu-24.10-desktop-amd64.iso.torrent");
         let torrent = FileMetadata::load(torrent_f).unwrap();
         let (metadata, announce_list) = torrent.to_metadata();
