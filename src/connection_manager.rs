@@ -1,11 +1,9 @@
 use bytes::BytesMut;
-use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, LazyLock};
 use tokio::io::{BufReader, BufWriter};
-use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time;
 
@@ -469,7 +467,7 @@ where
                 let blks = self.received_blocks.take();
                 self.transmit_handle
                     .sender
-                    .send(TransmitMsg::PeerMsg(PeerMsg::Pieces2(
+                    .send(TransmitMsg::PeerMsg(PeerMsg::Pieces(
                         self.read_stream.peer_addr(),
                         blks,
                     )))

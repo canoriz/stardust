@@ -1,8 +1,4 @@
-use std::collections::HashSet;
-
 use tokio::time;
-
-use crate::protocol::Request;
 
 /// modes for bandwidth control
 /// we want a balanced max-bandwidth and min rtt

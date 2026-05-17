@@ -4,7 +4,7 @@ mod regression;
 mod rtt;
 pub use regression::SlidingWindowRegression;
 pub use rtt::{ALPHA, BETA, RTT};
-use tracing::{info, instrument, trace};
+use tracing::trace;
 
 #[derive(Debug, Clone)]
 pub(crate) struct Bandwidth<const SLOT_SIZE: usize> {

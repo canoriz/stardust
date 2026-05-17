@@ -1,11 +1,7 @@
-use core::time;
 use std::{sync::Arc, time::Duration};
 
 use stardust::dht::{DHTOption, NodeID, RpcAddr, DHT};
-use tokio::{
-    io::{stdin, stdout, AsyncBufReadExt, AsyncWriteExt, BufReader},
-    time::timeout,
-};
+use tokio::io::{stdin, stdout, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::info;
 
 #[tokio::main]

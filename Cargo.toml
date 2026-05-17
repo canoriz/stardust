@@ -37,19 +37,6 @@ eframe = "0.34.2"
 rfd = "0.15"
 nix = { version = "0.31.2", features = ["fs"] }
 
-# [patch."https://github.com/canoriz/bt_bencode"]
-# bt_bencode = { path = "./bt_bencode" }
-
-[target.'cfg(mloom)'.dependencies]
-loom = { version = "0.7", features = ["checkpoint"] }
-
-[lints.rust]
-# TODO: What does this really do? Should it warn or not?
-unexpected_cfgs = { level = "warn", check-cfg = [
-    'cfg(mloom)',
-    'cfg(test_flush_migrate_concurrent)',
-] }
-
 [[bin]]
 name = "main"
 path = "src/bin/main.rs"

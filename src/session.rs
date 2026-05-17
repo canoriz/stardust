@@ -1,25 +1,22 @@
 use bon::Builder;
 use std::collections::HashMap;
+use std::io;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::{io, time};
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::lookup_host;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio_util::sync::{CancellationToken, DropGuard};
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::cache::cache_manager::{CacheManager, CacheManagerHandle};
-use crate::dht::{self, DHTOption, DhtDump, DHT};
+use crate::dht::{DHTOption, DhtDump, DHT};
 use crate::metadata::Magnet;
 use crate::protocol::{AcceptOpt, BTStream, HandshakeOption, InfoHash};
 use crate::torrent_manager::{TorrentManagerHandle, TransmitManagerSender};
-use crate::transmit_manager::{
-    RunningCmd, RunningStateDump, StableState, TorrentRuntimeStatus, TorrentTask, TransmitDump,
-};
+use crate::transmit_manager::{RunningCmd, TorrentRuntimeStatus, TorrentTask, TransmitDump};
 use crate::{announce_manager, Reunite, Split};
 
 /// A snapshot of every active torrent task in the session.

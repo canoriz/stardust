@@ -3,7 +3,7 @@ use crate::backfile::{BackFile, NormalFile, VoidFile};
 use crate::bandwidth::Bandwidth;
 use crate::buffer_pool::BlockBuf;
 use crate::cache::cache_manager::{CacheManagerHandle, GlobalPieceKey, PieceLease};
-use crate::cache::simple_buffer::{FlushErr, JointIndex, PieceBuf, SUB_PIECE_SIZE};
+use crate::cache::simple_buffer::{FlushErr, JointIndex, SUB_PIECE_SIZE};
 use crate::connection_manager::{
     ConnectionManagerHandle, CtrlOfRecv, CtrlOfSend, CtrlOfSend as ConnMsg, ReceivedBlocks,
 };
@@ -27,7 +27,7 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time;
 use tokio_util::sync::{CancellationToken, DropGuard as CancelDropGuard};
-use tracing::{debug, error, info, instrument, span, trace, warn, Level};
+use tracing::{debug, info, instrument, trace, warn};
 
 mod bandwidth_mode;
 mod inflight;
@@ -96,13 +96,7 @@ pub enum PeerMsg {
     Uninterested(PeerAddr),
     PieceState(PeerAddr, PieceState),
     Have(PeerAddr, u32),
-    Pieces2(PeerAddr, Option<ReceivedBlocks>),
-    Piece {
-        addr: PeerAddr,
-        piece: Piece,
-        buf: BlockBuf,
-        recv_time: std::time::Instant,
-    },
+    Pieces(PeerAddr, Option<ReceivedBlocks>),
     DhtPort(PeerAddr, u16),
     SuggestPiece(PeerAddr, u32),
     AllowedFast(PeerAddr, u32),
@@ -1401,13 +1395,7 @@ impl TransmitWorker {
                 }
                 Ok(())
             }
-            PeerMsg::Piece {
-                addr,
-                piece,
-                buf,
-                recv_time,
-            } => self.handle_piece_msg(&addr, piece, buf, recv_time),
-            PeerMsg::Pieces2(peer, receive_blks) => {
+            PeerMsg::Pieces(peer, receive_blks) => {
                 let mut count = 0;
                 if let Some(blks) = receive_blks {
                     for piece in blks.blocks {
@@ -2234,8 +2222,7 @@ impl TransmitWorker {
 
     fn handle_dht_port_msg(&mut self, mut addr: PeerAddr, port: u16) -> io::Result<()> {
         use crate::dht::RpcAddr;
-        if let Some(c) = &self.dht_client {
-            let c = c.clone();
+        if let Some(c) = self.dht_client.clone() {
             addr.set_port(port);
             tokio::spawn(async move {
                 _ = c.ping_rpc(RpcAddr::no_id(addr), Self::DHT_TIMEOUT).await;

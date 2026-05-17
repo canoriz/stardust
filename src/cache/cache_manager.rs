@@ -1,9 +1,8 @@
-use core::fmt;
-use std::collections::{BTreeSet, BinaryHeap, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::io;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::{cmp, io};
 
 use bytes::BytesMut;
 use derivative::Derivative;

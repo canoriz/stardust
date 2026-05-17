@@ -2,13 +2,7 @@ use std::collections::HashMap;
 
 use tokio::time;
 use tracing::info;
-
 use crate::protocol::Request;
-
-struct Info {
-    ts: time::Instant,
-    count: usize,
-}
 
 /// manages states of a peer's inflight requests
 pub struct Inflight {

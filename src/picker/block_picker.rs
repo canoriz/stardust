@@ -1442,10 +1442,7 @@ impl BlockPicker {
 
 #[cfg(test)]
 mod test {
-    use crate::{
-        bandwidth::{ALPHA, BETA},
-        picker::BitField,
-    };
+    use crate::picker::BitField;
 
     use super::*;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};

@@ -1,17 +1,11 @@
 use crate::bandwidth::Bandwidth;
-pub use crate::protocol::BitField;
-use crate::protocol::{self, Request};
-use heap::Heap;
+pub use crate::protocol::{self, BitField};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
-use std::time;
-use tracing::{debug, info, warn};
 
 mod block_picker;
-mod heap;
 mod rarest_first;
-pub use block_picker::{BlockPicker, BlockPickerDump, BlockStatus};
+pub use block_picker::{BlockPicker, BlockPickerDump};
 pub use rarest_first::Picker as RarestPicker;
 
 const BLOCK_SIZE: u32 = 16384;

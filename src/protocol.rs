@@ -1041,7 +1041,6 @@ where
 
         let peer_addr = t.remote_addr();
         let reserved = peer_handshake.reserved.common(&h.reserved);
-        let support_dht = reserved.have_dht();
         let s = BTStream {
             inner: t,
             peer_addr,
@@ -1172,32 +1171,6 @@ where
     pub async fn send_extend_pex(&mut self, pex: &ExtendedPex) -> io::Result<()> {
         send_extend_pex(&mut self.inner, pex, &self.extension_id).await
     }
-}
-
-/// returns added and dropped peers, and update pex_map to now_connected
-fn make_added_and_dropped(
-    now_connected: &HashMap<SocketAddr, Option<PexFlag>>,
-    old_connected: &HashMap<SocketAddr, Option<PexFlag>>,
-) -> (Vec<(SocketAddr, Option<PexFlag>)>, Vec<SocketAddr>) {
-    // to send added and dropped
-    // what we now have, but peer don't know comes to added
-    // what we don't have, but peer thinks we have, come to dropped
-
-    const MAX_PEERS: usize = 50; // spec says no more than 50 peer in one message
-
-    let added: Vec<_> = now_connected
-        .iter()
-        .filter(|(ip, _)| !old_connected.contains_key(ip))
-        .take(MAX_PEERS)
-        .map(|(ip, pex)| (*ip, *pex))
-        .collect();
-    let dropped: Vec<_> = old_connected
-        .iter()
-        .filter(|(ip, _)| !now_connected.contains_key(ip))
-        .take(MAX_PEERS)
-        .map(|(ip, _)| *ip)
-        .collect();
-    (added, dropped)
 }
 
 fn update_pex_map(
@@ -3667,7 +3640,7 @@ pub mod tests {
 
     #[tokio::test]
     async fn recv_msg_cancel_safe() {
-        let ((p1r, mut p1w), (mut p2r, p2w)) = make_ends_split().await;
+        let ((_p1r, mut p1w), (mut p2r, p2w)) = make_ends_split().await;
         let request_msg = [
             0u8, 0, 0, 13, 6, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xa, 0xb, 0xc,
         ];
