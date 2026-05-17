@@ -1,23 +1,17 @@
 1
-BT protocol
-announce
-download/seed control system
+seed
+announce ourself downloading to dht
 file implementation (mmap)
 udp announce
-announce list
 only select a part of files of a torrent (and handle only chosen a part of block)
 
 2
-lt_extension
-fast_extension
+fast_extension (allowed fast)
 obfuscation (encryption)
 upnp and nat-pmp
 
 3
 uTP (micro transmission protocol)
-
-4
-self implement bencode
 
 5
 unified trait for file and cache manager:

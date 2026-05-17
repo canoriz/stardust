@@ -131,19 +131,6 @@ impl From<ByteSocketAddr> for SocketAddr {
     }
 }
 
-#[derive(Serialize, Deserialize)]
-struct FindNodeResp {
-    #[serde(with = "serde_bytes")]
-    id: NodeID,
-    token: ByteString,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    values: Option<Vec<ByteSocketAddr>>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    nodes: Option<VecNode6>,
-}
-
 #[derive(Clone, Derivative, PartialEq, Serialize, Deserialize)]
 #[derivative(Debug)]
 struct GetPeersArg {
@@ -168,19 +155,6 @@ struct AnnouncePeerArg {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     implied_port: Option<u32>,
-
-    #[serde(with = "serde_bytes")]
-    #[derivative(Debug(format_with = "crate::helper::format_hex"))]
-    info_hash: NodeID,
-
-    port: u16,
-    token: ByteString,
-}
-
-#[derive(Clone, Derivative, PartialEq, Serialize, Deserialize)]
-#[derivative(Debug)]
-struct AnnouncePeerResp {
-    implied_port: u32,
 
     #[serde(with = "serde_bytes")]
     #[derivative(Debug(format_with = "crate::helper::format_hex"))]
@@ -597,7 +571,11 @@ impl DHT {
 
                 debug!("nodes not enough, ping bootstrap node {}", query_node);
                 _ = cl
-                    .get_peers_rpc(RpcAddr::no_id(ping_addr), target, time::Duration::from_secs(3))
+                    .get_peers_rpc(
+                        RpcAddr::no_id(ping_addr),
+                        target,
+                        time::Duration::from_secs(3),
+                    )
                     .await;
             });
         }
@@ -971,19 +949,6 @@ struct Server {
     out_buf: Vec<u8>,
 }
 
-fn to_nodes64(ns: &[NodeAddr], v4: &mut VecNode4, v6: &mut VecNode6) {
-    let r4 = &mut v4.0;
-    let r6 = &mut v6.0;
-    r4.clear();
-    r6.clear();
-    for na in ns {
-        match na.addr {
-            SocketAddr::V4(s4) => r4.push((na.id, s4)),
-            SocketAddr::V6(s6) => r6.push((na.id, s6)),
-        }
-    }
-}
-
 /// Convert an IPv4-mapped IPv6 address (::ffff:x.x.x.x) to a plain IPv4 address.
 /// All other addresses are returned unchanged.
 fn normalize_addr(addr: SocketAddr) -> SocketAddr {
@@ -993,6 +958,17 @@ fn normalize_addr(addr: SocketAddr) -> SocketAddr {
         }
     }
     addr
+}
+
+/// Parse the `want` list from a KRPC request into `(want_v4, want_v6)`.
+/// Falls back to the requesting address family when `want` is absent or empty.
+fn parse_want(want: &[ByteString], from_ipv6: bool) -> (bool, bool) {
+    if want.is_empty() {
+        return (!from_ipv6, from_ipv6);
+    }
+    let want_v4 = want.iter().any(|w| w.as_ref() == b"n4");
+    let want_v6 = want.iter().any(|w| w.as_ref() == b"n6");
+    (want_v4, want_v6)
 }
 
 fn is_ipv6(addr: SocketAddr) -> bool {
@@ -1143,24 +1119,42 @@ impl Server {
             KRPCInner::Request(Arg::FindNode(f)) => {
                 debug!("receive find_node from {}", from_addr);
                 add_route(f.id, from_addr, false);
-                self.nodes_buf.clear();
-                if from_ipv6 {
-                    // TODO: support "want" field
-                    self.route6
-                        .get_k_closest_nodes(&f.target, 8, &mut self.nodes_buf);
-                } else {
+                let (want_v4, want_v6) = parse_want(&f.want, from_ipv6);
+                let nodes4 = if want_v4 {
+                    self.nodes_buf.clear();
                     self.route4
                         .get_k_closest_nodes(&f.target, 8, &mut self.nodes_buf);
-                }
-                to_nodes64(&self.nodes_buf, &mut self.nodes4_buf, &mut self.nodes6_buf);
+                    self.nodes4_buf.0.clear();
+                    for na in &self.nodes_buf {
+                        if let SocketAddr::V4(s4) = na.addr {
+                            self.nodes4_buf.0.push((na.id, s4));
+                        }
+                    }
+                    Some(self.nodes4_buf.clone())
+                } else {
+                    None
+                };
+                let nodes6 = if want_v6 {
+                    self.nodes_buf.clear();
+                    self.route6
+                        .get_k_closest_nodes(&f.target, 8, &mut self.nodes_buf);
+                    self.nodes6_buf.0.clear();
+                    for na in &self.nodes_buf {
+                        if let SocketAddr::V6(s6) = na.addr {
+                            self.nodes6_buf.0.push((na.id, s6));
+                        }
+                    }
+                    Some(self.nodes6_buf.clone())
+                } else {
+                    None
+                };
                 let resp = KRPC {
                     t: krpc.t,
                     v: version,
                     inner: KRPCInner::Response(Resp {
                         id: self.id,
-                        // TODO: optimize clone, use ref or cow
-                        nodes: (!from_ipv6).then_some(self.nodes4_buf.clone()),
-                        nodes6: (from_ipv6).then_some(self.nodes6_buf.clone()),
+                        nodes: nodes4,
+                        nodes6,
                         token: None,
                         values: None,
                     }),
@@ -1170,30 +1164,50 @@ impl Server {
             KRPCInner::Request(Arg::GetPeers(gp)) => {
                 debug!("receive get_peer from {} {gp:?}", from_addr);
                 add_route(gp.id, from_addr, false);
-                self.nodes_buf.clear();
-                if from_ipv6 {
-                    // TODO: support "want" field
-                    self.route6
-                        .get_k_closest_nodes(&gp.info_hash, 8, &mut self.nodes_buf);
-                } else {
+                let (want_v4, want_v6) = parse_want(&gp.want, from_ipv6);
+                let nodes4 = if want_v4 {
+                    self.nodes_buf.clear();
                     self.route4
                         .get_k_closest_nodes(&gp.info_hash, 8, &mut self.nodes_buf);
-                }
-                to_nodes64(&self.nodes_buf, &mut self.nodes4_buf, &mut self.nodes6_buf);
+                    self.nodes4_buf.0.clear();
+                    for na in &self.nodes_buf {
+                        if let SocketAddr::V4(s4) = na.addr {
+                            self.nodes4_buf.0.push((na.id, s4));
+                        }
+                    }
+                    Some(self.nodes4_buf.clone())
+                } else {
+                    None
+                };
+                let nodes6 = if want_v6 {
+                    self.nodes_buf.clear();
+                    self.route6
+                        .get_k_closest_nodes(&gp.info_hash, 8, &mut self.nodes_buf);
+                    self.nodes6_buf.0.clear();
+                    for na in &self.nodes_buf {
+                        if let SocketAddr::V6(s6) = na.addr {
+                            self.nodes6_buf.0.push((na.id, s6));
+                        }
+                    }
+                    Some(self.nodes6_buf.clone())
+                } else {
+                    None
+                };
+
+                // values always correspond to the requesting address family, not the want field
                 let peers: Vec<ByteSocketAddr> = self
                     .storage
                     .get(&gp.info_hash, from_ipv6)
                     .into_iter()
                     .map(|v| v.addr.into())
                     .collect();
-                // TODO: support "want" field
                 let resp = KRPC {
                     t: krpc.t,
                     v: version,
                     inner: KRPCInner::Response(Resp {
                         id: self.id,
-                        nodes: (!from_ipv6).then_some(self.nodes4_buf.clone()),
-                        nodes6: (from_ipv6).then_some(self.nodes6_buf.clone()),
+                        nodes: nodes4,
+                        nodes6,
                         token: Some("abaaabba".into()), // TODO generate token
                         values: if peers.is_empty() { None } else { Some(peers) },
                     }),
