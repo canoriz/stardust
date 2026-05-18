@@ -37,6 +37,7 @@ const SESSION_FILE: &str = "session-gui.json";
 #[derive(Clone)]
 struct TorrentRow {
     info_hash: String,
+    name: Option<String>,
     progress: f64, // 0.0 … 1.0
     speed_bps: f64,
     state: RunningStateDump,
@@ -46,6 +47,7 @@ impl Default for TorrentRow {
     fn default() -> Self {
         Self {
             info_hash: String::new(),
+            name: None,
             progress: 0.0,
             speed_bps: 0.0,
             state: RunningStateDump::StableState(StableState::Stopped),
@@ -204,7 +206,7 @@ impl eframe::App for GuiApp {
                     .min_col_width(0.0)
                     .show(ui, |ui| {
                         // ── header row ──
-                        ui.strong("Info Hash");
+                        ui.strong("Name");
                         ui.strong("Progress");
                         ui.strong("Speed");
                         ui.strong("Status");
@@ -219,9 +221,23 @@ impl eframe::App for GuiApp {
 
                         // ── data rows ──
                         for row in &rows {
-                            ui.monospace(
-                                egui::RichText::new(&row.info_hash).color(egui::Color32::GRAY),
-                            );
+                            match &row.name {
+                                Some(n) => {
+                                    let display: String = n.chars().take(45).collect();
+                                    let display = if n.chars().count() > 45 {
+                                        format!("{}\u{2026}", display)
+                                    } else {
+                                        display
+                                    };
+                                    ui.label(display);
+                                }
+                                None => {
+                                    ui.monospace(
+                                        egui::RichText::new(&row.info_hash)
+                                            .color(egui::Color32::GRAY),
+                                    );
+                                }
+                            }
 
                             // Progress bar
                             let pct = row.progress as f32;
@@ -429,6 +445,7 @@ async fn refresh_rows(session: &Session, shared: &Arc<Mutex<Vec<TorrentRow>>>) {
         .await;
         if let RpcResponse::TorrentStatus {
             info_hash,
+            name,
             process,
             bandwidth_bps,
             state,
@@ -438,6 +455,7 @@ async fn refresh_rows(session: &Session, shared: &Arc<Mutex<Vec<TorrentRow>>>) {
             rows.push(TorrentRow {
                 state,
                 info_hash,
+                name,
                 progress: process,
                 speed_bps: bandwidth_bps,
             });

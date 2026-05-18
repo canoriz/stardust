@@ -38,8 +38,8 @@ use tracing::info;
 
 use crate::metadata::{FileMetadata, Magnet};
 use crate::session::Session;
-use crate::transmit_manager::{RunningCmd, TorrentTask};
 pub use crate::transmit_manager::{CheckState, RunningStateDump, StableState};
+use crate::transmit_manager::{RunningCmd, TorrentTask};
 
 // ── request types ────────────────────────────────────────────────────────────
 
@@ -103,6 +103,8 @@ pub enum RpcResponse {
     /// Runtime status of a torrent.
     TorrentStatus {
         info_hash: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
         process: f64,
         bandwidth_bps: f64,
         selected: Vec<u32>,
@@ -309,6 +311,7 @@ pub async fn handle_rpc(session: &Session, req: RpcRequest) -> (RpcResponse, boo
                 Ok(ih) => match session.get_torrent_status(&ih).await {
                     Ok(st) => RpcResponse::TorrentStatus {
                         info_hash: hex::encode(st.info_hash),
+                        name: st.name,
                         process: st.process,
                         bandwidth_bps: st.bandwidth_bps,
                         selected: st.selected,
@@ -450,6 +453,7 @@ mod tests {
 
         let status = serde_json::to_string(&RpcResponse::TorrentStatus {
             info_hash: "001122".into(),
+            name: None,
             process: 0.42,
             bandwidth_bps: 12345.0,
             selected: vec![0, 2],

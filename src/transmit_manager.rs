@@ -156,6 +156,7 @@ pub(crate) enum Msg {
 #[derive(Debug, Clone)]
 pub struct TorrentRuntimeStatus {
     pub info_hash: [u8; 20],
+    pub name: Option<String>,
     pub process: f64,
     pub bandwidth_bps: f64,
     pub selected: Vec<u32>,
@@ -1233,7 +1234,7 @@ impl TransmitWorker {
     }
 
     fn runtime_status(&self) -> TorrentRuntimeStatus {
-        let (process, selected, have) = match &self.torrent_state {
+        let (process, selected, have, name) = match &self.torrent_state {
             TorrentState::Metadata(Downloading {
                 metadata,
                 block_picker,
@@ -1261,9 +1262,9 @@ impl TransmitWorker {
                     }
                     done as f64 / total as f64
                 };
-                (process, selected, have)
+                (process, selected, have, Some(metadata.info.name.clone()))
             }
-            TorrentState::Fetching(_) => (0.0, Vec::new(), Vec::new()),
+            TorrentState::Fetching(_) => (0.0, Vec::new(), Vec::new(), None),
         };
 
         let bandwidth_bps = self
@@ -1274,6 +1275,7 @@ impl TransmitWorker {
 
         TorrentRuntimeStatus {
             info_hash: self.info_hash,
+            name,
             process,
             bandwidth_bps,
             selected,

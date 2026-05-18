@@ -4,6 +4,8 @@ use std::net::SocketAddr;
 use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, LazyLock};
 use tokio::io::{BufReader, BufWriter};
+#[cfg(feature = "mock_delay")]
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time;
 
@@ -127,22 +129,24 @@ impl ConnectionManagerHandle {
             _drop_guard: conn_break_guard,
         };
 
-        #[cfg(feature = "mock_delay")]
-        let (delayed_tx, mut delayed_rx) =
-            mpsc::unbounded_channel::<(time::Instant, UnboundedSender<CtrlOfSend>, CtrlOfSend)>();
-        #[cfg(feature = "mock_delay")]
-        tokio::spawn(async move {
-            loop {
-                if let Some((t, mut c, m)) = delayed_rx.recv().await {
-                    if t > time::Instant::now() {
-                        time::sleep_until(t).await;
+        cfg_if::cfg_if! {
+            if #[cfg(feature = "mock_delay")] {
+                let (delayed_tx, mut delayed_rx) =
+                    mpsc::unbounded_channel::<(time::Instant, UnboundedSender<CtrlOfSend>, CtrlOfSend)>();
+                tokio::spawn(async move {
+                    loop {
+                        if let Some((t, mut c, m)) = delayed_rx.recv().await {
+                            if t > time::Instant::now() {
+                                time::sleep_until(t).await;
+                            }
+                            c.send(m);
+                        } else {
+                            break;
+                        }
                     }
-                    c.send(m);
-                } else {
-                    break;
-                }
+                });
             }
-        });
+        }
 
         tokio::spawn(run_recv_stream(
             recv_stream,
