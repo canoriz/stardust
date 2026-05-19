@@ -8,6 +8,7 @@
 - [ ] only select a part of files of a torrent (and handle only chosen a part of block)
 - [ ] gui filename font size not equal
 - [ ] gui filename utf8
+- [ ] dht nodes returns 0.0.0.0:0 from libtorrent
 
 ## 2
 - [ ] fast_extension (allowed fast)

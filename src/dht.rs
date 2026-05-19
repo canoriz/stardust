@@ -1063,6 +1063,9 @@ impl Server {
         let version: ByteString = "st01".into();
         let from_ipv6 = is_ipv6(from_addr);
         let mut add_route = |id: NodeID, addr: SocketAddr, reachable: bool| {
+            if addr.port() == 0 || addr.ip().is_unspecified() {
+                return;
+            }
             // Normalize IPv4-mapped-IPv6 addresses so they go into route4 with a true IPv4 addr.
             let addr = normalize_addr(addr);
             let ipv6 = is_ipv6(addr);
@@ -1219,11 +1222,29 @@ impl Server {
                 add_route(resp.id, from_addr, true);
                 if let Some(ns) = &resp.nodes6 {
                     for (id, addr) in &ns.0 {
+                        if addr.port() == 0 || addr.ip().is_unspecified() {
+                            let v = std::str::from_utf8(krpc.v.as_ref())
+                                .map(|s| s.to_owned())
+                                .unwrap_or_else(|_| format!("{:02x?}", krpc.v.as_ref()));
+                            warn!(
+                                "peer {} (client v={:?}) sent bogus v6 node {:02x?} -> {}",
+                                from_addr, v, id, addr
+                            );
+                        }
                         add_route(*id, SocketAddr::V6(*addr), false);
                     }
                 }
                 if let Some(ns) = &resp.nodes {
                     for (id, addr) in &ns.0 {
+                        if addr.port() == 0 || addr.ip().is_unspecified() {
+                            let v = std::str::from_utf8(krpc.v.as_ref())
+                                .map(|s| s.to_owned())
+                                .unwrap_or_else(|_| format!("{:02x?}", krpc.v.as_ref()));
+                            warn!(
+                                "peer {} (client v={:?}) sent bogus v4 node {:02x?} -> {}",
+                                from_addr, v, id, addr
+                            );
+                        }
                         add_route(*id, SocketAddr::V4(*addr), false);
                     }
                 }
@@ -1240,6 +1261,7 @@ impl Server {
         }
     }
 
+    #[instrument(skip_all, fields(to = ?addr))]
     async fn handle_out_req(&mut self, addr: SocketAddr, krpc: KRPC) {
         self.out_buf.clear();
         // TODO: add logs
