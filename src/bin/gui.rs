@@ -511,7 +511,31 @@ fn main() {
     if let Err(e) = eframe::run_native(
         "Stardust",
         options,
-        Box::new(move |_cc| Ok(Box::new(GuiApp::new(cmd_tx, shared, gui_ctrl_c_rx)))),
+        Box::new(move |cc| {
+            // Load a CJK fallback font so torrent names in Chinese/Japanese/Korean
+            // render correctly instead of showing replacement boxes (□).
+            const CJK_FONT_PATH: &str = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc";
+            if let Ok(font_data) = std::fs::read(CJK_FONT_PATH) {
+                let mut fonts = egui::FontDefinitions::default();
+                fonts.font_data.insert(
+                    "noto_cjk".to_owned(),
+                    egui::FontData::from_owned(font_data).into(),
+                );
+                // Append as last fallback for both proportional and monospace families.
+                fonts
+                    .families
+                    .entry(egui::FontFamily::Proportional)
+                    .or_default()
+                    .push("noto_cjk".to_owned());
+                fonts
+                    .families
+                    .entry(egui::FontFamily::Monospace)
+                    .or_default()
+                    .push("noto_cjk".to_owned());
+                cc.egui_ctx.set_fonts(fonts);
+            }
+            Ok(Box::new(GuiApp::new(cmd_tx, shared, gui_ctrl_c_rx)))
+        }),
     ) {
         eprintln!("eframe error: {e}");
     }
