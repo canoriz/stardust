@@ -1230,8 +1230,9 @@ impl Server {
                                 "peer {} (client v={:?}) sent bogus v6 node {:02x?} -> {}",
                                 from_addr, v, id, addr
                             );
+                        } else {
+                            add_route(*id, SocketAddr::V6(*addr), false);
                         }
-                        add_route(*id, SocketAddr::V6(*addr), false);
                     }
                 }
                 if let Some(ns) = &resp.nodes {
@@ -1244,8 +1245,9 @@ impl Server {
                                 "peer {} (client v={:?}) sent bogus v4 node {:02x?} -> {}",
                                 from_addr, v, id, addr
                             );
+                        } else {
+                            add_route(*id, SocketAddr::V4(*addr), false);
                         }
-                        add_route(*id, SocketAddr::V4(*addr), false);
                     }
                 }
                 if let Some(ret) = self.tmap.lock().unwrap().remove(krpc.t.as_slice()) {

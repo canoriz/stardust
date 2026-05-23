@@ -963,7 +963,7 @@ impl TransmitWorker {
     /// pick blocks for a peer, return the number of blocks picked
     fn pick_blocks_for_peer(&mut self, addr: &SocketAddr, pick_n: usize) -> usize {
         if pick_n > 0 {
-            warn!("pick {pick_n} blocks from {addr:?}");
+            trace!("pick {pick_n} blocks from {addr:?}");
         }
         let Downloading { block_picker, .. } = match &mut self.torrent_state {
             TorrentState::Metadata(d) => d,
