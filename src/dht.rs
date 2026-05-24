@@ -1276,6 +1276,18 @@ impl Server {
                 return;
             }
         };
+        // On Windows, a dual-stack IPv6 socket requires IPv4 destinations in
+        // IPv4-mapped IPv6 form (::ffff:a.b.c.d). Passing a raw sockaddr_in
+        // to an AF_INET6 socket gives WSAEFAULT (os error 10014).
+        let addr = match addr {
+            SocketAddr::V4(v4) => SocketAddr::V6(SocketAddrV6::new(
+                v4.ip().to_ipv6_mapped(),
+                v4.port(),
+                0,
+                0,
+            )),
+            v6 => v6,
+        };
         if let Err(e) = self.s.send_to(&self.out_buf, addr).await {
             warn!("send udp packet failed error {e}");
         }

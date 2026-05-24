@@ -511,31 +511,31 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    #[ignore]
-    async fn test_real_torrent() {
-        use crate::metadata::FileMetadata;
-        let torrent_f = include_bytes!("../../ubuntu-24.10-desktop-amd64.iso.torrent");
-        let torrent = FileMetadata::load(torrent_f).unwrap();
-        let (metadata, announce_list) = torrent.to_metadata();
+    // #[tokio::test]
+    // #[ignore]
+    // async fn test_real_torrent() {
+    //     use crate::metadata::FileMetadata;
+    //     let torrent_f = include_bytes!("../../ubuntu-24.10-desktop-amd64.iso.torrent");
+    //     let torrent = FileMetadata::load(torrent_f).unwrap();
+    //     let (metadata, announce_list) = torrent.to_metadata();
 
-        let announce_req = TrackerGet {
-            peer_id: *b"-ZS0405-qwerasdfzxcv",
-            uploaded: 0,
-            port: 35515,
-            downloaded: 0,
-            left: 0,
-            ip: None,
-        };
+    //     let announce_req = TrackerGet {
+    //         peer_id: *b"-ZS0405-qwerasdfzxcv",
+    //         uploaded: 0,
+    //         port: 35515,
+    //         downloaded: 0,
+    //         left: 0,
+    //         ip: None,
+    //     };
 
-        let z = Announcer::announce_tier(
-            AnnounceType::V4,
-            &announce_req,
-            &metadata.info_hash,
-            announce_list[0][0].clone(),
-        )
-        .await
-        .unwrap();
-        dbg!(z);
-    }
+    //     let z = Announcer::announce_tier(
+    //         AnnounceType::V4,
+    //         &announce_req,
+    //         &metadata.info_hash,
+    //         announce_list[0][0].clone(),
+    //     )
+    //     .await
+    //     .unwrap();
+    //     dbg!(z);
+    // }
 }

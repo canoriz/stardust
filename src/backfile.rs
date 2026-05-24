@@ -7,7 +7,44 @@ use std::{path::Path, sync::Arc};
 use crate::metadata::Metadata;
 
 #[cfg(unix)]
-use std::os::unix::prelude::*;
+fn file_write_all_at_impl(file: &File, buf: &[u8], offset: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.write_all_at(buf, offset)
+}
+
+#[cfg(windows)]
+fn file_write_all_at_impl(file: &File, buf: &[u8], offset: u64) -> std::io::Result<()> {
+    use std::io::ErrorKind;
+    use std::os::windows::fs::FileExt;
+    let mut written = 0usize;
+    while written < buf.len() {
+        match file.seek_write(&buf[written..], offset + written as u64)? {
+            0 => return Err(ErrorKind::WriteZero.into()),
+            n => written += n,
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn file_read_exact_at_impl(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.read_exact_at(buf, offset)
+}
+
+#[cfg(windows)]
+fn file_read_exact_at_impl(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    use std::io::ErrorKind;
+    use std::os::windows::fs::FileExt;
+    let mut read = 0usize;
+    while read < buf.len() {
+        match file.seek_read(&mut buf[read..], offset + read as u64)? {
+            0 => return Err(ErrorKind::UnexpectedEof.into()),
+            n => read += n,
+        }
+    }
+    Ok(())
+}
 use tracing::{debug, info, warn};
 
 pub struct FileMetadata {
@@ -99,7 +136,7 @@ impl Access for NormalFile {
 
     fn write_all_at(&mut self, buf: &[u8], offset: usize) -> Result<()> {
         warn!("write_all begin at offset {offset} len {}", buf.len());
-        let r = self.file.write_all_at(buf, offset as u64);
+        let r = file_write_all_at_impl(&self.file, buf, offset as u64);
         #[cfg(any(
             target_os = "linux",
             target_os = "android",
@@ -125,7 +162,7 @@ impl Access for NormalFile {
 
     fn read_exact_at(&mut self, buf: &mut [u8], offset: usize) -> Result<()> {
         info!("read_exact begin at offset {offset} len {}", buf.len());
-        let r = self.file.read_exact_at(buf, offset as u64);
+        let r = file_read_exact_at_impl(&self.file, buf, offset as u64);
         info!("read_exact end at offset {offset} len {}", buf.len());
         r
     }

@@ -573,7 +573,11 @@ mod test {
     /// reclaim the allocation via `try_unwrap` instead of cloning.
     #[test]
     fn cowbuf_deref_mut_on_sole_shared_owner_reuses_allocation() {
-        let mut cow: CowBuf<Vec<u8>> = CowBuf::new(vec![1u8, 2, 3]);
+        // Pre-allocate with extra capacity so push(4) below does not reallocate,
+        // keeping the buffer pointer stable across the deref_mut call.
+        let mut v = Vec::with_capacity(4);
+        v.extend_from_slice(&[1u8, 2, 3]);
+        let mut cow: CowBuf<Vec<u8>> = CowBuf::new(v);
         // Transition to Shared, then drop the second handle so cow is the only owner.
         let shared = cow.clone();
         drop(shared);

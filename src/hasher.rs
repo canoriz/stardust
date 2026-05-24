@@ -1,4 +1,5 @@
-use std::io::{self, Write};
+use std::io;
+use sha1::digest::Update;
 
 #[derive(Copy, Clone, Debug)]
 pub struct HashState<T> {
@@ -20,10 +21,10 @@ impl<T> HashState<T> {
 
 impl<T> HashState<T>
 where
-    T: Write,
+    T: Update,
 {
     pub fn write(&mut self, data: &[u8]) -> io::Result<()> {
-        self.hasher.write_all(data)?;
+        self.hasher.update(data);
         self.next_offset += data.len();
         Ok(())
     }
