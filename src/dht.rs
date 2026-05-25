@@ -543,40 +543,23 @@ impl DHT {
                     }
                 };
 
-                let mut addr = None;
-                for a in addrs {
-                    match a {
-                        SocketAddr::V4(_) if !ipv6 => addr = Some(a),
-                        SocketAddr::V6(v) => match v.ip().to_ipv4_mapped() {
-                            Some(_) if !ipv6 => addr = Some(a),
-                            None if ipv6 => addr = Some(a),
-                            _ => {}
-                        },
-                        _ => {}
+                debug!("nodes not enough, ping bootstrap node {}", query_node);
+                let mut success = false;
+                for ping_addr in addrs.filter(|a| match a {
+                    SocketAddr::V4(_) => !ipv6,
+                    SocketAddr::V6(v) => match v.ip().to_ipv4_mapped() {
+                        Some(_) => !ipv6,
+                        None => ipv6,
+                    },
+                }) {
+                    if cl.get_peers_rpc(RpcAddr::no_id(ping_addr), target, time::Duration::from_secs(3)).await.is_ok() {
+                        success = true;
+                        break;
                     }
                 }
-
-                let ping_addr = match addr {
-                    Some(a) => a,
-                    None => {
-                        debug!(
-                            "dht bootstrap: no {} address for {}, trying next node",
-                            if ipv6 { "IPv6" } else { "IPv4" },
-                            query_node
-                        );
-                        cl.ping_bootstrap_node(ipv6, target);
-                        return;
-                    }
-                };
-
-                debug!("nodes not enough, ping bootstrap node {}", query_node);
-                _ = cl
-                    .get_peers_rpc(
-                        RpcAddr::no_id(ping_addr),
-                        target,
-                        time::Duration::from_secs(3),
-                    )
-                    .await;
+                if !success {
+                    cl.ping_bootstrap_node(ipv6, target);
+                }
             });
         }
     }
