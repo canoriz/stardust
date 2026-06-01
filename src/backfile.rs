@@ -148,6 +148,7 @@ impl Access for NormalFile {
         ))]
         {
             use nix::fcntl::{self, posix_fadvise};
+            use std::os::fd::AsFd;
             posix_fadvise(
                 self.file.as_fd(),
                 offset as i64,
