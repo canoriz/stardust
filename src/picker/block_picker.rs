@@ -730,7 +730,7 @@ impl BlockPicker {
                 for index in piece_index_order(pieces).iter().map(|(i, _)| i) {
                     let blocks = &mut pieces.get_mut(index).expect("must exist");
                     assert!(!endgame);
-                    if *remain <= 0 {
+                    if *remain == 0 {
                         break;
                     }
                     if peer_status.have(*index) {
@@ -814,7 +814,7 @@ impl BlockPicker {
                     };
                     for index in piece_index_order(&self.receiving).iter().map(|(i, _)| i) {
                         let blocks = &mut self.receiving.get_mut(index).expect("must exist");
-                        if remain <= 0 {
+                        if remain == 0 {
                             break;
                         }
                         if peer_status.have(*index) {
@@ -839,7 +839,7 @@ impl BlockPicker {
         } else if remain > 0 && rush_mode {
             for index in piece_index_order(&self.receiving).iter().map(|(i, _)| i) {
                 let blocks = &mut self.receiving.get_mut(index).expect("must exist");
-                if remain <= 0 {
+                if remain == 0 {
                     break;
                 }
                 if peer_status.have(*index) {
