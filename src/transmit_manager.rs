@@ -232,6 +232,7 @@ pub(crate) struct TransmitManagerHandle {
     pub sender: mpsc::UnboundedSender<Msg>,
 }
 
+
 pub(crate) struct TransmitManager {
     cancel: CancelDropGuard,
     worker_stop: oneshot::Receiver<TransmitDump>,
@@ -248,6 +249,7 @@ impl TransmitManager {
         announce_manager: AnnounceManagerHandle,
         cache_handle: CacheManagerHandle,
     ) -> Self {
+        let info_hash = t.info_hash();
         let worker = TransmitWorker::new(
             t,
             id,
@@ -293,6 +295,7 @@ impl TransmitManager {
         announce_manager: AnnounceManagerHandle,
         cache_handle: CacheManagerHandle,
     ) -> Self {
+        let info_hash = dump.info_hash();
         let peers = dump.peers.clone();
         let worker = TransmitWorker::from_dump(
             dump,
@@ -2188,6 +2191,7 @@ impl TransmitWorker {
                 // TODO: why that's error
                 // shall we reload?
                 // TODO: what to do about the remaing waiting blocks?
+                warn!("piecebuf ready error for {ji:?}: {e}");
                 return Err(e);
             }
         }
@@ -2520,6 +2524,30 @@ pub(crate) async fn run_transmit_worker(
             }
         };
     }
+    // Ensure all blocks in waiting_for_piecebuf are written into PieceBufs
+    // before shutdown. For entries not yet requested, send GetPiece now.
+    for (ji, state) in transmit.waiting_for_piecebuf.iter_mut() {
+        if !state.requested {
+            let key = GlobalPieceKey {
+                info_hash: transmit.info_hash,
+                index: *ji,
+            };
+            transmit
+                .cache_handle
+                .send_get_piece(key, transmit.self_handle.sender.clone());
+            state.requested = true;
+        }
+    }
+    while !transmit.waiting_for_piecebuf.is_empty() {
+        match transmit.receiver.recv().await {
+            Some(msg @ Msg::PieceBufReady { .. }) => {
+                let _ = transmit.handle_msg(msg);
+            }
+            Some(_) => {}
+            None => break,
+        }
+    }
+    transmit.cache_handle.unregister_torrent(transmit.info_hash);
     info!("dump transmit manager of {:02x?}", transmit.info_hash);
     let dump = transmit.handle_dump_status();
     let _ = done.send(dump);

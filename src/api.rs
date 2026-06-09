@@ -291,7 +291,8 @@ pub async fn handle_rpc(session: &Session, req: RpcRequest) -> (RpcResponse, boo
             let rsp = match parse_info_hash(&info_hash) {
                 Err(e) => RpcResponse::err(e),
                 Ok(ih) => match session.remove_torrent(&ih).await {
-                    Some(_) => RpcResponse::RemoveTorrentAccepted,
+                    Some(Ok(_)) => RpcResponse::RemoveTorrentAccepted,
+                    Some(Err(e)) => RpcResponse::err(format!("remove torrent failed: {e}")),
                     None => RpcResponse::err("torrent not found"),
                 },
             };

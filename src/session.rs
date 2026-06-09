@@ -197,8 +197,9 @@ impl Session {
     }
 
     /// remove torrent by info_hash
-    pub async fn remove_torrent(&self, info_hash: &InfoHash) -> Option<TorrentManagerHandle> {
-        self.tasks.lock().unwrap().remove(info_hash)
+    pub async fn remove_torrent(&self, info_hash: &InfoHash) -> Option<io::Result<TransmitDump>> {
+        let handle = self.tasks.lock().unwrap().remove(info_hash)?;
+        Some(handle.stop_wait().await)
     }
 
     pub async fn do_work<F, R>(&self, info_hash: &InfoHash, work: F) -> io::Result<R>

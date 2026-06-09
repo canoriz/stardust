@@ -233,15 +233,8 @@ impl CacheManager {
 
                 CacheMsg::UnregisterTorrent(info_hash) => {
                     self.torrents.remove(&info_hash);
-                    // Flush all Loaded pieces for this torrent so data is not lost.
-                    for (key, entry) in self.cache.iter_mut() {
-                        if key.info_hash == info_hash {
-                            if let CacheEntry::Loaded(Some(p)) = entry {
-                                p.flush(|_| {});
-                            }
-                        }
-                    }
-                    // TODO: remove pending entries
+                    self.cache.retain(|key, _| key.info_hash != info_hash);
+                    self.pending.retain(|key, _| key.info_hash != info_hash);
                 }
 
                 CacheMsg::GetPiece { key, sender } => {
@@ -314,7 +307,9 @@ impl CacheManager {
                     }
                 }
                 // No waiters: cache the loaded piece.
-                self.cache.insert(key, CacheEntry::Loaded(Some(piece)));
+                if self.torrents.contains_key(&key.info_hash) {
+                    self.cache.insert(key, CacheEntry::Loaded(Some(piece)));
+                }
             }
             Err(e) => {
                 // Read failed: remove Reading entry and notify all waiters.
@@ -355,11 +350,11 @@ impl CacheManager {
         }
 
         // No waiters: re-cache the piece.
-        // If the torrent is no longer registered, flush so data is not lost.
-        if !self.torrents.contains_key(&key.info_hash) {
-            piece.flush(|_| {});
+        // Only re-cache if the torrent is still registered; if not, just drop the piece.
+        // drop piece will auto write back if it's dirty, so we don't need to explicitly flush here.
+        if self.torrents.contains_key(&key.info_hash) {
+            self.cache.insert(key, CacheEntry::Loaded(Some(piece)));
         }
-        self.cache.insert(key, CacheEntry::Loaded(Some(piece)));
     }
 
     fn spawn_piece_read(&self, key: GlobalPieceKey) {

@@ -20,3 +20,7 @@
 
 ## 5
 - [ ] unified trait for file and cache manager: windows use copy, linux use move BlockBuf and flush by writev, reduce copy by one
+- [ ] stop_wait/remove_torrent guarantees data will be written (PieceBuf marked dirty, flush
+  scheduled via spawn_blocking), but does NOT guarantee writes are complete when returning.
+  To ensure all data is in kernel buffer at return time, need to await the spawn_blocking
+  flush tasks before unregister, or use a synchronous flush path in CacheManager.
