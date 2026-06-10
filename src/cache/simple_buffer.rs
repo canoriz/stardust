@@ -3,14 +3,16 @@ use std::{
     fmt, io,
     ops::{Deref, DerefMut},
     sync::{
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicU32, AtomicUsize, Ordering},
         Arc, Mutex,
     },
 };
 
 use super::MutexBackFile;
 use crate::protocol::Request;
+use crate::transmit_manager::Msg as TmMsg;
 use bytes::BytesMut;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time;
 use tracing::warn;
 
@@ -257,9 +259,6 @@ pub struct FlushErr {
     pub err: io::Error,
 }
 
-pub trait ErrorCallback: FnOnce(FlushErr) + Send + 'static {}
-impl<T> ErrorCallback for T where T: FnOnce(FlushErr) + Send + 'static {}
-
 pub struct PieceBuf {
     /// always Some, except in drop
     buf: CowBuf<PooledBuf>,
@@ -269,8 +268,13 @@ pub struct PieceBuf {
     state: Arc<AtomicU32>,
     file: MutexBackFile,
 
-    /// always Some, except drop takes this
-    on_error: Option<Box<dyn ErrorCallback>>,
+    // TODO: maybe remove Option, make flush tracking mandatory
+    /// Shared in-flight flush counter. Incremented before spawn_blocking in
+    /// Drop/flush, so the worker can wait until all flushes complete on exit.
+    flush_count: Option<Arc<AtomicUsize>>,
+    // TODO: maybe remove Option
+    /// Sends FlushComplete to the worker's main loop after each flush finishes.
+    msg_sender: Option<mpsc::UnboundedSender<TmMsg>>,
 }
 
 impl fmt::Debug for PieceBuf {
@@ -317,7 +321,7 @@ impl AsRef<[u8]> for PieceBuf {
 
 impl Drop for PieceBuf {
     fn drop(&mut self) {
-        let on_err = self.on_error.take();
+        let msg_sender = self.msg_sender.clone();
 
         let f = self.file.clone();
         let s = self.state.clone();
@@ -329,12 +333,17 @@ impl Drop for PieceBuf {
         let old_state = s.fetch_or(FLUSHING | DROPPING, Ordering::Acquire);
         if old_state & (DIRTY | FLUSHING) > 0 {
             // buffer may be dirty while DIRTY bit is 0 if other is FLUSHING
+            if let Some(ref count) = self.flush_count {
+                count.fetch_add(1, Ordering::Relaxed);
+            }
             let index = self.index;
             tokio::task::spawn_blocking(move || {
                 let r = flush_buf_force(buf, offset, s, f, true);
-                if let Err(e) = r {
-                    warn!("PieceBuf::Drop flush error index {index:?} {e:?}, data lost");
-                    on_err.unwrap()(e)
+                if let Err(ref e) = r {
+                    warn!("PieceBuf::Drop flush error index {index:?} {e:?}");
+                }
+                if let Some(sender) = msg_sender {
+                    let _ = sender.send(TmMsg::FlushComplete(r));
                 }
             });
         }
@@ -362,7 +371,7 @@ impl PieceBuf {
 
     pub fn flush<F>(&mut self, result_callback: F)
     where
-        F: FnOnce(Result<(), FlushErr>) + Send + 'static,
+        F: FnOnce(&Result<(), FlushErr>) + Send + 'static,
     {
         // set flushing bit and clear dirty bit
         // dirty flushing
@@ -384,16 +393,24 @@ impl PieceBuf {
                 let old_state = self.state.swap(FLUSHING, Ordering::Acquire);
                 assert_eq!(old_state, 0b10);
 
+                if let Some(ref count) = self.flush_count {
+                    count.fetch_add(1, Ordering::Relaxed);
+                }
+
                 let f = self.file.clone();
                 let s = self.state.clone();
                 let offset = self.offset;
+                let msg_sender = self.msg_sender.clone();
 
                 // create a cheap copy of buf, and implicitly make ourself read-only
                 // next time we write to ourself, we will clone the buf
                 let buf = self.buf.clone();
                 tokio::task::spawn_blocking(move || {
                     let r = flush_buf_force(buf, offset, s, f, false);
-                    result_callback(r);
+                    result_callback(&r);
+                    if let Some(sender) = msg_sender {
+                        let _ = sender.send(TmMsg::FlushComplete(r));
+                    }
                 });
             }
             0b11 => {}
@@ -409,7 +426,8 @@ impl PieceBuf {
         offset: usize,
         len: usize,
         file: MutexBackFile,
-        on_error: Box<dyn ErrorCallback>,
+        flush_count: Option<Arc<AtomicUsize>>,
+        msg_sender: Option<mpsc::UnboundedSender<TmMsg>>,
     ) -> Self {
         PieceBuf {
             buf: CowBuf::new(PooledBuf::new(pool.clone(), len)),
@@ -418,7 +436,8 @@ impl PieceBuf {
             offset,
             state: Arc::new(AtomicU32::new(0)),
             file,
-            on_error: Some(on_error),
+            flush_count,
+            msg_sender,
         }
     }
 }
@@ -514,7 +533,8 @@ mod test {
             touch: time::Instant::now(),
             state: Arc::new(AtomicU32::new(initial_state)),
             file: void_file(),
-            on_error: Some(Box::new(|_: FlushErr| {})),
+            flush_count: None,
+            msg_sender: None,
         }
     }
 
@@ -698,9 +718,9 @@ mod test {
 
         assert!(matches!(pb.buf, CowBuf::Owned(_)), "should start Owned");
 
-        let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), FlushErr>>();
+        let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
         pb.flush(move |r| {
-            let _ = tx.send(r);
+            let _ = tx.send(r.is_ok());
         });
 
         // After flush() the buffer is shared — no memcpy yet.
@@ -709,7 +729,7 @@ mod test {
             "buf should be Shared after flush"
         );
 
-        rx.await.unwrap().unwrap();
+        assert!(rx.await.unwrap());
     }
 
     #[tokio::test]
@@ -718,9 +738,9 @@ mod test {
         let mut pb = make_piece_buf_state(pool, 8, DIRTY);
         pb.as_mut()[..4].copy_from_slice(&[0xAA; 4]);
 
-        let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), FlushErr>>();
+        let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
         pb.flush(move |r| {
-            let _ = tx.send(r);
+            let _ = tx.send(r.is_ok());
         });
         assert!(matches!(pb.buf, CowBuf::Shared(_)));
 
@@ -733,7 +753,7 @@ mod test {
         );
         assert_eq!(pb.as_ref()[..4], [0xBB; 4]);
 
-        rx.await.unwrap().unwrap();
+        assert!(rx.await.unwrap());
     }
 
     #[tokio::test]
@@ -744,9 +764,9 @@ mod test {
         let mut pb = make_piece_buf_state(pool, 8, DIRTY);
         pb.as_mut()[..4].copy_from_slice(&[0xAA; 4]);
 
-        let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), FlushErr>>();
+        let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
         pb.flush(move |r| {
-            let _ = tx.send(r);
+            let _ = tx.send(r.is_ok());
         });
 
         // Grab a reference to the shared Arc before COW.
@@ -771,7 +791,7 @@ mod test {
         );
 
         // Wait for flush, then only snapshot holds the Arc.
-        rx.await.unwrap().unwrap();
+        assert!(rx.await.unwrap());
         assert_eq!(Arc::strong_count(snapshot.as_ref().unwrap()), 1);
 
         // The original data is intact in the snapshot.
@@ -821,7 +841,8 @@ mod test {
             touch: time::Instant::now(),
             state: Arc::new(AtomicU32::new(0)),
             file: file.clone(),
-            on_error: Some(Box::new(|_: FlushErr| {})),
+            flush_count: None,
+            msg_sender: None,
         };
         let _shared = pb.buf.clone(); // make Shared
                                       // read_from_file must panic when buf is Shared.

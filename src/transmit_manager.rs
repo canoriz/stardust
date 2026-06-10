@@ -22,6 +22,7 @@ use sha1::{Digest, Sha1};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -144,7 +145,9 @@ pub(crate) enum Msg {
 
     /// A message received from peer
     PeerMsg(PeerMsg),
-    FlushError(FlushErr),
+    /// A flush operation completed (success or failure). Used to track
+    /// pending writes so shutdown can wait for all flushes to finish.
+    FlushComplete(Result<(), FlushErr>),
 
     RequestMetadata(oneshot::Sender<Option<Arc<Metadata>>>),
     QueryStatus(oneshot::Sender<TorrentRuntimeStatus>),
@@ -231,7 +234,6 @@ fn compute_probe_bdp_rtt(min_rtt: time::Duration) -> time::Duration {
 pub(crate) struct TransmitManagerHandle {
     pub sender: mpsc::UnboundedSender<Msg>,
 }
-
 
 pub(crate) struct TransmitManager {
     cancel: CancelDropGuard,
@@ -653,6 +655,12 @@ pub struct TransmitWorker {
     /// piece buf is ready
     waiting_for_piecebuf: HashMap<JointIndex, PieceWaitState>,
 
+    /// Number of in-flight spawn_blocking flush tasks. PieceBuf does
+    /// fetch_add(1) before spawn, the worker's main loop does fetch_sub(1)
+    /// when handling FlushComplete. On shutdown the worker loops until this
+    /// reaches 0.
+    pending_flushes: Arc<AtomicUsize>,
+
     downloaded: watch::Sender<bool>,
 
     /// Handle to the global CacheManager actor.
@@ -757,11 +765,16 @@ impl TransmitWorker {
         cmd_receiver: mpsc::UnboundedReceiver<Msg>,
         cache_handle: CacheManagerHandle,
     ) -> Self {
+        let pending_flushes = Arc::new(AtomicUsize::new(0));
         let (info_hash, torrent_state) = match dump.state {
             TorrentStateDump::Metadata { metadata, picker } => {
                 let info_hash = metadata.info_hash;
-                let mut downloading =
-                    Self::metadata_into_downloading(metadata, &cache_handle, cmd_sender.clone());
+                let mut downloading = Self::metadata_into_downloading(
+                    metadata,
+                    &cache_handle,
+                    pending_flushes.clone(),
+                    cmd_sender.clone(),
+                );
                 downloading.block_picker.load_progress(picker);
                 (info_hash, TorrentState::Metadata(downloading))
             }
@@ -806,6 +819,7 @@ impl TransmitWorker {
             connecting_peers: HashSet::new(),
             announce_urls: dump.announce_urls,
             waiting_for_piecebuf: HashMap::new(),
+            pending_flushes,
             downloaded,
             running_state: dump.running_state.into(),
             cache_handle,
@@ -822,12 +836,14 @@ impl TransmitWorker {
         cmd_receiver: mpsc::UnboundedReceiver<Msg>,
         cache_handle: CacheManagerHandle,
     ) -> Self {
+        let pending_flushes = Arc::new(AtomicUsize::new(0));
         let (info_hash, state) = match t {
             TorrentTask::Torrent(m) => {
                 let info_hash = m.info_hash;
                 let state = TorrentState::Metadata(Self::metadata_into_downloading(
                     m,
                     &cache_handle,
+                    pending_flushes.clone(),
                     cmd_sender.clone(),
                 ));
                 (info_hash, state)
@@ -862,6 +878,7 @@ impl TransmitWorker {
             connecting_peers: HashSet::new(),
             announce_urls: Vec::new(),
             waiting_for_piecebuf: HashMap::new(),
+            pending_flushes,
             downloaded,
             running_state: RunningState::StableState(StableState::Stopped),
             cache_handle,
@@ -871,7 +888,8 @@ impl TransmitWorker {
     fn metadata_into_downloading(
         m: Metadata,
         cache_handle: &CacheManagerHandle,
-        error_sender: mpsc::UnboundedSender<Msg>,
+        pending_flushes: Arc<AtomicUsize>,
+        msg_sender: mpsc::UnboundedSender<Msg>,
     ) -> Downloading {
         let m = Arc::new(m);
         let piece_size = m.regular_piece_size() as u32;
@@ -897,7 +915,8 @@ impl TransmitWorker {
             m.regular_piece_size(),
             total_length,
             back_file,
-            error_sender,
+            Some(pending_flushes.clone()),
+            Some(msg_sender),
         );
 
         Downloading {
@@ -1195,8 +1214,17 @@ impl TransmitWorker {
                 Ok(())
             }
             Msg::PeerMsg(pm) => self.handle_peer_msg(pm),
-            Msg::FlushError(_) => {
-                todo!()
+            Msg::FlushComplete(r) => {
+                self.pending_flushes.fetch_sub(1, Ordering::Relaxed);
+                if let Err(e) = r {
+                    // TODO: A flush error breaks the invariant that dumped
+                    // BlockPicker ownership is backed by bytes on disk. This
+                    // must be surfaced to stop_wait/remove/shutdown, or the
+                    // corresponding picker progress must be rolled back before
+                    // creating a dump.
+                    warn!("flush error: {:?}", e);
+                }
+                Ok(())
             }
             Msg::PieceBufReady { index, buf } => self.handle_piecebuf_ready(index, buf),
             Msg::RequestMetadata(sender) => {
@@ -2082,6 +2110,11 @@ impl TransmitWorker {
             return Ok(());
         }
 
+        // TODO: BlockPicker marks this block as Received before the bytes are
+        // copied into PieceBuf. Shutdown must not create a dump with this state
+        // unless waiting_for_piecebuf is drained successfully, or the picker
+        // state is rolled back / stop_wait returns an error. Otherwise restore
+        // can think a block is owned while its bytes never reached the cache.
         let (complete, peers_revoked) = block_picker.receive_block(req);
         for addr in peers_revoked {
             if addr != *peer {
@@ -2188,9 +2221,12 @@ impl TransmitWorker {
                 Ok(())
             }
             Err(e) => {
-                // TODO: why that's error
-                // shall we reload?
-                // TODO: what to do about the remaing waiting blocks?
+                // TODO: This sub-piece may already contain blocks marked
+                // Received in BlockPicker, but the bytes were not copied into
+                // PieceBuf. Shutdown should fail or roll back that picker
+                // state; keeping waiting_for_piecebuf uncleared currently
+                // tends to hang, while clearing it without rollback would dump
+                // false ownership.
                 warn!("piecebuf ready error for {ji:?}: {e}");
                 return Err(e);
             }
@@ -2357,6 +2393,7 @@ impl TransmitWorker {
                         let mut downloading = Self::metadata_into_downloading(
                             m,
                             &self.cache_handle,
+                            self.pending_flushes.clone(),
                             self.self_handle.sender.clone(),
                         );
                         let piece_picker = &mut downloading.block_picker;
@@ -2526,28 +2563,46 @@ pub(crate) async fn run_transmit_worker(
     }
     // Ensure all blocks in waiting_for_piecebuf are written into PieceBufs
     // before shutdown. For entries not yet requested, send GetPiece now.
-    for (ji, state) in transmit.waiting_for_piecebuf.iter_mut() {
-        if !state.requested {
-            let key = GlobalPieceKey {
-                info_hash: transmit.info_hash,
-                index: *ji,
-            };
-            transmit
-                .cache_handle
-                .send_get_piece(key, transmit.self_handle.sender.clone());
-            state.requested = true;
-        }
+    for (ji, state) in transmit
+        .waiting_for_piecebuf
+        .iter_mut()
+        .filter(|(_, s)| !s.requested)
+    {
+        let key = GlobalPieceKey {
+            info_hash: transmit.info_hash,
+            index: *ji,
+        };
+        transmit
+            .cache_handle
+            .send_get_piece(key, transmit.self_handle.sender.clone());
+        state.requested = true;
     }
     while !transmit.waiting_for_piecebuf.is_empty() {
         match transmit.receiver.recv().await {
-            Some(msg @ Msg::PieceBufReady { .. }) => {
+            Some(msg @ (Msg::PieceBufReady { .. } | Msg::FlushComplete(_))) => {
                 let _ = transmit.handle_msg(msg);
             }
-            Some(_) => {}
+            Some(other) => {
+                info!("ignored msg during piecebuf drain: {other:?}");
+            }
             None => break,
         }
     }
-    transmit.cache_handle.unregister_torrent(transmit.info_hash);
+    transmit
+        .cache_handle
+        .unregister_torrent(transmit.info_hash)
+        .await;
+    while transmit.pending_flushes.load(Ordering::Relaxed) > 0 {
+        match transmit.receiver.recv().await {
+            Some(msg @ Msg::FlushComplete(_)) => {
+                let _ = transmit.handle_msg(msg);
+            }
+            Some(other) => {
+                info!("ignored msg during flush drain: {other:?}");
+            }
+            None => break,
+        }
+    }
     info!("dump transmit manager of {:02x?}", transmit.info_hash);
     let dump = transmit.handle_dump_status();
     let _ = done.send(dump);

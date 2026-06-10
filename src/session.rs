@@ -91,14 +91,15 @@ impl Session {
             None
         };
 
+        let _cancel = cancel.clone().drop_guard();
         let s = Self {
             self_id: opt.self_id,
             tasks,
             port: opt.port,
             dht_client,
             cache_handle,
-            cancel: cancel.clone(),
-            _cancel: cancel.drop_guard(),
+            cancel,
+            _cancel,
         };
 
         if let Some(previous_session) = opt.previous {

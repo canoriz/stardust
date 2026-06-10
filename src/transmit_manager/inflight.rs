@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
+use crate::protocol::Request;
 use tokio::time;
 use tracing::info;
-use crate::protocol::Request;
 
 /// manages states of a peer's inflight requests
 pub struct Inflight {

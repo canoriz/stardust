@@ -11,7 +11,7 @@ use tracing::{info, warn};
 
 use super::MutexBackFile;
 use crate::cache::simple_buffer::{
-    read_from_file, ErrorCallback, FlushErr, JointIndex, PieceBuf, Pool, POOL_SIZE, SUB_PIECE_SIZE,
+    read_from_file, FlushErr, JointIndex, PieceBuf, Pool, POOL_SIZE, SUB_PIECE_SIZE,
 };
 use crate::math_helper::piece_total_and_last_size;
 use crate::transmit_manager::Msg as TmMsg;
@@ -42,8 +42,10 @@ struct TorrentInfo {
     piece_size: usize,
     last_piece_size: usize,
     piece_total: usize,
-    /// Channel for routing flush errors back to the TM event loop.
-    error_sender: mpsc::UnboundedSender<TmMsg>,
+    /// Shared in-flight flush counter for this torrent's pieces.
+    flush_count: Option<Arc<AtomicUsize>>,
+    /// Sends FlushComplete to the worker's main loop after each flush.
+    msg_sender: Option<mpsc::UnboundedSender<TmMsg>>,
 }
 
 /// Messages handled by the CacheManager actor.
@@ -53,9 +55,10 @@ pub enum CacheMsg {
         piece_size: usize,
         total_length: usize,
         back_file: MutexBackFile,
-        error_sender: mpsc::UnboundedSender<TmMsg>,
+        flush_count: Option<Arc<AtomicUsize>>,
+        msg_sender: Option<mpsc::UnboundedSender<TmMsg>>,
     },
-    UnregisterTorrent([u8; 20]),
+    UnregisterTorrent([u8; 20], oneshot::Sender<()>),
     /// Request a piece; the sender receives `TmMsg::PieceBufReady` when it is ready.
     GetPiece {
         key: GlobalPieceKey,
@@ -93,19 +96,23 @@ impl CacheManagerHandle {
         piece_size: usize,
         total_length: usize,
         back_file: MutexBackFile,
-        error_sender: mpsc::UnboundedSender<TmMsg>,
+        flush_count: Option<Arc<AtomicUsize>>,
+        msg_sender: Option<mpsc::UnboundedSender<TmMsg>>,
     ) {
         let _ = self.sender.send(CacheMsg::RegisterTorrent {
             info_hash,
             piece_size,
             total_length,
             back_file,
-            error_sender,
+            flush_count,
+            msg_sender,
         });
     }
 
-    pub fn unregister_torrent(&self, info_hash: [u8; 20]) {
-        let _ = self.sender.send(CacheMsg::UnregisterTorrent(info_hash));
+    pub async fn unregister_torrent(&self, info_hash: [u8; 20]) {
+        let (tx, rx) = oneshot::channel();
+        let _ = self.sender.send(CacheMsg::UnregisterTorrent(info_hash, tx));
+        let _ = rx.await;
     }
 
     pub fn vacant_count(&self) -> usize {
@@ -146,7 +153,7 @@ impl PieceLease {
     // TODO: do we need this result_callback, shall we just inform cache manager?
     pub fn flush<F>(&mut self, result_callback: F)
     where
-        F: FnOnce(Result<(), FlushErr>) + Send + 'static,
+        F: FnOnce(&Result<(), FlushErr>) + Send + 'static,
     {
         self.inner.as_mut().unwrap().flush(result_callback);
     }
@@ -215,7 +222,8 @@ impl CacheManager {
                     piece_size,
                     total_length,
                     back_file,
-                    error_sender,
+                    flush_count,
+                    msg_sender,
                 } => {
                     let (piece_total, last_piece_size) =
                         piece_total_and_last_size(total_length, piece_size);
@@ -226,15 +234,17 @@ impl CacheManager {
                             piece_size,
                             last_piece_size,
                             piece_total,
-                            error_sender,
+                            flush_count,
+                            msg_sender,
                         },
                     );
                 }
 
-                CacheMsg::UnregisterTorrent(info_hash) => {
+                CacheMsg::UnregisterTorrent(info_hash, done) => {
                     self.torrents.remove(&info_hash);
                     self.cache.retain(|key, _| key.info_hash != info_hash);
                     self.pending.retain(|key, _| key.info_hash != info_hash);
+                    let _ = done.send(());
                 }
 
                 CacheMsg::GetPiece { key, sender } => {
@@ -395,7 +405,8 @@ impl CacheManager {
         let offset = piece_idx * info.piece_size + in_piece_offset;
         let len = (SUB_PIECE_SIZE as usize).min(this_piece_size - in_piece_offset);
         let file = info.back_file.clone();
-        let error_sender = info.error_sender.clone();
+        let flush_count = info.flush_count.clone();
+        let msg_sender = info.msg_sender.clone();
         let pool = self.pool.clone();
         let handle = self.self_handle.clone();
 
@@ -405,9 +416,8 @@ impl CacheManager {
             offset,
             len,
             file.clone(),
-            Box::new(move |e| {
-                let _ = error_sender.send(TmMsg::FlushError(e));
-            }),
+            flush_count,
+            msg_sender,
         );
 
         tokio::task::spawn_blocking(move || match read_from_file(piece, file) {

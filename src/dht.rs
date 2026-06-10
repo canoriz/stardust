@@ -552,7 +552,15 @@ impl DHT {
                         None => ipv6,
                     },
                 }) {
-                    if cl.get_peers_rpc(RpcAddr::no_id(ping_addr), target, time::Duration::from_secs(3)).await.is_ok() {
+                    if cl
+                        .get_peers_rpc(
+                            RpcAddr::no_id(ping_addr),
+                            target,
+                            time::Duration::from_secs(3),
+                        )
+                        .await
+                        .is_ok()
+                    {
                         success = true;
                         break;
                     }
@@ -1263,12 +1271,9 @@ impl Server {
         // IPv4-mapped IPv6 form (::ffff:a.b.c.d). Passing a raw sockaddr_in
         // to an AF_INET6 socket gives WSAEFAULT (os error 10014).
         let addr = match addr {
-            SocketAddr::V4(v4) => SocketAddr::V6(SocketAddrV6::new(
-                v4.ip().to_ipv6_mapped(),
-                v4.port(),
-                0,
-                0,
-            )),
+            SocketAddr::V4(v4) => {
+                SocketAddr::V6(SocketAddrV6::new(v4.ip().to_ipv6_mapped(), v4.port(), 0, 0))
+            }
             v6 => v6,
         };
         if let Err(e) = self.s.send_to(&self.out_buf, addr).await {

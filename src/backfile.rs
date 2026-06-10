@@ -310,6 +310,9 @@ impl BackFile {
             if w.file.handle.is_none() {
                 w.file.handle = match opener(w.file.path.as_ref()) {
                     Err(e) => {
+                        // TODO: Propagate this error. Silently skipping a file
+                        // write can make the session dump claim BlockPicker owns
+                        // blocks or pieces whose bytes were never written.
                         warn!("error open file {} {e:?}", w.file.path);
                         None
                     }
@@ -337,6 +340,10 @@ impl BackFile {
             if r.file.handle.is_none() {
                 r.file.handle = match opener(r.file.path.as_ref()) {
                     Err(e) => {
+                        // TODO: Propagate this error. Returning Ok after a
+                        // failed open leaves the newly allocated PieceBuf
+                        // zero-filled, which can hide missing on-disk data for
+                        // blocks the restored BlockPicker believes it owns.
                         warn!("error open file {} {e:?}", r.file.path);
                         None
                     }

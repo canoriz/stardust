@@ -1,5 +1,5 @@
-use std::io;
 use sha1::digest::Update;
+use std::io;
 
 #[derive(Copy, Clone, Debug)]
 pub struct HashState<T> {
