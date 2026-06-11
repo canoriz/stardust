@@ -121,9 +121,10 @@ impl Access for NormalFile {
     where
         P: AsRef<Path>,
     {
-        // TODO: this is wild
-        let prefix = path.as_ref().parent().unwrap();
-        std::fs::create_dir_all(prefix).unwrap();
+        let prefix = path.as_ref().parent().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "no parent directory")
+        })?;
+        std::fs::create_dir_all(prefix)?;
 
         let file = File::options()
             .read(true)

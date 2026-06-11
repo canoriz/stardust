@@ -254,6 +254,7 @@ impl Drop for PooledBuf {
 
 #[derive(Debug)]
 pub struct FlushErr {
+    pub ji: JointIndex,
     pub offset: usize,
     pub len: usize,
     pub err: io::Error,
@@ -338,7 +339,7 @@ impl Drop for PieceBuf {
             }
             let index = self.index;
             tokio::task::spawn_blocking(move || {
-                let r = flush_buf_force(buf, offset, s, f, true);
+                let r = flush_buf_force(buf, offset, index, s, f, true);
                 if let Err(ref e) = r {
                     warn!("PieceBuf::Drop flush error index {index:?} {e:?}");
                 }
@@ -400,13 +401,14 @@ impl PieceBuf {
                 let f = self.file.clone();
                 let s = self.state.clone();
                 let offset = self.offset;
+                let ji = self.index;
                 let msg_sender = self.msg_sender.clone();
 
                 // create a cheap copy of buf, and implicitly make ourself read-only
                 // next time we write to ourself, we will clone the buf
                 let buf = self.buf.clone();
                 tokio::task::spawn_blocking(move || {
-                    let r = flush_buf_force(buf, offset, s, f, false);
+                    let r = flush_buf_force(buf, offset, ji, s, f, false);
                     result_callback(&r);
                     if let Some(sender) = msg_sender {
                         let _ = sender.send(TmMsg::FlushComplete(r));
@@ -448,6 +450,7 @@ impl PieceBuf {
 fn flush_buf_force<T>(
     buf: T,
     offset: usize,
+    ji: JointIndex,
     state: Arc<AtomicU32>,
     file: MutexBackFile,
     from_drop: bool,
@@ -476,6 +479,7 @@ where
         state.fetch_and(!FLUSHING, Ordering::Release);
         // assert!(old_state & FLUSHING > 0);
         Err(FlushErr {
+            ji,
             offset,
             len,
             err: e,

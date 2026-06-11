@@ -1217,12 +1217,11 @@ impl TransmitWorker {
             Msg::FlushComplete(r) => {
                 self.pending_flushes.fetch_sub(1, Ordering::Relaxed);
                 if let Err(e) = r {
-                    // TODO: A flush error breaks the invariant that dumped
-                    // BlockPicker ownership is backed by bytes on disk. This
-                    // must be surfaced to stop_wait/remove/shutdown, or the
-                    // corresponding picker progress must be rolled back before
-                    // creating a dump.
-                    warn!("flush error: {:?}", e);
+                    warn!("flush error, pausing: {:?}", e);
+                    if let TorrentState::Metadata(ref mut d) = self.torrent_state {
+                        d.block_picker.piece_verified(e.ji.index(), false);
+                    }
+                    self.running_state = RunningState::StableState(StableState::Paused);
                 }
                 Ok(())
             }
@@ -2221,14 +2220,16 @@ impl TransmitWorker {
                 Ok(())
             }
             Err(e) => {
-                // TODO: This sub-piece may already contain blocks marked
-                // Received in BlockPicker, but the bytes were not copied into
-                // PieceBuf. Shutdown should fail or roll back that picker
-                // state; keeping waiting_for_piecebuf uncleared currently
-                // tends to hang, while clearing it without rollback would dump
-                // false ownership.
+                // This sub-piece may already contain blocks marked Received
+                // in BlockPicker, but the bytes were not copied into PieceBuf.
+                // Roll back the entire piece in the picker so that blocks are
+                // re-requested on resume, and clear waiting_for_piecebuf to
+                // prevent shutdown hang.
                 warn!("piecebuf ready error for {ji:?}: {e}");
-                return Err(e);
+                self.waiting_for_piecebuf.remove(&ji);
+                block_picker.piece_verified(ji.index(), false);
+                self.running_state = RunningState::StableState(StableState::Paused);
+                Ok(())
             }
         }
     }
