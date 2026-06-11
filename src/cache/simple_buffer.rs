@@ -833,6 +833,108 @@ mod test {
         assert!(!called.load(AtomicOrd::SeqCst));
     }
 
+    #[tokio::test]
+    async fn flush_sends_flush_complete_via_msg_sender() {
+        use crate::transmit_manager::Msg as TmMsg;
+        use std::sync::atomic::AtomicUsize;
+        use tokio::sync::mpsc;
+
+        let pool = Arc::new(Mutex::new(Pool::new(4)));
+        let flush_count = Arc::new(AtomicUsize::new(0));
+        let (tx, mut rx) = mpsc::unbounded_channel::<TmMsg>();
+
+        let mut pb = PieceBuf {
+            buf: CowBuf::new(PooledBuf::new(pool, 8)),
+            offset: 0,
+            index: JointIndex::new(3, 0),
+            touch: time::Instant::now(),
+            state: Arc::new(AtomicU32::new(DIRTY)),
+            file: void_file(),
+            flush_count: Some(flush_count.clone()),
+            msg_sender: Some(tx),
+        };
+
+        let (cb_tx, cb_rx) = tokio::sync::oneshot::channel::<bool>();
+        pb.flush(move |r| {
+            let _ = cb_tx.send(r.is_ok());
+        });
+
+        // flush_count incremented before spawn_blocking
+        assert_eq!(flush_count.load(AtomicOrd::SeqCst), 1);
+
+        // callback confirms success
+        assert!(cb_rx.await.unwrap());
+
+        // FlushComplete message received
+        match rx.recv().await.unwrap() {
+            TmMsg::FlushComplete(Ok(())) => {}
+            other => panic!("expected FlushComplete(Ok), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn drop_dirty_piecebuf_sends_flush_complete() {
+        use crate::transmit_manager::Msg as TmMsg;
+        use std::sync::atomic::AtomicUsize;
+        use tokio::sync::mpsc;
+
+        let pool = Arc::new(Mutex::new(Pool::new(4)));
+        let flush_count = Arc::new(AtomicUsize::new(0));
+        let (tx, mut rx) = mpsc::unbounded_channel::<TmMsg>();
+
+        let pb = PieceBuf {
+            buf: CowBuf::new(PooledBuf::new(pool, 8)),
+            offset: 0,
+            index: JointIndex::new(5, 0),
+            touch: time::Instant::now(),
+            state: Arc::new(AtomicU32::new(DIRTY)),
+            file: void_file(),
+            flush_count: Some(flush_count.clone()),
+            msg_sender: Some(tx),
+        };
+
+        drop(pb);
+
+        // flush_count incremented
+        assert_eq!(flush_count.load(AtomicOrd::SeqCst), 1);
+
+        // FlushComplete sent from drop path
+        match rx.recv().await.unwrap() {
+            TmMsg::FlushComplete(Ok(())) => {}
+            other => panic!("expected FlushComplete(Ok), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn drop_clean_piecebuf_does_not_send_flush_complete() {
+        use crate::transmit_manager::Msg as TmMsg;
+        use std::sync::atomic::AtomicUsize;
+        use tokio::sync::mpsc;
+
+        let pool = Arc::new(Mutex::new(Pool::new(4)));
+        let flush_count = Arc::new(AtomicUsize::new(0));
+        let (tx, mut rx) = mpsc::unbounded_channel::<TmMsg>();
+
+        let pb = PieceBuf {
+            buf: CowBuf::new(PooledBuf::new(pool, 8)),
+            offset: 0,
+            index: JointIndex::new(7, 0),
+            touch: time::Instant::now(),
+            state: Arc::new(AtomicU32::new(0)), // clean
+            file: void_file(),
+            flush_count: Some(flush_count.clone()),
+            msg_sender: Some(tx),
+        };
+
+        drop(pb);
+
+        // No flush should happen
+        assert_eq!(flush_count.load(AtomicOrd::SeqCst), 0);
+
+        // Channel should be empty (sender dropped with no message)
+        assert!(rx.try_recv().is_err());
+    }
+
     #[test]
     #[should_panic(expected = "should not be write to shared Cow")]
     fn read_from_file_panics_on_shared_buf() {
