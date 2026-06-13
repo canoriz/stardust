@@ -9,7 +9,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio_util::sync::{CancellationToken, DropGuard};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::cache::cache_manager::{CacheManager, CacheManagerHandle};
 use crate::dht::{DHTOption, DhtDump, DHT};
@@ -269,7 +269,14 @@ async fn run_listener(l: Listener, port: u16) -> std::io::Result<()> {
                 info!("session listener cancelled");
                 break Ok(());
             }
-            Ok((conn, addr)) = listener.accept() => {
+            r = listener.accept() => {
+                let (conn, addr) = match r {
+                    Ok(ca) => ca,
+                    Err(e) => {
+                        warn!("session listener accept error {e}");
+                        continue;
+                    }
+                };
                 let ic = IncomeConn {
                     conn,
                     addr,

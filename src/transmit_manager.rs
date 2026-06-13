@@ -579,23 +579,31 @@ impl MetadataBuffer {
     }
 
     fn add_size_to_bucket(&mut self, sz: usize) {
-        self.size_bucket
+        let new_count = *self
+            .size_bucket
             .entry(sz)
             .and_modify(|c| *c += 1)
             .or_insert(1);
-        if let Some(cc) = self.size_bucket.get(&sz) {
-            if *cc > self.most_frequent_size {
-                if sz > self.most_frequent_size {
-                    for p in (self.most_frequent_size / 16384)..=((sz - 1) / 16384) {
-                        self.not_requested.insert(p as u32);
-                    }
-                } else {
-                    for p in (sz / 16384)..=((self.most_frequent_size - 1) / 16384) {
-                        self.not_requested.insert(p as u32);
-                    }
+        let current_count = self
+            .size_bucket
+            .get(&self.most_frequent_size)
+            .copied()
+            .unwrap_or(0);
+        if new_count > current_count {
+            if sz > self.most_frequent_size {
+                for p in (self.most_frequent_size / 16384)..=((sz - 1) / 16384) {
+                    self.not_requested.insert(p as u32);
                 }
-                self.most_frequent_size = sz;
+            } else {
+                // TODO: fragile. `most_frequent_size - 1` underflows if
+                // `most_frequent_size == 0`. Safe only because the count-vs-count
+                // guard above can't pick this branch when most_frequent_size is 0.
+                // Guard explicitly if that invariant ever changes.
+                for p in (sz / 16384)..=((self.most_frequent_size - 1) / 16384) {
+                    self.not_requested.insert(p as u32);
+                }
             }
+            self.most_frequent_size = sz;
         }
 
         let buf = &mut self.metadata;

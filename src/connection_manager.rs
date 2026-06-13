@@ -472,7 +472,7 @@ where
                 self.transmit_handle
                     .sender
                     .send(TransmitMsg::PeerMsg(PeerMsg::Pieces(
-                        self.read_stream.peer_addr(),
+                        to_canonical_addr(self.read_stream.peer_addr()),
                         blks,
                     )))
                     .unwrap();

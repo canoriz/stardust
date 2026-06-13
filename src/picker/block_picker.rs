@@ -1068,19 +1068,23 @@ impl BlockPicker {
             let r = b.receive(req);
             if b.is_all_requested_or_received() {
                 let b = self.requesting.remove(&ji.index()).unwrap();
+                // return peers to cancel
+                let complete = PieceComplete {
+                    piece: b.is_all_received(),
+                    sub_piece: b.is_sub_all_received(req.begin),
+                };
                 self.receiving.insert(ji.index(), b);
+                (complete, r)
             } else {
-                return (
+                (
                     PieceComplete {
                         piece: false,
                         sub_piece: b.is_sub_all_received(req.begin),
                     },
                     r,
-                );
+                )
             }
-        }
-
-        if let Some(b) = self.receiving.get_mut(&ji.index()) {
+        } else if let Some(b) = self.receiving.get_mut(&ji.index()) {
             let r = b.receive(req);
             (
                 PieceComplete {

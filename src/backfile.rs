@@ -309,20 +309,10 @@ impl BackFile {
             );
 
             if w.file.handle.is_none() {
-                w.file.handle = match opener(w.file.path.as_ref()) {
-                    Err(e) => {
-                        // TODO: Propagate this error. Silently skipping a file
-                        // write can make the session dump claim BlockPicker owns
-                        // blocks or pieces whose bytes were never written.
-                        warn!("error open file {} {e:?}", w.file.path);
-                        None
-                    }
-                    Ok(fh) => Some(fh),
-                };
+                w.file.handle = Some(opener(w.file.path.as_ref())?);
             }
 
             if let Some(ref mut fh) = w.file.handle {
-                // TODO: FIXME: one error write should not trigger fn call error
                 fh.file_write_all_at(&buf[w.buf_begin..w.buf_begin + w.buf_len], w.offset)?;
             }
         }
