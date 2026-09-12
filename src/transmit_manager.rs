@@ -1084,6 +1084,7 @@ impl TransmitWorker {
         picked_n
     }
 
+    #[instrument(skip_all, fields(hash = crate::helper::to_hex(&self.id)))]
     fn handle_msg(&mut self, m: Msg) -> io::Result<()> {
         match m {
             Msg::NewDiscoveredPeer { addr, from } => {

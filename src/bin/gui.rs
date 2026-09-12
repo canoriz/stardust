@@ -415,7 +415,7 @@ async fn backend_main(
 
     // Persist session state to disk.
     let dump = session.shutdown().await;
-    match serde_json::to_string_pretty(&dump) {
+    match serde_json::to_string(&dump) {
         Ok(data) => {
             if let Err(e) = std::fs::write(SESSION_FILE, &data) {
                 tracing::error!("failed to write {SESSION_FILE}: {e}");
