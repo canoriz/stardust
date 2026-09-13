@@ -65,7 +65,7 @@ pub trait Access: Sized + Sync {
     // TODO: maybe use OpenDAL's pattern, first generate a "Opener"
     // then let opener open Handle, Handle impls FileAt
     // then discard the types.
-    fn open<P>(path: P) -> Result<Self>
+    fn open<P>(path: P, len: usize) -> Result<Self>
     where
         P: AsRef<Path>;
     fn write_all_at(&mut self, buf: &[u8], offset: usize) -> Result<()>;
@@ -77,8 +77,8 @@ trait AccessDyn
 where
     Self: Access + Send + 'static,
 {
-    fn open_dyn(path: &Path) -> Result<Box<dyn FileAt + Send>> {
-        let fh = Self::open(path)?;
+    fn open_dyn(path: &Path, len: usize) -> Result<Box<dyn FileAt + Send>> {
+        let fh = Self::open(path, len)?;
         Ok(Box::new(fh))
     }
 }
@@ -112,12 +112,12 @@ impl<A: Access> FileAt for A {
     }
 }
 
-fn open_fn<A: AccessDyn>() -> fn(&Path) -> Result<Box<dyn FileAt + Send>> {
+fn open_fn<A: AccessDyn>() -> fn(&Path, usize) -> Result<Box<dyn FileAt + Send>> {
     A::open_dyn
 }
 
 impl Access for NormalFile {
-    fn open<P>(path: P) -> Result<Self>
+    fn open<P>(path: P, len: usize) -> Result<Self>
     where
         P: AsRef<Path>,
     {
@@ -132,6 +132,7 @@ impl Access for NormalFile {
             .create(true)
             .truncate(false)
             .open(path)?;
+        file.set_len(len as u64)?;
         Ok(Self { file })
     }
 
@@ -178,7 +179,7 @@ impl Access for NormalFile {
 }
 
 impl Access for VoidFile {
-    fn open<P>(_path: P) -> Result<Self>
+    fn open<P>(_path: P, _len: usize) -> Result<Self>
     where
         P: AsRef<Path>,
     {
@@ -256,7 +257,7 @@ where
 }
 
 pub struct BackFile {
-    opener: fn(path: &Path) -> Result<Box<dyn FileAt + Send>>,
+    opener: fn(path: &Path, len: usize) -> Result<Box<dyn FileAt + Send>>,
     file_range: Vec<FileRange>,
 }
 
@@ -309,7 +310,7 @@ impl BackFile {
             );
 
             if w.file.handle.is_none() {
-                w.file.handle = Some(opener(w.file.path.as_ref())?);
+                w.file.handle = Some(opener(w.file.path.as_ref(), w.file.len)?);
             }
 
             if let Some(ref mut fh) = w.file.handle {
@@ -329,7 +330,7 @@ impl BackFile {
             );
 
             if r.file.handle.is_none() {
-                r.file.handle = match opener(r.file.path.as_ref()) {
+                r.file.handle = match opener(r.file.path.as_ref(), r.file.len) {
                     Err(e) => {
                         // TODO: Propagate this error. Returning Ok after a
                         // failed open leaves the newly allocated PieceBuf
