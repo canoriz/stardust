@@ -147,15 +147,19 @@ impl Session {
             let mut guard = self.tasks.lock().unwrap();
             guard.drain().map(|(_, h)| h).collect()
         };
-        let mut torrents = Vec::with_capacity(handles.len());
+        let mut wg = tokio::task::JoinSet::new();
         for tm in handles {
-            match tm.stop_wait().await {
-                Ok(d) => torrents.push(d),
-                Err(e) => {
-                    info!("dump torrent error: {}", e);
+            wg.spawn(async move {
+                match tm.stop_wait().await {
+                    Ok(d) => Some(d),
+                    Err(e) => {
+                        info!("dump torrent error: {}", e);
+                        None
+                    }
                 }
-            }
+            });
         }
+        let torrents = wg.join_all().await.into_iter().filter_map(|d| d).collect();
         SessionDump {
             torrents,
             dht_nodes,
