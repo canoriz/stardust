@@ -1445,7 +1445,7 @@ impl TransmitWorker {
                     }
                 }
                 debug!("handled {count} piece messages");
-                self.handle_blocks_receieved(peer)
+                self.handle_blocks_received(peer)
             }
             PeerMsg::DhtPort(addr, port) => self.handle_dht_port_msg(addr, port),
             PeerMsg::ExtendMetadata(pa, m) => {
@@ -1680,7 +1680,7 @@ impl TransmitWorker {
     // }
 
     #[instrument(skip_all)]
-    fn handle_blocks_receieved(&mut self, peer: PeerAddr) -> io::Result<()> {
+    fn handle_blocks_received(&mut self, peer: PeerAddr) -> io::Result<()> {
         let peer = to_canonical_addr(peer);
         info!("get BlockReceived from {peer}");
         // TODO: OPTIMIZE: return connection handle to reduce map search
