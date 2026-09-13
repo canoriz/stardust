@@ -260,13 +260,15 @@ pub struct FlushErr {
     pub err: io::Error,
 }
 
+type BufState = AtomicU32;
+
 pub struct PieceBuf {
     /// always Some, except in drop
     buf: CowBuf<PooledBuf>,
     offset: usize,
     index: JointIndex,
     touch: time::Instant,
-    state: Arc<AtomicU32>,
+    state: Arc<BufState>,
     file: MutexBackFile,
 
     // TODO: maybe remove Option, make flush tracking mandatory
@@ -386,12 +388,14 @@ impl PieceBuf {
         // dirty bit may change from 0 to 1
 
         let state = self.state.load(Ordering::Acquire) & (DIRTY | FLUSHING);
+        const DIRTY_AGAIN_DURING_FLUSHING: u32 = DIRTY | FLUSHING;
+        const DIRTY_AND_FLUSHING: u32 = FLUSHING;
         match state {
             0b00 => {}
-            0b01 => {}
-            0b10 => {
+            DIRTY_AND_FLUSHING => {}
+            DIRTY => {
                 // no flushing in progress, no one else can change state
-                let old_state = self.state.swap(FLUSHING, Ordering::Acquire);
+                let old_state = self.state.swap(DIRTY_AND_FLUSHING, Ordering::Acquire);
                 assert_eq!(old_state, 0b10);
 
                 if let Some(ref count) = self.flush_count {
@@ -404,8 +408,8 @@ impl PieceBuf {
                 let ji = self.index;
                 let msg_sender = self.msg_sender.clone();
 
-                // create a cheap copy of buf, and implicitly make ourself read-only
-                // next time we write to ourself, we will clone the buf
+                // Create a cheap copy of buf, and implicitly make ourself read-only.
+                // Next time we write to ourself, we will clone the buf.
                 let buf = self.buf.clone();
                 tokio::task::spawn_blocking(move || {
                     let r = flush_buf_force(buf, offset, ji, s, f, false);
@@ -415,7 +419,7 @@ impl PieceBuf {
                     }
                 });
             }
-            0b11 => {}
+            DIRTY_AGAIN_DURING_FLUSHING => {}
             _ => unreachable!(),
         }
     }
