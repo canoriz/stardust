@@ -95,6 +95,10 @@ impl<T> Pool<T> {
     pub(crate) fn get(&mut self) -> Option<T> {
         self.pool.pop_front()
     }
+
+    pub(crate) fn capacity(&self) -> usize {
+        self.limit
+    }
 }
 
 /// A copy-on-write buffer that can be either owned or shared.
@@ -268,6 +272,7 @@ pub struct PieceBuf {
     offset: usize,
     index: JointIndex,
     touch: time::Instant,
+    write_time: time::Instant,
     state: Arc<BufState>,
     file: MutexBackFile,
 
@@ -288,7 +293,7 @@ impl fmt::Debug for PieceBuf {
             .field("buf", &self.buf)
             .field("offset", &self.offset)
             .field("index", &self.index)
-            .field("touch", &self.touch.elapsed())
+            .field("write_time", &self.write_time.elapsed())
             .field("state", &dirty)
             .finish()
     }
@@ -310,7 +315,8 @@ impl DerefMut for PieceBuf {
 impl AsMut<[u8]> for PieceBuf {
     fn as_mut(&mut self) -> &mut [u8] {
         self.state.fetch_or(DIRTY, Ordering::Acquire);
-        self.touch = time::Instant::now();
+        self.write_time = time::Instant::now();
+        self.touch = self.write_time;
         self.buf.as_mut()
     }
 }
@@ -366,6 +372,10 @@ impl PieceBuf {
     pub fn is_flushing(&self) -> bool {
         let s = self.state.load(Ordering::Relaxed);
         (s & FLUSHING) > 0
+    }
+
+    pub fn write_time(&self) -> time::Instant {
+        self.write_time
     }
 
     pub fn access_time(&self) -> time::Instant {
@@ -427,7 +437,7 @@ impl PieceBuf {
     /// Allocate a new PieceBuf with the given parameters.
     /// Used by `CacheManager` to create pieces for file loading.
     pub(crate) fn alloc(
-        pool: &Arc<Mutex<Pool<BytesMut>>>,
+        pool: Arc<Mutex<Pool<BytesMut>>>,
         index: JointIndex,
         offset: usize,
         len: usize,
@@ -436,7 +446,8 @@ impl PieceBuf {
         msg_sender: Option<mpsc::UnboundedSender<TmMsg>>,
     ) -> Self {
         PieceBuf {
-            buf: CowBuf::new(PooledBuf::new(pool.clone(), len)),
+            buf: CowBuf::new(PooledBuf::new(pool, len)),
+            write_time: time::Instant::now(),
             touch: time::Instant::now(),
             index,
             offset,
@@ -538,6 +549,7 @@ mod test {
             buf: CowBuf::new(PooledBuf::new(pool, len)),
             offset: 0,
             index: JointIndex::new(0, 0),
+            write_time: time::Instant::now(),
             touch: time::Instant::now(),
             state: Arc::new(AtomicU32::new(initial_state)),
             file: void_file(),
@@ -851,6 +863,7 @@ mod test {
             buf: CowBuf::new(PooledBuf::new(pool, 8)),
             offset: 0,
             index: JointIndex::new(3, 0),
+            write_time: time::Instant::now(),
             touch: time::Instant::now(),
             state: Arc::new(AtomicU32::new(DIRTY)),
             file: void_file(),
@@ -890,6 +903,7 @@ mod test {
             buf: CowBuf::new(PooledBuf::new(pool, 8)),
             offset: 0,
             index: JointIndex::new(5, 0),
+            write_time: time::Instant::now(),
             touch: time::Instant::now(),
             state: Arc::new(AtomicU32::new(DIRTY)),
             file: void_file(),
@@ -923,6 +937,7 @@ mod test {
             buf: CowBuf::new(PooledBuf::new(pool, 8)),
             offset: 0,
             index: JointIndex::new(7, 0),
+            write_time: time::Instant::now(),
             touch: time::Instant::now(),
             state: Arc::new(AtomicU32::new(0)), // clean
             file: void_file(),
@@ -948,6 +963,7 @@ mod test {
             buf: CowBuf::new(PooledBuf::new(pool, 8)),
             offset: 0,
             index: JointIndex::new(0, 0),
+            write_time: time::Instant::now(),
             touch: time::Instant::now(),
             state: Arc::new(AtomicU32::new(0)),
             file: file.clone(),

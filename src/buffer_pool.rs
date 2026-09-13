@@ -1,3 +1,4 @@
+//! Pooled block buffers
 use bytes::BytesMut;
 use std::collections::VecDeque;
 use std::fmt;
