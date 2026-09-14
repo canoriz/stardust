@@ -1313,7 +1313,13 @@ impl BlockPicker {
     }
 
     pub fn our_state(&self) -> PieceState {
-        let state = self.piece_picker.dump().have;
+        // `piece_picker.have` also marks pieces that are currently being
+        // downloaded so they are not picked by another peer.  Only expose
+        // fully verified pieces to peers in our bitfield.
+        let mut state = BitField::with_bit_len(self.n);
+        for i in 0..(self.n as u32) {
+            state.set(i, self.have(i as u32));
+        }
         let ones = state.count_ones() as usize;
         if ones == self.n {
             PieceState::HaveAll

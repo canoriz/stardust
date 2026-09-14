@@ -19,7 +19,7 @@ use crate::tracker;
 
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{hash_map, BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1517,11 +1517,27 @@ impl TransmitWorker {
             TorrentState::Metadata(d) => d,
             TorrentState::Fetching(_) => panic!("should not receive piece before metadata"),
         };
+
         let piece_size = block_picker.piece_size(index);
 
-        let hasher = piece_hasher
-            .entry(index)
-            .or_insert_with(|| HashState::new(Sha1::new()));
+        // Only a delivery of the first sub-piece may start a new hash.
+        // `piece_hasher` has no entry for `index` both before a piece starts
+        // hashing and after it finished (removed in
+        // `handle_sub_piece_received`), so unconditionally creating one here
+        // makes those two states indistinguishable: a stale or duplicated
+        // delivery for an already verified piece would start a fresh hasher at
+        // offset 0, re-request sub-piece 0, re-hash the whole piece and end in
+        // a second `broadcast_have` plus a `running_state` overwrite.
+        let hasher = match piece_hasher.entry(index) {
+            hash_map::Entry::Occupied(e) => e.into_mut(),
+            hash_map::Entry::Vacant(e) => {
+                if ji.in_piece_offset() == 0 {
+                    e.insert(HashState::new(Sha1::new()))
+                } else {
+                    return Ok(false);
+                }
+            }
+        };
 
         let req = Request {
             index,
@@ -1573,6 +1589,21 @@ impl TransmitWorker {
         piecebuf: &mut PieceLease,
         force_check: bool,
     ) -> io::Result<Option<bool>> {
+        let Downloading { block_picker, .. } = match &self.torrent_state {
+            TorrentState::Metadata(d) => d,
+            TorrentState::Fetching(_) => panic!("should not receive piece before metadata"),
+        };
+
+        // In the normal download path, only a sub-piece belonging to a piece
+        // that is not yet complete may enter hashing.  A stale or duplicate
+        // PieceBufReady for a verified piece can still satisfy have_sub(), so
+        // keep both checks at this boundary.  File checking intentionally
+        // bypasses them.
+        let should_hash = block_picker.have_sub(ji) && !block_picker.have(ji.index());
+        if !force_check && !should_hash {
+            return Ok(None);
+        }
+
         info!("sub piece of {:?} received, hashing...", ji);
         let full_hashed = self.advance_hash(ji, piecebuf, force_check)?;
 
@@ -2169,7 +2200,11 @@ impl TransmitWorker {
         ji: JointIndex,
         buf: io::Result<PieceLease>,
     ) -> io::Result<()> {
-        let Downloading { block_picker, .. } = match &mut self.torrent_state {
+        let Downloading {
+            block_picker,
+            hasher: piece_hasher,
+            ..
+        } = match &mut self.torrent_state {
             TorrentState::Metadata(d) => d,
             TorrentState::Fetching(_) => {
                 unreachable!();
@@ -2202,29 +2237,27 @@ impl TransmitWorker {
                     RunningState::Checking { .. } => true,
                     _ => false,
                 };
-                if is_checking || block_picker.have_sub(ji) {
-                    info!("sub piece {ji:?} piece loaded",);
-                    match self.handle_sub_piece_received(ji, &mut lease, is_checking)? {
-                        Some(passed) => {
-                            if is_checking {
-                                // TODO: FIXME: if we verified to have a piece we previously not,
-                                // we should notify peers, sending them a HAVE
-                                // and only send HAVE if we have NOT sent them one before!
-                                self.handle_checkfile_on_piece_verified(ji.index(), passed)?;
-                                if passed {
-                                    self.broadcast_have(ji.index() as u32);
-                                }
-                            } else if passed {
+                info!("sub piece {ji:?} piece loaded",);
+                match self.handle_sub_piece_received(ji, &mut lease, is_checking)? {
+                    Some(passed) => {
+                        if is_checking {
+                            // TODO: FIXME: if we verified to have a piece we previously not,
+                            // we should notify peers, sending them a HAVE
+                            // and only send HAVE if we have NOT sent them one before!
+                            self.handle_checkfile_on_piece_verified(ji.index(), passed)?;
+                            if passed {
                                 self.broadcast_have(ji.index() as u32);
-                                if self.is_downloaded() {
-                                    self.running_state =
-                                        RunningState::StableState(StableState::Seeding);
-                                    self.downloaded.send(true);
-                                }
+                            }
+                        } else if passed {
+                            self.broadcast_have(ji.index() as u32);
+                            if self.is_downloaded() {
+                                self.running_state =
+                                    RunningState::StableState(StableState::Seeding);
+                                self.downloaded.send(true);
                             }
                         }
-                        None => {}
                     }
+                    None => {}
                 }
                 Ok(())
             }
@@ -2236,6 +2269,17 @@ impl TransmitWorker {
                 // prevent shutdown hang.
                 warn!("piecebuf ready error for {ji:?}: {e}");
                 self.waiting_for_piecebuf.remove(&ji);
+
+                // `piece_verified(_, false)` below rolls the whole piece back
+                // for re-download, so whatever was already fed into this
+                // piece's SHA1 is stale. Drop the half-finished hasher so the
+                // next attempt starts at sub-piece 0. Keeping it would leave
+                // the hash frontier past the re-downloaded prefix sub-pieces:
+                // their bytes get copied into the PieceBuf and reach the disk,
+                // but never the hasher, so the piece would be verified against
+                // old bytes and could pass over corrupt on-disk data.
+                piece_hasher.remove(&ji.index());
+
                 block_picker.piece_verified(ji.index(), false);
                 self.running_state = RunningState::StableState(StableState::Paused);
                 Ok(())
