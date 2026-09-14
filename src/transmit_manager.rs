@@ -276,7 +276,6 @@ impl TransmitManager {
     }
 
     pub async fn stop_wait(self) -> io::Result<TransmitDump> {
-        // TODO: dump status
         self.cancel.disarm().cancel();
         self.worker_stop
             .await
@@ -1272,17 +1271,19 @@ impl TransmitWorker {
                 Ok(())
             }
             Msg::ChangeState(cmd, sender) => {
-                // TODO: FIXME: should pause announce task as well
                 match cmd {
                     RunningCmd::Resume => {
                         self.running_state = RunningState::StableState(StableState::Downloading);
                         self.pick_blocks_for_all_peers(10);
+                        self.announce_manager.send(announce_manager::Msg::Resume);
                     }
                     RunningCmd::Pause => {
                         self.running_state = RunningState::StableState(StableState::Paused);
+                        self.announce_manager.send(announce_manager::Msg::Pause);
                     }
                     RunningCmd::Stop => {
                         self.running_state = RunningState::StableState(StableState::Stopped);
+                        self.announce_manager.send(announce_manager::Msg::Pause);
                     }
                     RunningCmd::Check => todo!(),
                 }

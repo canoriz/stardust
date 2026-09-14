@@ -1,18 +1,20 @@
 use crate::tracker::{self, AnnounceResult, AnnounceType, TrackerGet};
 use crate::transmit_manager;
+use futures::StreamExt;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
-use tokio::task;
-use tokio::time;
 use tokio_util::sync::{CancellationToken, DropGuard};
+use tokio_util::time::{delay_queue, DelayQueue};
 use tracing::info;
 
 #[derive(Debug)]
 pub enum Msg {
     AddUrl(Vec<String>),
     RemoveUrl(String),
+    Pause,
+    Resume,
 }
 
 pub struct AnnounceManagerHandle {
@@ -40,8 +42,9 @@ impl AnnounceManagerHandle {
             receiver: cmd_rx,
 
             transmit_mgr: tx,
-            announce_timer: task::JoinSet::new(),
+            announce_timer: DelayQueue::new(),
             url_list: HashMap::new(),
+            paused: false,
         };
 
         #[cfg(feature = "mock_delay")]
@@ -82,8 +85,9 @@ struct AnnounceManager {
     announce_list: Vec<Vec<String>>,
     receiver: mpsc::UnboundedReceiver<Msg>,
     transmit_mgr: mpsc::UnboundedSender<transmit_manager::Msg>,
-    announce_timer: tokio::task::JoinSet<TimeUp>,
-    url_list: HashMap<(AnnounceType, Arc<String>), tokio::task::AbortHandle>,
+    announce_timer: DelayQueue<(AnnounceType, Arc<String>)>,
+    url_list: HashMap<(AnnounceType, Arc<String>), (Option<delay_queue::Key>, u64)>,
+    paused: bool,
 }
 
 impl AnnounceManager {
@@ -97,36 +101,53 @@ impl AnnounceManager {
                     let u2 = u.clone();
                     let u3 = u.clone();
                     let u4 = u.clone();
-                    let h1 = self.announce_timer.spawn(async {
-                        TimeUp {
-                            announce_type: AnnounceType::V4,
-                            url: u,
-                            sleeped: 0,
-                        }
-                    });
-                    let h2 = self.announce_timer.spawn(async {
-                        TimeUp {
-                            announce_type: AnnounceType::V6,
-                            url: u2,
-                            sleeped: 0,
-                        }
-                    });
-                    self.url_list.insert((AnnounceType::V4, u3), h1);
-                    self.url_list.insert((AnnounceType::V6, u4), h2);
+                    if self.paused {
+                        self.url_list.insert((AnnounceType::V4, u3), (None, 0));
+                        self.url_list.insert((AnnounceType::V6, u4), (None, 0));
+                    } else {
+                        let k1 = self
+                            .announce_timer
+                            .insert((AnnounceType::V4, u), Duration::from_secs(0));
+                        let k2 = self
+                            .announce_timer
+                            .insert((AnnounceType::V6, u2), Duration::from_secs(0));
+                        self.url_list.insert((AnnounceType::V4, u3), (Some(k1), 0));
+                        self.url_list.insert((AnnounceType::V6, u4), (Some(k2), 0));
+                    }
                 }
             }
             Msg::RemoveUrl(url) => {
                 info!("removing announce url {url}");
                 let ptr = Arc::new(url);
-                if let Some(h) = self.url_list.remove(&(AnnounceType::V4, ptr.clone())) {
+                if let Some((Some(k), _)) = self.url_list.remove(&(AnnounceType::V4, ptr.clone()))
+                {
                     info!("abort {}", &ptr.as_ref());
-                    h.abort();
+                    self.announce_timer.try_remove(&k);
                 }
-                if let Some(h) = self.url_list.remove(&(AnnounceType::V6, ptr)) {
+                if let Some((Some(k), _)) = self.url_list.remove(&(AnnounceType::V6, ptr)) {
                     info!("abort 2");
-                    h.abort();
+                    self.announce_timer.try_remove(&k);
                 }
                 info!("announce manager url list {}", self.url_list.len());
+            }
+            Msg::Pause => {
+                info!("announce manager paused");
+                self.paused = true;
+                self.announce_timer.clear();
+                for (key, _) in self.url_list.values_mut() {
+                    *key = None;
+                }
+            }
+            Msg::Resume => {
+                info!("announce manager resumed");
+                self.paused = false;
+                for (k, (key, sleeped)) in self.url_list.iter_mut() {
+                    *sleeped = 0;
+                    *key = Some(
+                        self.announce_timer
+                            .insert(k.clone(), Duration::from_secs(0)),
+                    );
+                }
             }
         }
     }
@@ -192,16 +213,18 @@ async fn run_announce_manager<A>(
                     break;
                 }
             }
-            Some(r) = manager.announce_timer.join_next() => {
-                if let Ok(t) = r {
-                    info!("announce {:?} url {}", t.announce_type, t.url);
-                    if manager.url_list.get(&(t.announce_type, t.url.clone())).is_some() {
-                        announce_task_tx.send(t);
-                    }
-                } else {
-                    // maybe cancelled announce?
-                    info!("announce task timer some error {r:?}");
+            Some(expired) = manager.announce_timer.next() => {
+                let (announce_type, url) = expired.into_inner();
+                info!("announce {:?} url {}", announce_type, url);
+                if let Some((key, sleeped)) = manager.url_list.get_mut(&(announce_type, url.clone())) {
+                    *key = None;
+                    announce_task_tx.send(TimeUp {
+                        announce_type,
+                        url,
+                        sleeped: *sleeped,
+                    });
                 }
+                // else: removed while its timer was in flight; drop it.
             }
             Some((resp, req)) = output_rx.recv() => {
                 info!("announce output rx received");
@@ -225,16 +248,16 @@ async fn run_announce_manager<A>(
                 };
                 info!("next announce interval {next_interval}");
 
-                manager.announce_timer.spawn(
-                    async move {
-                        time::sleep(Duration::from_secs(next_interval)).await;
-                        TimeUp{
-                            announce_type: req.announce_type,
-                            url: req.url,
-                            sleeped: next_interval,
-                        }
+                if let Some((key, sleeped)) = manager.url_list.get_mut(&(req.announce_type, req.url.clone())) {
+                    *sleeped = next_interval;
+                    if !manager.paused {
+                        *key = Some(manager.announce_timer.insert(
+                            (req.announce_type, req.url.clone()),
+                            Duration::from_secs(next_interval),
+                        ));
                     }
-                );
+                }
+                // else: removed while the announce request was in flight; drop it.
 
                 let send_res = manager.transmit_mgr.send(transmit_manager::Msg::AnnounceFinish(resp));
                 if send_res.is_err() {
@@ -243,7 +266,6 @@ async fn run_announce_manager<A>(
             }
         };
     }
-    manager.announce_timer.shutdown().await;
     let _ = done.send(());
 }
 
