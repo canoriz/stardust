@@ -397,6 +397,7 @@ pub enum StableState {
     Paused,  // maintains connection but do not download
     Stopped, // all stopped
     Seeding,
+    Fatal(String), // unrecoverable error, torrent halted; string is the reason
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1248,11 +1249,12 @@ impl TransmitWorker {
             Msg::FlushComplete(r) => {
                 self.pending_flushes.fetch_sub(1, Ordering::Relaxed);
                 if let Err(e) = r {
-                    warn!("flush error, pausing: {:?}", e);
+                    warn!("flush error, fatal: {:?}", e);
                     if let TorrentState::Metadata(ref mut d) = self.torrent_state {
                         d.block_picker.piece_verified(e.ji.index(), false);
                     }
-                    self.running_state = RunningState::StableState(StableState::Paused);
+                    self.running_state =
+                        RunningState::StableState(StableState::Fatal(format!("{e:?}")));
                 }
                 Ok(())
             }
@@ -1694,6 +1696,9 @@ impl TransmitWorker {
                         }
                         StableState::Stopped => {
                             self.running_state = RunningState::StableState(StableState::Stopped);
+                        }
+                        StableState::Fatal(_) => {
+                            self.running_state = RunningState::StableState(StableState::Paused);
                         }
                     }
                 } else {
@@ -2270,8 +2275,6 @@ impl TransmitWorker {
                 // TODO: FIXME: only abandon that sub-piece and preserve other
                 // existing sub-pieces, so that no need to remove hasher and re-
                 // download entire piece.
-                // Moreover, a read error is typically a more severe issue, re-
-                // download does not solve the read error problem
 
                 // `piece_verified(_, false)` below rolls the whole piece back
                 // for re-download, so whatever was already fed into this
@@ -2284,7 +2287,8 @@ impl TransmitWorker {
                 piece_hasher.remove(&ji.index());
 
                 block_picker.piece_verified(ji.index(), false);
-                self.running_state = RunningState::StableState(StableState::Paused);
+                self.running_state =
+                    RunningState::StableState(StableState::Fatal(format!("{e}")));
                 Ok(())
             }
         }

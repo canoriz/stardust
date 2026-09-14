@@ -275,6 +275,12 @@ impl eframe::App for GuiApp {
                                         "Downloading",
                                     );
                                 }
+                                RunningStateDump::StableState(StableState::Fatal(reason)) => {
+                                    ui.colored_label(
+                                        egui::Color32::RED,
+                                        format!("Fatal: {reason}"),
+                                    );
+                                }
                                 RunningStateDump::Checking { checked, .. } => {
                                     let total = checked.total_checking_pieces();
                                     let done = checked.checked_count();
@@ -297,7 +303,9 @@ impl eframe::App for GuiApp {
                                 let is_paused = matches!(
                                     &row.state,
                                     RunningStateDump::StableState(
-                                        StableState::Paused | StableState::Stopped
+                                        StableState::Paused
+                                            | StableState::Stopped
+                                            | StableState::Fatal(_)
                                     )
                                 );
                                 if is_paused {
