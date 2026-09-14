@@ -233,9 +233,14 @@ pub struct CacheManager {
 
 impl CacheManager {
     pub fn new() -> (Self, CacheManagerHandle) {
-        const SIZE: usize = POOL_SIZE;
+        Self::with_capacity(POOL_SIZE)
+    }
+
+    /// Build a manager that holds at most `capacity` pieces.
+    /// Tests use a small capacity to reach the cache-full paths deterministically.
+    fn with_capacity(capacity: usize) -> (Self, CacheManagerHandle) {
         let (tx, rx) = mpsc::unbounded_channel();
-        let vacant = Arc::new(AtomicUsize::new(SIZE));
+        let vacant = Arc::new(AtomicUsize::new(capacity));
         let handle = CacheManagerHandle {
             sender: tx,
             vacant_count: vacant,
@@ -248,9 +253,9 @@ impl CacheManager {
             pending: HashMap::new(),
             waiting_slot: VecDeque::new(),
             torrents: HashMap::new(),
-            capacity: SIZE,
+            capacity,
             assume_clear: HashSet::new(),
-            pool: Arc::new(Mutex::new(Pool::new(SIZE))),
+            pool: Arc::new(Mutex::new(Pool::new(capacity))),
         };
         (manager, handle)
     }
@@ -430,7 +435,7 @@ impl CacheManager {
                         Some(c) => c.push_back(sender),
                         None => {
                             self.waiting_slot.push_back(key);
-                            self.pending.insert(key, Default::default());
+                            self.pending.insert(key, VecDeque::from([sender]));
                         }
                     }
                 }
@@ -523,13 +528,12 @@ impl CacheManager {
         let n_evicted = self.purge_least_accessed_clear_pieces(n_to_evict);
 
         // TODO: FIXME: load pending pieces by priority order
-        while let Some(key) = self.waiting_slot.pop_front() {
-            if self.cache.len() < self.capacity {
-                self.spawn_piece_read(key);
-                self.cache.insert(key, CacheEntry::Reading);
-            } else {
-                break;
-            }
+        // Only pop a key once there is room for it: a popped key that is not
+        // scheduled is lost, and nothing will ever put it back.
+        while self.cache.len() < self.capacity && !self.waiting_slot.is_empty() {
+            let key = self.waiting_slot.pop_front().expect("checked non-empty");
+            self.spawn_piece_read(key);
+            self.cache.insert(key, CacheEntry::Reading);
         }
         if n_evicted < n_to_evict {
             self.flush_least_accessed_dirty_pieces(n_to_evict - n_evicted);
@@ -671,5 +675,135 @@ impl CacheManager {
         self.self_handle
             .vacant_count
             .store(vacant, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::backfile::{BackFile, VoidFile};
+
+    fn void_file() -> MutexBackFile {
+        Arc::new(Mutex::new(BackFile::new::<VoidFile>().build()))
+    }
+
+    /// Drive the actor by hand until it has been idle for `IDLE`, long enough
+    /// for the `spawn_blocking` file read to report back through the channel.
+    /// Hand-pumping instead of `run()` keeps the cache state inspectable
+    /// between steps, and never ticks `piece_evict_timer`, so nothing depends
+    /// on the 2s retry.
+    async fn pump(mgr: &mut CacheManager) {
+        const IDLE: Duration = Duration::from_millis(100);
+        while let Ok(Some(msg)) = tokio::time::timeout(IDLE, mgr.receiver.recv()).await {
+            mgr.handle_msg(msg);
+        }
+    }
+
+    fn drain_ready(rx: &mut mpsc::UnboundedReceiver<TmMsg>) -> Vec<(JointIndex, PieceLease)> {
+        let mut ready = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                TmMsg::PieceBufReady { index, buf: Ok(l) } => ready.push((index, l)),
+                other => panic!("unexpected message {other:?}"),
+            }
+        }
+        ready
+    }
+
+    fn registered(capacity: usize) -> (CacheManager, CacheManagerHandle, [u8; 20]) {
+        let (mgr, handle) = CacheManager::with_capacity(capacity);
+        let info_hash = [7u8; 20];
+        let piece_size = SUB_PIECE_SIZE as usize;
+        handle.register_torrent(info_hash, piece_size, piece_size * 8, void_file(), None, None);
+        (mgr, handle, info_hash)
+    }
+
+    /// A request that arrives while the cache is full must be parked, not
+    /// dropped: the requester waits for `PieceBufReady` forever and has no
+    /// retry, so losing its sender stalls the download permanently.
+    #[tokio::test]
+    async fn request_parked_by_full_cache_is_served_when_a_slot_frees() {
+        let (mut mgr, handle, info_hash) = registered(2);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let key = |i| GlobalPieceKey {
+            info_hash,
+            index: JointIndex::new(i, 0),
+        };
+
+        // Fill the cache and keep both leases, so nothing is evictable:
+        // cache is at capacity and no piece is known clear.
+        handle.send_get_piece(key(0), tx.clone());
+        handle.send_get_piece(key(1), tx.clone());
+        pump(&mut mgr).await;
+        let mut held = drain_ready(&mut rx);
+        assert_eq!(held.len(), 2);
+        assert_eq!(mgr.cache.len(), mgr.capacity());
+        assert!(mgr.assume_clear.is_empty());
+
+        handle.send_get_piece(key(2), tx.clone());
+        pump(&mut mgr).await;
+        assert!(
+            drain_ready(&mut rx).is_empty(),
+            "cache is full, nothing can be delivered yet"
+        );
+        assert_eq!(mgr.waiting_slot.len(), 1, "the request must be parked");
+
+        // Free a slot: the parked request must now be answered.
+        drop(held.pop());
+        pump(&mut mgr).await;
+        let served = drain_ready(&mut rx);
+        assert_eq!(
+            served.len(),
+            1,
+            "parked request must be answered once a slot frees"
+        );
+        assert_eq!(served[0].0, key(2).index);
+    }
+
+    /// When more requests are parked than there are free slots, the ones that
+    /// do not fit must stay parked. Popping a key off `waiting_slot` without
+    /// scheduling its read loses it: no later event will ever put it back.
+    #[tokio::test]
+    async fn parked_requests_are_served_one_slot_at_a_time() {
+        let (mut mgr, handle, info_hash) = registered(1);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let key = |i| GlobalPieceKey {
+            info_hash,
+            index: JointIndex::new(i, 0),
+        };
+
+        // Occupy the single slot with a lease we hold.
+        handle.send_get_piece(key(0), tx.clone());
+        pump(&mut mgr).await;
+        let mut held = drain_ready(&mut rx);
+        assert_eq!(held.len(), 1);
+
+        // Two requests park behind it; only one can fit at a time.
+        handle.send_get_piece(key(1), tx.clone());
+        handle.send_get_piece(key(2), tx.clone());
+        pump(&mut mgr).await;
+        assert!(drain_ready(&mut rx).is_empty());
+        assert_eq!(mgr.waiting_slot.len(), 2);
+
+        drop(held.pop());
+        pump(&mut mgr).await;
+        let first = drain_ready(&mut rx);
+        assert_eq!(first.len(), 1, "one parked request fits now");
+        assert_eq!(
+            mgr.waiting_slot.len(),
+            1,
+            "the request that does not fit yet must stay parked"
+        );
+
+        // Free the slot again: the remaining parked request must be served.
+        drop(first);
+        pump(&mut mgr).await;
+        assert_eq!(
+            drain_ready(&mut rx).len(),
+            1,
+            "the last parked request must be served too"
+        );
     }
 }
