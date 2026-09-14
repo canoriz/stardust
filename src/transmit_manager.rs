@@ -761,6 +761,30 @@ impl TransmitWorker {
         }
     }
 
+    /// Request a piece buffer, ensuring at most one GetPiece is outstanding
+    /// per key. The entry also collects blocks that arrive before PieceBufReady.
+    fn request_piecebuf(&mut self, ji: JointIndex) {
+        let state = self
+            .waiting_for_piecebuf
+            .entry(ji)
+            .or_insert_with(|| PieceWaitState {
+                blocks: Vec::new(),
+                requested: false,
+                sub_piece_complete: false,
+            });
+        if state.requested {
+            return;
+        }
+        state.requested = true;
+        self.cache_handle.send_get_piece(
+            GlobalPieceKey {
+                info_hash: self.info_hash,
+                index: ji,
+            },
+            self.self_handle.sender.clone(),
+        );
+    }
+
     /// Build a `TransmitWorker` directly from a `TransmitDump`, restoring
     /// block-picker state and announce URLs without any message round-trip.
     pub fn from_dump(
@@ -791,19 +815,13 @@ impl TransmitWorker {
                 (info_hash, TorrentState::Fetching(f))
             }
         };
-        if let RunningStateDump::Checking { to_check, .. } = &dump.running_state {
-            // If we were checking at dump time, we should re-check on restore to rebuild the in-memory check state.
-            info!("dump is in checking state, start in stopped state and trigger re-check");
-            if let Some(next_piece) = to_check.first() {
-                cache_handle.send_get_piece(
-                    GlobalPieceKey {
-                        info_hash,
-                        index: JointIndex::new(*next_piece, 0),
-                    },
-                    cmd_sender.clone(),
-                );
+        let restore_check_piece = match &dump.running_state {
+            RunningStateDump::Checking { to_check, .. } => {
+                info!("dump is in checking state, start in stopped state and trigger re-check");
+                to_check.first().copied()
             }
-        }
+            _ => None,
+        };
         // Re-register announce URLs with the announce manager.
         if !dump.announce_urls.is_empty() {
             announce_manager.send(announce_manager::Msg::AddUrl(dump.announce_urls.clone()));
@@ -814,7 +832,7 @@ impl TransmitWorker {
             .dht_port(dht_client.as_ref().map(|c| c.port()))
             .build();
         let downloaded = watch::channel(false).0;
-        Self {
+        let mut worker = Self {
             id,
             info_hash,
             handshake_opt: opt,
@@ -831,7 +849,11 @@ impl TransmitWorker {
             downloaded,
             running_state: dump.running_state.into(),
             cache_handle,
+        };
+        if let Some(piece) = restore_check_piece {
+            worker.request_piecebuf(JointIndex::new(piece, 0));
         }
+        worker
     }
 
     pub fn new(
@@ -1565,12 +1587,7 @@ impl TransmitWorker {
                 JointIndex::from(req)
             };
             if block_picker.have_sub(next_ji) || force_check {
-                let key = GlobalPieceKey {
-                    info_hash: self.info_hash,
-                    index: next_ji,
-                };
-                self.cache_handle
-                    .send_get_piece(key, self.self_handle.sender.clone());
+                self.request_piecebuf(next_ji);
             }
         }
         info!("advance hash of piece {index} from sub piece {next_sub_piece} / {total_sub_pieces}");
@@ -1682,13 +1699,7 @@ impl TransmitWorker {
                 } else {
                     // load next piece to check
                     let next_piece = *to_check.first().unwrap();
-                    self.cache_handle.send_get_piece(
-                        GlobalPieceKey {
-                            info_hash: self.info_hash,
-                            index: JointIndex::new(next_piece, 0),
-                        },
-                        self.self_handle.sender.clone(),
-                    );
+                    self.request_piecebuf(JointIndex::new(next_piece, 0));
                 }
                 Ok(())
             }
@@ -2169,28 +2180,14 @@ impl TransmitWorker {
         }
 
         let ji = JointIndex::from(piece.to_request());
-        {
-            let state = self
-                .waiting_for_piecebuf
-                .entry(ji)
-                .or_insert_with(|| PieceWaitState {
-                    blocks: Vec::new(),
-                    requested: false,
-                    sub_piece_complete: false,
-                });
-            state.blocks.push(BlockWaitingBuf { piece, buf });
-            if complete.sub_piece {
-                state.sub_piece_complete = true;
-            }
-            if !state.requested {
-                let key = GlobalPieceKey {
-                    info_hash: self.info_hash,
-                    index: ji,
-                };
-                self.cache_handle
-                    .send_get_piece(key, self.self_handle.sender.clone());
-                state.requested = true;
-            }
+        self.request_piecebuf(ji);
+        let state = self
+            .waiting_for_piecebuf
+            .get_mut(&ji)
+            .expect("just requested, should exist");
+        state.blocks.push(BlockWaitingBuf { piece, buf });
+        if complete.sub_piece {
+            state.sub_piece_complete = true;
         }
         Ok(())
     }
@@ -2269,6 +2266,12 @@ impl TransmitWorker {
                 // prevent shutdown hang.
                 warn!("piecebuf ready error for {ji:?}: {e}");
                 self.waiting_for_piecebuf.remove(&ji);
+
+                // TODO: FIXME: only abandon that sub-piece and preserve other
+                // existing sub-pieces, so that no need to remove hasher and re-
+                // download entire piece.
+                // Moreover, a read error is typically a more severe issue, re-
+                // download does not solve the read error problem
 
                 // `piece_verified(_, false)` below rolls the whole piece back
                 // for re-download, so whatever was already fed into this
@@ -2384,13 +2387,7 @@ impl TransmitWorker {
                     };
                 }
             }
-            self.cache_handle.send_get_piece(
-                GlobalPieceKey {
-                    info_hash: self.info_hash,
-                    index: JointIndex::new(first, 0),
-                },
-                self.self_handle.sender.clone(),
-            );
+            self.request_piecebuf(JointIndex::new(first, 0));
         } else {
             info!("no piece selected for checking, check file complete");
             // TODO: MAYBE FIXME: we did not select any piece, but we return true here
@@ -2615,21 +2612,16 @@ pub(crate) async fn run_transmit_worker(
             }
         };
     }
+
     // Ensure all blocks in waiting_for_piecebuf are written into PieceBufs
     // before shutdown. For entries not yet requested, send GetPiece now.
-    for (ji, state) in transmit
+    let to_request: Vec<_> = transmit
         .waiting_for_piecebuf
-        .iter_mut()
-        .filter(|(_, s)| !s.requested)
-    {
-        let key = GlobalPieceKey {
-            info_hash: transmit.info_hash,
-            index: *ji,
-        };
-        transmit
-            .cache_handle
-            .send_get_piece(key, transmit.self_handle.sender.clone());
-        state.requested = true;
+        .iter()
+        .filter_map(|(ji, state)| (!state.requested).then_some(*ji))
+        .collect();
+    for ji in to_request {
+        transmit.request_piecebuf(ji);
     }
     while !transmit.waiting_for_piecebuf.is_empty() {
         match transmit.receiver.recv().await {
