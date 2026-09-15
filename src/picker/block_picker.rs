@@ -1365,6 +1365,17 @@ impl BlockPicker {
             .unwrap_or(false)
     }
 
+    /// Unverified pieces whose first sub-piece (sub-piece 0) is already received
+    /// Used for restoring hashers
+    pub fn unverified_pieces_whose_head_received(&self) -> impl Iterator<Item = u32> + '_ {
+        self.requesting
+            .iter()
+            .chain(self.receiving.iter())
+            .filter_map(|(&index, blocks)| {
+                (self.selected(index) && blocks.is_sub_all_received(0)).then_some(index)
+            })
+    }
+
     pub fn peer_choke(&mut self, peer: &PeerAddr) {
         let requested_peer = |p: &PeerAddr, _: &time::Instant| p == peer;
 

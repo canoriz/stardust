@@ -785,6 +785,41 @@ impl TransmitWorker {
         );
     }
 
+    /// Resume hashers of partial received pieces
+    /// Hashers are not saved when a task is paused, restore them
+    fn resume_pending_hashes(&mut self) {
+        let TorrentState::Metadata(d) = &self.torrent_state else {
+            return;
+        };
+        let ready: Vec<_> = d
+            .block_picker
+            .unverified_pieces_whose_head_received()
+            .filter_map(|index| {
+                let offset = d.hasher.get(&index).map_or(0, |h| h.next_offset());
+                let ji = JointIndex::new(index, offset as u32);
+                d.block_picker.have_sub(ji).then_some(ji)
+            })
+            .collect();
+        for ji in ready {
+            self.request_piecebuf(ji);
+        }
+    }
+
+    fn invalidate_piece(&mut self, index: u32) {
+        if let TorrentState::Metadata(d) = &mut self.torrent_state {
+            d.hasher.remove(&index);
+            d.block_picker.piece_verified(index, false);
+        }
+        // Discard data from the rolled-back attempt, but retain outstanding
+        // requests until their replies arrive so GetPiece stays deduplicated.
+        for (ji, pending) in &mut self.waiting_for_piecebuf {
+            if ji.index() == index {
+                pending.blocks.clear();
+                pending.sub_piece_complete = false;
+            }
+        }
+    }
+
     /// Build a `TransmitWorker` directly from a `TransmitDump`, restoring
     /// block-picker state and announce URLs without any message round-trip.
     pub fn from_dump(
@@ -815,17 +850,10 @@ impl TransmitWorker {
                 (info_hash, TorrentState::Fetching(f))
             }
         };
-        let restore_check_piece = match &dump.running_state {
-            RunningStateDump::Checking { to_check, .. } => {
-                info!("dump is in checking state, start in stopped state and trigger re-check");
-                to_check.first().copied()
-            }
-            _ => None,
-        };
+
         // Re-register announce URLs with the announce manager.
-        if !dump.announce_urls.is_empty() {
-            announce_manager.send(announce_manager::Msg::AddUrl(dump.announce_urls.clone()));
-        }
+        announce_manager.send(announce_manager::Msg::AddUrl(dump.announce_urls.clone()));
+
         let opt = HandshakeOption::builder()
             .client_id(id)
             .port(port)
@@ -850,9 +878,19 @@ impl TransmitWorker {
             running_state: dump.running_state.into(),
             cache_handle,
         };
-        if let Some(piece) = restore_check_piece {
-            worker.request_piecebuf(JointIndex::new(piece, 0));
-        }
+
+        match &worker.running_state {
+            RunningState::Checking { to_check, .. } => {
+                info!("dump is in checking state, start in stopped state and trigger re-check");
+                if let Some(piece) = to_check.first() {
+                    worker.request_piecebuf(JointIndex::new(*piece, 0));
+                }
+            }
+            RunningState::StableState(StableState::Downloading | StableState::Seeding) => {
+                worker.resume_pending_hashes();
+            }
+            _ => {}
+        };
         worker
     }
 
@@ -1249,9 +1287,7 @@ impl TransmitWorker {
                 self.pending_flushes.fetch_sub(1, Ordering::Relaxed);
                 if let Err(e) = r {
                     warn!("flush error, fatal: {:?}", e);
-                    if let TorrentState::Metadata(ref mut d) = self.torrent_state {
-                        d.block_picker.piece_verified(e.ji.index(), false);
-                    }
+                    self.invalidate_piece(e.ji.index());
                     self.running_state =
                         RunningState::StableState(StableState::Fatal(format!("{e:?}")));
                 }
@@ -1274,6 +1310,10 @@ impl TransmitWorker {
                 match cmd {
                     RunningCmd::Resume => {
                         self.running_state = RunningState::StableState(StableState::Downloading);
+                        self.resume_pending_hashes();
+                        if self.is_downloaded() {
+                            self.running_state = RunningState::StableState(StableState::Seeding);
+                        }
                         self.pick_blocks_for_all_peers(10);
                         self.announce_manager.send(announce_manager::Msg::Resume);
                     }
@@ -1545,20 +1585,19 @@ impl TransmitWorker {
 
         let piece_size = block_picker.piece_size(index);
 
-        // Only a delivery of the first sub-piece may start a new hash.
-        // `piece_hasher` has no entry for `index` both before a piece starts
-        // hashing and after it finished (removed in
-        // `handle_sub_piece_received`), so unconditionally creating one here
-        // makes those two states indistinguishable: a stale or duplicated
-        // delivery for an already verified piece would start a fresh hasher at
-        // offset 0, re-request sub-piece 0, re-hash the whole piece and end in
-        // a second `broadcast_have` plus a `running_state` overwrite.
+        // A hash starts at sub-piece 0. A later delivery may be the only event
+        // after restore, so request the prefix instead of losing that trigger.
+        // handle_sub_piece_received excludes already verified pieces.
         let hasher = match piece_hasher.entry(index) {
             hash_map::Entry::Occupied(e) => e.into_mut(),
             hash_map::Entry::Vacant(e) => {
                 if ji.in_piece_offset() == 0 {
                     e.insert(HashState::new(Sha1::new()))
                 } else {
+                    let first = JointIndex::new(index, 0);
+                    if block_picker.have_sub(first) || force_check {
+                        self.request_piecebuf(first);
+                    }
                     return Ok(false);
                 }
             }
@@ -1647,7 +1686,7 @@ impl TransmitWorker {
             Ok(Some(true))
         } else {
             info!("piece {} verify failed", ji.index());
-            block_picker.piece_verified(ji.index() as u32, false);
+            self.invalidate_piece(ji.index());
             Ok(Some(false))
         }
     }
@@ -1675,7 +1714,7 @@ impl TransmitWorker {
                 if to_check.is_empty() {
                     let r = checked.state.iter().all(|s| *s != CheckState::CORRUPT);
                     notify_waiter(r);
-                    match prev_state {
+                    self.running_state = match prev_state {
                         StableState::Downloading | StableState::Seeding => {
                             let Downloading { block_picker, .. } = match &mut self.torrent_state {
                                 TorrentState::Metadata(d) => d,
@@ -1684,23 +1723,25 @@ impl TransmitWorker {
                                 }
                             };
                             if block_picker.is_finished() {
-                                self.running_state =
-                                    RunningState::StableState(StableState::Seeding);
-                                self.downloaded.send(true);
+                                RunningState::StableState(StableState::Seeding)
                             } else {
-                                self.running_state =
-                                    RunningState::StableState(StableState::Downloading);
+                                RunningState::StableState(StableState::Downloading)
                             }
                         }
-                        StableState::Paused => {
-                            self.running_state = RunningState::StableState(StableState::Paused);
+                        StableState::Paused => RunningState::StableState(StableState::Paused),
+                        StableState::Stopped => RunningState::StableState(StableState::Stopped),
+                        StableState::Fatal(_) => RunningState::StableState(StableState::Paused),
+                    };
+
+                    match self.running_state {
+                        RunningState::StableState(StableState::Downloading) => {
+                            // TODO: FIXME: really needed?
+                            self.resume_pending_hashes();
                         }
-                        StableState::Stopped => {
-                            self.running_state = RunningState::StableState(StableState::Stopped);
+                        RunningState::StableState(StableState::Seeding) => {
+                            self.downloaded.send(true);
                         }
-                        StableState::Fatal(_) => {
-                            self.running_state = RunningState::StableState(StableState::Paused);
-                        }
+                        _ => {}
                     }
                 } else {
                     // load next piece to check
@@ -2203,23 +2244,9 @@ impl TransmitWorker {
         ji: JointIndex,
         buf: io::Result<PieceLease>,
     ) -> io::Result<()> {
-        let Downloading {
-            block_picker,
-            hasher: piece_hasher,
-            ..
-        } = match &mut self.torrent_state {
-            TorrentState::Metadata(d) => d,
-            TorrentState::Fetching(_) => {
-                unreachable!();
-            }
-        };
         match buf {
             Ok(mut lease) => {
                 let pending = self.waiting_for_piecebuf.remove(&ji);
-                let sub_piece_complete = pending
-                    .as_ref()
-                    .map(|s| s.sub_piece_complete)
-                    .unwrap_or(false);
                 if let Some(ps) = pending {
                     info!(
                         "piecebuf {ji:?} now ready, flushing {} blocks into it",
@@ -2236,26 +2263,34 @@ impl TransmitWorker {
                 // } else {
                 //     // storage.forget_piece(buf);
                 // }
+                // TODO: FIXME: It's difficult to correctly handling
+                // mixed downloading and checking pieces
                 let is_checking = match &self.running_state {
                     RunningState::Checking { .. } => true,
                     _ => false,
+                };
+                let had_piece = match &self.torrent_state {
+                    TorrentState::Metadata(d) => d.block_picker.have(ji.index()),
+                    TorrentState::Fetching(_) => false,
                 };
                 info!("sub piece {ji:?} piece loaded",);
                 match self.handle_sub_piece_received(ji, &mut lease, is_checking)? {
                     Some(passed) => {
                         if is_checking {
-                            // TODO: FIXME: if we verified to have a piece we previously not,
-                            // we should notify peers, sending them a HAVE
-                            // and only send HAVE if we have NOT sent them one before!
                             self.handle_checkfile_on_piece_verified(ji.index(), passed)?;
-                            if passed {
+                            if passed && !had_piece {
                                 self.broadcast_have(ji.index() as u32);
                             }
                         } else if passed {
                             self.broadcast_have(ji.index() as u32);
                             if self.is_downloaded() {
-                                self.running_state =
-                                    RunningState::StableState(StableState::Seeding);
+                                if matches!(
+                                    self.running_state,
+                                    RunningState::StableState(StableState::Downloading)
+                                ) {
+                                    self.running_state =
+                                        RunningState::StableState(StableState::Seeding);
+                                }
                                 self.downloaded.send(true);
                             }
                         }
@@ -2277,19 +2312,8 @@ impl TransmitWorker {
                 // existing sub-pieces, so that no need to remove hasher and re-
                 // download entire piece.
 
-                // `piece_verified(_, false)` below rolls the whole piece back
-                // for re-download, so whatever was already fed into this
-                // piece's SHA1 is stale. Drop the half-finished hasher so the
-                // next attempt starts at sub-piece 0. Keeping it would leave
-                // the hash frontier past the re-downloaded prefix sub-pieces:
-                // their bytes get copied into the PieceBuf and reach the disk,
-                // but never the hasher, so the piece would be verified against
-                // old bytes and could pass over corrupt on-disk data.
-                piece_hasher.remove(&ji.index());
-
-                block_picker.piece_verified(ji.index(), false);
-                self.running_state =
-                    RunningState::StableState(StableState::Fatal(format!("{e}")));
+                self.invalidate_piece(ji.index());
+                self.running_state = RunningState::StableState(StableState::Fatal(format!("{e}")));
                 Ok(())
             }
         }
@@ -2345,7 +2369,11 @@ impl TransmitWorker {
     }
 
     fn handle_check_file(&mut self, sender: oneshot::Sender<bool>) -> io::Result<()> {
-        let Downloading { block_picker, .. } = match &mut self.torrent_state {
+        let Downloading {
+            block_picker,
+            hasher,
+            ..
+        } = match &mut self.torrent_state {
             TorrentState::Metadata(d) => d,
             TorrentState::Fetching(_) => {
                 info!("check file when fetching metadata, maybe unreachable");
@@ -2360,6 +2388,10 @@ impl TransmitWorker {
             }
             _ => (),
         };
+
+        // A force check must hash every byte again, not reuse an incremental
+        // prefix from the previous download or from before a disk error.
+        hasher.clear();
 
         // arrange for loading pieces not in buffer
         let mut selected = block_picker
@@ -2804,6 +2836,8 @@ mod tests {
     use super::*;
     use serde_json;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    mod hashing;
 
     #[test]
     fn test_dump_and_load_fetching() {

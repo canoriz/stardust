@@ -118,6 +118,10 @@ impl Session {
             None
         };
 
+        if self.tasks.lock().unwrap().get(&info_hash).is_some() {
+            return;
+        }
+
         let mut tm = TorrentManagerHandle::new(
             job,
             self.self_id,

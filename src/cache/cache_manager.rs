@@ -10,7 +10,7 @@ use tokio::{
     sync::{mpsc, oneshot},
     time::Interval,
 };
-use tracing::{info, warn};
+use tracing::warn;
 
 use super::MutexBackFile;
 use crate::cache::simple_buffer::{
@@ -37,6 +37,43 @@ enum CacheEntry {
     Loaded(Option<PieceBuf>),
     /// File-read is in progress; further GetPiece requests are queued in pending.
     Reading,
+}
+
+/// FIFO queue of cache keys waiting for a slot, with a side map that prevents
+/// the same key from being queued more than once.
+#[derive(Default)]
+struct WaitingSlots {
+    queue: VecDeque<GlobalPieceKey>,
+    keys: HashSet<GlobalPieceKey>,
+}
+
+impl WaitingSlots {
+    fn push(&mut self, key: GlobalPieceKey) {
+        if self.keys.insert(key) {
+            self.queue.push_back(key);
+        }
+    }
+
+    fn pop(&mut self) -> Option<GlobalPieceKey> {
+        let key = self.queue.pop_front()?;
+        self.keys.remove(&key);
+        Some(key)
+    }
+
+    fn remove_torrent(&mut self, info_hash: [u8; 20]) {
+        for k in self.queue.iter().filter(|key| key.info_hash == info_hash) {
+            self.keys.remove(&k);
+        }
+        self.queue.retain(|key| key.info_hash != info_hash);
+    }
+
+    fn len(&self) -> usize {
+        self.queue.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.queue.len() == 0
+    }
 }
 
 /// Metadata about a registered torrent, needed to allocate and load pieces.
@@ -77,7 +114,7 @@ pub enum CacheMsg {
         key: GlobalPieceKey,
         piece: PieceBuf,
     },
-    /// A piece is flushed successfully.
+    /// A flush attempt completed.
     /// Note: this does not mean it's clear, new data may come after flush started,
     /// so piece may still be dirty.
     /// A check for dirty is always required
@@ -139,6 +176,21 @@ impl CacheManagerHandle {
     fn piece_loaded(&self, key: GlobalPieceKey, buf: io::Result<PieceBuf>) {
         let _ = self.sender.send(CacheMsg::PieceLoaded { key, buf });
     }
+
+    /// Flush `PieceBuf` and report to the cache at completion
+    fn flush_piece<F>(&self, key: GlobalPieceKey, piece: &mut PieceBuf, callback: F)
+    where
+        F: FnOnce(&Result<(), FlushErr>) + Send + 'static,
+    {
+        let sender = self.sender.clone();
+        piece.flush(move |result| {
+            callback(result);
+            let _ = sender.send(CacheMsg::PieceFlushed {
+                key,
+                result: result.as_ref().map(|_| ()).map_err(|e| format!("{e:?}")),
+            });
+        });
+    }
 }
 
 /// RAII wrapper that holds a `PieceBuf` on behalf of a torrent task.
@@ -165,18 +217,8 @@ impl PieceLease {
     where
         F: FnOnce(&Result<(), FlushErr>) + Send + 'static,
     {
-        let sender = self.return_tx.clone();
-        let key = self.key;
-        self.inner.as_mut().unwrap().flush(move |e| {
-            result_callback(e);
-            let _ = sender.sender.send(CacheMsg::PieceFlushed {
-                key,
-                result: match e {
-                    Ok(_) => Ok(()),
-                    Err(e) => Err(format!("{e:?}")),
-                },
-            });
-        });
+        self.return_tx
+            .flush_piece(self.key, self.inner.as_mut().unwrap(), result_callback);
     }
 }
 
@@ -218,14 +260,17 @@ pub struct CacheManager {
     pending: HashMap<GlobalPieceKey, VecDeque<mpsc::UnboundedSender<TmMsg>>>,
 
     /// Pending requests waiting for a cache slot.
-    waiting_slot: VecDeque<GlobalPieceKey>,
+    waiting_slot: WaitingSlots,
 
     /// Registered torrent metadata.
     torrents: HashMap<[u8; 20], TorrentInfo>,
     /// Shared `BytesMut` allocator pool.
     pool: Arc<Mutex<Pool<BytesMut>>>,
 
-    /// pieces we assume it's clear
+    /// Clean buffers currently owned by the cache, indexed for eviction without
+    /// scanning every entry.
+    /// NOTE: this is an "at least" map, entries in the map are guaranteed clean
+    /// but some clean slot may not be in the map at every moment (eventually will)
     assume_clear: HashSet<GlobalPieceKey>,
 
     capacity: usize,
@@ -251,7 +296,7 @@ impl CacheManager {
             self_handle: handle.clone(),
             cache: HashMap::new(),
             pending: HashMap::new(),
-            waiting_slot: VecDeque::new(),
+            waiting_slot: WaitingSlots::default(),
             torrents: HashMap::new(),
             capacity,
             assume_clear: HashSet::new(),
@@ -312,7 +357,7 @@ impl CacheManager {
                 self.cache.retain(|key, _| key.info_hash != info_hash);
                 self.assume_clear.retain(|key| key.info_hash != info_hash);
                 self.pending.retain(|key, _| key.info_hash != info_hash);
-                self.waiting_slot.retain(|key| key.info_hash != info_hash);
+                self.waiting_slot.remove_torrent(info_hash);
                 let _ = done.send(());
                 self.load_pending_pieces();
             }
@@ -330,67 +375,22 @@ impl CacheManager {
             }
 
             CacheMsg::PieceFlushed { key, result } => {
-                let piece = self.cache.get(&key);
-                let evict = match piece {
-                    Some(CacheEntry::Loaded(Some(p))) if !p.is_dirty() => {
-                        // There are lots of possibilities
-                        // 1. PieceLease.flush()
-                        // 2. PieceLease returned (dirty at return, n_clear should not change)
-                        // 3. PieceFlushed (dirty becomes clear, n_clear++)
-                        //
-                        // 1. PieceLease.flush()
-                        // 2. PieceFlushed (dirty becomes clear, not in cache
-                        //    n_clear should not increase)
-                        // 3. PieceLease returned (clear at return, n_clear++)
-                        //
-                        // 1. PieceLease.flush()
-                        // 2. PieceLease returned (dirty at return, n_clear should not change)
-                        // 3. PieceLease lent out again
-                        // 4. flush finish, atomic cleared, but PieceFlushed not come yet
-                        // 5. PieceLease returned (clear at return, n_clear++)
-                        // 6. PieceFlushed of 1 returns (clear, BUT SHOULD NOT ++,
-                        //    SHOULD NOT DOUBLE COUNT)
-                        //
-                        // At this time, there is no unified way to maintain correct n_clear
-
-                        // Anyway, it's definitely clear now
-                        true
-                    }
-                    Some(CacheEntry::Loaded(Some(_))) => {
-                        // It's flushed, but it's dirty and held by manager
-                        // likely: steps
-                        // 1. PieceLease.flush()
-                        // 2. PieceLease returned
-                        // 3. PieceLease lent out again
-                        // 4. PieceLease returned
-                        // 5. flush of 1 completes, but 3,4 modified it again
-                        info!("key {key:?} dirty after flushed, what should we do?");
-                        false
-                    }
-                    Some(CacheEntry::Loaded(None)) => {
-                        info!("key {key:?} dispatched after flushed, what should we do?");
-                        // It's lent out again
-                        false
-                    }
-                    Some(CacheEntry::Reading) => {
-                        info!("key {key:?} is reading again after flushed, what should we do?");
-                        // Will this even happen?
-                        false
-                    }
-                    None => true, // will this even happen?
-                };
-
-                if evict {
-                    self.assume_clear.remove(&key);
-                    self.cache.remove(&key);
+                if let Err(e) = result {
+                    warn!("cache flush error for {key:?}: {e}");
+                }
+                // The buffer may have been borrowed or written again since this
+                // flush started. Only its current state determines whether it is clean.
+                if matches!(self.cache.get(&key), Some(CacheEntry::Loaded(Some(p))) if !p.is_dirty())
+                {
+                    self.assume_clear.insert(key);
                 }
                 self.load_pending_pieces();
             }
 
             CacheMsg::Shutdown(tx) => {
-                for (_, entry) in self.cache.iter_mut() {
+                for (key, entry) in self.cache.iter_mut() {
                     if let CacheEntry::Loaded(Some(p)) = entry {
-                        p.flush(|_| {});
+                        self.self_handle.flush_piece(*key, p, |_| {});
                     }
                 }
                 let _ = tx.send(());
@@ -418,27 +418,15 @@ impl CacheManager {
                 self.pending.entry(key).or_default().push_back(sender);
             }
             None => {
-                if self.cache.len() >= self.capacity && !self.assume_clear.is_empty() {
-                    // cache no space, but we can evict
-                    self.purge_least_accessed_clear_pieces(1);
-                }
-
-                if self.cache.len() < self.capacity {
-                    // cache have space: queue sender and spawn file-read.
-                    self.pending.entry(key).or_default().push_back(sender);
-                    self.spawn_piece_read(key);
-                    self.cache.insert(key, CacheEntry::Reading);
-                } else {
-                    // we are full of cache, this request shall wait until some piece
-                    // being actively or passively evicted
-                    match self.pending.get_mut(&key) {
-                        Some(c) => c.push_back(sender),
-                        None => {
-                            self.waiting_slot.push_back(key);
-                            self.pending.insert(key, VecDeque::from([sender]));
-                        }
-                    }
-                }
+                // Just put it into pending pieces queue, then try load pending pieces
+                // if the cache is not full, the request will be executed immediately
+                let waiters = self.pending.entry(key).or_insert_with(|| VecDeque::new());
+                waiters.push_back(sender);
+                // Several callers may request the same key before its read starts.
+                // Keep one cache-load entry for that key and fan out the result to
+                // all waiters through `pending`.
+                self.waiting_slot.push(key);
+                self.load_pending_pieces();
             }
         }
     }
@@ -479,6 +467,7 @@ impl CacheManager {
                         });
                     }
                 }
+                self.load_pending_pieces();
             }
         }
     }
@@ -525,18 +514,21 @@ impl CacheManager {
         }
 
         let n_to_evict = (self.waiting_slot.len() + self.cache.len()).saturating_sub(self.capacity);
-        let n_evicted = self.purge_least_accessed_clear_pieces(n_to_evict);
+        self.purge_least_accessed_clear_pieces(n_to_evict);
 
         // TODO: FIXME: load pending pieces by priority order
         // Only pop a key once there is room for it: a popped key that is not
         // scheduled is lost, and nothing will ever put it back.
         while self.cache.len() < self.capacity && !self.waiting_slot.is_empty() {
-            let key = self.waiting_slot.pop_front().expect("checked non-empty");
+            let key = self.waiting_slot.pop().expect("checked non-empty");
+            // A duplicate stale queue entry may remain from an older request
+            // sequence. The cache entry is authoritative; do not start a second
+            // read for a key that is already being read or lent out.
+            if self.cache.contains_key(&key) {
+                continue;
+            }
             self.spawn_piece_read(key);
             self.cache.insert(key, CacheEntry::Reading);
-        }
-        if n_evicted < n_to_evict {
-            self.flush_least_accessed_dirty_pieces(n_to_evict - n_evicted);
         }
     }
 
@@ -546,6 +538,8 @@ impl CacheManager {
     /// pieces.
     fn handle_evict_timeout(&mut self) {
         self.load_pending_pieces();
+        self.flush_least_accessed_dirty_pieces(self.waiting_slot.len());
+        self.update_vacant_count();
     }
 
     fn spawn_piece_read(&self, key: GlobalPieceKey) {
@@ -616,9 +610,9 @@ impl CacheManager {
         let clear_pieces: BTreeSet<_> = self
             .assume_clear
             .iter()
-            .map(|k| match self.cache.get(k).unwrap() {
-                CacheEntry::Loaded(Some(p)) => (p.access_time(), *k),
-                _ => unreachable!(),
+            .map(|key| match self.cache.get(key).unwrap() {
+                CacheEntry::Loaded(Some(p)) => (p.access_time(), *key),
+                _ => unreachable!("only cache-owned buffers may be indexed as clean"),
             })
             .collect();
         let mut n = 0;
@@ -634,7 +628,7 @@ impl CacheManager {
         n
     }
 
-    ///! Flush least accessed clear pieces
+    ///! Flush least recently written dirty pieces
     ///! returns number of pieces scheduled for flushing
     /// TODO: shall me mark flushed pieces as `Retired` so they
     /// cannot be accessed again before evicted?
@@ -653,28 +647,23 @@ impl CacheManager {
             })
             .collect();
         let mut flushed = 0;
-        for (_, p) in to_flush.into_iter().take(n_flush) {
-            p.flush(|_| {});
+        for ((_, key), p) in to_flush.into_iter().take(n_flush) {
+            self.self_handle.flush_piece(key, p, |_| {});
             flushed += 1;
         }
         flushed
     }
 
+    /// Returns immediately available slots
+    /// sum of number of vacant slots and occupied but clean slots
+    fn available_slots(&self) -> usize {
+        self.assume_clear.len() + self.capacity.saturating_sub(self.cache.len())
+    }
+
     fn update_vacant_count(&self) {
-        // TODO: optimize
-        let known_clear_pieces = self
-            .cache
-            .iter()
-            .filter(|(_, entry)| match entry {
-                CacheEntry::Loaded(Some(p)) if !p.is_dirty() => true,
-                _ => false,
-            })
-            .count();
-        let remain = POOL_SIZE.saturating_sub(self.cache.len());
-        let vacant = known_clear_pieces + remain;
         self.self_handle
             .vacant_count
-            .store(vacant, Ordering::Relaxed);
+            .store(self.available_slots(), Ordering::Relaxed);
     }
 }
 
@@ -685,6 +674,9 @@ mod test {
     use super::*;
     use crate::backfile::{BackFile, VoidFile};
 
+    mod regression;
+
+    // Create a back file that accepts reads and writes without accessing the filesystem.
     fn void_file() -> MutexBackFile {
         Arc::new(Mutex::new(BackFile::new::<VoidFile>().build()))
     }
@@ -701,6 +693,7 @@ mod test {
         }
     }
 
+    // Collect all successful PieceBufReady messages currently available to the test.
     fn drain_ready(rx: &mut mpsc::UnboundedReceiver<TmMsg>) -> Vec<(JointIndex, PieceLease)> {
         let mut ready = Vec::new();
         while let Ok(msg) = rx.try_recv() {
@@ -712,11 +705,19 @@ mod test {
         ready
     }
 
+    // Build a cache manager with one registered torrent and a configurable capacity.
     fn registered(capacity: usize) -> (CacheManager, CacheManagerHandle, [u8; 20]) {
         let (mgr, handle) = CacheManager::with_capacity(capacity);
         let info_hash = [7u8; 20];
         let piece_size = SUB_PIECE_SIZE as usize;
-        handle.register_torrent(info_hash, piece_size, piece_size * 8, void_file(), None, None);
+        handle.register_torrent(
+            info_hash,
+            piece_size,
+            piece_size * 8,
+            void_file(),
+            None,
+            None,
+        );
         (mgr, handle, info_hash)
     }
 
@@ -740,7 +741,7 @@ mod test {
         let mut held = drain_ready(&mut rx);
         assert_eq!(held.len(), 2);
         assert_eq!(mgr.cache.len(), mgr.capacity());
-        assert!(mgr.assume_clear.is_empty());
+        assert_eq!(handle.vacant_count(), 0);
 
         handle.send_get_piece(key(2), tx.clone());
         pump(&mut mgr).await;
