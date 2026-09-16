@@ -23,6 +23,7 @@
 //! | shutdown         | —                                  | `"shutdown_accepted"` |
 //! | list_torrents    | —                                  | `{"list_torrents":{"torrents":["<hex>", ...]}}` |
 //! | get_torrent_status | `info_hash`                      | `{"torrent_status":{"info_hash":"<hex>","process":0.42,"bandwidth_bps":12345.0,"selected":[0,1],"have":[0]}}` |
+//! | get_cache_stats  | —                                  | `{"cache_stats":{"capacity":60,"request_rate":12.0,"clear_ratio":0.5, ...}}` |
 //!
 //! On error: `{"error":{"error":"<message>"}}`
 //!
@@ -38,6 +39,7 @@ use tracing::info;
 
 use crate::metadata::{FileMetadata, Magnet};
 use crate::session::Session;
+pub use crate::cache::cache_manager::CacheStats;
 pub use crate::transmit_manager::{CheckState, RunningStateDump, StableState};
 use crate::transmit_manager::{RunningCmd, TorrentTask};
 
@@ -77,6 +79,8 @@ pub enum RpcRequest {
     ListTorrents,
     /// Get process and bandwidth status for one torrent.
     GetTorrentStatus { info_hash: String },
+    /// Get global cache statistics (rates and occupancy ratios).
+    GetCacheStats,
     /// Ask the server to shut down gracefully.
     Shutdown,
 }
@@ -113,6 +117,8 @@ pub enum RpcResponse {
     },
     /// HTTP accepted Shutdown and queued it for async processing.
     ShutdownAccepted,
+    /// Global cache statistics snapshot.
+    CacheStats(CacheStats),
     /// Something went wrong.
     Error { error: String },
 }
@@ -178,6 +184,7 @@ async fn rpc_handler(
     State(state): State<AppState>,
     Json(req): Json<RpcRequest>,
 ) -> Json<RpcResponse> {
+    // TODO: why diffrent handling for query requests and others
     if is_query_request(&req) {
         let (reply_tx, reply_rx) = oneshot::channel();
         let cmd = ApiCommand {
@@ -330,13 +337,23 @@ pub async fn handle_rpc(session: &Session, req: RpcRequest) -> (RpcResponse, boo
             info!("shutdown requested via API");
             (RpcResponse::ShutdownAccepted, true)
         }
+
+        RpcRequest::GetCacheStats => {
+            let rsp = match session.cache_stats().await {
+                Some(stats) => RpcResponse::CacheStats(stats),
+                None => RpcResponse::err("cache manager unavailable"),
+            };
+            (rsp, false)
+        }
     }
 }
 
 fn is_query_request(req: &RpcRequest) -> bool {
     matches!(
         req,
-        RpcRequest::ListTorrents | RpcRequest::GetTorrentStatus { .. }
+        RpcRequest::ListTorrents
+            | RpcRequest::GetTorrentStatus { .. }
+            | RpcRequest::GetCacheStats
     )
 }
 
@@ -351,6 +368,7 @@ fn accepted_response(req: &RpcRequest) -> RpcResponse {
         RpcRequest::GetTorrentStatus { .. } => {
             RpcResponse::err("get_torrent_status is a query command")
         }
+        RpcRequest::GetCacheStats => RpcResponse::err("get_cache_stats is a query command"),
         RpcRequest::Shutdown => RpcResponse::ShutdownAccepted,
     }
 }
@@ -476,5 +494,23 @@ mod tests {
             RpcResponse::Error { error } => assert_eq!(error, "boom"),
             _ => panic!("unexpected response variant"),
         }
+    }
+
+    #[test]
+    fn request_deserialize_get_cache_stats() {
+        let req: RpcRequest =
+            serde_json::from_str(r#""get_cache_stats""#).expect("deserialize get_cache_stats");
+        assert!(matches!(req, super::RpcRequest::GetCacheStats));
+    }
+
+    #[test]
+    fn response_serialize_cache_stats_is_externally_tagged() {
+        let rsp = super::RpcResponse::CacheStats(super::CacheStats {
+            capacity: 60,
+            ..Default::default()
+        });
+        let out = serde_json::to_string(&rsp).expect("serialize cache stats");
+        assert!(out.starts_with(r#"{"cache_stats":{"#), "got {out}");
+        assert!(out.contains(r#""capacity":60"#), "got {out}");
     }
 }

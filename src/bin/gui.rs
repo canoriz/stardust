@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 use tracing_subscriber::fmt::format::FmtSpan;
 
 use stardust::api::{
-    handle_rpc, RpcRequest, RpcResponse, RunningStateDump, StableState, TorrentSource,
+    handle_rpc, CacheStats, RpcRequest, RpcResponse, RunningStateDump, StableState, TorrentSource,
 };
 use stardust::{Session, SessionDump, SessionOpt};
 
@@ -60,6 +60,8 @@ impl Default for TorrentRow {
 struct GuiApp {
     cmd_tx: async_mpsc::UnboundedSender<RpcRequest>,
     shared: Arc<Mutex<Vec<TorrentRow>>>,
+    /// Latest cache statistics snapshot, refreshed by the backend.
+    cache_shared: Arc<Mutex<Option<CacheStats>>>,
     /// Receives a `()` from the ctrl-c listener task; triggers a graceful close.
     ctrl_c_rx: std_mpsc::Receiver<()>,
 
@@ -74,11 +76,13 @@ impl GuiApp {
     fn new(
         cmd_tx: async_mpsc::UnboundedSender<RpcRequest>,
         shared: Arc<Mutex<Vec<TorrentRow>>>,
+        cache_shared: Arc<Mutex<Option<CacheStats>>>,
         ctrl_c_rx: std_mpsc::Receiver<()>,
     ) -> Self {
         Self {
             cmd_tx,
             shared,
+            cache_shared,
             ctrl_c_rx,
             show_add: false,
             add_input: String::new(),
@@ -187,6 +191,52 @@ impl eframe::App for GuiApp {
         if close_add {
             self.show_add = false;
         }
+
+        // ── cache statistics panel ────────────────────────────────────────────
+        egui::Panel::bottom("cache_stats").show_inside(ui, |ui| {
+            let stats = *self.cache_shared.lock().unwrap();
+            ui.add_space(2.0);
+            match stats {
+                None => {
+                    ui.weak("Cache: no data yet");
+                }
+                Some(s) => {
+                    egui::CollapsingHeader::new("Cache statistics")
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(egui::RichText::new(format!(
+                                    "slots {}/{} (vacant {})",
+                                    s.occupied, s.capacity, s.vacant
+                                ))
+                                .monospace());
+                                ui.separator();
+                                ui.label(egui::RichText::new(format!(
+                                    "clean {}  dirty {}  lent {}  reading {}",
+                                    s.clean_pieces, s.dirty_pieces, s.lent_pieces, s.reading_pieces
+                                ))
+                                .monospace());
+                            });
+                            ui.horizontal_wrapped(|ui| {
+                                ratio_bar(ui, "clear", s.clear_ratio, egui::Color32::from_rgb(100, 200, 120));
+                                ratio_bar(ui, "dirty", s.dirty_ratio, egui::Color32::from_rgb(220, 140, 0));
+                            });
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(egui::RichText::new(format!(
+                                    "req {:.1}/s  lend {:.1}/s  return {:.1}/s  flush {:.1}/s  cache-flush {:.1}/s  evict {:.1}/s",
+                                    s.request_rate,
+                                    s.lend_rate,
+                                    s.return_rate,
+                                    s.flush_rate,
+                                    s.cache_flush_rate,
+                                    s.evict_rate,
+                                ))
+                                .monospace());
+                            });
+                        });
+                }
+            }
+        });
 
         // ── torrent list ──────────────────────────────────────────────────────
         egui::CentralPanel::default().show_inside(ui, |ui| {
@@ -339,6 +389,15 @@ impl eframe::App for GuiApp {
     }
 }
 
+fn ratio_bar(ui: &mut egui::Ui, label: &str, ratio: f64, color: egui::Color32) {
+    ui.add(
+        egui::ProgressBar::new(ratio as f32)
+            .desired_width(120.0)
+            .fill(color)
+            .text(format!("{label} {:.0}%", ratio * 100.0)),
+    );
+}
+
 fn fmt_speed(bps: f64) -> String {
     if bps >= 1_048_576.0 {
         format!("{:.2} MB/s", bps / 1_048_576.0)
@@ -356,6 +415,7 @@ fn fmt_speed(bps: f64) -> String {
 async fn backend_main(
     mut cmd_rx: async_mpsc::UnboundedReceiver<RpcRequest>,
     shared: Arc<Mutex<Vec<TorrentRow>>>,
+    cache_shared: Arc<Mutex<Option<CacheStats>>>,
     shutdown: CancellationToken,
     gui_ctrl_c_tx: std_mpsc::Sender<()>,
 ) {
@@ -411,6 +471,11 @@ async fn backend_main(
             }
             _ = interval.tick() => {
                 refresh_rows(&session, &shared).await;
+                if let (RpcResponse::CacheStats(stats), _) =
+                    handle_rpc(&session, RpcRequest::GetCacheStats).await
+                {
+                    *cache_shared.lock().unwrap() = Some(stats);
+                }
             }
             Some(cmd) = cmd_rx.recv() => {
                 let (rsp, _) = handle_rpc(&session, cmd).await;
@@ -490,6 +555,7 @@ fn main() {
         .init();
 
     let shared: Arc<Mutex<Vec<TorrentRow>>> = Arc::new(Mutex::new(Vec::new()));
+    let cache_shared: Arc<Mutex<Option<CacheStats>>> = Arc::new(Mutex::new(None));
     let (cmd_tx, cmd_rx) = async_mpsc::unbounded_channel::<RpcRequest>();
     let shutdown = CancellationToken::new();
     // Channel for the ctrl-c task to signal the GUI to close its viewport.
@@ -498,13 +564,20 @@ fn main() {
     // Launch the tokio backend on a dedicated OS thread.
     let backend_handle = {
         let shared = shared.clone();
+        let cache_shared = cache_shared.clone();
         let shutdown = shutdown.clone();
         thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
                 .expect("failed to build tokio runtime");
-            rt.block_on(backend_main(cmd_rx, shared, shutdown, gui_ctrl_c_tx));
+            rt.block_on(backend_main(
+                cmd_rx,
+                shared,
+                cache_shared,
+                shutdown,
+                gui_ctrl_c_tx,
+            ));
         })
     };
 
@@ -542,7 +615,12 @@ fn main() {
                     .push("noto_cjk".to_owned());
                 cc.egui_ctx.set_fonts(fonts);
             }
-            Ok(Box::new(GuiApp::new(cmd_tx, shared, gui_ctrl_c_rx)))
+            Ok(Box::new(GuiApp::new(
+                cmd_tx,
+                shared,
+                cache_shared,
+                gui_ctrl_c_rx,
+            )))
         }),
     ) {
         eprintln!("eframe error: {e}");

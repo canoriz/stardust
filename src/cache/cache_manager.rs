@@ -6,6 +6,7 @@ use std::{io, time};
 
 use bytes::BytesMut;
 use derivative::Derivative;
+use serde::{Deserialize, Serialize};
 use tokio::{
     sync::{mpsc, oneshot},
     time::Interval,
@@ -122,6 +123,8 @@ pub enum CacheMsg {
         key: GlobalPieceKey,
         result: Result<(), String>,
     },
+    /// Query current cache statistics
+    GetStats(oneshot::Sender<CacheStats>),
     Shutdown(oneshot::Sender<()>),
 }
 
@@ -165,6 +168,14 @@ impl CacheManagerHandle {
 
     pub fn vacant_count(&self) -> usize {
         self.vacant_count.load(Ordering::Relaxed)
+    }
+
+    /// Query a snapshot of cache statistics. Returns `None` if the manager task
+    /// has already stopped.
+    pub async fn cache_stats(&self) -> Option<CacheStats> {
+        let (tx, rx) = oneshot::channel();
+        self.sender.send(CacheMsg::GetStats(tx)).ok()?;
+        rx.await.ok()
     }
 
     /// Called by `PieceLease::drop` to return the piece to the cache.
@@ -244,6 +255,73 @@ impl Drop for PieceLease {
     }
 }
 
+/// A snapshot of cache statistics returned by `CacheMsg::GetStats`.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct CacheStats {
+    /// Total number of piece slots.
+    pub capacity: usize,
+    /// Slots currently tracked in the cache (loaded, lent out, or reading).
+    pub occupied: usize,
+    /// Slots not tracked at all.
+    pub vacant: usize,
+    /// Cached pieces that are clean (safe to evict without a write-back).
+    pub clean_pieces: usize,
+    /// Cached pieces with unflushed writes.
+    pub dirty_pieces: usize,
+    /// Pieces currently lent out as a `PieceLease`.
+    pub lent_pieces: usize,
+    /// Pieces with a file read in flight.
+    pub reading_pieces: usize,
+    /// `clean_pieces / capacity`.
+    pub clear_ratio: f64,
+    /// `dirty_pieces / capacity`.
+    pub dirty_ratio: f64,
+    /// `GetPiece` requests per second.
+    pub request_rate: f64,
+    /// Pieces lent out (as `PieceLease`) per second.
+    pub lend_rate: f64,
+    /// Pieces returned to the cache per second.
+    pub return_rate: f64,
+    /// Flush completions per second (`PieceFlushed`), regardless of who
+    /// initiated the flush.
+    pub flush_rate: f64,
+    /// Flushes the cache itself initiated per second to free slots
+    /// (`flush_least_accessed_dirty_pieces`). Excludes lease-drop writebacks.
+    pub cache_flush_rate: f64,
+    /// Clean pieces proactively evicted (dropped) to free slots per second
+    /// (`purge_least_accessed_clear_pieces`). A high value signals cache
+    /// pressure: these pieces will have to be re-read later.
+    pub evict_rate: f64,
+}
+
+/// Event counts accumulated within one sampling window (the evict-timer period).
+#[derive(Debug, Clone, Copy, Default)]
+struct StatCounts {
+    requests: u64,
+    lends: u64,
+    returns: u64,
+    /// Flush completions (`PieceFlushed`), regardless of initiator.
+    flushes: u64,
+    /// Flushes the cache initiated to free slots (`flush_least_accessed_dirty_pieces`).
+    cache_flushes: u64,
+    /// Clean pieces evicted (`purge_least_accessed_clear_pieces`).
+    evicts: u64,
+}
+
+/// All count-related state: the in-progress window (`current`) and the previous
+/// completed window (`last`) of event counts, plus the live gauges (`lent`,
+/// `reading`) maintained on each cache transition. `current` is reset into
+/// `last` on each evict-timer tick; `GetStats` blends the two windows 50/50.
+#[derive(Debug, Clone, Copy, Default)]
+struct WindowStats {
+    current: StatCounts,
+    last: StatCounts,
+    /// Live gauge: pieces currently lent out (`Loaded(None)`).
+    lent: usize,
+    /// Live gauge: pieces with a file read in flight (`Reading`).
+    reading: usize,
+}
+
 /// The CacheManager actor. Spawn via `tokio::spawn(manager.run())`.
 pub struct CacheManager {
     receiver: mpsc::UnboundedReceiver<CacheMsg>,
@@ -274,7 +352,15 @@ pub struct CacheManager {
     assume_clear: HashSet<GlobalPieceKey>,
 
     capacity: usize,
+
+    /// All count-related state: current + last window and the live `lent` /
+    /// `reading` gauges (maintained on each cache transition, no scan). See
+    /// [`WindowStats`].
+    stats: WindowStats,
 }
+
+/// Interval of `piece_evict_timer`.
+const TIMER_INTERVAL: time::Duration = time::Duration::from_secs(2);
 
 impl CacheManager {
     pub fn new() -> (Self, CacheManagerHandle) {
@@ -292,7 +378,7 @@ impl CacheManager {
         };
         let manager = Self {
             receiver: rx,
-            piece_evict_timer: tokio::time::interval(time::Duration::from_secs(2)),
+            piece_evict_timer: tokio::time::interval(TIMER_INTERVAL),
             self_handle: handle.clone(),
             cache: HashMap::new(),
             pending: HashMap::new(),
@@ -301,6 +387,7 @@ impl CacheManager {
             capacity,
             assume_clear: HashSet::new(),
             pool: Arc::new(Mutex::new(Pool::new(capacity))),
+            stats: WindowStats::default(),
         };
         (manager, handle)
     }
@@ -354,6 +441,15 @@ impl CacheManager {
 
             CacheMsg::UnregisterTorrent(info_hash, done) => {
                 self.torrents.remove(&info_hash);
+                for (key, entry) in &self.cache {
+                    if key.info_hash == info_hash {
+                        match entry {
+                            CacheEntry::Loaded(None) => self.stats.lent -= 1,
+                            CacheEntry::Reading => self.stats.reading -= 1,
+                            CacheEntry::Loaded(Some(_)) => {}
+                        }
+                    }
+                }
                 self.cache.retain(|key, _| key.info_hash != info_hash);
                 self.assume_clear.retain(|key| key.info_hash != info_hash);
                 self.pending.retain(|key, _| key.info_hash != info_hash);
@@ -378,6 +474,7 @@ impl CacheManager {
                 if let Err(e) = result {
                     warn!("cache flush error for {key:?}: {e}");
                 }
+                self.stats.current.flushes += 1;
                 // The buffer may have been borrowed or written again since this
                 // flush started. Only its current state determines whether it is clean.
                 if matches!(self.cache.get(&key), Some(CacheEntry::Loaded(Some(p))) if !p.is_dirty())
@@ -385,6 +482,10 @@ impl CacheManager {
                     self.assume_clear.insert(key);
                 }
                 self.load_pending_pieces();
+            }
+
+            CacheMsg::GetStats(reply) => {
+                let _ = reply.send(self.build_stats());
             }
 
             CacheMsg::Shutdown(tx) => {
@@ -402,12 +503,15 @@ impl CacheManager {
 
     // TODO: if too many get_piece requests, make a queue and only read when there are available cache slots
     fn handle_get_piece(&mut self, key: GlobalPieceKey, sender: mpsc::UnboundedSender<TmMsg>) {
+        self.stats.current.requests += 1;
         match self.cache.get_mut(&key) {
             Some(CacheEntry::Loaded(piece @ Some(_))) => {
                 // Piece is available: remove, mark Sent, deliver as PieceLease.
                 let pb = piece.take().unwrap();
                 self.assume_clear.remove(&key);
                 let lease = PieceLease::new(pb, key, self.self_handle.clone());
+                self.stats.lent += 1;
+                self.stats.current.lends += 1;
                 let _ = sender.send(TmMsg::PieceBufReady {
                     index: key.index,
                     buf: Ok(lease),
@@ -436,8 +540,13 @@ impl CacheManager {
             Ok(piece) => {
                 if let Some(q) = self.pending.get_mut(&key) {
                     if let Some(first_sender) = q.pop_front() {
-                        self.cache.insert(key, CacheEntry::Loaded(None));
+                        // Reading -> lent out.
+                        if self.cache.insert(key, CacheEntry::Loaded(None)).is_some() {
+                            self.stats.reading -= 1;
+                        }
+                        self.stats.lent += 1;
                         let lease = PieceLease::new(piece, key, self.self_handle.clone());
+                        self.stats.current.lends += 1;
                         let _ = first_sender.send(TmMsg::PieceBufReady {
                             index: key.index,
                             buf: Ok(lease),
@@ -450,13 +559,22 @@ impl CacheManager {
                 }
                 // No waiters: cache the loaded piece.
                 if self.torrents.contains_key(&key.info_hash) {
-                    self.cache.insert(key, CacheEntry::Loaded(Some(piece)));
+                    // Reading -> clean cached.
+                    if self
+                        .cache
+                        .insert(key, CacheEntry::Loaded(Some(piece)))
+                        .is_some()
+                    {
+                        self.stats.reading -= 1;
+                    }
                     self.assume_clear.insert(key);
                 }
             }
             Err(e) => {
                 // Read failed: remove Reading entry and notify all waiters.
-                self.cache.remove(&key);
+                if matches!(self.cache.remove(&key), Some(CacheEntry::Reading)) {
+                    self.stats.reading -= 1;
+                }
                 let msg = format!("{e}");
                 let kind = e.kind();
                 if let Some(waiters) = self.pending.remove(&key) {
@@ -473,6 +591,7 @@ impl CacheManager {
     }
 
     fn handle_return_piece(&mut self, key: GlobalPieceKey, piece: PieceBuf) {
+        self.stats.current.returns += 1;
         if let Some(mut q) = self.pending.remove(&key) {
             if let Some(first_sender) = q.pop_front() {
                 if !q.is_empty() {
@@ -484,6 +603,7 @@ impl CacheManager {
                 ));
 
                 let lease = PieceLease::new(piece, key, self.self_handle.clone());
+                self.stats.current.lends += 1;
                 let _ = first_sender.send(TmMsg::PieceBufReady {
                     index: key.index,
                     buf: Ok(lease),
@@ -497,7 +617,13 @@ impl CacheManager {
         // drop piece will auto write back if it's dirty, so we don't need to explicitly flush here.
         if self.torrents.contains_key(&key.info_hash) {
             let is_clear = !piece.is_dirty();
-            self.cache.insert(key, CacheEntry::Loaded(Some(piece)));
+            // lent out -> cached.
+            if matches!(
+                self.cache.insert(key, CacheEntry::Loaded(Some(piece))),
+                Some(CacheEntry::Loaded(None))
+            ) {
+                self.stats.lent -= 1;
+            }
             if is_clear {
                 self.assume_clear.insert(key);
                 // TODO: maybe do nothing, let only timeout to call `load_pending_pieces`
@@ -529,6 +655,7 @@ impl CacheManager {
             }
             self.spawn_piece_read(key);
             self.cache.insert(key, CacheEntry::Reading);
+            self.stats.reading += 1;
         }
     }
 
@@ -539,6 +666,9 @@ impl CacheManager {
     fn handle_evict_timeout(&mut self) {
         self.load_pending_pieces();
         self.flush_least_accessed_dirty_pieces(self.waiting_slot.len());
+        // Roll the window: the just-finished window becomes `last`, start fresh.
+        self.stats.last = self.stats.current;
+        self.stats.current = StatCounts::default();
         self.update_vacant_count();
     }
 
@@ -625,6 +755,7 @@ impl CacheManager {
             }
             n += 1;
         }
+        self.stats.current.evicts += n as u64;
         n
     }
 
@@ -651,6 +782,7 @@ impl CacheManager {
             self.self_handle.flush_piece(key, p, |_| {});
             flushed += 1;
         }
+        self.stats.current.cache_flushes += flushed as u64;
         flushed
     }
 
@@ -664,6 +796,42 @@ impl CacheManager {
         self.self_handle
             .vacant_count
             .store(self.available_slots(), Ordering::Relaxed);
+    }
+
+    /// Build a statistics snapshot in O(1): gauges are derived from the
+    /// maintained `stats.lent` / `stats.reading` gauges and `assume_clear` (no per-entry
+    /// scan); rates blend the last completed window and the in-progress window 50/50.
+    fn build_stats(&self) -> CacheStats {
+        let occupied = self.cache.len();
+        let lent = self.stats.lent;
+        let reading = self.stats.reading;
+        // Loaded(Some) pieces = occupied minus lent-out and in-flight reads.
+        let cached = occupied.saturating_sub(lent + reading);
+        // `assume_clear` is a guaranteed-clean lower bound; the rest of `cached`
+        // is treated as dirty.
+        let clean = self.assume_clear.len().min(cached);
+        let dirty = cached - clean;
+        let cap = self.capacity as f64;
+        let w = TIMER_INTERVAL.as_secs_f64();
+        let (last, cur) = (&self.stats.last, &self.stats.current);
+        let rate = |l: u64, c: u64| (l as f64 * 0.5 + c as f64 * 0.5) / w;
+        CacheStats {
+            capacity: self.capacity,
+            occupied,
+            vacant: self.capacity.saturating_sub(occupied),
+            clean_pieces: clean,
+            dirty_pieces: dirty,
+            lent_pieces: lent,
+            reading_pieces: reading,
+            clear_ratio: if cap > 0.0 { clean as f64 / cap } else { 0.0 },
+            dirty_ratio: if cap > 0.0 { dirty as f64 / cap } else { 0.0 },
+            request_rate: rate(last.requests, cur.requests),
+            lend_rate: rate(last.lends, cur.lends),
+            return_rate: rate(last.returns, cur.returns),
+            flush_rate: rate(last.flushes, cur.flushes),
+            cache_flush_rate: rate(last.cache_flushes, cur.cache_flushes),
+            evict_rate: rate(last.evicts, cur.evicts),
+        }
     }
 }
 

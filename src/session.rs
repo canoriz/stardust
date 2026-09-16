@@ -11,7 +11,7 @@ use tokio::sync::oneshot;
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{info, warn};
 
-use crate::cache::cache_manager::{CacheManager, CacheManagerHandle};
+use crate::cache::cache_manager::{CacheManager, CacheManagerHandle, CacheStats};
 use crate::dht::{DHTOption, DhtDump, DHT};
 use crate::metadata::Magnet;
 use crate::protocol::{AcceptOpt, BTStream, HandshakeOption, InfoHash};
@@ -138,6 +138,11 @@ impl Session {
         }
         _ = tm.sender.change_state(RunningCmd::Resume).await;
         self.tasks.lock().unwrap().insert(info_hash, tm);
+    }
+
+    /// Snapshot of global cache statistics (shared across all torrents).
+    pub async fn cache_stats(&self) -> Option<CacheStats> {
+        self.cache_handle.cache_stats().await
     }
 
     /// Dump progress of every active torrent task.
