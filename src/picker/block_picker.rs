@@ -194,7 +194,7 @@ impl PieceBlocks {
                                 peer,
                                 PickedDetail::new(now, *n_in_flight, avg_speed, rtt),
                             )]),
-                            revoked: revoked.clone(), // TODO: optimize clone
+                            revoked: std::mem::take(revoked),
                         };
                         *n_in_flight += 1;
                         self.all_request_or_received_before = i + 1;
@@ -293,7 +293,7 @@ impl PieceBlocks {
                                 peer,
                                 PickedDetail::new(pick_time, *n_in_flight, avg_speed, rtt),
                             )]),
-                            revoked: revoked.clone(),
+                            revoked: std::mem::take(revoked),
                         };
                         *n_in_flight += 1;
                         if from.is_none() {
@@ -382,7 +382,7 @@ impl PieceBlocks {
                 revoked.retain(|_, t| t.pick_time.elapsed() < NO_RESPONSE_TIMEOUT);
                 if requested.is_empty() {
                     *b = BlockStatus::NotRequested {
-                        revoked: revoked.clone(),
+                        revoked: std::mem::take(revoked),
                     };
                     if self.all_request_or_received_before > b_index {
                         self.all_request_or_received_before = b_index;
@@ -439,7 +439,7 @@ impl PieceBlocks {
                     revoked.retain(|_, t| t.pick_time.elapsed() < NO_RESPONSE_TIMEOUT);
                     if requested.is_empty() {
                         *b = BlockStatus::NotRequested {
-                            revoked: revoked.clone(),
+                            revoked: std::mem::take(revoked),
                         };
                         self.requested_or_received_count -= 1;
                         if self.all_request_or_received_before > i {
@@ -738,8 +738,10 @@ impl BlockPicker {
                             blocks.pick(*peer, *remain, n_in_flight, avg_speed, rtt, repick_option)
                         {
                             *remain -= n_picked;
-                            let pb: Vec<_> = blks.iter(piece_size as u32).collect();
-                            trace!("pick piece {index} from peer {peer} (requesting), picked blks: {pb:?}");
+                            if tracing::enabled!(tracing::Level::TRACE) {
+                                let pb: Vec<_> = blks.iter(piece_size as u32).collect();
+                                trace!("pick piece {index} from peer {peer} (requesting), picked blks: {pb:?}");
+                            }
                             ret.push(blks);
                         }
                     }
@@ -759,13 +761,12 @@ impl BlockPicker {
                 rtt,
                 self.piece_size,
             );
-            for (index, blocks) in self.requesting.iter_mut() {
-                if blocks.is_all_requested_or_received() {
-                    self.receiving.insert(*index, blocks.clone());
-                }
+            for (index, blocks) in self
+                .requesting
+                .extract_if(.., |_, b| b.is_all_requested_or_received())
+            {
+                self.receiving.insert(index, blocks);
             }
-            self.requesting
-                .retain(|_, b| !b.is_all_requested_or_received());
         }
 
         let endgame = self.update_endgame();
@@ -873,13 +874,12 @@ impl BlockPicker {
                 rtt,
                 self.piece_size,
             );
-            for (index, blocks) in self.requesting.iter_mut() {
-                if blocks.is_all_requested_or_received() {
-                    self.receiving.insert(*index, blocks.clone());
-                }
+            for (index, blocks) in self
+                .requesting
+                .extract_if(.., |_, b| b.is_all_requested_or_received())
+            {
+                self.receiving.insert(index, blocks);
             }
-            self.requesting
-                .retain(|_, b| !b.is_all_requested_or_received());
         }
 
         let endgame = self.update_endgame();
@@ -1133,14 +1133,12 @@ impl BlockPicker {
     /// longer than timeout
     fn revoke_unrespond(&mut self, revoked: &mut HashMap<PeerAddr, Vec<Request>>) {
         let no_response = |_: &PeerAddr, at: &time::Instant| at.elapsed() > NO_RESPONSE_TIMEOUT;
-        for (index, blocks) in self.receiving.iter_mut() {
+        for (index, blocks) in self.receiving.extract_if(.., |_, blocks| {
             blocks.revoke_all_requested_if(no_response, revoked);
-            if !blocks.is_all_requested_or_received() {
-                self.requesting.insert(*index, blocks.clone());
-            }
+            !blocks.is_all_requested_or_received()
+        }) {
+            self.requesting.insert(index, blocks);
         }
-        self.receiving
-            .retain(|_, b| b.is_all_requested_or_received());
 
         for (index, blocks) in self.requesting.iter_mut() {
             blocks.revoke_all_requested_if(no_response, revoked);
@@ -1338,14 +1336,12 @@ impl BlockPicker {
         // Revoke all blocks requested by this peer so they become available immediately.
         let requested_peer = |p: &PeerAddr, _: &time::Instant| p == addr;
         let mut revoked = HashMap::new();
-        for (i, b) in self.receiving.iter_mut() {
+        for (i, b) in self.receiving.extract_if(.., |_, b| {
             b.revoke_all_requested_if(requested_peer, &mut revoked);
-            if !b.is_all_requested_or_received() {
-                self.requesting.insert(*i, b.clone());
-            }
+            !b.is_all_requested_or_received()
+        }) {
+            self.requesting.insert(i, b);
         }
-        self.receiving
-            .retain(|_, b| b.is_all_requested_or_received());
         for (i, b) in self.requesting.iter_mut() {
             b.revoke_all_requested_if(requested_peer, &mut revoked);
             if b.is_all_not_requested() {
@@ -1380,15 +1376,13 @@ impl BlockPicker {
         let requested_peer = |p: &PeerAddr, _: &time::Instant| p == peer;
 
         let mut revoked = HashMap::new();
-        for (i, b) in self.receiving.iter_mut() {
+        for (i, b) in self.receiving.extract_if(.., |_, b| {
             b.revoke_all_requested_if(requested_peer, &mut revoked);
-            if !b.is_all_requested_or_received() {
-                self.requesting.insert(*i, b.clone());
-                info!("345");
-            }
+            !b.is_all_requested_or_received()
+        }) {
+            self.requesting.insert(i, b);
+            info!("345");
         }
-        self.receiving
-            .retain(|_, b| b.is_all_requested_or_received());
 
         for (i, b) in self.requesting.iter_mut() {
             b.revoke_all_requested_if(requested_peer, &mut revoked);

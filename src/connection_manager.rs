@@ -364,7 +364,7 @@ async fn run_recv_stream<T>(
                 // TODO: need handle None case
                 // TODO: use buffer and tokio::Notify
                 // info!("connection manager recv stream of {} received msg {msg:?}", &manager.conn);
-                info!("{addr} ctrl cmd");
+                trace!("{addr} ctrl cmd");
                 conn.handle_ctrl_cmd(msg);
             }
             _ = ticker.tick() => {
@@ -405,7 +405,7 @@ where
 {
     fn handle_report_tick(&mut self) {
         let peer = to_canonical_addr(self.read_stream.peer_addr());
-        info!("{peer} handle report tick");
+        trace!("{peer} handle report tick");
         if let Err(e) = self
             .transmit_handle
             .sender

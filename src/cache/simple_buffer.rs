@@ -195,7 +195,7 @@ impl PooledBuf {
                 b.resize(len, 0);
                 b
             })
-            .unwrap_or(BytesMut::zeroed(len));
+            .unwrap_or_else(|| BytesMut::zeroed(len));
         Self {
             buf: Some(buf),
             pool,

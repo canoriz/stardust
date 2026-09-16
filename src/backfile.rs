@@ -45,7 +45,7 @@ fn file_read_exact_at_impl(file: &File, buf: &mut [u8], offset: u64) -> std::io:
     }
     Ok(())
 }
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 pub struct FileMetadata {
     pub len: usize, // length of file
@@ -137,7 +137,7 @@ impl Access for NormalFile {
     }
 
     fn write_all_at(&mut self, buf: &[u8], offset: usize) -> Result<()> {
-        warn!("write_all begin at offset {offset} len {}", buf.len());
+        trace!("write_all begin at offset {offset} len {}", buf.len());
         let r = file_write_all_at_impl(&self.file, buf, offset as u64);
         #[cfg(any(
             target_os = "linux",
@@ -159,14 +159,14 @@ impl Access for NormalFile {
             )
             .unwrap_or_else(|e| warn!("posix_fadvise error: {e:?}"));
         }
-        warn!("write_all end at offset {offset} len {}", buf.len());
+        trace!("write_all end at offset {offset} len {}", buf.len());
         r
     }
 
     fn read_exact_at(&mut self, buf: &mut [u8], offset: usize) -> Result<()> {
-        info!("read_exact begin at offset {offset} len {}", buf.len());
+        trace!("read_exact begin at offset {offset} len {}", buf.len());
         let r = file_read_exact_at_impl(&self.file, buf, offset as u64);
-        info!("read_exact end at offset {offset} len {}", buf.len());
+        trace!("read_exact end at offset {offset} len {}", buf.len());
         r
     }
 
