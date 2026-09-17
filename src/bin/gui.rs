@@ -212,8 +212,8 @@ impl eframe::App for GuiApp {
                                 .monospace());
                                 ui.separator();
                                 ui.label(egui::RichText::new(format!(
-                                    "clean {}  dirty {}  lent {}  reading {}",
-                                    s.clean_pieces, s.dirty_pieces, s.lent_pieces, s.reading_pieces
+                                    "clean {}  dirty {}  lent {}  reading {}  waiting {}",
+                                    s.clean_pieces, s.dirty_pieces, s.lent_pieces, s.reading_pieces, s.waiting_requests
                                 ))
                                 .monospace());
                             });

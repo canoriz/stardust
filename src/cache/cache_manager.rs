@@ -272,6 +272,8 @@ pub struct CacheStats {
     pub lent_pieces: usize,
     /// Pieces with a file read in flight.
     pub reading_pieces: usize,
+    /// requests waiting for slots
+    pub waiting_requests: usize,
     /// `clean_pieces / capacity`.
     pub clear_ratio: f64,
     /// `dirty_pieces / capacity`.
@@ -823,6 +825,7 @@ impl CacheManager {
             dirty_pieces: dirty,
             lent_pieces: lent,
             reading_pieces: reading,
+            waiting_requests: self.waiting_slot.len(),
             clear_ratio: if cap > 0.0 { clean as f64 / cap } else { 0.0 },
             dirty_ratio: if cap > 0.0 { dirty as f64 / cap } else { 0.0 },
             request_rate: rate(last.requests, cur.requests),

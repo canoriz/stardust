@@ -672,7 +672,7 @@ impl BlockPicker {
             self.prev_time_check = time::Instant::now();
         }
 
-        let rush_mode = n_cache_vacant < POOL_SIZE / 2;
+        let rush_mode = n_cache_vacant < POOL_SIZE *3 / 4;
         let endgame = self.update_endgame();
         let repick_option = if endgame {
             RepickOption {
