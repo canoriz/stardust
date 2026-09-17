@@ -20,7 +20,8 @@ use tokio_util::sync::CancellationToken;
 use tracing_subscriber::fmt::format::FmtSpan;
 
 use stardust::api::{
-    handle_rpc, CacheStats, RpcRequest, RpcResponse, RunningStateDump, StableState, TorrentSource,
+    handle_rpc, BufferPoolStats, CacheStats, RpcRequest, RpcResponse, RunningStateDump, StableState,
+    TorrentSource,
 };
 use stardust::{Session, SessionDump, SessionOpt};
 
@@ -62,6 +63,8 @@ struct GuiApp {
     shared: Arc<Mutex<Vec<TorrentRow>>>,
     /// Latest cache statistics snapshot, refreshed by the backend.
     cache_shared: Arc<Mutex<Option<CacheStats>>>,
+    /// Latest block buffer pool snapshot, refreshed by the backend.
+    pool_shared: Arc<Mutex<Option<BufferPoolStats>>>,
     /// Receives a `()` from the ctrl-c listener task; triggers a graceful close.
     ctrl_c_rx: std_mpsc::Receiver<()>,
 
@@ -77,12 +80,14 @@ impl GuiApp {
         cmd_tx: async_mpsc::UnboundedSender<RpcRequest>,
         shared: Arc<Mutex<Vec<TorrentRow>>>,
         cache_shared: Arc<Mutex<Option<CacheStats>>>,
+        pool_shared: Arc<Mutex<Option<BufferPoolStats>>>,
         ctrl_c_rx: std_mpsc::Receiver<()>,
     ) -> Self {
         Self {
             cmd_tx,
             shared,
             cache_shared,
+            pool_shared,
             ctrl_c_rx,
             show_add: false,
             add_input: String::new(),
@@ -233,6 +238,15 @@ impl eframe::App for GuiApp {
                                 ))
                                 .monospace());
                             });
+                            if let Some(p) = *self.pool_shared.lock().unwrap() {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(egui::RichText::new(format!(
+                                        "block pool {}/{} in use (available {})",
+                                        p.in_use, p.capacity, p.available
+                                    ))
+                                    .monospace());
+                                });
+                            }
                         });
                 }
             }
@@ -416,6 +430,7 @@ async fn backend_main(
     mut cmd_rx: async_mpsc::UnboundedReceiver<RpcRequest>,
     shared: Arc<Mutex<Vec<TorrentRow>>>,
     cache_shared: Arc<Mutex<Option<CacheStats>>>,
+    pool_shared: Arc<Mutex<Option<BufferPoolStats>>>,
     shutdown: CancellationToken,
     gui_ctrl_c_tx: std_mpsc::Sender<()>,
 ) {
@@ -475,6 +490,11 @@ async fn backend_main(
                     handle_rpc(&session, RpcRequest::GetCacheStats).await
                 {
                     *cache_shared.lock().unwrap() = Some(stats);
+                }
+                if let (RpcResponse::BufferPoolStats(stats), _) =
+                    handle_rpc(&session, RpcRequest::GetBufferPoolStats).await
+                {
+                    *pool_shared.lock().unwrap() = Some(stats);
                 }
             }
             Some(cmd) = cmd_rx.recv() => {
@@ -556,6 +576,7 @@ fn main() {
 
     let shared: Arc<Mutex<Vec<TorrentRow>>> = Arc::new(Mutex::new(Vec::new()));
     let cache_shared: Arc<Mutex<Option<CacheStats>>> = Arc::new(Mutex::new(None));
+    let pool_shared: Arc<Mutex<Option<BufferPoolStats>>> = Arc::new(Mutex::new(None));
     let (cmd_tx, cmd_rx) = async_mpsc::unbounded_channel::<RpcRequest>();
     let shutdown = CancellationToken::new();
     // Channel for the ctrl-c task to signal the GUI to close its viewport.
@@ -565,6 +586,7 @@ fn main() {
     let backend_handle = {
         let shared = shared.clone();
         let cache_shared = cache_shared.clone();
+        let pool_shared = pool_shared.clone();
         let shutdown = shutdown.clone();
         thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_multi_thread()
@@ -575,6 +597,7 @@ fn main() {
                 cmd_rx,
                 shared,
                 cache_shared,
+                pool_shared,
                 shutdown,
                 gui_ctrl_c_tx,
             ));
@@ -619,6 +642,7 @@ fn main() {
                 cmd_tx,
                 shared,
                 cache_shared,
+                pool_shared,
                 gui_ctrl_c_rx,
             )))
         }),

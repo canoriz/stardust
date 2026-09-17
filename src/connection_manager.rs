@@ -2,17 +2,12 @@ use bytes::BytesMut;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::AtomicU32;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use tokio::io::{BufReader, BufWriter};
 #[cfg(feature = "mock_delay")]
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time;
-
-const BLOCK_SIZE: usize = 16384;
-const POOL_SLOTS: usize = 256;
-static BLOCK_BUF_POOL: LazyLock<Arc<BufferPool<BytesMut>>> =
-    LazyLock::new(|| BufferPool::new(POOL_SLOTS, || BytesMut::with_capacity(BLOCK_SIZE)));
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::sync::{CancellationToken, DropGuard};
@@ -77,19 +72,27 @@ pub(crate) struct ConnectionManagerHandle {
 }
 
 impl ConnectionManagerHandle {
-    pub fn new<T>(conn: BTStream<T>, trh: TransmitManagerHandle) -> Self
+    pub fn new<T>(
+        conn: BTStream<T>,
+        trh: TransmitManagerHandle,
+        block_pool: Arc<BufferPool<BytesMut>>,
+    ) -> Self
     where
         T: AsyncRead + AsyncWrite + Split + Unpin + Send + 'static,
     {
         let conn_info = conn.info();
         let (read_stream, write_stream) = conn.split_buffered();
-        Self::from_splitted_buffered(read_stream, write_stream, trh, conn_info)
+        Self::from_splitted_buffered(read_stream, write_stream, trh, conn_info, block_pool)
     }
 
-    pub fn new_dyn(conn: BTStream<Box<dyn Conn>>, trh: TransmitManagerHandle) -> Self {
+    pub fn new_dyn(
+        conn: BTStream<Box<dyn Conn>>,
+        trh: TransmitManagerHandle,
+        block_pool: Arc<BufferPool<BytesMut>>,
+    ) -> Self {
         let conn_info = conn.info();
         let (read_stream, write_stream) = conn.split_buffered();
-        Self::from_splitted_buffered(read_stream, write_stream, trh, conn_info)
+        Self::from_splitted_buffered(read_stream, write_stream, trh, conn_info, block_pool)
     }
 
     fn from_splitted_buffered<R, W>(
@@ -97,6 +100,7 @@ impl ConnectionManagerHandle {
         write_stream: WriteStream<BufWriter<W>>,
         trh: TransmitManagerHandle,
         conn_info: ConnInfo,
+        block_pool: Arc<BufferPool<BytesMut>>,
     ) -> Self
     where
         R: protocol::Reader,
@@ -118,6 +122,7 @@ impl ConnectionManagerHandle {
             _drop_guard: conn_break_guard.clone(),
             current_buf: None,
             received_blocks: None,
+            block_pool,
         };
 
         let (send_tx, send_rx) = mpsc::unbounded_channel();
@@ -302,6 +307,9 @@ struct RecvStream<T> {
 
     /// Received blocks are stored here until transmit manager asks for
     received_blocks: Option<ReceivedBlocks>,
+
+    /// Session-level pool that piece-body buffers are drawn from.
+    block_pool: Arc<BufferPool<BytesMut>>,
 }
 
 struct SendStreamHandle {
@@ -375,6 +383,7 @@ async fn run_recv_stream<T>(
                 &mut conn.read_stream,
                 &mut conn.current_buf,
                 &mut conn.transmit_handle,
+                &conn.block_pool,
                 addr,
             ) => {
                 trace!("{addr} received {:?}", r);
@@ -424,19 +433,20 @@ where
         read_stream: &mut ReadStream<T>,
         current_buf: &mut Option<PooledBuf<BytesMut>>,
         transmit_handle: &mut TransmitManagerHandle,
+        block_pool: &Arc<BufferPool<BytesMut>>,
         addr: SocketAddr,
     ) -> io::Result<(Message, Option<BlockBuf>)> {
         match read_stream.recv_msg_header().await? {
             RecvResult::Message(msg) => Ok((msg, None)),
             RecvResult::PiecePending { index, begin, len } => {
                 if current_buf.is_none() {
-                    let mut buf = match BLOCK_BUF_POOL.try_acquire() {
+                    let mut buf = match block_pool.try_acquire() {
                         Some(b) => b,
                         None => {
                             let _ = transmit_handle
                                 .sender
                                 .send(TransmitMsg::PeerMsg(PeerMsg::BufferWaiting { peer: addr }));
-                            BLOCK_BUF_POOL.acquire().await
+                            block_pool.acquire().await
                         }
                     };
                     buf.clear();
@@ -791,8 +801,9 @@ mod test {
         let (tx, mut rx2) = mpsc::unbounded_channel();
         let tmh2 = TransmitManagerHandle { sender: tx };
 
-        let _c1 = ConnectionManagerHandle::new(end1, tmh1.clone());
-        let _c2 = ConnectionManagerHandle::new(end2, tmh2.clone());
+        let pool = BufferPool::new(4, || BytesMut::with_capacity(16384));
+        let _c1 = ConnectionManagerHandle::new(end1, tmh1.clone(), pool.clone());
+        let _c2 = ConnectionManagerHandle::new(end2, tmh2.clone(), pool.clone());
         let first1 = rx1.recv().await.unwrap();
         let first2 = rx2.recv().await.unwrap();
         let inner1 = match first1 {
@@ -822,8 +833,9 @@ mod test {
         let (tx, _rx2) = mpsc::unbounded_channel();
         let tmh2 = TransmitManagerHandle { sender: tx };
 
-        let _c1 = ConnectionManagerHandle::new(end1, tmh1.clone());
-        let c2 = ConnectionManagerHandle::new(end2, tmh2.clone());
+        let pool = BufferPool::new(4, || BytesMut::with_capacity(16384));
+        let _c1 = ConnectionManagerHandle::new(end1, tmh1.clone(), pool.clone());
+        let c2 = ConnectionManagerHandle::new(end2, tmh2.clone(), pool.clone());
 
         drop(c2);
         // after drop, c1 recv should fail, and generate a PeerLeave to transmit handle

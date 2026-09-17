@@ -89,9 +89,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
 
                 let (rsp, should_shutdown) = stardust::api::handle_rpc(&session, cmd.request).await;
-                if let Some(reply) = cmd.reply {
-                    let _ = reply.send(rsp);
-                }
+                let _ = cmd.reply.send(rsp);
 
                 if should_shutdown {
                     info!("shutdown requested via API, shutting down");

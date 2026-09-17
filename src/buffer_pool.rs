@@ -1,5 +1,6 @@
 //! Pooled block buffers
 use bytes::BytesMut;
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::fmt;
 use std::ops::{Deref, DerefMut};
@@ -10,6 +11,17 @@ pub struct BufferPool<T> {
     storage: Mutex<VecDeque<T>>,
     semaphore: Arc<Semaphore>,
     capacity: usize,
+}
+
+/// Snapshot of a `BufferPool`'s occupancy.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct BufferPoolStats {
+    /// Total slots the pool was created with.
+    pub capacity: usize,
+    /// Slots currently free (not handed out).
+    pub available: usize,
+    /// Slots currently checked out (`capacity - available`).
+    pub in_use: usize,
 }
 
 impl<T> fmt::Debug for BufferPool<T> {
@@ -72,6 +84,15 @@ impl<T: Send + 'static> BufferPool<T> {
 
     pub fn capacity(&self) -> usize {
         self.capacity
+    }
+
+    pub fn stats(&self) -> BufferPoolStats {
+        let available = self.semaphore.available_permits();
+        BufferPoolStats {
+            capacity: self.capacity,
+            available,
+            in_use: self.capacity.saturating_sub(available),
+        }
     }
 }
 

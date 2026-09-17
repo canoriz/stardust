@@ -1,4 +1,5 @@
 use bon::Builder;
+use bytes::BytesMut;
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
@@ -11,6 +12,7 @@ use tokio::sync::oneshot;
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{info, warn};
 
+use crate::buffer_pool::{BufferPool, BufferPoolStats};
 use crate::cache::cache_manager::{CacheManager, CacheManagerHandle, CacheStats};
 use crate::dht::{DHTOption, DhtDump, DHT};
 use crate::metadata::Magnet;
@@ -34,6 +36,7 @@ pub struct Session {
     port: u16,
     dht_client: Option<Arc<DHT>>,
     cache_handle: CacheManagerHandle,
+    block_pool: Arc<BufferPool<BytesMut>>,
 
     // TODO: do we really need cancel and drop guard both? maybe just one of them is enough?
     /// Token shared with the listener; kept so `shutdown` can cancel explicitly.
@@ -70,6 +73,10 @@ impl Session {
         // TODO: maybe let new to start the task, not manually spawn here
         tokio::spawn(cache_manager.run());
 
+        const BLOCK_SIZE: usize = 16384;
+        const POOL_SLOTS: usize = 256;
+        let block_pool = BufferPool::new(POOL_SLOTS, || BytesMut::with_capacity(BLOCK_SIZE));
+
         // TODO: clients connect to us who prefers uTP will be rejected by our DHT handler
         // and not trying to connect with TCP
         // support dual protocol on DHT port, or choose a different dht/tcp port
@@ -98,6 +105,7 @@ impl Session {
             port: opt.port,
             dht_client,
             cache_handle,
+            block_pool,
             cancel,
             _cancel,
         };
@@ -128,6 +136,7 @@ impl Session {
             self.port,
             self.dht_client.clone(),
             self.cache_handle.clone(),
+            self.block_pool.clone(),
         );
 
         for addr in announce_list {
@@ -143,6 +152,11 @@ impl Session {
     /// Snapshot of global cache statistics (shared across all torrents).
     pub async fn cache_stats(&self) -> Option<CacheStats> {
         self.cache_handle.cache_stats().await
+    }
+
+    /// Snapshot of the session-level block buffer pool occupancy.
+    pub fn buffer_pool_stats(&self) -> BufferPoolStats {
+        self.block_pool.stats()
     }
 
     /// Dump progress of every active torrent task.
@@ -195,6 +209,7 @@ impl Session {
                 self.port,
                 self.dht_client.clone(),
                 self.cache_handle.clone(),
+                self.block_pool.clone(),
             );
             self.tasks.lock().unwrap().insert(info_hash, tm);
         }

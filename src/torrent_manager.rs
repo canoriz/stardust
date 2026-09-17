@@ -2,9 +2,11 @@ use std::io;
 use std::sync::Arc;
 
 use crate::announce_manager::{self, AnnounceManagerHandle};
+use crate::buffer_pool::BufferPool;
 use crate::cache::cache_manager::CacheManagerHandle;
 use crate::dht::DHT;
 use crate::transmit_manager::{self, TorrentTask, TransmitDump, TransmitManager};
+use bytes::BytesMut;
 use tokio::sync::{mpsc, oneshot};
 
 #[derive(Clone)]
@@ -23,6 +25,7 @@ impl TorrentManagerHandle {
         port: u16,
         dht_client: Option<Arc<DHT>>,
         cache_handle: CacheManagerHandle,
+        block_pool: Arc<BufferPool<BytesMut>>,
     ) -> Self {
         let (tx, rx) = mpsc::unbounded_channel::<transmit_manager::Msg>();
 
@@ -41,6 +44,7 @@ impl TorrentManagerHandle {
             dht_client,
             am,
             cache_handle,
+            block_pool,
         );
 
         Self {
@@ -80,6 +84,7 @@ impl TorrentManagerHandle {
         port: u16,
         dht_client: Option<Arc<DHT>>,
         cache_handle: CacheManagerHandle,
+        block_pool: Arc<BufferPool<BytesMut>>,
     ) -> Self {
         let (tx, rx) = mpsc::unbounded_channel::<transmit_manager::Msg>();
 
@@ -94,6 +99,7 @@ impl TorrentManagerHandle {
             dht_client,
             am,
             cache_handle,
+            block_pool,
         );
 
         Self {

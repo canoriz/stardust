@@ -1,7 +1,8 @@
 use crate::announce_manager::{self, AnnounceManagerHandle};
 use crate::backfile::{BackFile, NormalFile, VoidFile};
 use crate::bandwidth::Bandwidth;
-use crate::buffer_pool::BlockBuf;
+use crate::buffer_pool::{BlockBuf, BufferPool};
+use bytes::BytesMut;
 use crate::cache::cache_manager::{CacheManagerHandle, GlobalPieceKey, PieceLease};
 use crate::cache::simple_buffer::{FlushErr, JointIndex, SUB_PIECE_SIZE};
 use crate::connection_manager::{
@@ -250,6 +251,7 @@ impl TransmitManager {
         dht_client: Option<Arc<DHT>>,
         announce_manager: AnnounceManagerHandle,
         cache_handle: CacheManagerHandle,
+        block_pool: Arc<BufferPool<BytesMut>>,
     ) -> Self {
         let info_hash = t.info_hash();
         let worker = TransmitWorker::new(
@@ -261,6 +263,7 @@ impl TransmitManager {
             cmd_sender,
             cmd_receiver,
             cache_handle,
+            block_pool,
         );
         let cancel_transmit = CancellationToken::new();
         let (done_transmit, done_transmit_rx) = oneshot::channel();
@@ -295,6 +298,7 @@ impl TransmitManager {
         dht_client: Option<Arc<DHT>>,
         announce_manager: AnnounceManagerHandle,
         cache_handle: CacheManagerHandle,
+        block_pool: Arc<BufferPool<BytesMut>>,
     ) -> Self {
         let info_hash = dump.info_hash();
         let peers = dump.peers.clone();
@@ -307,6 +311,7 @@ impl TransmitManager {
             cmd_sender.clone(),
             cmd_receiver,
             cache_handle,
+            block_pool,
         );
         let cancel_transmit = CancellationToken::new();
         let (dump_tx, dump_rx) = oneshot::channel();
@@ -673,6 +678,9 @@ pub struct TransmitWorker {
 
     /// Handle to the global CacheManager actor.
     cache_handle: CacheManagerHandle,
+
+    /// Session-level pool that peer connections draw piece-body buffers from.
+    block_pool: Arc<BufferPool<BytesMut>>,
 }
 
 // impl std::fmt::Debug for TransmitWorker {
@@ -831,6 +839,7 @@ impl TransmitWorker {
         cmd_sender: mpsc::UnboundedSender<Msg>,
         cmd_receiver: mpsc::UnboundedReceiver<Msg>,
         cache_handle: CacheManagerHandle,
+        block_pool: Arc<BufferPool<BytesMut>>,
     ) -> Self {
         let pending_flushes = Arc::new(AtomicUsize::new(0));
         let (info_hash, torrent_state) = match dump.state {
@@ -877,6 +886,7 @@ impl TransmitWorker {
             downloaded,
             running_state: dump.running_state.into(),
             cache_handle,
+            block_pool,
         };
 
         match &worker.running_state {
@@ -903,6 +913,7 @@ impl TransmitWorker {
         cmd_sender: mpsc::UnboundedSender<Msg>,
         cmd_receiver: mpsc::UnboundedReceiver<Msg>,
         cache_handle: CacheManagerHandle,
+        block_pool: Arc<BufferPool<BytesMut>>,
     ) -> Self {
         let pending_flushes = Arc::new(AtomicUsize::new(0));
         let (info_hash, state) = match t {
@@ -950,6 +961,7 @@ impl TransmitWorker {
             downloaded,
             running_state: RunningState::StableState(StableState::Stopped),
             cache_handle,
+            block_pool,
         }
     }
 
@@ -1190,7 +1202,11 @@ impl TransmitWorker {
                 );
                 let peer_addr = to_canonical_addr(bt_conn.peer_addr());
                 if !self.connected_peers.contains_key(&peer_addr) {
-                    let cm = ConnectionManagerHandle::new_dyn(bt_conn, self.self_handle.clone());
+                    let cm = ConnectionManagerHandle::new_dyn(
+                        bt_conn,
+                        self.self_handle.clone(),
+                        self.block_pool.clone(),
+                    );
                     let state = match &mut self.torrent_state {
                         TorrentState::Metadata(d) => {
                             Some((d.block_picker.our_state(), d.block_picker.n_pieces()))

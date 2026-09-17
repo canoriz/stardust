@@ -28,8 +28,8 @@
 //! On error: `{"error":{"error":"<message>"}}`
 //!
 //! Notes:
-//! - HTTP response only confirms command was accepted and queued.
-//! - Actual execution happens asynchronously in main loop that owns `Session`.
+//! - Every HTTP request is forwarded to the main loop that owns `Session`.
+//! - The HTTP handler waits for that loop to return the corresponding response.
 
 use axum::{extract::State, routing::post, Json, Router};
 use serde::{Deserialize, Serialize};
@@ -37,9 +37,10 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
+pub use crate::buffer_pool::BufferPoolStats;
+pub use crate::cache::cache_manager::CacheStats;
 use crate::metadata::{FileMetadata, Magnet};
 use crate::session::Session;
-pub use crate::cache::cache_manager::CacheStats;
 pub use crate::transmit_manager::{CheckState, RunningStateDump, StableState};
 use crate::transmit_manager::{RunningCmd, TorrentTask};
 
@@ -81,6 +82,8 @@ pub enum RpcRequest {
     GetTorrentStatus { info_hash: String },
     /// Get global cache statistics (rates and occupancy ratios).
     GetCacheStats,
+    /// Get session-level block buffer pool occupancy.
+    GetBufferPoolStats,
     /// Ask the server to shut down gracefully.
     Shutdown,
 }
@@ -119,6 +122,8 @@ pub enum RpcResponse {
     ShutdownAccepted,
     /// Global cache statistics snapshot.
     CacheStats(CacheStats),
+    /// Session-level block buffer pool occupancy snapshot.
+    BufferPoolStats(BufferPoolStats),
     /// Something went wrong.
     Error { error: String },
 }
@@ -134,7 +139,7 @@ impl RpcResponse {
 /// A command forwarded by HTTP layer to the session-owning loop.
 pub struct ApiCommand {
     pub request: RpcRequest,
-    pub reply: Option<oneshot::Sender<RpcResponse>>,
+    pub reply: oneshot::Sender<RpcResponse>,
 }
 
 // ── axum state ───────────────────────────────────────────────────────────────
@@ -184,32 +189,10 @@ async fn rpc_handler(
     State(state): State<AppState>,
     Json(req): Json<RpcRequest>,
 ) -> Json<RpcResponse> {
-    // TODO: why diffrent handling for query requests and others
-    if is_query_request(&req) {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let cmd = ApiCommand {
-            request: req,
-            reply: Some(reply_tx),
-        };
-
-        if let Err(e) = state.command_tx.send(cmd) {
-            return Json(RpcResponse::err(format!(
-                "failed to forward command to session loop: {e}"
-            )));
-        }
-
-        return match reply_rx.await {
-            Ok(rsp) => Json(rsp),
-            Err(e) => Json(RpcResponse::err(format!(
-                "session loop dropped response channel: {e}"
-            ))),
-        };
-    }
-
-    let accepted = accepted_response(&req);
+    let (reply_tx, reply_rx) = oneshot::channel();
     let cmd = ApiCommand {
         request: req,
-        reply: None,
+        reply: reply_tx,
     };
 
     if let Err(e) = state.command_tx.send(cmd) {
@@ -218,7 +201,12 @@ async fn rpc_handler(
         )));
     }
 
-    Json(accepted)
+    match reply_rx.await {
+        Ok(rsp) => Json(rsp),
+        Err(e) => Json(RpcResponse::err(format!(
+            "session loop dropped response channel: {e}"
+        ))),
+    }
 }
 
 /// Handle one forwarded RPC command using the session owned by main loop.
@@ -345,31 +333,10 @@ pub async fn handle_rpc(session: &Session, req: RpcRequest) -> (RpcResponse, boo
             };
             (rsp, false)
         }
-    }
-}
 
-fn is_query_request(req: &RpcRequest) -> bool {
-    matches!(
-        req,
-        RpcRequest::ListTorrents
-            | RpcRequest::GetTorrentStatus { .. }
-            | RpcRequest::GetCacheStats
-    )
-}
-
-fn accepted_response(req: &RpcRequest) -> RpcResponse {
-    match req {
-        RpcRequest::AddTorrent { .. } => RpcResponse::AddTorrentAccepted,
-        RpcRequest::PauseTorrent { .. } => RpcResponse::PauseTorrentAccepted,
-        RpcRequest::ResumeTorrent { .. } => RpcResponse::ResumeTorrentAccepted,
-        RpcRequest::RecheckTorrent { .. } => RpcResponse::RecheckTorrentAccepted,
-        RpcRequest::RemoveTorrent { .. } => RpcResponse::RemoveTorrentAccepted,
-        RpcRequest::ListTorrents => RpcResponse::err("list_torrents is a query command"),
-        RpcRequest::GetTorrentStatus { .. } => {
-            RpcResponse::err("get_torrent_status is a query command")
+        RpcRequest::GetBufferPoolStats => {
+            (RpcResponse::BufferPoolStats(session.buffer_pool_stats()), false)
         }
-        RpcRequest::GetCacheStats => RpcResponse::err("get_cache_stats is a query command"),
-        RpcRequest::Shutdown => RpcResponse::ShutdownAccepted,
     }
 }
 

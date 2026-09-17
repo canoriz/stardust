@@ -82,8 +82,9 @@ fn restore_worker(
     let task = tokio::spawn(cache.run());
     let (tx, rx) = mpsc::unbounded_channel();
     let announce = AnnounceManagerHandle::new([53; 20], 0, [52; 20], tx.clone());
+    let pool = BufferPool::new(4, || BytesMut::with_capacity(16384));
     (
-        TransmitWorker::from_dump(dump, [53; 20], 0, None, announce, tx, rx, handle),
+        TransmitWorker::from_dump(dump, [53; 20], 0, None, announce, tx, rx, handle, pool),
         task,
     )
 }
@@ -95,6 +96,7 @@ fn new_downloading_worker() -> (TransmitWorker, tokio::task::JoinHandle<()>) {
     let task = tokio::spawn(cache.run());
     let (tx, rx) = mpsc::unbounded_channel();
     let announce = AnnounceManagerHandle::new([53; 20], 0, [52; 20], tx.clone());
+    let pool = BufferPool::new(4, || BytesMut::with_capacity(16384));
     let mut worker = TransmitWorker::new(
         TorrentTask::Torrent(meta),
         [53; 20],
@@ -104,6 +106,7 @@ fn new_downloading_worker() -> (TransmitWorker, tokio::task::JoinHandle<()>) {
         tx,
         rx,
         handle,
+        pool,
     );
     worker.running_state = RunningState::StableState(StableState::Downloading);
     (worker, task)
