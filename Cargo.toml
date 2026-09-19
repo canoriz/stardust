@@ -13,6 +13,7 @@ clap = { version = "4", features = ["derive"] }
 bt_bencode = { git = "https://github.com/canoriz/bt_bencode", rev = "b6b64a9", features = [
     "raw_value",
 ] }
+libc = "0"
 bytes = "1.10.1"
 derivative = "2.2.0"
 futures = "0.3.31"
@@ -20,7 +21,7 @@ hex = "0.4.3"
 percent-encoding = "2.3.1"
 pin-project = "1.1.10"
 rand = { version = "0.9.0", features = ["thread_rng"] }
-reqwest = "0.12.11"
+reqwest = { version = "0.13.5", features = ["json", "rustls"] }
 serde = { version = "1.0.217", features = ["derive"] }
 serde_bytes = "0.11.19"
 serde_json = "1.0.145"
