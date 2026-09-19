@@ -139,25 +139,56 @@ impl Access for NormalFile {
     fn write_all_at(&mut self, buf: &[u8], offset: usize) -> Result<()> {
         trace!("write_all begin at offset {offset} len {}", buf.len());
         let r = file_write_all_at_impl(&self.file, buf, offset as u64);
-        #[cfg(any(
-            target_os = "linux",
-            target_os = "android",
-            target_os = "emscripten",
-            target_os = "fuchsia",
-            target_os = "wasi",
-            target_env = "uclibc",
-            target_os = "freebsd",
+        #[cfg(all(
+            target_arch = "x86_64",
+            any(
+                target_os = "linux",
+                target_os = "android",
+                target_os = "emscripten",
+                target_os = "fuchsia",
+                target_os = "wasi",
+                target_env = "uclibc",
+                target_os = "freebsd",
+            )
         ))]
         {
-            use nix::fcntl::{self, posix_fadvise};
+            use nix::{
+                fcntl::{self, posix_fadvise},
+                libc,
+            };
             use std::os::fd::AsFd;
             posix_fadvise(
                 self.file.as_fd(),
-                offset as i64,
-                buf.len() as i64,
+                offset as libc::off_t,
+                buf.len() as libc::off_t,
                 fcntl::PosixFadviseAdvice::POSIX_FADV_DONTNEED,
             )
             .unwrap_or_else(|e| warn!("posix_fadvise error: {e:?}"));
+        }
+        #[cfg(all(
+            target_arch = "arm",
+            any(
+                target_os = "linux",
+                target_os = "android",
+                target_os = "emscripten",
+                target_os = "fuchsia",
+                target_os = "wasi",
+                target_env = "uclibc",
+                target_os = "freebsd",
+            )
+        ))]
+        unsafe {
+            use libc::{self, posix_fadvise};
+            use std::os::fd::AsRawFd;
+            match libc::posix_fadvise64(
+                self.file.as_raw_fd(),
+                offset as i64,
+                buf.len() as i64,
+                libc::POSIX_FADV_DONTNEED,
+            ) {
+                0 => {}
+                e => warn!("posix_fadvise error: {e:?}"),
+            }
         }
         trace!("write_all end at offset {offset} len {}", buf.len());
         r

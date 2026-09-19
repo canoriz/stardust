@@ -105,7 +105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dump = session.shutdown().await;
 
     if let Some(path) = &args.session {
-        let data = serde_json::to_string_pretty(&dump)?;
+        let data = serde_json::to_string(&dump)?;
         std::fs::write(path, data)?;
         info!("session saved to {}", path.display());
     }

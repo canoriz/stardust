@@ -1,29 +1,110 @@
 //! Stardust GUI client.
 //!
-//! TCP peer port : 41773
-//! DHT UDP port  : 41774
-//! Session file  : session-gui.json
+//! The GUI is always a frontend. It talks to a backend through a [`Transport`]:
+//!   - `Target::Remote` — a stardust server over the JSON-RPC HTTP API
+//!     (`POST /api/rpc`); the address is chosen inside the app (toolbar
+//!     "Server" field + Connect).
+//!   - `Target::Local` — the in-process backend started with `--backend`,
+//!     reached directly over a command channel (no HTTP round-trip).
 //!
-//! The GUI runs on the main thread (eframe/egui); a separate background thread
-//! hosts a Tokio multi-thread runtime that owns the [`Session`].  The two
-//! sides communicate through:
-//!   - an unbounded MPSC channel  (GUI → backend commands)
-//!   - a shared `Arc<Mutex<Vec<TorrentRow>>>` (backend → GUI state)
-//!   - a `CancellationToken`       (GUI window close → backend shutdown)
+//! With `--backend`, the program additionally starts a local backend
+//! (owning a [`Session`] + HTTP API server for remote clients) and
+//! auto-connects the frontend to it in-process via the "Local" target.
+//!
+//! TCP peer port : 41773   DHT UDP port : 41774   Session file : session-gui.json
+//!
+//! Threads:
+//!   - main thread: eframe/egui UI
+//!   - one background Tokio runtime hosting the frontend poll loop and, when
+//!     `--backend` is set, the backend server.
+//!
+//! Shared state:
+//!   - unbounded MPSC channel        (GUI → frontend commands)
+//!   - `Arc<Mutex<Vec<TorrentRow>>>` (backend → GUI state)
+//!   - `Arc<Mutex<Target>>`          (GUI → frontend loop: connection target)
+//!   - `CancellationToken`           (GUI window close → shutdown)
 
+use clap::Parser;
 use eframe::egui;
 use std::sync::{mpsc as std_mpsc, Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 use tokio::sync::mpsc as async_mpsc;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::fmt::format::FmtSpan;
 
 use stardust::api::{
-    handle_rpc, BufferPoolStats, CacheStats, RpcRequest, RpcResponse, RunningStateDump, StableState,
-    TorrentSource,
+    handle_rpc, ApiCommand, BufferPoolStats, CacheStats, RpcRequest, RpcResponse, RunningStateDump,
+    StableState, TorrentSource,
 };
 use stardust::{Session, SessionDump, SessionOpt};
+
+// ── CLI ────────────────────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+#[command(about = "Stardust GUI client")]
+struct Args {
+    /// Also start a local backend server in-process and auto-connect to it.
+    /// Omit to run as a pure frontend and pick a remote server inside the GUI.
+    #[arg(long)]
+    backend: bool,
+
+    /// TCP port the local backend server binds its JSON-RPC API to (only used
+    /// with `--backend`); the frontend also auto-connects to this port.
+    #[arg(long, default_value_t = 9026)]
+    api_port: u16,
+}
+
+/// Connection state to the server, shown in the toolbar.
+#[derive(Clone)]
+enum ConnStatus {
+    Disconnected,
+    Connecting,
+    Connected,
+    Error(String),
+}
+
+/// What the frontend loop should talk to. Chosen inside the GUI.
+#[derive(Clone)]
+enum Target {
+    /// Not connected to anything.
+    None,
+    /// The in-process backend running in this program (only with `--backend`).
+    Local,
+    /// A remote stardust server over HTTP; holds the full `.../api/rpc` URL.
+    Remote(String),
+}
+
+/// Transport the frontend uses to issue one RPC. The in-process variant talks
+/// to the local backend's command channel directly (no HTTP), while the HTTP
+/// variant POSTs to a remote server. Cheap to construct per request.
+enum Transport {
+    InProcess(async_mpsc::UnboundedSender<ApiCommand>),
+    Http {
+        client: reqwest::Client,
+        endpoint: String,
+    },
+}
+
+impl Transport {
+    async fn call(&self, req: RpcRequest) -> Result<RpcResponse, String> {
+        match self {
+            Transport::InProcess(tx) => {
+                let (reply_tx, reply_rx) = oneshot::channel();
+                tx.send(ApiCommand {
+                    request: req,
+                    reply: reply_tx,
+                })
+                .map_err(|e| format!("backend channel closed: {e}"))?;
+                reply_rx
+                    .await
+                    .map_err(|e| format!("backend dropped reply: {e}"))
+            }
+            Transport::Http { client, endpoint } => rpc_call(client, endpoint, &req).await,
+        }
+    }
+}
 
 // ── constants ─────────────────────────────────────────────────────────────────
 
@@ -65,8 +146,17 @@ struct GuiApp {
     cache_shared: Arc<Mutex<Option<CacheStats>>>,
     /// Latest block buffer pool snapshot, refreshed by the backend.
     pool_shared: Arc<Mutex<Option<BufferPoolStats>>>,
+    /// Live connection status to the current server.
+    status_shared: Arc<Mutex<ConnStatus>>,
+    /// Target the frontend loop should talk to; `Target::None` = disconnected.
+    target_shared: Arc<Mutex<Target>>,
+    /// Whether an in-process backend exists (i.e. started with `--backend`).
+    has_local: bool,
     /// Receives a `()` from the ctrl-c listener task; triggers a graceful close.
     ctrl_c_rx: std_mpsc::Receiver<()>,
+
+    /// Server address text field in the toolbar.
+    server_input: String,
 
     // Add-torrent dialog state
     show_add: bool,
@@ -81,6 +171,10 @@ impl GuiApp {
         shared: Arc<Mutex<Vec<TorrentRow>>>,
         cache_shared: Arc<Mutex<Option<CacheStats>>>,
         pool_shared: Arc<Mutex<Option<BufferPoolStats>>>,
+        status_shared: Arc<Mutex<ConnStatus>>,
+        target_shared: Arc<Mutex<Target>>,
+        has_local: bool,
+        server_input: String,
         ctrl_c_rx: std_mpsc::Receiver<()>,
     ) -> Self {
         Self {
@@ -88,11 +182,31 @@ impl GuiApp {
             shared,
             cache_shared,
             pool_shared,
+            status_shared,
+            target_shared,
+            has_local,
             ctrl_c_rx,
+            server_input,
             show_add: false,
             add_input: String::new(),
             file_rx: None,
         }
+    }
+
+    /// Apply the current `server_input` as a remote HTTP connection target.
+    fn connect(&mut self) {
+        let addr = self.server_input.trim();
+        if addr.is_empty() {
+            return;
+        }
+        *self.target_shared.lock().unwrap() = Target::Remote(build_endpoint(addr));
+        *self.status_shared.lock().unwrap() = ConnStatus::Connecting;
+    }
+
+    /// Connect to the in-process backend (only meaningful with `--backend`).
+    fn connect_local(&mut self) {
+        *self.target_shared.lock().unwrap() = Target::Local;
+        *self.status_shared.lock().unwrap() = ConnStatus::Connecting;
     }
 }
 
@@ -116,8 +230,40 @@ impl eframe::App for GuiApp {
                     self.show_add = true;
                     self.add_input.clear();
                 }
+                ui.separator();
+
+                // Server connection controls.
+                ui.label("Server:");
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.server_input)
+                        .desired_width(200.0)
+                        .hint_text("host:port"),
+                );
+                let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if ui.button("Connect").clicked() || enter {
+                    self.connect();
+                }
+                if self.has_local && ui.button("Local").clicked() {
+                    self.connect_local();
+                }
+                match &*self.status_shared.lock().unwrap() {
+                    ConnStatus::Disconnected => {
+                        ui.colored_label(egui::Color32::DARK_GRAY, "● disconnected");
+                    }
+                    ConnStatus::Connecting => {
+                        ui.colored_label(egui::Color32::from_rgb(220, 140, 0), "● connecting");
+                    }
+                    ConnStatus::Connected => {
+                        ui.colored_label(egui::Color32::GREEN, "● connected");
+                    }
+                    ConnStatus::Error(e) => {
+                        let short: String = e.chars().take(60).collect();
+                        ui.colored_label(egui::Color32::RED, format!("● {short}"));
+                    }
+                }
+
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Shutdown").clicked() {
+                    if ui.button("Quit").clicked() {
                         ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                 });
@@ -257,8 +403,16 @@ impl eframe::App for GuiApp {
             let rows: Vec<TorrentRow> = self.shared.lock().unwrap().clone();
 
             if rows.is_empty() {
+                let disconnected = matches!(
+                    &*self.status_shared.lock().unwrap(),
+                    ConnStatus::Disconnected
+                );
                 ui.centered_and_justified(|ui| {
-                    ui.label("No active torrents — click \"Add Torrent\" to begin.");
+                    if disconnected {
+                        ui.label("Not connected — enter a server address and click Connect.");
+                    } else {
+                        ui.label("No active torrents — click \"Add Torrent\" to begin.");
+                    }
                 });
                 return;
             }
@@ -424,28 +578,18 @@ fn fmt_speed(bps: f64) -> String {
     }
 }
 
-// ── backend ───────────────────────────────────────────────────────────────────
+// ── backend server (local, --backend) ─────────────────────────────────────────
 
-async fn backend_main(
-    mut cmd_rx: async_mpsc::UnboundedReceiver<RpcRequest>,
-    shared: Arc<Mutex<Vec<TorrentRow>>>,
-    cache_shared: Arc<Mutex<Option<CacheStats>>>,
-    pool_shared: Arc<Mutex<Option<BufferPoolStats>>>,
+/// Run an in-process backend server: owns a [`Session`], serves the JSON-RPC
+/// HTTP API on `api_port` (for remote clients), and also consumes commands that
+/// the local frontend sends in-process via `cmd_tx`. Persists the session on
+/// shutdown. Mirrors the standalone `main` binary.
+async fn backend_server_main(
+    api_port: u16,
+    cmd_tx: async_mpsc::UnboundedSender<ApiCommand>,
+    mut cmd_rx: async_mpsc::UnboundedReceiver<ApiCommand>,
     shutdown: CancellationToken,
-    gui_ctrl_c_tx: std_mpsc::Sender<()>,
 ) {
-    // Dedicated task: waits for ctrl-c, then notifies both the GUI and the
-    // backend select loop so both sides shut down gracefully.
-    {
-        let shutdown = shutdown.clone();
-        tokio::spawn(async move {
-            if tokio::signal::ctrl_c().await.is_ok() {
-                tracing::info!("ctrl-c received — notifying GUI and backend");
-                let _ = gui_ctrl_c_tx.send(());
-                shutdown.cancel();
-            }
-        });
-    }
     let opt = SessionOpt::builder()
         .self_id(SELF_ID)
         .port(TCP_PORT)
@@ -476,31 +620,23 @@ async fn backend_main(
         }
     };
 
-    let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+    // Serve the HTTP API for remote clients, feeding the same command channel.
+    tokio::spawn(stardust::api::serve(api_port, cmd_tx, shutdown.clone()));
 
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => {
-                tracing::info!("backend: shutdown signal — saving session");
+                tracing::info!("backend server: shutdown signal — saving session");
                 break;
             }
-            _ = interval.tick() => {
-                refresh_rows(&session, &shared).await;
-                if let (RpcResponse::CacheStats(stats), _) =
-                    handle_rpc(&session, RpcRequest::GetCacheStats).await
-                {
-                    *cache_shared.lock().unwrap() = Some(stats);
-                }
-                if let (RpcResponse::BufferPoolStats(stats), _) =
-                    handle_rpc(&session, RpcRequest::GetBufferPoolStats).await
-                {
-                    *pool_shared.lock().unwrap() = Some(stats);
-                }
-            }
-            Some(cmd) = cmd_rx.recv() => {
-                let (rsp, _) = handle_rpc(&session, cmd).await;
-                if let RpcResponse::Error { error } = rsp {
-                    tracing::warn!("rpc error: {error}");
+            maybe_cmd = cmd_rx.recv() => {
+                let Some(cmd) = maybe_cmd else { break };
+                let (rsp, should_shutdown) = handle_rpc(&session, cmd.request).await;
+                let _ = cmd.reply.send(rsp);
+                if should_shutdown {
+                    tracing::info!("shutdown requested via API");
+                    shutdown.cancel();
+                    break;
                 }
             }
         }
@@ -520,22 +656,132 @@ async fn backend_main(
     }
 }
 
-async fn refresh_rows(session: &Session, shared: &Arc<Mutex<Vec<TorrentRow>>>) {
-    let (list_rsp, _) = handle_rpc(session, RpcRequest::ListTorrents).await;
-    let hashes = match list_rsp {
+// ── frontend loop ─────────────────────────────────────────────────────────────
+
+/// Normalize a user-entered server address into a full
+/// `http://host:port/api/rpc` URL.
+fn build_endpoint(server: &str) -> String {
+    let base = if server.starts_with("http://") || server.starts_with("https://") {
+        server.to_string()
+    } else {
+        format!("http://{server}")
+    };
+    let base = base.trim_end_matches('/');
+    if base.ends_with("/api/rpc") {
+        base.to_string()
+    } else {
+        format!("{base}/api/rpc")
+    }
+}
+
+async fn rpc_call(
+    client: &reqwest::Client,
+    endpoint: &str,
+    req: &RpcRequest,
+) -> Result<RpcResponse, String> {
+    let resp = client
+        .post(endpoint)
+        .json(req)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    resp.json::<RpcResponse>().await.map_err(|e| e.to_string())
+}
+
+/// Frontend loop: reads the current [`Target`] from `target_shared` each tick,
+/// resolves it to a [`Transport`] (in-process channel to the local backend, or
+/// HTTP to a remote server), pulls all stats, and forwards UI commands. Owns no
+/// `Session`. Reconnects automatically when the target changes.
+async fn frontend_main(
+    mut cmd_rx: async_mpsc::UnboundedReceiver<RpcRequest>,
+    shared: Arc<Mutex<Vec<TorrentRow>>>,
+    cache_shared: Arc<Mutex<Option<CacheStats>>>,
+    pool_shared: Arc<Mutex<Option<BufferPoolStats>>>,
+    status_shared: Arc<Mutex<ConnStatus>>,
+    target_shared: Arc<Mutex<Target>>,
+    local_tx: Option<async_mpsc::UnboundedSender<ApiCommand>>,
+    shutdown: CancellationToken,
+) {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("failed to build http client");
+
+    // Resolve the current target into a transport, or None when disconnected.
+    let resolve = |target: Target| -> Option<Transport> {
+        match target {
+            Target::None => None,
+            Target::Local => local_tx.clone().map(Transport::InProcess),
+            Target::Remote(endpoint) => Some(Transport::Http {
+                client: client.clone(),
+                endpoint,
+            }),
+        }
+    };
+
+    let mut interval = tokio::time::interval(Duration::from_millis(500));
+
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => {
+                tracing::info!("frontend loop: shutdown signal");
+                break;
+            }
+            _ = interval.tick() => {
+                let Some(transport) = resolve(target_shared.lock().unwrap().clone()) else {
+                    *status_shared.lock().unwrap() = ConnStatus::Disconnected;
+                    continue;
+                };
+                match refresh_rows(&transport, &shared).await {
+                    Ok(()) => *status_shared.lock().unwrap() = ConnStatus::Connected,
+                    Err(e) => {
+                        *status_shared.lock().unwrap() = ConnStatus::Error(e);
+                        continue;
+                    }
+                }
+                if let Ok(RpcResponse::CacheStats(stats)) =
+                    transport.call(RpcRequest::GetCacheStats).await
+                {
+                    *cache_shared.lock().unwrap() = Some(stats);
+                }
+                if let Ok(RpcResponse::BufferPoolStats(stats)) =
+                    transport.call(RpcRequest::GetBufferPoolStats).await
+                {
+                    *pool_shared.lock().unwrap() = Some(stats);
+                }
+            }
+            Some(cmd) = cmd_rx.recv() => {
+                let Some(transport) = resolve(target_shared.lock().unwrap().clone()) else {
+                    tracing::warn!("command dropped: not connected to a server");
+                    continue;
+                };
+                match transport.call(cmd).await {
+                    Ok(RpcResponse::Error { error }) => tracing::warn!("rpc error: {error}"),
+                    Err(e) => tracing::warn!("rpc call failed: {e}"),
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+async fn refresh_rows(
+    transport: &Transport,
+    shared: &Arc<Mutex<Vec<TorrentRow>>>,
+) -> Result<(), String> {
+    let hashes = match transport.call(RpcRequest::ListTorrents).await? {
         RpcResponse::ListTorrents { torrents } => torrents,
-        _ => return,
+        RpcResponse::Error { error } => return Err(error),
+        _ => return Err("unexpected list_torrents response".into()),
     };
 
     let mut rows = Vec::with_capacity(hashes.len());
     for hash in &hashes {
-        let (status_rsp, _) = handle_rpc(
-            session,
-            RpcRequest::GetTorrentStatus {
+        let rsp = transport
+            .call(RpcRequest::GetTorrentStatus {
                 info_hash: hash.clone(),
-            },
-        )
-        .await;
+            })
+            .await?;
         if let RpcResponse::TorrentStatus {
             info_hash,
             name,
@@ -543,7 +789,7 @@ async fn refresh_rows(session: &Session, shared: &Arc<Mutex<Vec<TorrentRow>>>) {
             bandwidth_bps,
             state,
             ..
-        } = status_rsp
+        } = rsp
         {
             rows.push(TorrentRow {
                 state,
@@ -556,11 +802,14 @@ async fn refresh_rows(session: &Session, shared: &Arc<Mutex<Vec<TorrentRow>>>) {
     }
 
     *shared.lock().unwrap() = rows;
+    Ok(())
 }
 
 // ── entry point ───────────────────────────────────────────────────────────────
 
 fn main() {
+    let args = Args::parse();
+
     let (non_blocking, _guard) = tracing_appender::non_blocking(std::io::stdout());
     tracing_subscriber::fmt()
         .with_writer(non_blocking)
@@ -582,25 +831,79 @@ fn main() {
     // Channel for the ctrl-c task to signal the GUI to close its viewport.
     let (gui_ctrl_c_tx, gui_ctrl_c_rx) = std_mpsc::channel::<()>();
 
-    // Launch the tokio backend on a dedicated OS thread.
+    // With --backend, auto-connect the frontend to the in-process backend;
+    // otherwise start disconnected and let the user pick a remote server.
+    let local_addr = format!("127.0.0.1:{}", args.api_port);
+    let (initial_target, initial_status) = if args.backend {
+        (Target::Local, ConnStatus::Connecting)
+    } else {
+        (Target::None, ConnStatus::Disconnected)
+    };
+    let server_input = local_addr;
+    let status_shared: Arc<Mutex<ConnStatus>> = Arc::new(Mutex::new(initial_status));
+    let target_shared: Arc<Mutex<Target>> = Arc::new(Mutex::new(initial_target));
+
+    // Launch the Tokio runtime on a dedicated OS thread: it hosts the frontend
+    // poll loop and, with --backend, the in-process backend server.
     let backend_handle = {
         let shared = shared.clone();
         let cache_shared = cache_shared.clone();
         let pool_shared = pool_shared.clone();
+        let status_shared = status_shared.clone();
+        let target_shared = target_shared.clone();
         let shutdown = shutdown.clone();
+        let start_backend = args.backend;
+        let api_port = args.api_port;
         thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
                 .expect("failed to build tokio runtime");
-            rt.block_on(backend_main(
-                cmd_rx,
-                shared,
-                cache_shared,
-                pool_shared,
-                shutdown,
-                gui_ctrl_c_tx,
-            ));
+            rt.block_on(async move {
+                // Ctrl-c: notify the GUI to close and cancel the shutdown token.
+                {
+                    let shutdown = shutdown.clone();
+                    tokio::spawn(async move {
+                        if tokio::signal::ctrl_c().await.is_ok() {
+                            tracing::info!("ctrl-c received — notifying GUI and backend");
+                            let _ = gui_ctrl_c_tx.send(());
+                            shutdown.cancel();
+                        }
+                    });
+                }
+
+                // In --backend mode, create the command channel shared by the
+                // in-process frontend transport and the HTTP API server.
+                let (local_tx, server_task) = if start_backend {
+                    let (api_tx, api_rx) = async_mpsc::unbounded_channel::<ApiCommand>();
+                    let task = tokio::spawn(backend_server_main(
+                        api_port,
+                        api_tx.clone(),
+                        api_rx,
+                        shutdown.clone(),
+                    ));
+                    (Some(api_tx), Some(task))
+                } else {
+                    (None, None)
+                };
+
+                frontend_main(
+                    cmd_rx,
+                    shared,
+                    cache_shared,
+                    pool_shared,
+                    status_shared,
+                    target_shared,
+                    local_tx,
+                    shutdown,
+                )
+                .await;
+
+                // Wait for the backend server to finish saving the session.
+                if let Some(task) = server_task {
+                    let _ = task.await;
+                }
+            });
         })
     };
 
@@ -643,6 +946,10 @@ fn main() {
                 shared,
                 cache_shared,
                 pool_shared,
+                status_shared,
+                target_shared,
+                args.backend,
+                server_input,
                 gui_ctrl_c_rx,
             )))
         }),
@@ -650,8 +957,8 @@ fn main() {
         eprintln!("eframe error: {e}");
     }
 
-    // Window has closed.  Signal the backend to save the session and wait for
-    // it to finish before the process exits.
+    // Window has closed. Signal the backend/frontend to stop (and save the
+    // session in --backend mode) and wait before the process exits.
     shutdown.cancel();
     if let Err(e) = backend_handle.join() {
         eprintln!("backend thread panicked: {e:?}");

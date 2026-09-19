@@ -86,11 +86,10 @@ impl Session {
                 .port(dht_port)
                 .version("ST01".into())
                 .bootstrap_nodes(vec![
-                    // "router.bittorrent.com:6881".into(),
-                    // "router.utorrent.com:6881".into(),
-                    "[2408:820c:5b38:440:eef2:2ba6:d8be:5f31]:53866".into(),
-                    // "dht.transmissionbt.com:6881".into(),
-                    // "dht.libtorrent.org:25401".into(),
+                    "router.bittorrent.com:6881".into(),
+                    "router.utorrent.com:6881".into(),
+                    "dht.transmissionbt.com:6881".into(),
+                    "dht.libtorrent.org:25401".into(),
                 ])
                 .build();
             Some(Arc::new(DHT::new(dht_opt)))
