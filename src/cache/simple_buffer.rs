@@ -259,7 +259,7 @@ impl Drop for PooledBuf {
 #[derive(Debug)]
 pub struct FlushErr {
     pub ji: JointIndex,
-    pub offset: usize,
+    pub offset: u64,
     pub len: usize,
     pub err: io::Error,
 }
@@ -269,7 +269,7 @@ type BufState = AtomicU32;
 pub struct PieceBuf {
     /// always Some, except in drop
     buf: CowBuf<PooledBuf>,
-    offset: usize,
+    offset: u64,
     index: JointIndex,
     touch: time::Instant,
     write_time: time::Instant,
@@ -439,7 +439,7 @@ impl PieceBuf {
     pub(crate) fn alloc(
         pool: Arc<Mutex<Pool<BytesMut>>>,
         index: JointIndex,
-        offset: usize,
+        offset: u64,
         len: usize,
         file: MutexBackFile,
         flush_count: Option<Arc<AtomicUsize>>,
@@ -464,7 +464,7 @@ impl PieceBuf {
 /// flushing must change from 1 to 0
 fn flush_buf_force<T>(
     buf: T,
-    offset: usize,
+    offset: u64,
     ji: JointIndex,
     state: Arc<AtomicU32>,
     file: MutexBackFile,

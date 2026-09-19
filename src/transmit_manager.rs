@@ -523,7 +523,6 @@ impl FetchingMetadata {
         }
         let probably_tot_size = mbuf.probable_total_size();
         let offset = (piece * 16384) as usize;
-        info!("receiving metadata part {piece}");
 
         // Reject a chunk whose length doesn't match what this piece must hold.
         // A short/oversized chunk leaves a hole or extra bytes and would fail
@@ -2638,7 +2637,13 @@ fn check_received_metadata(
     // that briefly favored a larger value leaves trailing zero padding, and
     // `from_slice` rejects trailing data.
     let bytes = &mbuf.metadata[..total.min(mbuf.metadata.len())];
-    let info: InfoWithRaw = bt_bencode::from_slice(bytes)?;
+    let info: InfoWithRaw = match bt_bencode::from_slice(bytes) {
+        Ok(i) => i,
+        Err(e) => {
+            warn!("metadata parse failed: err={e:?} total={total} buf_len={}", mbuf.metadata.len());
+            return Err(io::Error::new(io::ErrorKind::Other, e));
+        }
+    };
     let meta = info.to_metadata(info_hash);
     if let Ok(true) = meta.verify_info_hash() {
         Ok(meta)

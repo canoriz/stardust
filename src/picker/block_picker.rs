@@ -503,7 +503,7 @@ pub struct PieceComplete {
 
 impl BlockPicker {
     pub fn new(
-        total_size: usize,
+        total_size: u64,
         piece_size: usize,
         piece_picker: Box<Picker>,
         no_response_timeout: time::Duration,
@@ -1820,8 +1820,8 @@ mod test {
         use crate::picker::RarestPicker;
         const PIECE_SIZE: usize = 16384 * 10;
         const TOTAL_SIZE: usize = 16384 * 10 * 10 + 1500;
-        let p = Box::new(RarestPicker::new(TOTAL_SIZE, PIECE_SIZE));
-        let mut b = BlockPicker::new(TOTAL_SIZE, PIECE_SIZE, p, time::Duration::from_secs(10));
+        let p = Box::new(RarestPicker::new(TOTAL_SIZE as u64, PIECE_SIZE));
+        let mut b = BlockPicker::new(TOTAL_SIZE as u64, PIECE_SIZE, p, time::Duration::from_secs(10));
         b.peer_add(PEER1, PieceState::HaveAll);
         b.peer_add(
             PEER2,
@@ -2134,8 +2134,8 @@ mod test {
     ) -> (BlockPicker, Vec<PeerAddr>) {
         use crate::picker::RarestPicker;
         let total_size = n_pieces * piece_size;
-        let p = Box::new(RarestPicker::new(total_size, piece_size));
-        let mut bp = BlockPicker::new(total_size, piece_size, p, time::Duration::from_secs(10));
+        let p = Box::new(RarestPicker::new(total_size as u64, piece_size));
+        let mut bp = BlockPicker::new(total_size as u64, piece_size, p, time::Duration::from_secs(10));
 
         let mut peers = Vec::new();
         for i in 0..n_peers {

@@ -14,7 +14,7 @@ pub struct Metadata {
     pub raw_info: Vec<u8>, // raw, byte-format info, for sending metadata to peers
     pub info_hash: [u8; 20],
 
-    pub len: usize,
+    pub len: u64,
 
     pub files: Vec<File>,
     pub comment: Option<String>,
@@ -23,7 +23,7 @@ pub struct Metadata {
 }
 
 impl Metadata {
-    pub fn len(&self) -> usize {
+    pub fn len(&self) -> u64 {
         self.len
     }
 
@@ -36,19 +36,21 @@ impl Metadata {
     }
 
     pub fn total_pieces(&self) -> usize {
-        (self.len() + self.regular_piece_size() - 1) / self.regular_piece_size()
+        let ps = self.regular_piece_size() as u64;
+        ((self.len() + ps - 1) / ps) as usize
     }
 
     pub fn piece_size_of(&self, index: u32) -> usize {
         assert!((index as usize) < self.total_pieces());
-        let n_full_piece = self.len() / self.regular_piece_size();
-        let full_piece_total_size = n_full_piece * self.regular_piece_size();
-        if (index as usize) < n_full_piece {
+        let ps = self.regular_piece_size() as u64;
+        let n_full_piece = self.len() / ps;
+        let full_piece_total_size = n_full_piece * ps;
+        if (index as u64) < n_full_piece {
             self.regular_piece_size()
         } else {
             assert_eq!((index as usize), self.total_pieces() - 1);
-            assert_eq!(n_full_piece + 1, self.total_pieces());
-            self.len() - full_piece_total_size
+            assert_eq!((n_full_piece + 1) as usize, self.total_pieces());
+            (self.len() - full_piece_total_size) as usize
         }
     }
 
@@ -161,7 +163,7 @@ impl InfoWithRaw {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 enum LenFiles {
     #[serde(rename = "length")]
-    Length(usize),
+    Length(u64),
 
     #[serde(rename = "files")]
     Files(Vec<File>),
@@ -203,7 +205,7 @@ pub trait ToMetadata {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct File {
-    pub length: usize,
+    pub length: u64,
 
     // TODO: many sub path are same, e.g. a sub directory containing many files
     // use a more effeicient structure

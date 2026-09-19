@@ -33,7 +33,7 @@ pub struct Picker {
 }
 
 impl Picker {
-    pub fn new(total_size: usize, piece_size: usize) -> Self {
+    pub fn new(total_size: u64, piece_size: usize) -> Self {
         let (n, _) = piece_total_and_last_size(total_size, piece_size);
         let mut rarity = BTreeMap::new();
         for i in 0..n {

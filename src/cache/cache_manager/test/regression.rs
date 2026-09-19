@@ -203,11 +203,11 @@ static WRITE_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
 struct FailFirstWrite;
 impl Access for FailFirstWrite {
     // Construct the fake backend without opening a real file.
-    fn open<P: AsRef<Path>>(_: P, _: usize) -> io::Result<Self> {
+    fn open<P: AsRef<Path>>(_: P, _: u64) -> io::Result<Self> {
         Ok(Self)
     }
     // Inject one write failure using the attempt counter shared with the test.
-    fn write_all_at(&mut self, _: &[u8], _: usize) -> io::Result<()> {
+    fn write_all_at(&mut self, _: &[u8], _: u64) -> io::Result<()> {
         if WRITE_ATTEMPTS.fetch_add(1, Ordering::SeqCst) == 0 {
             Err(io::Error::other("injected disk error"))
         } else {
@@ -215,13 +215,13 @@ impl Access for FailFirstWrite {
         }
     }
     // Supply deterministic zero-filled data when the cache loads a buffer.
-    fn read_exact_at(&mut self, buf: &mut [u8], _: usize) -> io::Result<()> {
+    fn read_exact_at(&mut self, buf: &mut [u8], _: u64) -> io::Result<()> {
         buf.fill(0);
         Ok(())
     }
     // Report a length large enough for every offset used by the test.
     fn metadata(&self) -> io::Result<FileMetadata> {
-        Ok(FileMetadata { len: usize::MAX })
+        Ok(FileMetadata { len: u64::MAX })
     }
 }
 
@@ -235,7 +235,7 @@ async fn failed_flush_retries_without_losing_waiter() {
     handle.register_torrent(
         info_hash,
         SUB_PIECE_SIZE as usize,
-        2 * SUB_PIECE_SIZE as usize,
+        2 * SUB_PIECE_SIZE as u64,
         Arc::new(Mutex::new(BackFile::new::<FailFirstWrite>().build())),
         None,
         None,

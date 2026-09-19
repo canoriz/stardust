@@ -94,7 +94,7 @@ pub enum CacheMsg {
     RegisterTorrent {
         info_hash: [u8; 20],
         piece_size: usize,
-        total_length: usize,
+        total_length: u64,
         back_file: MutexBackFile,
         flush_count: Option<Arc<AtomicUsize>>,
         msg_sender: Option<mpsc::UnboundedSender<TmMsg>>,
@@ -145,7 +145,7 @@ impl CacheManagerHandle {
         &self,
         info_hash: [u8; 20],
         piece_size: usize,
-        total_length: usize,
+        total_length: u64,
         back_file: MutexBackFile,
         flush_count: Option<Arc<AtomicUsize>>,
         msg_sender: Option<mpsc::UnboundedSender<TmMsg>>,
@@ -709,7 +709,7 @@ impl CacheManager {
             return;
         }
 
-        let offset = piece_idx * info.piece_size + in_piece_offset;
+        let offset = piece_idx as u64 * info.piece_size as u64 + in_piece_offset as u64;
         let len = (SUB_PIECE_SIZE as usize).min(this_piece_size - in_piece_offset);
         let file = info.back_file.clone();
         let flush_count = info.flush_count.clone();
@@ -884,7 +884,7 @@ mod test {
         handle.register_torrent(
             info_hash,
             piece_size,
-            piece_size * 8,
+            piece_size as u64 * 8,
             void_file(),
             None,
             None,

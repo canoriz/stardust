@@ -28,9 +28,9 @@ fn metadata() -> Metadata {
         info,
         raw_info: vec![],
         info_hash: [52; 20],
-        len,
+        len: len as u64,
         files: vec![File {
-            length: len,
+            length: len as u64,
             path: vec![path.to_str().unwrap().to_owned()],
         }],
         comment: None,

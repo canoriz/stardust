@@ -48,7 +48,7 @@ fn file_read_exact_at_impl(file: &File, buf: &mut [u8], offset: u64) -> std::io:
 use tracing::{debug, info, trace, warn};
 
 pub struct FileMetadata {
-    pub len: usize, // length of file
+    pub len: u64, // length of file
 }
 
 pub struct NormalFile {
@@ -65,11 +65,11 @@ pub trait Access: Sized + Sync {
     // TODO: maybe use OpenDAL's pattern, first generate a "Opener"
     // then let opener open Handle, Handle impls FileAt
     // then discard the types.
-    fn open<P>(path: P, len: usize) -> Result<Self>
+    fn open<P>(path: P, len: u64) -> Result<Self>
     where
         P: AsRef<Path>;
-    fn write_all_at(&mut self, buf: &[u8], offset: usize) -> Result<()>;
-    fn read_exact_at(&mut self, buf: &mut [u8], offset: usize) -> Result<()>;
+    fn write_all_at(&mut self, buf: &[u8], offset: u64) -> Result<()>;
+    fn read_exact_at(&mut self, buf: &mut [u8], offset: u64) -> Result<()>;
     fn metadata(&self) -> Result<FileMetadata>;
 }
 
@@ -77,7 +77,7 @@ trait AccessDyn
 where
     Self: Access + Send + 'static,
 {
-    fn open_dyn(path: &Path, len: usize) -> Result<Box<dyn FileAt + Send>> {
+    fn open_dyn(path: &Path, len: u64) -> Result<Box<dyn FileAt + Send>> {
         let fh = Self::open(path, len)?;
         Ok(Box::new(fh))
     }
@@ -86,12 +86,12 @@ where
 impl<A: Access + Send + 'static> AccessDyn for A {}
 
 trait FileAt {
-    fn file_write_all_at(&mut self, buf: &[u8], offset: usize) -> Result<()>;
-    fn file_read_exact_at(&mut self, buf: &mut [u8], offset: usize) -> Result<()>;
+    fn file_write_all_at(&mut self, buf: &[u8], offset: u64) -> Result<()>;
+    fn file_read_exact_at(&mut self, buf: &mut [u8], offset: u64) -> Result<()>;
     fn file_metadata(&self) -> Result<FileMetadata>;
 
     #[cfg(test)]
-    fn get_inner(&mut self, offset: usize, len: usize) -> Result<Vec<u8>> {
+    fn get_inner(&mut self, offset: u64, len: usize) -> Result<Vec<u8>> {
         let mut buf = vec![0; len];
         self.file_read_exact_at(&mut buf, offset)?;
         Ok(buf)
@@ -99,11 +99,11 @@ trait FileAt {
 }
 
 impl<A: Access> FileAt for A {
-    fn file_write_all_at(&mut self, buf: &[u8], offset: usize) -> Result<()> {
+    fn file_write_all_at(&mut self, buf: &[u8], offset: u64) -> Result<()> {
         self.write_all_at(buf, offset)
     }
 
-    fn file_read_exact_at(&mut self, buf: &mut [u8], offset: usize) -> Result<()> {
+    fn file_read_exact_at(&mut self, buf: &mut [u8], offset: u64) -> Result<()> {
         self.read_exact_at(buf, offset)
     }
 
@@ -112,12 +112,12 @@ impl<A: Access> FileAt for A {
     }
 }
 
-fn open_fn<A: AccessDyn>() -> fn(&Path, usize) -> Result<Box<dyn FileAt + Send>> {
+fn open_fn<A: AccessDyn>() -> fn(&Path, u64) -> Result<Box<dyn FileAt + Send>> {
     A::open_dyn
 }
 
 impl Access for NormalFile {
-    fn open<P>(path: P, len: usize) -> Result<Self>
+    fn open<P>(path: P, len: u64) -> Result<Self>
     where
         P: AsRef<Path>,
     {
@@ -132,13 +132,13 @@ impl Access for NormalFile {
             .create(true)
             .truncate(false)
             .open(path)?;
-        file.set_len(len as u64)?;
+        file.set_len(len)?;
         Ok(Self { file })
     }
 
-    fn write_all_at(&mut self, buf: &[u8], offset: usize) -> Result<()> {
+    fn write_all_at(&mut self, buf: &[u8], offset: u64) -> Result<()> {
         trace!("write_all begin at offset {offset} len {}", buf.len());
-        let r = file_write_all_at_impl(&self.file, buf, offset as u64);
+        let r = file_write_all_at_impl(&self.file, buf, offset);
         #[cfg(all(
             target_arch = "x86_64",
             any(
@@ -194,9 +194,9 @@ impl Access for NormalFile {
         r
     }
 
-    fn read_exact_at(&mut self, buf: &mut [u8], offset: usize) -> Result<()> {
+    fn read_exact_at(&mut self, buf: &mut [u8], offset: u64) -> Result<()> {
         trace!("read_exact begin at offset {offset} len {}", buf.len());
-        let r = file_read_exact_at_impl(&self.file, buf, offset as u64);
+        let r = file_read_exact_at_impl(&self.file, buf, offset);
         trace!("read_exact end at offset {offset} len {}", buf.len());
         r
     }
@@ -204,24 +204,24 @@ impl Access for NormalFile {
     fn metadata(&self) -> Result<FileMetadata> {
         let meta = self.file.metadata()?;
         Ok(FileMetadata {
-            len: meta.len() as usize,
+            len: meta.len(),
         })
     }
 }
 
 impl Access for VoidFile {
-    fn open<P>(_path: P, _len: usize) -> Result<Self>
+    fn open<P>(_path: P, _len: u64) -> Result<Self>
     where
         P: AsRef<Path>,
     {
         Ok(Self {})
     }
 
-    fn write_all_at(&mut self, _buf: &[u8], _offset: usize) -> Result<()> {
+    fn write_all_at(&mut self, _buf: &[u8], _offset: u64) -> Result<()> {
         Ok(())
     }
 
-    fn read_exact_at(&mut self, _buf: &mut [u8], _offset: usize) -> Result<()> {
+    fn read_exact_at(&mut self, _buf: &mut [u8], _offset: u64) -> Result<()> {
         Ok(())
     }
 
@@ -233,8 +233,8 @@ impl Access for VoidFile {
 struct FileRange {
     handle: Option<Box<dyn FileAt + Send>>,
     path: String,
-    begin: usize,
-    len: usize,
+    begin: u64,
+    len: u64,
 }
 
 pub struct Builder<T> {
@@ -256,7 +256,7 @@ where
             Some(m) => {
                 let files = m.files();
                 let mut file_range = Vec::with_capacity(files.capacity());
-                let mut last = 0usize;
+                let mut last = 0u64;
                 for f in files {
                     file_range.push(FileRange {
                         handle: None,
@@ -276,7 +276,7 @@ where
                     handle: None,
                     path: "None path".into(),
                     begin: 0,
-                    len: usize::MAX,
+                    len: u64::MAX,
                 }];
                 BackFile {
                     opener: open_fn::<T>(),
@@ -288,12 +288,12 @@ where
 }
 
 pub struct BackFile {
-    opener: fn(path: &Path, len: usize) -> Result<Box<dyn FileAt + Send>>,
+    opener: fn(path: &Path, len: u64) -> Result<Box<dyn FileAt + Send>>,
     file_range: Vec<FileRange>,
 }
 
 // get intersection of (x1, len1) and (x2, len2)
-fn intersection(range1: (usize, usize), range2: (usize, usize)) -> Option<(usize, usize)> {
+fn intersection(range1: (u64, u64), range2: (u64, u64)) -> Option<(u64, u64)> {
     let ir0 = max(range1.0, range2.0);
     let ir1 = min(range1.0 + range1.1, range2.0 + range2.1);
     if ir0 < ir1 {
@@ -313,16 +313,16 @@ impl BackFile {
     }
 
     // TODO: optimize this to use binary search or whatever, not iterating
-    fn find_files(&mut self, offset: usize, buf: &[u8]) -> impl Iterator<Item = FileOp<'_>> {
-        let len = buf.len();
+    fn find_files(&mut self, offset: u64, buf: &[u8]) -> impl Iterator<Item = FileOp<'_>> {
+        let len = buf.len() as u64;
         self.file_range.iter_mut().filter_map(move |f| {
             intersection((f.begin, f.len), (offset, len)).map(move |(w_offset, len)| {
                 let f_begin = f.begin;
                 FileOp {
                     file: f,
                     offset: w_offset - f_begin,
-                    buf_begin: w_offset - offset,
-                    buf_len: len,
+                    buf_begin: (w_offset - offset) as usize,
+                    buf_len: len as usize,
                 }
             })
         })
@@ -330,7 +330,7 @@ impl BackFile {
 }
 
 impl BackFile {
-    pub fn write_all_at(&mut self, offset: usize, buf: &[u8]) -> Result<()> {
+    pub fn write_all_at(&mut self, offset: u64, buf: &[u8]) -> Result<()> {
         debug!("backfile write at {offset} len {}", buf.len());
         let opener = self.opener;
         let wops = self.find_files(offset, buf);
@@ -351,7 +351,7 @@ impl BackFile {
         Ok(())
     }
 
-    pub fn read_exact_at(&mut self, offset: usize, buf: &mut [u8]) -> Result<()> {
+    pub fn read_exact_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<()> {
         let opener = self.opener;
         let rops = self.find_files(offset, buf);
         for r in rops {
@@ -378,7 +378,7 @@ impl BackFile {
                 // TODO: FIXME: one error should not trigger fn call error
                 let meta = fh.file_metadata()?;
                 if r.offset < meta.len {
-                    let len_limit = (meta.len - r.offset).min(r.buf_len);
+                    let len_limit = ((meta.len - r.offset).min(r.buf_len as u64)) as usize;
 
                     if r.offset < meta.len {
                         fh.file_read_exact_at(
@@ -393,7 +393,7 @@ impl BackFile {
     }
 
     #[cfg(test)]
-    pub fn get_inner(&mut self, offset: usize, len: usize) -> Option<Result<Vec<u8>>> {
+    pub fn get_inner(&mut self, offset: u64, len: usize) -> Option<Result<Vec<u8>>> {
         assert_eq!(self.file_range.len(), 1);
         self.file_range[0]
             .handle
@@ -407,7 +407,7 @@ struct FileOp<'a> {
 
     // Operation's begin offset relative to this "real" file, not relative to
     // the whole "logical" file
-    offset: usize,
+    offset: u64,
 
     // the range of buffer
     buf_begin: usize,
