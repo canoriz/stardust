@@ -2,7 +2,6 @@ use crate::announce_manager::{self, AnnounceManagerHandle};
 use crate::backfile::{BackFile, NormalFile, VoidFile};
 use crate::bandwidth::Bandwidth;
 use crate::buffer_pool::{BlockBuf, BufferPool};
-use bytes::BytesMut;
 use crate::cache::cache_manager::{CacheManagerHandle, GlobalPieceKey, PieceLease};
 use crate::cache::simple_buffer::{FlushErr, JointIndex, SUB_PIECE_SIZE};
 use crate::connection_manager::{
@@ -17,6 +16,7 @@ use crate::protocol::{
     PexFlag, Piece, Request,
 };
 use crate::tracker;
+use bytes::BytesMut;
 
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
@@ -522,23 +522,38 @@ impl FetchingMetadata {
             mbuf.add_size_to_bucket(sz);
         }
         let probably_tot_size = mbuf.probable_total_size();
-        let buf = &mut mbuf.metadata;
         let offset = (piece * 16384) as usize;
+        info!("receiving metadata part {piece}");
+
+        // Reject a chunk whose length doesn't match what this piece must hold.
+        // A short/oversized chunk leaves a hole or extra bytes and would fail
+        // the whole-buffer SHA1 check; re-request instead of poisoning the buffer.
+        if probably_tot_size > 0 && offset >= probably_tot_size {
+            mbuf.requesting.remove(&piece);
+            return None;
+        }
+        let expected_len = probably_tot_size.saturating_sub(offset).min(16384);
+        if data.len() != expected_len {
+            mbuf.requesting.remove(&piece);
+            return None;
+        }
+
+        let buf = &mut mbuf.metadata;
+        if buf.len() < offset + data.len() {
+            buf.resize(offset + data.len(), 0);
+        }
         buf[offset..offset + data.len()].copy_from_slice(&data);
         mbuf.requesting.remove(&piece);
-        mbuf.not_requested.remove(&piece);
+        mbuf.not_have.remove(&piece);
 
-        if probably_tot_size > 0 && mbuf.not_requested.len() == 0 && mbuf.requesting.len() == 0 {
+        if probably_tot_size > 0 && mbuf.not_have.len() == 0 {
             // received full metadata
-            match check_received_metadata(mbuf, self.magnet.info_hash) {
+            match check_received_metadata(mbuf, probably_tot_size, self.magnet.info_hash) {
                 Ok(m) => Some(m),
-                Err(_) => {
-                    warn!("metadata verify failed, needs re-download");
+                Err(e) => {
+                    warn!("metadata verify failed, needs re-download {e}");
                     for p in 0..=((probably_tot_size - 1) / 16384) {
-                        let p = p as u32;
-                        if !mbuf.requesting.contains_key(&p) {
-                            mbuf.not_requested.insert(p);
-                        }
+                        mbuf.not_have.insert(p as u32);
                     }
                     None
                 }
@@ -564,8 +579,8 @@ struct MetadataBuffer {
     // buffer for metadata
     pub metadata: Vec<u8>,
 
-    // records which parts of metadata are not requested yet
-    not_requested: BTreeSet<u32>,
+    // records which parts of metadata are not have yet
+    not_have: BTreeSet<u32>,
 
     // requests for parts of metadata sent, but no response yet
     #[serde(skip)]
@@ -578,7 +593,7 @@ impl MetadataBuffer {
             size_bucket: HashMap::new(),
             most_frequent_size: 0,
             metadata: Vec::with_capacity(16384),
-            not_requested: BTreeSet::new(),
+            not_have: BTreeSet::new(),
             requesting: BTreeMap::new(),
         }
     }
@@ -596,16 +611,16 @@ impl MetadataBuffer {
             .unwrap_or(0);
         if new_count > current_count {
             if sz > self.most_frequent_size {
-                for p in (self.most_frequent_size / 16384)..=((sz - 1) / 16384) {
-                    self.not_requested.insert(p as u32);
+                for p in self.most_frequent_size.div_ceil(16384)..=((sz - 1) / 16384) {
+                    self.not_have.insert(p as u32);
                 }
             } else {
                 // TODO: fragile. `most_frequent_size - 1` underflows if
                 // `most_frequent_size == 0`. Safe only because the count-vs-count
                 // guard above can't pick this branch when most_frequent_size is 0.
                 // Guard explicitly if that invariant ever changes.
-                for p in (sz / 16384)..=((self.most_frequent_size - 1) / 16384) {
-                    self.not_requested.insert(p as u32);
+                for p in sz.div_ceil(16384)..=((self.most_frequent_size - 1) / 16384) {
+                    self.not_have.remove(&(p as u32));
                 }
             }
             self.most_frequent_size = sz;
@@ -614,8 +629,7 @@ impl MetadataBuffer {
         let buf = &mut self.metadata;
 
         // TODO: filter out malicious very large size
-        let expand_to = buf.len().max(self.most_frequent_size);
-        buf.resize(expand_to, 0);
+        buf.resize(self.most_frequent_size, 0);
     }
 
     fn probable_total_size(&self) -> usize {
@@ -1156,7 +1170,7 @@ impl TransmitWorker {
         picked_n
     }
 
-    #[instrument(skip_all, fields(hash = crate::helper::to_hex(&self.id)))]
+    #[instrument(skip_all, fields(hash = crate::helper::to_hex(&self.info_hash)))]
     fn handle_msg(&mut self, m: Msg) -> io::Result<()> {
         match m {
             Msg::NewDiscoveredPeer { addr, from } => {
@@ -2520,7 +2534,7 @@ impl TransmitWorker {
                         self.torrent_state = TorrentState::Metadata(downloading);
                     } else {
                         // if we don't have metadata yet, fetch more from this peer
-                        Self::fetching_metadata_from_peer_addr(
+                        Self::fetch_metadata_from_peer_addr(
                             &self.connected_peers,
                             &addr,
                             3,
@@ -2536,7 +2550,7 @@ impl TransmitWorker {
                 TorrentState::Fetching(f) => {
                     let mbuf = &mut f.meta_buf;
                     mbuf.requesting.remove(&piece);
-                    mbuf.not_requested.insert(piece);
+                    mbuf.not_have.insert(piece);
                     info!("metadata request of piece {piece} to {addr:?} is rejected");
                 }
                 TorrentState::Metadata(_) => {
@@ -2558,7 +2572,7 @@ impl TransmitWorker {
         }
     }
 
-    fn fetching_metadata(&mut self) {
+    fn fetch_metadata(&mut self) {
         let meta_buf = match &mut self.torrent_state {
             TorrentState::Metadata(_) => {
                 return;
@@ -2568,18 +2582,7 @@ impl TransmitWorker {
 
         let now = tokio::time::Instant::now();
         let timeout = tokio::time::Duration::from_secs(5);
-        let mut timeout_pieces = vec![];
-        meta_buf.requesting.retain(|k, v| {
-            if v.elapsed() > timeout {
-                timeout_pieces.push(*k);
-                false
-            } else {
-                true
-            }
-        });
-        for p in timeout_pieces {
-            meta_buf.not_requested.insert(p);
-        }
+        meta_buf.requesting.retain(|_, v| v.elapsed() < timeout);
 
         for (_, h) in &mut self.connected_peers {
             if h.conn.capability().have(protocol::Capability::METADATA)
@@ -2587,43 +2590,55 @@ impl TransmitWorker {
             {
                 // TODO: adaptively set value of n
                 meta_buf.add_size_to_bucket(h.conn.metadata_size());
-                Self::fetching_metadata_from_peer(h, 2, meta_buf, now);
+                Self::fetch_metadata_from_peer(h, 2, meta_buf, now);
             }
         }
     }
 
-    fn fetching_metadata_from_peer_addr(
+    fn fetch_metadata_from_peer_addr(
         peers: &HashMap<PeerAddr, PeerConn>,
         addr: &PeerAddr,
         n: usize,
         meta_buf: &mut MetadataBuffer,
     ) {
         if let Some(c) = peers.get(addr) {
-            Self::fetching_metadata_from_peer(c, n, meta_buf, time::Instant::now());
+            Self::fetch_metadata_from_peer(c, n, meta_buf, time::Instant::now());
         }
     }
 
-    fn fetching_metadata_from_peer(
+    fn fetch_metadata_from_peer(
         conn: &PeerConn,
-        n: usize,
+        mut n: usize,
         meta_buf: &mut MetadataBuffer,
         now: time::Instant,
     ) {
-        for _ in 0..n {
-            if let Some(piece) = meta_buf.not_requested.pop_first() {
+        for piece in meta_buf.not_have.iter() {
+            if n == 0 {
+                break;
+            }
+            if !meta_buf.requesting.contains_key(piece) {
+                n -= 1;
                 conn.conn
                     .send_stream_cmd(ConnMsg::Extend(ExtendedMsg::Metadata(
-                        ExtendedMetadata::Request { piece },
+                        ExtendedMetadata::Request { piece: *piece },
                     )));
-                meta_buf.requesting.insert(piece, now);
+                meta_buf.requesting.insert(*piece, now);
             }
         }
     }
 }
 
-fn check_received_metadata(mbuf: &mut MetadataBuffer, info_hash: [u8; 20]) -> io::Result<Metadata> {
+fn check_received_metadata(
+    mbuf: &mut MetadataBuffer,
+    total: usize,
+    info_hash: [u8; 20],
+) -> io::Result<Metadata> {
     use crate::metadata::InfoWithRaw;
-    let info: InfoWithRaw = bt_bencode::from_slice(&mbuf.metadata)?;
+    // Hash exactly `total` bytes: the buffer only ever grows, so a size vote
+    // that briefly favored a larger value leaves trailing zero padding, and
+    // `from_slice` rejects trailing data.
+    let bytes = &mbuf.metadata[..total.min(mbuf.metadata.len())];
+    let info: InfoWithRaw = bt_bencode::from_slice(bytes)?;
     let meta = info.to_metadata(info_hash);
     if let Ok(true) = meta.verify_info_hash() {
         Ok(meta)
@@ -2657,7 +2672,7 @@ pub(crate) async fn run_transmit_worker(
             }
             _ = ticker.tick() => {
                 // transmit.pick_blocks_for_all_peers(2);
-                transmit.fetching_metadata();
+                transmit.fetch_metadata();
             }
             _ = cancel.cancelled() => {
                 info!("transmit manager cancelled");
