@@ -203,9 +203,7 @@ impl Access for NormalFile {
 
     fn metadata(&self) -> Result<FileMetadata> {
         let meta = self.file.metadata()?;
-        Ok(FileMetadata {
-            len: meta.len(),
-        })
+        Ok(FileMetadata { len: meta.len() })
     }
 }
 
@@ -312,20 +310,41 @@ impl BackFile {
         }
     }
 
-    // TODO: optimize this to use binary search or whatever, not iterating
     fn find_files(&mut self, offset: u64, buf: &[u8]) -> impl Iterator<Item = FileOp<'_>> {
         let len = buf.len() as u64;
-        self.file_range.iter_mut().filter_map(move |f| {
-            intersection((f.begin, f.len), (offset, len)).map(move |(w_offset, len)| {
-                let f_begin = f.begin;
-                FileOp {
-                    file: f,
-                    offset: w_offset - f_begin,
-                    buf_begin: (w_offset - offset) as usize,
-                    buf_len: len as usize,
+
+        // find first i that does not satisfy cond, if all i satisfy, return len()
+        // invariant l <= not satisfy < r
+        fn partition(fr: &[FileRange], cond: impl Fn(&FileRange) -> bool) -> usize {
+            let mut r = fr.len();
+            let mut l = 0;
+            while l < r {
+                let mid = (l + r) / 2;
+                let f = &fr[mid];
+                if cond(f) {
+                    l = mid + 1;
+                } else {
+                    r = mid
                 }
+            }
+            l
+        }
+
+        let lower = partition(&self.file_range, |f| f.begin + f.len <= offset);
+        let upper = lower + partition(&self.file_range[lower..], |f| offset + len > f.begin);
+        self.file_range[lower..upper]
+            .iter_mut()
+            .filter_map(move |f| {
+                intersection((f.begin, f.len), (offset, len)).map(move |(w_offset, len)| {
+                    let f_begin = f.begin;
+                    FileOp {
+                        file: f,
+                        offset: w_offset - f_begin,
+                        buf_begin: (w_offset - offset) as usize,
+                        buf_len: len as usize,
+                    }
+                })
             })
-        })
     }
 }
 
