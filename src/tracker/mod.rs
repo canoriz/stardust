@@ -19,9 +19,9 @@ pub struct TrackerGet {
     pub peer_id: [u8; 20],
     pub ip: Option<Ipv4Addr>,
     pub port: u16,
-    pub uploaded: usize,
-    pub downloaded: usize,
-    pub left: usize,
+    pub uploaded: u64,
+    pub downloaded: u64,
+    pub left: u64,
     // event: Option<Enum<...>>
 }
 

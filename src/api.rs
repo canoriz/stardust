@@ -7,6 +7,11 @@
 //! ```json
 //! {"add_torrent":{"source":{"magnet":"magnet:?xt=urn:btih:..."}}}
 //! ```
+//! To add a `.torrent` file, the client reads it locally and sends the bytes
+//! base64-encoded:
+//! ```json
+//! {"add_torrent":{"source":{"file_contents":"ZDg6YW5ub3VuY2U..."}}}
+//! ```
 //! Response:
 //! ```json
 //! "add_torrent_accepted"
@@ -32,6 +37,7 @@
 //! - The HTTP handler waits for that loop to return the corresponding response.
 
 use axum::{extract::State, routing::post, Json, Router};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -52,8 +58,10 @@ use crate::transmit_manager::{RunningCmd, TorrentTask};
 pub enum TorrentSource {
     /// A magnet URI, e.g. `magnet:?xt=urn:btih:…`
     Magnet(String),
-    /// Absolute path to a `.torrent` file accessible on the server filesystem.
-    FilePath(String),
+    /// Raw `.torrent` file bytes, base64-encoded. The client reads the file
+    /// locally and ships its contents over the wire, so this works whether the
+    /// server is in-process or remote.
+    FileContents(String),
 }
 
 /// Every command the API accepts, dispatched via `POST /api/rpc`.
@@ -226,11 +234,14 @@ pub async fn handle_rpc(session: &Session, req: RpcRequest) -> (RpcResponse, boo
                         return (RpcResponse::err(format!("invalid magnet URI: {e}")), false);
                     }
                 },
-                TorrentSource::FilePath(path) => {
-                    let bytes = match std::fs::read(&path) {
+                TorrentSource::FileContents(b64) => {
+                    let bytes = match BASE64.decode(b64.trim()) {
                         Ok(b) => b,
                         Err(e) => {
-                            return (RpcResponse::err(format!("read torrent file: {e}")), false);
+                            return (
+                                RpcResponse::err(format!("decode torrent contents: {e}")),
+                                false,
+                            );
                         }
                     };
                     match FileMetadata::load(&bytes) {

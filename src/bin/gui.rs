@@ -25,6 +25,7 @@
 //!   - `CancellationToken`           (GUI window close → shutdown)
 
 use clap::Parser;
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use eframe::egui;
 use std::sync::{mpsc as std_mpsc, Arc, Mutex};
 use std::thread;
@@ -161,6 +162,8 @@ struct GuiApp {
     // Add-torrent dialog state
     show_add: bool,
     add_input: String,
+    /// Error from the last Add attempt (e.g. local file read failed), shown in the dialog.
+    add_error: Option<String>,
     /// Receives a picked file path from the native file dialog (one-shot).
     file_rx: Option<oneshot::Receiver<Option<String>>>,
 }
@@ -189,6 +192,7 @@ impl GuiApp {
             server_input,
             show_add: false,
             add_input: String::new(),
+            add_error: None,
             file_rx: None,
         }
     }
@@ -229,6 +233,7 @@ impl eframe::App for GuiApp {
                 if ui.button("Add Torrent").clicked() {
                     self.show_add = true;
                     self.add_input.clear();
+                    self.add_error = None;
                 }
                 ui.separator();
 
@@ -315,6 +320,9 @@ impl eframe::App for GuiApp {
                         }
                     });
                     ui.separator();
+                    if let Some(err) = &self.add_error {
+                        ui.colored_label(egui::Color32::RED, err);
+                    }
                     ui.horizontal(|ui| {
                         let has_input = !self.add_input.trim().is_empty();
                         if ui
@@ -323,15 +331,27 @@ impl eframe::App for GuiApp {
                         {
                             let s = self.add_input.trim().to_string();
                             let source = if s.starts_with("magnet:") {
-                                TorrentSource::Magnet(s)
+                                Some(TorrentSource::Magnet(s))
                             } else {
-                                TorrentSource::FilePath(s)
+                                // Read the .torrent locally and ship its bytes so it works
+                                // against a remote server too.
+                                match std::fs::read(&s) {
+                                    Ok(bytes) => {
+                                        Some(TorrentSource::FileContents(BASE64.encode(bytes)))
+                                    }
+                                    Err(e) => {
+                                        self.add_error = Some(format!("read {s}: {e}"));
+                                        None
+                                    }
+                                }
                             };
-                            let _ = self.cmd_tx.send(RpcRequest::AddTorrent {
-                                source,
-                                announce_list: vec![vec!["1".into()]],
-                            });
-                            close_add = true;
+                            if let Some(source) = source {
+                                let _ = self.cmd_tx.send(RpcRequest::AddTorrent {
+                                    source,
+                                    announce_list: vec![],
+                                });
+                                close_add = true;
+                            }
                         }
                         if ui.button("Cancel").clicked() {
                             close_add = true;

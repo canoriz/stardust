@@ -1387,10 +1387,10 @@ impl TransmitWorker {
                 let process = if total == 0 {
                     0.0
                 } else {
-                    let mut done: usize = 0;
+                    let mut done = 0u64;
                     for i in 0..block_picker.n_pieces() {
                         if block_picker.have(i as u32) {
-                            done += block_picker.piece_size(i as u32);
+                            done += block_picker.piece_size(i as u32) as u64;
                         }
                     }
                     done as f64 / total as f64
