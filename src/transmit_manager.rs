@@ -12,18 +12,20 @@ use crate::hasher::HashState;
 use crate::metadata::{self, Magnet, Metadata};
 use crate::picker::{BlockPicker, BlockPickerDump, PieceState, RarestPicker};
 use crate::protocol::{
-    self, Capability, Conn, ExtendedMetadata, ExtendedMsg, ExtendedPex, HandshakeOption, InfoHash,
-    PexFlag, Piece, Request,
+    self, Capability, Conn, ExtendedMetadata, ExtendedMsg, ExtendedPex, HandshakeOption, PexFlag,
+    Piece, Request,
 };
 use crate::tracker;
 use bytes::BytesMut;
 
+use bandwidth_mode::BandwidthMode;
+use inflight::Inflight;
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use std::collections::{hash_map, BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -31,10 +33,10 @@ use tokio::time;
 use tokio_util::sync::{CancellationToken, DropGuard as CancelDropGuard};
 use tracing::{debug, info, instrument, trace, warn};
 
+pub use crate::protocol::InfoHash;
+
 mod bandwidth_mode;
 mod inflight;
-use bandwidth_mode::BandwidthMode;
-use inflight::Inflight;
 
 const PROBE_TO_AUTO_NORMAL_RTT_LIMIT: u32 = 2;
 const PROBE_TO_SLOWDOWN_SLOW_RTT_LIMIT: u32 = 2;
@@ -74,7 +76,7 @@ pub enum TorrentTask {
 }
 
 impl TorrentTask {
-    pub fn info_hash(&self) -> [u8; 20] {
+    pub fn info_hash(&self) -> InfoHash {
         match self {
             TorrentTask::Torrent(m) => m.info_hash,
             TorrentTask::Magnet(m) => m.info_hash,
@@ -146,8 +148,10 @@ pub(crate) enum Msg {
 
     /// A message received from peer
     PeerMsg(PeerMsg),
+
     /// A flush operation completed (success or failure). Used to track
     /// pending writes so shutdown can wait for all flushes to finish.
+    /// TODO: maybe only send flusherr, so the clean up work might be easier
     FlushComplete(Result<(), FlushErr>),
 
     RequestMetadata(oneshot::Sender<Option<Arc<Metadata>>>),
@@ -159,7 +163,7 @@ pub(crate) enum Msg {
 
 #[derive(Debug, Clone)]
 pub struct TorrentRuntimeStatus {
-    pub info_hash: [u8; 20],
+    pub info_hash: InfoHash,
     pub name: Option<String>,
     pub process: f64,
     pub bandwidth_bps: f64,
@@ -244,7 +248,7 @@ pub(crate) struct TransmitManager {
 impl TransmitManager {
     pub fn new(
         t: TorrentTask,
-        id: [u8; 20],
+        id: InfoHash,
         port: u16,
         cmd_sender: mpsc::UnboundedSender<Msg>,
         cmd_receiver: mpsc::UnboundedReceiver<Msg>,
@@ -291,7 +295,7 @@ impl TransmitManager {
     /// `TransmitWorker` state inline without any message round-trip.
     pub fn from_dump(
         dump: TransmitDump,
-        id: [u8; 20],
+        id: InfoHash,
         port: u16,
         cmd_sender: mpsc::UnboundedSender<Msg>,
         cmd_receiver: mpsc::UnboundedReceiver<Msg>,
@@ -648,7 +652,7 @@ pub struct Downloading {
 
 pub struct TransmitWorker {
     // our peer ID
-    id: [u8; 20],
+    id: InfoHash,
     info_hash: InfoHash,
 
     handshake_opt: HandshakeOption,
@@ -685,7 +689,7 @@ pub struct TransmitWorker {
     /// fetch_add(1) before spawn, the worker's main loop does fetch_sub(1)
     /// when handling FlushComplete. On shutdown the worker loops until this
     /// reaches 0.
-    pending_flushes: Arc<AtomicUsize>,
+    pending_flushes: Arc<AtomicU32>,
 
     downloaded: watch::Sender<bool>,
 
@@ -742,7 +746,7 @@ pub struct TransmitDump {
 }
 
 impl TransmitDump {
-    pub fn info_hash(&self) -> [u8; 20] {
+    pub fn info_hash(&self) -> InfoHash {
         match &self.state {
             TorrentStateDump::Metadata { metadata, .. } => metadata.info_hash,
             TorrentStateDump::Fetching(f) => f.magnet.info_hash,
@@ -845,7 +849,7 @@ impl TransmitWorker {
     /// block-picker state and announce URLs without any message round-trip.
     pub fn from_dump(
         dump: TransmitDump,
-        id: [u8; 20],
+        id: InfoHash,
         port: u16,
         dht_client: Option<Arc<DHT>>,
         announce_manager: AnnounceManagerHandle,
@@ -854,7 +858,7 @@ impl TransmitWorker {
         cache_handle: CacheManagerHandle,
         block_pool: Arc<BufferPool<BytesMut>>,
     ) -> Self {
-        let pending_flushes = Arc::new(AtomicUsize::new(0));
+        let pending_flushes = Arc::new(AtomicU32::new(0));
         let (info_hash, torrent_state) = match dump.state {
             TorrentStateDump::Metadata { metadata, picker } => {
                 let info_hash = metadata.info_hash;
@@ -919,7 +923,7 @@ impl TransmitWorker {
 
     pub fn new(
         t: TorrentTask,
-        id: [u8; 20],
+        id: InfoHash,
         port: u16,
         dht_client: Option<Arc<DHT>>,
         announce_manager: AnnounceManagerHandle,
@@ -928,7 +932,7 @@ impl TransmitWorker {
         cache_handle: CacheManagerHandle,
         block_pool: Arc<BufferPool<BytesMut>>,
     ) -> Self {
-        let pending_flushes = Arc::new(AtomicUsize::new(0));
+        let pending_flushes = Arc::new(AtomicU32::new(0));
         let (info_hash, state) = match t {
             TorrentTask::Torrent(m) => {
                 let info_hash = m.info_hash;
@@ -981,7 +985,7 @@ impl TransmitWorker {
     fn metadata_into_downloading(
         m: Metadata,
         cache_handle: &CacheManagerHandle,
-        pending_flushes: Arc<AtomicUsize>,
+        pending_flushes: Arc<AtomicU32>,
         msg_sender: mpsc::UnboundedSender<Msg>,
     ) -> Downloading {
         let m = Arc::new(m);
@@ -2630,7 +2634,7 @@ impl TransmitWorker {
 fn check_received_metadata(
     mbuf: &mut MetadataBuffer,
     total: usize,
-    info_hash: [u8; 20],
+    info_hash: InfoHash,
 ) -> io::Result<Metadata> {
     use crate::metadata::InfoWithRaw;
     // Hash exactly `total` bytes: the buffer only ever grows, so a size vote
@@ -2640,7 +2644,10 @@ fn check_received_metadata(
     let info: InfoWithRaw = match bt_bencode::from_slice(bytes) {
         Ok(i) => i,
         Err(e) => {
-            warn!("metadata parse failed: err={e:?} total={total} buf_len={}", mbuf.metadata.len());
+            warn!(
+                "metadata parse failed: err={e:?} total={total} buf_len={}",
+                mbuf.metadata.len()
+            );
             return Err(io::Error::new(io::ErrorKind::Other, e));
         }
     };
@@ -2707,6 +2714,7 @@ pub(crate) async fn run_transmit_worker(
             None => break,
         }
     }
+
     transmit
         .cache_handle
         .unregister_torrent(transmit.info_hash)
@@ -2802,8 +2810,8 @@ fn run_pex(transmit: &mut TransmitWorker) {
 
 async fn dht_get_peers(
     client: Arc<DHT>,
-    self_id: [u8; 20],
-    target: [u8; 20],
+    self_id: InfoHash,
+    target: InfoHash,
     handshake_opt: HandshakeOption,
     tmh: TransmitManagerHandle,
     listen_port: u16,

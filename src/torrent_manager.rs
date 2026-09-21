@@ -9,6 +9,8 @@ use crate::transmit_manager::{self, TorrentTask, TransmitDump, TransmitManager};
 use bytes::BytesMut;
 use tokio::sync::{mpsc, oneshot};
 
+pub use crate::protocol::InfoHash;
+
 #[derive(Clone)]
 pub struct TransmitManagerSender(mpsc::UnboundedSender<transmit_manager::Msg>);
 
@@ -21,7 +23,7 @@ pub struct TorrentManagerHandle {
 impl TorrentManagerHandle {
     pub fn new(
         t: TorrentTask,
-        self_id: [u8; 20],
+        self_id: InfoHash,
         port: u16,
         dht_client: Option<Arc<DHT>>,
         cache_handle: CacheManagerHandle,
@@ -80,7 +82,7 @@ impl TorrentManagerHandle {
     /// inline — no message round-trip needed.
     pub fn restore_from_dump(
         dump: TransmitDump,
-        self_id: [u8; 20],
+        self_id: InfoHash,
         port: u16,
         dht_client: Option<Arc<DHT>>,
         cache_handle: CacheManagerHandle,

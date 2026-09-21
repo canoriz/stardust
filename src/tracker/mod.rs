@@ -14,9 +14,11 @@ use serde::{
 use thiserror::Error;
 use tracing::warn;
 
+pub use crate::protocol::InfoHash;
+
 #[derive(Debug, Clone)]
 pub struct TrackerGet {
-    pub peer_id: [u8; 20],
+    pub peer_id: InfoHash,
     pub ip: Option<Ipv4Addr>,
     pub port: u16,
     pub uploaded: u64,
@@ -26,7 +28,7 @@ pub struct TrackerGet {
 }
 
 impl TrackerGet {
-    pub fn url(&self, info_hash: &[u8; 20], url: String) -> String {
+    pub fn url(&self, info_hash: &InfoHash, url: String) -> String {
         fn percent_encoding_str<T: AsRef<[u8]>, P: AsRef<[u8]>>(k: &T, v: &P) -> String {
             percent_encoding::percent_encode(k.as_ref(), percent_encoding::NON_ALPHANUMERIC)
                 .collect::<String>()
@@ -304,7 +306,7 @@ pub trait Announce {
     fn announce_tier(
         net_type: AnnounceType,
         req: &TrackerGet,
-        torrent: &[u8; 20],
+        torrent: &InfoHash,
         url: String,
     ) -> impl Future<Output = AnnounceResult> + Send;
 }
@@ -316,7 +318,7 @@ impl Announce for Announcer {
     async fn announce_tier(
         net_type: AnnounceType,
         req: &TrackerGet,
-        info_hash: &[u8; 20],
+        info_hash: &InfoHash,
         url: String,
     ) -> AnnounceResult {
         announce_one(net_type, req, info_hash, url).await
@@ -326,7 +328,7 @@ impl Announce for Announcer {
 async fn announce_one(
     net_type: AnnounceType,
     req: &TrackerGet,
-    info_hash: &[u8; 20],
+    info_hash: &InfoHash,
     url: String,
 ) -> AnnounceResult {
     let url2 = url.clone();

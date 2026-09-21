@@ -193,8 +193,8 @@ pub struct BTStream<T> {
     metadata_size: usize,
 
     reserved: FuncBits,
-    peer_id: [u8; 20],
-    info_hash: [u8; 20],
+    peer_id: InfoHash,
+    info_hash: InfoHash,
     // TODO: maybe add a torrent hash Arc<>
     // torrent_hash: [u8; 20],
 
@@ -339,8 +339,8 @@ pub struct ReadStream<T> {
 
     metadata_size: usize,
 
-    peer_id: [u8; 20],
-    info_hash: [u8; 20],
+    peer_id: InfoHash,
+    info_hash: InfoHash,
     reserved: FuncBits,
 
     pending_recvs: Vec<Message>,
@@ -396,8 +396,8 @@ pub struct WriteStream<T> {
 
     metadata_size: usize,
 
-    peer_id: [u8; 20],
-    info_hash: [u8; 20],
+    peer_id: InfoHash,
+    info_hash: InfoHash,
     reserved: FuncBits,
 
     reqq_limit: usize,
@@ -430,7 +430,7 @@ impl Capability {
 
 pub struct ConnInfo {
     pub func_bits: FuncBits,
-    pub peer_id: [u8; 20],
+    pub peer_id: InfoHash,
     pub info_hash: InfoHash,
     pub metadata_size: usize,
     pub capability: Capability,
@@ -849,7 +849,7 @@ pub struct HandshakeOption {
     #[builder(required)]
     pub dht_port: Option<u16>, // dht port
     // fast: bool,       // fast extension
-    pub client_id: [u8; 20],
+    pub client_id: InfoHash,
     pub client_version: Option<String>, // used in extension
 }
 
@@ -1429,7 +1429,7 @@ impl Default for FuncBits {
 #[derive(Debug, Eq, PartialEq)]
 pub struct Handshake {
     pub reserved: FuncBits,
-    pub client_id: [u8; 20],
+    pub client_id: InfoHash,
 }
 
 struct MsgTy {}

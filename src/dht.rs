@@ -19,6 +19,8 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::instrument;
 use tracing::{debug, info, warn};
 
+pub use crate::protocol::InfoHash;
+
 mod routing;
 mod wire;
 mod wire_serde;
@@ -140,7 +142,7 @@ struct GetPeersArg {
 
     #[serde(with = "serde_bytes")]
     #[derivative(Debug(format_with = "crate::helper::format_hex"))]
-    info_hash: [u8; 20],
+    info_hash: InfoHash,
 
     #[serde(default = "Vec::new")]
     want: Vec<ByteString>,

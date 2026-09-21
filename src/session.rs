@@ -30,7 +30,7 @@ pub struct SessionDump {
 }
 
 pub struct Session {
-    self_id: [u8; 20], // TODO: use randomized self_id
+    self_id: InfoHash, // TODO: use randomized self_id
 
     tasks: Arc<Mutex<HashMap<InfoHash, TorrentManagerHandle>>>,
     port: u16,
@@ -46,7 +46,7 @@ pub struct Session {
 
 #[derive(Builder, Clone)]
 pub struct SessionOpt {
-    self_id: [u8; 20],
+    self_id: InfoHash,
     port: u16,
 
     // TODO: support uTP and dht in same port
@@ -283,7 +283,7 @@ impl Session {
 struct Listener {
     tasks: Arc<Mutex<HashMap<InfoHash, TorrentManagerHandle>>>,
     cancel: CancellationToken,
-    self_id: [u8; 20],
+    self_id: InfoHash,
     dht_port: Option<u16>,
 }
 
@@ -325,7 +325,7 @@ struct IncomeConn<T> {
     conn: T,
     dht_port: Option<u16>,
     addr: SocketAddr,
-    self_id: [u8; 20],
+    self_id: InfoHash,
     tasks: Arc<Mutex<HashMap<InfoHash, TorrentManagerHandle>>>,
 }
 

@@ -3,19 +3,23 @@ use std::{
     fmt, io,
     ops::{Deref, DerefMut},
     sync::{
-        atomic::{AtomicU32, AtomicUsize, Ordering},
+        atomic::{AtomicU32, Ordering},
         Arc, Mutex,
     },
 };
 
 use super::MutexBackFile;
-use crate::protocol::Request;
 use crate::transmit_manager::Msg as TmMsg;
+use crate::{
+    cache::cache_manager::{CacheMsg, GlobalPieceKey},
+    protocol::Request,
+};
 use bytes::BytesMut;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio::time;
 use tracing::warn;
 
+pub use crate::protocol::InfoHash;
 pub type PieceIndex = u32;
 pub type SubPieceIndex = u32;
 
@@ -269,6 +273,8 @@ type BufState = AtomicU32;
 pub struct PieceBuf {
     /// always Some, except in drop
     buf: CowBuf<PooledBuf>,
+
+    info_hash: InfoHash,
     offset: u64,
     index: JointIndex,
     touch: time::Instant,
@@ -279,10 +285,17 @@ pub struct PieceBuf {
     // TODO: maybe remove Option, make flush tracking mandatory
     /// Shared in-flight flush counter. Incremented before spawn_blocking in
     /// Drop/flush, so the worker can wait until all flushes complete on exit.
-    flush_count: Option<Arc<AtomicUsize>>,
+    flush_count: Option<Arc<AtomicU32>>,
+
+    // TODO: maybe remove Option, make flush tracking mandatory
+    // flush_count2 for cache manager
+    flush_count2: Option<Arc<AtomicU32>>,
+
     // TODO: maybe remove Option
     /// Sends FlushComplete to the worker's main loop after each flush finishes.
     msg_sender: Option<mpsc::UnboundedSender<TmMsg>>,
+
+    cache_mgr_sender: Option<mpsc::UnboundedSender<CacheMsg>>,
 }
 
 impl fmt::Debug for PieceBuf {
@@ -331,6 +344,7 @@ impl AsRef<[u8]> for PieceBuf {
 impl Drop for PieceBuf {
     fn drop(&mut self) {
         let msg_sender = self.msg_sender.clone();
+        let cache_mgr_sender = self.cache_mgr_sender.clone();
 
         let f = self.file.clone();
         let s = self.state.clone();
@@ -340,16 +354,32 @@ impl Drop for PieceBuf {
         // if drop is running, all background flush should stop
         // set in_drop, if other worker see in_drop is true, they stop
         let old_state = s.fetch_or(FLUSHING | DROPPING, Ordering::Acquire);
+
+        // buffer may be dirty while DIRTY bit is 0 if other is FLUSHING
         if old_state & (DIRTY | FLUSHING) > 0 {
-            // buffer may be dirty while DIRTY bit is 0 if other is FLUSHING
             if let Some(ref count) = self.flush_count {
                 count.fetch_add(1, Ordering::Relaxed);
             }
+            if let Some(ref count) = self.flush_count2 {
+                count.fetch_add(1, Ordering::Relaxed);
+            }
             let index = self.index;
+            let info_hash = self.info_hash;
             tokio::task::spawn_blocking(move || {
                 let r = flush_buf_force(buf, offset, index, s, f, true);
                 if let Err(ref e) = r {
                     warn!("PieceBuf::Drop flush error index {index:?} {e:?}");
+                }
+                if let Some(sender) = cache_mgr_sender {
+                    let _ = sender.send(CacheMsg::PieceFlushed {
+                        key: GlobalPieceKey { info_hash, index },
+                        result: r
+                            .as_ref()
+                            .map_err(|e| {
+                                format!("PieceBuf::Drop flush error index {index:?} {e:?}")
+                            })
+                            .map(|_| ()),
+                    });
                 }
                 if let Some(sender) = msg_sender {
                     let _ = sender.send(TmMsg::FlushComplete(r));
@@ -411,12 +441,17 @@ impl PieceBuf {
                 if let Some(ref count) = self.flush_count {
                     count.fetch_add(1, Ordering::Relaxed);
                 }
+                if let Some(ref count) = self.flush_count2 {
+                    count.fetch_add(1, Ordering::Relaxed);
+                }
 
                 let f = self.file.clone();
                 let s = self.state.clone();
                 let offset = self.offset;
                 let ji = self.index;
                 let msg_sender = self.msg_sender.clone();
+                let cache_mgr_sender = self.cache_mgr_sender.clone();
+                let info_hash = self.info_hash;
 
                 // Create a cheap copy of buf, and implicitly make ourself read-only.
                 // Next time we write to ourself, we will clone the buf.
@@ -424,6 +459,15 @@ impl PieceBuf {
                 tokio::task::spawn_blocking(move || {
                     let r = flush_buf_force(buf, offset, ji, s, f, false);
                     result_callback(&r);
+                    if let Some(sender) = cache_mgr_sender {
+                        let _ = sender.send(CacheMsg::PieceFlushed {
+                            key: GlobalPieceKey { info_hash, index: ji },
+                            result: r
+                                .as_ref()
+                                .map_err(|e| format!("PieceBuf::flush error index {ji:?} {e:?}"))
+                                .map(|_| ()),
+                        });
+                    }
                     if let Some(sender) = msg_sender {
                         let _ = sender.send(TmMsg::FlushComplete(r));
                     }
@@ -438,14 +482,18 @@ impl PieceBuf {
     /// Used by `CacheManager` to create pieces for file loading.
     pub(crate) fn alloc(
         pool: Arc<Mutex<Pool<BytesMut>>>,
+        info_hash: InfoHash,
         index: JointIndex,
         offset: u64,
         len: usize,
         file: MutexBackFile,
-        flush_count: Option<Arc<AtomicUsize>>,
+        flush_count: Option<Arc<AtomicU32>>,
+        flush_count2: Option<Arc<AtomicU32>>,
         msg_sender: Option<mpsc::UnboundedSender<TmMsg>>,
+        cache_mgr_sender: Option<mpsc::UnboundedSender<CacheMsg>>,
     ) -> Self {
         PieceBuf {
+            info_hash,
             buf: CowBuf::new(PooledBuf::new(pool, len)),
             write_time: time::Instant::now(),
             touch: time::Instant::now(),
@@ -454,7 +502,9 @@ impl PieceBuf {
             state: Arc::new(AtomicU32::new(0)),
             file,
             flush_count,
+            flush_count2,
             msg_sender,
+            cache_mgr_sender,
         }
     }
 }
@@ -547,6 +597,7 @@ mod test {
     ) -> PieceBuf {
         PieceBuf {
             buf: CowBuf::new(PooledBuf::new(pool, len)),
+            info_hash: [0u8; 20],
             offset: 0,
             index: JointIndex::new(0, 0),
             write_time: time::Instant::now(),
@@ -554,7 +605,9 @@ mod test {
             state: Arc::new(AtomicU32::new(initial_state)),
             file: void_file(),
             flush_count: None,
+            flush_count2: None,
             msg_sender: None,
+            cache_mgr_sender: None,
         }
     }
 
@@ -852,15 +905,15 @@ mod test {
     #[tokio::test]
     async fn flush_sends_flush_complete_via_msg_sender() {
         use crate::transmit_manager::Msg as TmMsg;
-        use std::sync::atomic::AtomicUsize;
         use tokio::sync::mpsc;
 
         let pool = Arc::new(Mutex::new(Pool::new(4)));
-        let flush_count = Arc::new(AtomicUsize::new(0));
+        let flush_count = Arc::new(AtomicU32::new(0));
         let (tx, mut rx) = mpsc::unbounded_channel::<TmMsg>();
 
         let mut pb = PieceBuf {
             buf: CowBuf::new(PooledBuf::new(pool, 8)),
+            info_hash: [0u8; 20],
             offset: 0,
             index: JointIndex::new(3, 0),
             write_time: time::Instant::now(),
@@ -868,7 +921,9 @@ mod test {
             state: Arc::new(AtomicU32::new(DIRTY)),
             file: void_file(),
             flush_count: Some(flush_count.clone()),
+            flush_count2: None,
             msg_sender: Some(tx),
+            cache_mgr_sender: None,
         };
 
         let (cb_tx, cb_rx) = tokio::sync::oneshot::channel::<bool>();
@@ -892,15 +947,15 @@ mod test {
     #[tokio::test]
     async fn drop_dirty_piecebuf_sends_flush_complete() {
         use crate::transmit_manager::Msg as TmMsg;
-        use std::sync::atomic::AtomicUsize;
         use tokio::sync::mpsc;
 
         let pool = Arc::new(Mutex::new(Pool::new(4)));
-        let flush_count = Arc::new(AtomicUsize::new(0));
+        let flush_count = Arc::new(AtomicU32::new(0));
         let (tx, mut rx) = mpsc::unbounded_channel::<TmMsg>();
 
         let pb = PieceBuf {
             buf: CowBuf::new(PooledBuf::new(pool, 8)),
+            info_hash: [0u8; 20],
             offset: 0,
             index: JointIndex::new(5, 0),
             write_time: time::Instant::now(),
@@ -908,7 +963,9 @@ mod test {
             state: Arc::new(AtomicU32::new(DIRTY)),
             file: void_file(),
             flush_count: Some(flush_count.clone()),
+            flush_count2: None,
             msg_sender: Some(tx),
+            cache_mgr_sender: None,
         };
 
         drop(pb);
@@ -926,15 +983,15 @@ mod test {
     #[tokio::test]
     async fn drop_clean_piecebuf_does_not_send_flush_complete() {
         use crate::transmit_manager::Msg as TmMsg;
-        use std::sync::atomic::AtomicUsize;
         use tokio::sync::mpsc;
 
         let pool = Arc::new(Mutex::new(Pool::new(4)));
-        let flush_count = Arc::new(AtomicUsize::new(0));
+        let flush_count = Arc::new(AtomicU32::new(0));
         let (tx, mut rx) = mpsc::unbounded_channel::<TmMsg>();
 
         let pb = PieceBuf {
             buf: CowBuf::new(PooledBuf::new(pool, 8)),
+            info_hash: [0u8; 20],
             offset: 0,
             index: JointIndex::new(7, 0),
             write_time: time::Instant::now(),
@@ -942,7 +999,9 @@ mod test {
             state: Arc::new(AtomicU32::new(0)), // clean
             file: void_file(),
             flush_count: Some(flush_count.clone()),
+            flush_count2: None,
             msg_sender: Some(tx),
+            cache_mgr_sender: None,
         };
 
         drop(pb);
@@ -961,6 +1020,7 @@ mod test {
         let file = void_file();
         let mut pb = PieceBuf {
             buf: CowBuf::new(PooledBuf::new(pool, 8)),
+            info_hash: [0u8; 20],
             offset: 0,
             index: JointIndex::new(0, 0),
             write_time: time::Instant::now(),
@@ -968,7 +1028,9 @@ mod test {
             state: Arc::new(AtomicU32::new(0)),
             file: file.clone(),
             flush_count: None,
+            flush_count2: None,
             msg_sender: None,
+            cache_mgr_sender: None,
         };
         let _shared = pb.buf.clone(); // make Shared
                                       // read_from_file must panic when buf is Shared.

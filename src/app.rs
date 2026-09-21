@@ -2,7 +2,7 @@
 ///
 /// Only compiled when the `mock_delay` Cargo feature is enabled.
 #[cfg(feature = "mock_delay")]
-pub async fn add_mock_torrent(session: &crate::session::Session) -> [u8; 20] {
+pub async fn add_mock_torrent(session: &crate::session::Session) -> InfoHash {
     use crate::metadata;
     use crate::transmit_manager::TorrentTask;
 

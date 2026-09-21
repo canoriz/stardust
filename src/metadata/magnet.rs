@@ -5,11 +5,13 @@ use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::str::FromStr;
 
+pub use crate::protocol::InfoHash;
+
 #[derive(Clone, Derivative, Eq, PartialEq, Serialize, Deserialize)]
 #[derivative(Debug)]
 pub struct Magnet {
     #[derivative(Debug(format_with = "crate::helper::format_hex"))]
-    pub info_hash: [u8; 20],
+    pub info_hash: InfoHash,
 
     // display name
     pub dn: Option<String>,
@@ -91,7 +93,7 @@ impl FromStr for Magnet {
     }
 }
 
-fn parse_info_hash(s: &str) -> Result<[u8; 20], &'static str> {
+fn parse_info_hash(s: &str) -> Result<InfoHash, &'static str> {
     match hex::decode(s) {
         Ok(ih) if ih.len() == 20 => {
             let mut info_hash = [0; 20];

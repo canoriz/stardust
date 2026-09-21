@@ -1,12 +1,12 @@
 use clap::Parser;
-use stardust::{Session, SessionDump, SessionOpt};
+use stardust::{protocol::InfoHash, Session, SessionDump, SessionOpt};
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 use tracing_subscriber::fmt::format::FmtSpan;
 
-const SELF_ID: [u8; 20] = *b"-TR3000-fjbo402nczk3";
+const SELF_ID: InfoHash = *b"-TR3000-fjbo402nczk3";
 
 #[derive(Parser)]
 #[command(about = "Stardust BitTorrent client")]

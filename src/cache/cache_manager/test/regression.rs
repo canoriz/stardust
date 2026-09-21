@@ -128,7 +128,10 @@ async fn write_during_flush_preserves_newer_data() {
     handle.send_get_piece(key(0), tx.clone());
     pump(&mut mgr).await;
     let (_, mut lease) = drain_ready(&mut rx).pop().unwrap();
-    let file = mgr.torrents[&info_hash].back_file.clone();
+    let file = match &mgr.torrents[&info_hash] {
+        TorrentState::Registed(t) => t.back_file.clone(),
+        TorrentState::Unregisting((_, t)) => t.back_file.clone(),
+    };
     // Hold the disk mutex so a second write deterministically precedes flush completion.
     let disk = file.lock().unwrap();
     lease.as_mut()[0] = 0x11;

@@ -9,6 +9,8 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 use tokio_util::time::{delay_queue, DelayQueue};
 use tracing::info;
 
+pub use crate::protocol::InfoHash;
+
 #[derive(Debug)]
 pub enum Msg {
     AddUrl(Vec<String>),
@@ -25,9 +27,9 @@ pub struct AnnounceManagerHandle {
 
 impl AnnounceManagerHandle {
     pub fn new(
-        peer_id: [u8; 20],
+        peer_id: InfoHash,
         port: u16,
-        info_hash: [u8; 20],
+        info_hash: InfoHash,
         tx: mpsc::UnboundedSender<transmit_manager::Msg>,
     ) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
@@ -80,7 +82,7 @@ impl AnnounceManagerHandle {
 }
 
 struct AnnounceManager {
-    peer_id: [u8; 20],
+    peer_id: InfoHash,
     port: u16,
     announce_list: Vec<Vec<String>>,
     receiver: mpsc::UnboundedReceiver<Msg>,
@@ -119,8 +121,7 @@ impl AnnounceManager {
             Msg::RemoveUrl(url) => {
                 info!("removing announce url {url}");
                 let ptr = Arc::new(url);
-                if let Some((Some(k), _)) = self.url_list.remove(&(AnnounceType::V4, ptr.clone()))
-                {
+                if let Some((Some(k), _)) = self.url_list.remove(&(AnnounceType::V4, ptr.clone())) {
                     info!("abort {}", &ptr.as_ref());
                     self.announce_timer.try_remove(&k);
                 }
@@ -167,7 +168,7 @@ impl AnnounceManager {
 
 async fn run_announce_manager<A>(
     mut manager: AnnounceManager,
-    info_hash: [u8; 20],
+    info_hash: InfoHash,
     cancel: CancellationToken,
     done: oneshot::Sender<()>,
 ) where
@@ -274,7 +275,7 @@ impl tracker::Announce for FakeAnnouncer {
     async fn announce_tier(
         _net_type: tracker::AnnounceType,
         _req: &TrackerGet,
-        _torrent: &[u8; 20],
+        _torrent: &InfoHash,
         _url: String,
     ) -> tracker::AnnounceResult {
         // return Err(metadata::AnnounceError::ClientErr(
@@ -314,8 +315,8 @@ async fn announce_task<A>(
     mut rx: mpsc::UnboundedReceiver<TimeUp>,
     output: mpsc::UnboundedSender<(AnnounceResult, TimeUp)>,
     cancel: CancellationToken,
-    info_hash: [u8; 20],
-    id: [u8; 20],
+    info_hash: InfoHash,
+    id: InfoHash,
     port: u16,
 ) where
     A: tracker::Announce,

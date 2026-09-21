@@ -36,6 +36,9 @@
 //! - Every HTTP request is forwarded to the main loop that owns `Session`.
 //! - The HTTP handler waits for that loop to return the corresponding response.
 
+use crate::metadata::{FileMetadata, Magnet};
+use crate::session::Session;
+use crate::transmit_manager::{RunningCmd, TorrentTask};
 use axum::{extract::State, routing::post, Json, Router};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::{Deserialize, Serialize};
@@ -45,10 +48,8 @@ use tracing::info;
 
 pub use crate::buffer_pool::BufferPoolStats;
 pub use crate::cache::cache_manager::CacheStats;
-use crate::metadata::{FileMetadata, Magnet};
-use crate::session::Session;
+pub use crate::protocol::InfoHash;
 pub use crate::transmit_manager::{CheckState, RunningStateDump, StableState};
-use crate::transmit_manager::{RunningCmd, TorrentTask};
 
 // ── request types ────────────────────────────────────────────────────────────
 
@@ -345,15 +346,16 @@ pub async fn handle_rpc(session: &Session, req: RpcRequest) -> (RpcResponse, boo
             (rsp, false)
         }
 
-        RpcRequest::GetBufferPoolStats => {
-            (RpcResponse::BufferPoolStats(session.buffer_pool_stats()), false)
-        }
+        RpcRequest::GetBufferPoolStats => (
+            RpcResponse::BufferPoolStats(session.buffer_pool_stats()),
+            false,
+        ),
     }
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-fn parse_info_hash(s: &str) -> Result<[u8; 20], String> {
+fn parse_info_hash(s: &str) -> Result<InfoHash, String> {
     let bytes = hex::decode(s).map_err(|e| format!("invalid info_hash hex: {e}"))?;
     bytes
         .try_into()

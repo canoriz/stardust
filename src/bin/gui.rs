@@ -24,8 +24,8 @@
 //!   - `Arc<Mutex<Target>>`          (GUI → frontend loop: connection target)
 //!   - `CancellationToken`           (GUI window close → shutdown)
 
-use clap::Parser;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use clap::Parser;
 use eframe::egui;
 use std::sync::{mpsc as std_mpsc, Arc, Mutex};
 use std::thread;
@@ -39,7 +39,7 @@ use stardust::api::{
     handle_rpc, ApiCommand, BufferPoolStats, CacheStats, RpcRequest, RpcResponse, RunningStateDump,
     StableState, TorrentSource,
 };
-use stardust::{Session, SessionDump, SessionOpt};
+use stardust::{protocol::InfoHash, Session, SessionDump, SessionOpt};
 
 // ── CLI ────────────────────────────────────────────────────────────────────────
 
@@ -109,7 +109,7 @@ impl Transport {
 
 // ── constants ─────────────────────────────────────────────────────────────────
 
-const SELF_ID: [u8; 20] = *b"-TR3000-fjbo402nczk3";
+const SELF_ID: InfoHash = *b"-TR3000-fjbo402nczk3";
 const TCP_PORT: u16 = 41773;
 const DHT_PORT: u16 = 41774;
 const SESSION_FILE: &str = "session-gui.json";

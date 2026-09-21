@@ -6,13 +6,14 @@ use std::io;
 
 mod magnet;
 pub use magnet::Magnet;
+pub use crate::protocol::InfoHash;
 
 // Metadata is a universal structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Metadata {
     pub info: Info,
     pub raw_info: Vec<u8>, // raw, byte-format info, for sending metadata to peers
-    pub info_hash: [u8; 20],
+    pub info_hash: InfoHash,
 
     pub len: u64,
 
@@ -57,7 +58,7 @@ impl Metadata {
     pub fn verify_info_hash(&self) -> io::Result<bool> {
         let mut hasher = Sha1::new();
         hasher.update(&self.raw_info);
-        let info_hash: [u8; 20] = hasher.finalize().into();
+        let info_hash: InfoHash = hasher.finalize().into();
         Ok(info_hash == self.info_hash)
     }
 }
@@ -73,7 +74,7 @@ pub struct FileMetadata {
     info: InfoWithRaw,
 
     #[serde(skip)]
-    info_hash: [u8; 20],
+    info_hash: InfoHash,
 
     comment: Option<String>,
     #[serde(rename = "created by")]
@@ -123,7 +124,7 @@ impl TryFrom<RawValue> for InfoWithRaw {
 }
 
 impl InfoWithRaw {
-    pub fn to_metadata(self, info_hash: [u8; 20]) -> Metadata {
+    pub fn to_metadata(self, info_hash: InfoHash) -> Metadata {
         let info = &self.info;
         let (len, files) = match &info.len_or_files {
             LenFiles::Length(l) => (
