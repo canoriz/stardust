@@ -7,6 +7,7 @@ use std::{io, time};
 use bytes::BytesMut;
 use derivative::Derivative;
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::{
     sync::{mpsc, oneshot},
     time::Interval,
@@ -125,6 +126,16 @@ pub enum CacheMsg {
         key: GlobalPieceKey,
         piece: PieceBuf,
     },
+    /// Rename a file.
+    /// Renaming is one of file operations.
+    /// File operations are mutually exclusive with new cache requests.
+    /// Already submitted reads, leases, and flushes are allowed to complete;
+    /// the operation runs after the required I/O barrier is clear.
+    Fop {
+        info_hash: InfoHash,
+        sender: oneshot::Sender<Result<FileOpID, &'static str>>,
+        fop: Fop,
+    },
     /// A flush attempt completed.
     /// Note: this does not mean it's clear, new data may come after flush started,
     /// so piece may still be dirty.
@@ -141,13 +152,13 @@ pub enum CacheMsg {
 /// A cheap-to-clone handle to the CacheManager.
 #[derive(Clone)]
 pub struct CacheManagerHandle {
-    sender: mpsc::UnboundedSender<CacheMsg>,
+    sender: UnboundedSender<CacheMsg>,
     /// Approximate number of cache slots currently available (updated after each message).
     pub vacant_count: Arc<AtomicUsize>,
 }
 
 impl CacheManagerHandle {
-    pub fn send_get_piece(&self, key: GlobalPieceKey, sender: mpsc::UnboundedSender<TmMsg>) {
+    pub fn send_get_piece(&self, key: GlobalPieceKey, sender: UnboundedSender<TmMsg>) {
         let _ = self.sender.send(CacheMsg::GetPiece { key, sender });
     }
 
@@ -170,6 +181,23 @@ impl CacheManagerHandle {
         });
     }
 
+    pub async fn send_file_op(
+        &self,
+        info_hash: InfoHash,
+        fop: Fop,
+    ) -> Result<FileOpID, &'static str> {
+        let (tx, rx) = oneshot::channel();
+        let _ = self.sender.send(CacheMsg::Fop {
+            info_hash,
+            fop,
+            sender: tx,
+        });
+        rx.await.expect("should be some")
+    }
+
+    /// Unregister a torrent.
+    /// for all returned(auto dropped) `PieceLease` before calling `unregister_torrent`
+    /// It's ensured these changes are flushed to disk before `unregister_torrent` returns.
     pub async fn unregister_torrent(&self, info_hash: InfoHash) {
         let (tx, rx) = oneshot::channel();
         let _ = self.sender.send(CacheMsg::UnregisterTorrent(info_hash, tx));
@@ -334,14 +362,44 @@ struct WindowStats {
     reading: usize,
 }
 
+/// Lifecycle of a registered torrent inside the cache.
 enum TorrentState {
     Registed(TorrentInfo),
+    /// Unregister requested; holds the waiters to notify once pending flushes drain.
     Unregisting((Vec<oneshot::Sender<()>>, TorrentInfo)),
+}
+
+/// A file-level operation (e.g. rename) deferred behind the cache's I/O barrier.
+pub enum Fop {
+    Rename {
+        file_index: usize,
+        to: String,
+        /// Logical byte range covered by the rename, expressed as [begin, end).
+        begin: u64,
+        end: u64,
+        /// Drop and flush pieces in the range once when handling the Fop message.
+        flush_all: bool,
+        sender: UnboundedSender<TmMsg>,
+    },
+}
+
+pub type FileOpID = u64;
+
+/// Per-torrent I/O bookkeeping. File ops must not run concurrently with piece
+/// I/O, so they wait here until outstanding I/O drains.
+#[derive(Default)]
+struct IoState {
+    /// number of processing io jobs (reading + lease)
+    in_io: u32,
+    /// File ops accepted but not yet executed.
+    pending_ops: Vec<(FileOpID, Fop)>,
+    /// Piece requests deferred until queued file ops finish.
+    pending_req: Vec<CacheMsg>,
 }
 
 /// The CacheManager actor. Spawn via `tokio::spawn(manager.run())`.
 pub struct CacheManager {
-    receiver: mpsc::UnboundedReceiver<CacheMsg>,
+    receiver: UnboundedReceiver<CacheMsg>,
 
     /// Retry timer for a pending read-piece request
     /// Once timer set, piece not accessed for a while
@@ -349,22 +407,21 @@ pub struct CacheManager {
     piece_evict_timer: Interval,
 
     self_handle: CacheManagerHandle,
+
     /// All tracked pieces by state.
     cache: HashMap<GlobalPieceKey, CacheEntry>,
+
     /// Pending senders waiting for a specific piece.
-    pending: HashMap<GlobalPieceKey, VecDeque<mpsc::UnboundedSender<TmMsg>>>,
+    pending: HashMap<GlobalPieceKey, VecDeque<UnboundedSender<TmMsg>>>,
 
     /// Pending requests waiting for a cache slot.
     waiting_slot: WaitingSlots,
 
     /// Registered torrent metadata.
-    torrents: HashMap<InfoHash, TorrentState>,
+    torrents: HashMap<InfoHash, (TorrentState, IoState)>,
+
     /// Shared `BytesMut` allocator pool.
     pool: Arc<Mutex<Pool<BytesMut>>>,
-
-    /// Cache-owned in-flight flush counter, incremented for every flush/drop of
-    /// pieces this manager allocated.
-    flush_count: Arc<AtomicU32>,
 
     /// Clean buffers currently owned by the cache, indexed for eviction without
     /// scanning every entry.
@@ -378,6 +435,8 @@ pub struct CacheManager {
     /// `reading` gauges (maintained on each cache transition, no scan). See
     /// [`WindowStats`].
     stats: WindowStats,
+
+    file_op_id: u64,
 }
 
 /// Interval of `piece_evict_timer`.
@@ -408,8 +467,8 @@ impl CacheManager {
             capacity,
             assume_clear: HashSet::new(),
             pool: Arc::new(Mutex::new(Pool::new(capacity))),
-            flush_count: Arc::new(AtomicU32::new(0)),
             stats: WindowStats::default(),
+            file_op_id: 0,
         };
         (manager, handle)
     }
@@ -449,67 +508,30 @@ impl CacheManager {
                 let (piece_total, last_piece_size) =
                     piece_total_and_last_size(total_length, piece_size);
                 let flush_count2 = Some(Arc::new(AtomicU32::new(0)));
+                // TODO: Tag registrations and asynchronous piece messages with a
+                // generation. Unregister can finish before old reads or leases
+                // return; re-registering the same info_hash must not let their
+                // PieceLoaded/ReturnPiece/PieceFlushed messages update the new
+                // registration's buffers, waiters, or I/O/flush counters.
                 self.torrents.insert(
                     info_hash,
-                    TorrentState::Registed(TorrentInfo {
-                        back_file,
-                        piece_size,
-                        last_piece_size,
-                        piece_total,
-                        flush_count,
-                        flush_count2,
-                        msg_sender,
-                    }),
+                    (
+                        TorrentState::Registed(TorrentInfo {
+                            back_file,
+                            piece_size,
+                            last_piece_size,
+                            piece_total,
+                            flush_count,
+                            flush_count2,
+                            msg_sender,
+                        }),
+                        IoState::default(),
+                    ),
                 );
             }
 
             CacheMsg::UnregisterTorrent(info_hash, done) => {
-                match self.torrents.remove(&info_hash) {
-                    Some(TorrentState::Registed(t)) => {
-                        self.torrents
-                            .insert(info_hash, TorrentState::Unregisting((vec![], t)));
-                    }
-                    Some(TorrentState::Unregisting(t)) => {
-                        self.torrents
-                            .insert(info_hash, TorrentState::Unregisting(t));
-                    }
-                    _ => {
-                        let _ = done.send(());
-                        return;
-                    }
-                };
-                let (waiters, ti) = match self
-                    .torrents
-                    .get_mut(&info_hash)
-                    .expect("unregisting torrent should exist")
-                {
-                    TorrentState::Registed(_) => unreachable!("should be unregisting"),
-                    TorrentState::Unregisting(t) => t,
-                };
-
-                for (key, entry) in &self.cache {
-                    if key.info_hash == info_hash {
-                        match entry {
-                            CacheEntry::Loaded(None) => self.stats.lent -= 1,
-                            CacheEntry::Reading => self.stats.reading -= 1,
-                            CacheEntry::Loaded(Some(_)) => {}
-                        }
-                    }
-                }
-                self.cache.retain(|key, _| key.info_hash != info_hash);
-                self.assume_clear.retain(|key| key.info_hash != info_hash);
-                self.pending.retain(|key, _| key.info_hash != info_hash);
-                self.waiting_slot.remove_torrent(info_hash);
-
-                if match ti.flush_count2.as_ref() {
-                    Some(count) => count.load(Ordering::Relaxed) == 0,
-                    None => true,
-                } {
-                    let _ = done.send(());
-                } else {
-                    waiters.push(done)
-                }
-                self.load_pending_pieces();
+                self.handle_unregister_torrent(info_hash, done);
             }
 
             CacheMsg::GetPiece { key, sender } => {
@@ -520,55 +542,20 @@ impl CacheManager {
                 self.handle_piece_loaded(key, buf);
             }
 
+            CacheMsg::Fop {
+                info_hash,
+                fop,
+                sender,
+            } => {
+                self.handle_file_op(info_hash, fop, sender);
+            }
+
             CacheMsg::ReturnPiece { key, piece } => {
                 self.handle_return_piece(key, piece);
             }
 
             CacheMsg::PieceFlushed { key, result } => {
-                if let Err(e) = result {
-                    warn!("cache flush error for {key:?}: {e}");
-                }
-                self.stats.current.flushes += 1;
-
-                // TODO: maybe let `PieceBuf::flush()` managing flush_count, flush_count2
-                let unregistered = match self
-                    .torrents
-                    .get(&key.info_hash)
-                    .expect("entry of flushing piece should exist")
-                {
-                    TorrentState::Registed(ti) => match &ti.flush_count2 {
-                        Some(fc) => {
-                            fc.fetch_sub(1, Ordering::Relaxed);
-                            false
-                        }
-                        None => false,
-                    },
-                    TorrentState::Unregisting((_, ti)) => match &ti.flush_count2 {
-                        Some(fc) => fc.fetch_sub(1, Ordering::Relaxed) == 1,
-                        None => false,
-                    },
-                };
-                if unregistered {
-                    let w = match self
-                        .torrents
-                        .remove(&key.info_hash)
-                        .expect("entry of flushing piece should exist")
-                    {
-                        TorrentState::Registed(_) => unreachable!("should be unregistering state"),
-                        TorrentState::Unregisting((w, _)) => w,
-                    };
-                    for i in w {
-                        let _ = i.send(());
-                    }
-                }
-
-                // The buffer may have been borrowed or written again since this
-                // flush started. Only its current state determines whether it is clean.
-                if matches!(self.cache.get(&key), Some(CacheEntry::Loaded(Some(p))) if !p.is_dirty())
-                {
-                    self.assume_clear.insert(key);
-                }
-                self.load_pending_pieces();
+                self.handle_piece_flushed(key, result);
             }
 
             CacheMsg::GetStats(reply) => {
@@ -589,8 +576,43 @@ impl CacheManager {
     }
 
     // TODO: if too many get_piece requests, make a queue and only read when there are available cache slots
-    fn handle_get_piece(&mut self, key: GlobalPieceKey, sender: mpsc::UnboundedSender<TmMsg>) {
+    fn handle_get_piece(&mut self, key: GlobalPieceKey, sender: UnboundedSender<TmMsg>) {
         self.stats.current.requests += 1;
+        let ios = match self.torrents.get_mut(&key.info_hash) {
+            Some((TorrentState::Unregisting(_), _)) => {
+                let _ = sender.send(TmMsg::PieceBufReady {
+                    index: key.index,
+                    buf: Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        "torrent is unregistering",
+                    )),
+                });
+                return;
+            }
+            Some((
+                _,
+                IoState {
+                    in_io,
+                    pending_ops,
+                    pending_req,
+                },
+            )) if pending_ops.len() > 0 => {
+                pending_req.push(CacheMsg::GetPiece { key, sender });
+                return;
+            }
+            Some((TorrentState::Registed(_), ios)) => ios,
+            None => {
+                let _ = sender.send(TmMsg::PieceBufReady {
+                    index: key.index,
+                    buf: Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        "torrent is not registered",
+                    )),
+                });
+                return;
+            }
+        };
+
         match self.cache.get_mut(&key) {
             Some(CacheEntry::Loaded(piece @ Some(_))) => {
                 // Piece is available: remove, mark Sent, deliver as PieceLease.
@@ -599,6 +621,7 @@ impl CacheManager {
                 let lease = PieceLease::new(pb, key, self.self_handle.clone());
                 self.stats.lent += 1;
                 self.stats.current.lends += 1;
+                ios.in_io += 1;
                 let _ = sender.send(TmMsg::PieceBufReady {
                     index: key.index,
                     buf: Ok(lease),
@@ -623,15 +646,14 @@ impl CacheManager {
     }
 
     fn handle_piece_loaded(&mut self, key: GlobalPieceKey, result: io::Result<PieceBuf>) {
+        self.stats.reading -= 1;
         match result {
             Ok(piece) => {
                 if let Some(q) = self.pending.get_mut(&key) {
                     if let Some(first_sender) = q.pop_front() {
                         // Reading -> lent out.
-                        if self.cache.insert(key, CacheEntry::Loaded(None)).is_some() {
-                            self.stats.reading -= 1;
-                        }
                         self.stats.lent += 1;
+                        self.cache.insert(key, CacheEntry::Loaded(None));
                         let lease = PieceLease::new(piece, key, self.self_handle.clone());
                         self.stats.current.lends += 1;
                         let _ = first_sender.send(TmMsg::PieceBufReady {
@@ -644,23 +666,26 @@ impl CacheManager {
                         return;
                     }
                 }
+
                 // No waiters: cache the loaded piece.
-                if self.torrents.contains_key(&key.info_hash) {
-                    // Reading -> clean cached.
-                    if self
-                        .cache
-                        .insert(key, CacheEntry::Loaded(Some(piece)))
-                        .is_some()
-                    {
-                        self.stats.reading -= 1;
+                if let Some(i) = self.torrents.get_mut(&key.info_hash).map(|(_, i)| i) {
+                    i.in_io -= 1;
+                }
+                match self.torrents.get(&key.info_hash) {
+                    Some((TorrentState::Registed(_), _)) => {
+                        // Reading -> clean cached.
+                        self.cache.insert(key, CacheEntry::Loaded(Some(piece)));
+                        self.assume_clear.insert(key);
+                        self.maybe_do_all_file_op(key.info_hash);
                     }
-                    self.assume_clear.insert(key);
+                    _ => {}
                 }
             }
             Err(e) => {
                 // Read failed: remove Reading entry and notify all waiters.
-                if matches!(self.cache.remove(&key), Some(CacheEntry::Reading)) {
-                    self.stats.reading -= 1;
+                self.cache.remove(&key);
+                if let Some(i) = self.torrents.get_mut(&key.info_hash).map(|(_, i)| i) {
+                    i.in_io -= 1;
                 }
                 let msg = format!("{e}");
                 let kind = e.kind();
@@ -672,6 +697,7 @@ impl CacheManager {
                         });
                     }
                 }
+                self.maybe_do_all_file_op(key.info_hash);
                 self.load_pending_pieces();
             }
         }
@@ -679,10 +705,10 @@ impl CacheManager {
 
     fn handle_return_piece(&mut self, key: GlobalPieceKey, piece: PieceBuf) {
         self.stats.current.returns += 1;
-        if let Some(mut q) = self.pending.remove(&key) {
+        if let Some(q) = self.pending.get_mut(&key) {
             if let Some(first_sender) = q.pop_front() {
-                if !q.is_empty() {
-                    self.pending.insert(key, q);
+                if q.is_empty() {
+                    self.pending.remove(&key);
                 }
                 assert!(matches!(
                     self.cache.get(&key),
@@ -699,6 +725,10 @@ impl CacheManager {
             }
         }
 
+        if let Some(i) = self.torrents.get_mut(&key.info_hash).map(|(_, i)| i) {
+            i.in_io -= 1;
+        }
+
         // No waiters: re-cache the piece.
         // Only re-cache if the torrent is still registered; if not, just drop the piece.
         // drop piece will auto write back if it's dirty, so we don't need to explicitly flush here.
@@ -711,8 +741,12 @@ impl CacheManager {
             ) {
                 self.stats.lent -= 1;
             }
+
             if is_clear {
                 self.assume_clear.insert(key);
+            }
+            self.maybe_do_all_file_op(key.info_hash);
+            if is_clear {
                 // TODO: maybe do nothing, let only timeout to call `load_pending_pieces`
                 self.load_pending_pieces();
             }
@@ -746,6 +780,244 @@ impl CacheManager {
         }
     }
 
+    /// Start unregistering a torrent: mark it `Unregisting`, drop its cached
+    /// pieces, and record `done` to be notified once pending flushes finish.
+    fn handle_unregister_torrent(&mut self, info_hash: InfoHash, done: oneshot::Sender<()>) {
+        match self.torrents.remove(&info_hash) {
+            Some((TorrentState::Registed(t), i)) => {
+                self.torrents
+                    .insert(info_hash, (TorrentState::Unregisting((vec![], t)), i));
+            }
+            Some((TorrentState::Unregisting(t), i)) => {
+                self.torrents
+                    .insert(info_hash, (TorrentState::Unregisting(t), i));
+            }
+            _ => {
+                let _ = done.send(());
+                return;
+            }
+        };
+
+        for (key, entry) in &self.cache {
+            if key.info_hash == info_hash {
+                match entry {
+                    CacheEntry::Loaded(None) => self.stats.lent -= 1,
+                    CacheEntry::Reading => { /* handled by piece_loaded */ }
+                    CacheEntry::Loaded(Some(_)) => {}
+                }
+            }
+        }
+        self.cache.retain(|key, _| key.info_hash != info_hash);
+        self.assume_clear.retain(|key| key.info_hash != info_hash);
+        self.pending.retain(|key, _| key.info_hash != info_hash);
+        self.waiting_slot.remove_torrent(info_hash);
+
+        match self
+            .torrents
+            .get_mut(&info_hash)
+            .expect("unregisting torrent should exist")
+        {
+            (TorrentState::Registed(_), _) => unreachable!("should be unregisting"),
+            (TorrentState::Unregisting((waiters, _)), _) => waiters.push(done),
+        };
+        self.handle_unregister_after(info_hash);
+    }
+
+    /// Try to finish an in-progress unregister. Safe to call at any time.
+    fn handle_unregister_after(&mut self, info_hash: InfoHash) {
+        let (waiters, ti, ios) = match self
+            .torrents
+            .get_mut(&info_hash)
+            .expect("unregisting torrent should exist")
+        {
+            (TorrentState::Registed(_), _) => return,
+            (TorrentState::Unregisting(t), ios) => (&mut t.0, &mut t.1, ios),
+        };
+        match ti.flush_count2.as_ref() {
+            Some(count) if count.load(Ordering::Relaxed) == 0 => {
+                for w in waiters.drain(0..) {
+                    let _ = w.send(());
+                }
+                for op in ios.pending_ops.drain(0..) {
+                    match op {
+                        (id, Fop::Rename { sender, .. }) => {
+                            _ = sender.send(TmMsg::FileOpDone {
+                                id,
+                                result: Err(io::Error::new(
+                                    io::ErrorKind::Other,
+                                    "unregisted torrent",
+                                )),
+                            });
+                        }
+                    }
+                }
+                let pending_req = std::mem::take(&mut ios.pending_req);
+                self.torrents.remove(&info_hash);
+                for msg in pending_req {
+                    self.handle_msg(msg);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_piece_flushed(&mut self, key: GlobalPieceKey, result: Result<(), String>) {
+        if let Err(e) = result {
+            warn!("cache flush error for {key:?}: {e}");
+        }
+        self.stats.current.flushes += 1;
+
+        let ti = match self
+            .torrents
+            .get(&key.info_hash)
+            .expect("entry of flushing piece should exist")
+        {
+            (TorrentState::Registed(ti), _) => ti,
+            (TorrentState::Unregisting((_, ti)), _) => ti,
+        };
+        if let Some(fc) = &ti.flush_count2 {
+            fc.fetch_sub(1, Ordering::Relaxed);
+        }
+        self.maybe_do_all_file_op(key.info_hash);
+        self.handle_unregister_after(key.info_hash);
+
+        // The buffer may have been borrowed or written again since this
+        // flush started. Only its current state determines whether it is clean.
+        if matches!(self.cache.get(&key), Some(CacheEntry::Loaded(Some(p))) if !p.is_dirty()) {
+            self.assume_clear.insert(key);
+        }
+        self.load_pending_pieces();
+    }
+
+    /// Handles a file operation.
+    /// `flush_all` is evaluated once when the Fop message is handled. It
+    /// drops all cache-owned pieces in the requested range at that point; the
+    /// actual operation waits for those drop-triggered flushes and existing
+    /// I/O to finish.
+    fn handle_file_op(
+        &mut self,
+        info_hash: InfoHash,
+        op: Fop,
+        sender: oneshot::Sender<Result<FileOpID, &'static str>>,
+    ) {
+        let flush_range = match &op {
+            Fop::Rename {
+                begin,
+                end,
+                flush_all: true,
+                ..
+            } => Some((*begin, *end)),
+            _ => None,
+        };
+        match self.torrents.get_mut(&info_hash) {
+            Some((TorrentState::Unregisting(_), _)) => {
+                let _ = sender.send(Err("unregisting torrent"));
+            }
+            Some((TorrentState::Registed(_), IoState { pending_ops, .. })) => {
+                self.file_op_id += 1;
+                pending_ops.push((self.file_op_id, op));
+                let _ = sender.send(Ok(self.file_op_id));
+            }
+            None => {
+                let _ = sender.send(Err("untracked torrent"));
+                return;
+            }
+        };
+
+        if let Some((begin, end)) = flush_range {
+            self.drop_fop_related_dirty_pieces(info_hash, begin, end);
+        }
+        self.maybe_do_all_file_op(info_hash);
+    }
+
+    /// Drop all cache-owned pieces intersecting [begin, end). Their Drop
+    /// implementation submits the final buffer contents for write-back.
+    fn drop_fop_related_dirty_pieces(&mut self, info_hash: InfoHash, begin: u64, end: u64) {
+        if begin >= end {
+            return;
+        }
+        let (piece_size, last_piece_size, piece_total) = match self.torrents.get(&info_hash) {
+            Some((TorrentState::Registed(ti), _)) => {
+                (ti.piece_size, ti.last_piece_size, ti.piece_total)
+            }
+            Some((TorrentState::Unregisting((_, ti)), _)) => {
+                (ti.piece_size, ti.last_piece_size, ti.piece_total)
+            }
+            None => return,
+        };
+        let fop_range = (begin, end - begin);
+        let keys: Vec<_> = self
+            .cache
+            .iter()
+            .filter(|(key, _)| key.info_hash == info_hash)
+            .filter_map(|(key, entry)| {
+                if matches!(entry, CacheEntry::Loaded(Some(p)) if p.is_dirty()) {
+                    let piece_range = piece_range(piece_size, last_piece_size, piece_total, *key)?;
+                    ranges_overlap(piece_range, fop_range).then_some(*key)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for key in keys {
+            self.assume_clear.remove(&key);
+            self.cache.remove(&key);
+        }
+    }
+
+    /// Run queued file ops if the torrent's I/O barrier is clear, then replay
+    /// any piece requests that were deferred behind them.
+    fn maybe_do_all_file_op(&mut self, info_hash: InfoHash) {
+        match self.torrents.get_mut(&info_hash) {
+            Some((
+                t,
+                IoState {
+                    in_io,
+                    pending_ops,
+                    pending_req,
+                },
+            )) => {
+                let ti = match t {
+                    TorrentState::Registed(ti) => ti,
+                    TorrentState::Unregisting((_, ti)) => ti,
+                };
+
+                let all_flushed = if let Some(fc) = &ti.flush_count2 {
+                    fc.load(Ordering::Relaxed) == 0
+                } else {
+                    true
+                };
+
+                if all_flushed && *in_io == 0 {
+                    {
+                        let mut file = ti.back_file.lock().unwrap();
+                        for op in pending_ops.drain(0..) {
+                            match op {
+                                (
+                                    id,
+                                    Fop::Rename {
+                                        file_index,
+                                        to,
+                                        sender,
+                                        ..
+                                    },
+                                ) => {
+                                    let result = file.rename(file_index, to);
+                                    _ = sender.send(TmMsg::FileOpDone { id, result });
+                                }
+                            }
+                        }
+                    }
+                    for req in std::mem::take(pending_req) {
+                        self.handle_msg(req);
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+
     /// Swap old pieces out and new pieces in.
     /// Old pieces may not be frequently used, even if they are
     /// frequently used, sometimes they should give change to fewer used
@@ -759,10 +1031,15 @@ impl CacheManager {
         self.update_vacant_count();
     }
 
-    fn spawn_piece_read(&self, key: GlobalPieceKey) {
-        let info = match self.torrents.get(&key.info_hash) {
-            Some(TorrentState::Registed(i)) => i,
-            Some(TorrentState::Unregisting(_)) => {
+    fn spawn_piece_read(&mut self, key: GlobalPieceKey) {
+        let info = match self.torrents.get_mut(&key.info_hash) {
+            Some((TorrentState::Registed(ti), i)) => {
+                i.in_io += 1;
+                ti
+            }
+            Some((TorrentState::Unregisting(_), i)) => {
+                unreachable!("does this even happen?");
+                i.in_io += 1;
                 warn!(
                     "spawn_piece_read: torrent is unregisting for key {:?}",
                     key.index
@@ -940,6 +1217,40 @@ impl CacheManager {
     }
 }
 
+/// Absolute byte range `(offset, len)` covered by a sub-piece, or `None` if the
+/// key falls outside the torrent.
+// TODO: maybe remove option, those None cases should be unreachable
+fn piece_range(
+    piece_size: usize,
+    last_piece_size: usize,
+    piece_total: usize,
+    key: GlobalPieceKey,
+) -> Option<(u64, u64)> {
+    let piece_index = key.index.index() as usize;
+    if piece_index >= piece_total {
+        return None;
+    }
+    let piece_len = if piece_index + 1 == piece_total {
+        last_piece_size
+    } else {
+        piece_size
+    };
+    let in_piece_offset = key.index.in_piece_offset();
+    if in_piece_offset >= piece_len {
+        return None;
+    }
+    let offset = piece_index as u64 * piece_size as u64 + in_piece_offset as u64;
+    let len = (SUB_PIECE_SIZE as usize).min(piece_len - in_piece_offset) as u64;
+    Some((offset, len))
+}
+
+/// Whether two `(offset, len)` byte ranges intersect.
+fn ranges_overlap(a: (u64, u64), b: (u64, u64)) -> bool {
+    let a_end = a.0.saturating_add(a.1);
+    let b_end = b.0.saturating_add(b.1);
+    a.0 < b_end && b.0 < a_end
+}
+
 #[cfg(test)]
 mod test {
     use std::time::Duration;
@@ -967,7 +1278,7 @@ mod test {
     }
 
     // Collect all successful PieceBufReady messages currently available to the test.
-    fn drain_ready(rx: &mut mpsc::UnboundedReceiver<TmMsg>) -> Vec<(JointIndex, PieceLease)> {
+    fn drain_ready(rx: &mut UnboundedReceiver<TmMsg>) -> Vec<(JointIndex, PieceLease)> {
         let mut ready = Vec::new();
         while let Ok(msg) = rx.try_recv() {
             match msg {

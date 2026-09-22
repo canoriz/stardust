@@ -450,8 +450,6 @@ impl PieceBuf {
                 let offset = self.offset;
                 let ji = self.index;
                 let msg_sender = self.msg_sender.clone();
-                let cache_mgr_sender = self.cache_mgr_sender.clone();
-                let info_hash = self.info_hash;
 
                 // Create a cheap copy of buf, and implicitly make ourself read-only.
                 // Next time we write to ourself, we will clone the buf.
@@ -459,15 +457,6 @@ impl PieceBuf {
                 tokio::task::spawn_blocking(move || {
                     let r = flush_buf_force(buf, offset, ji, s, f, false);
                     result_callback(&r);
-                    if let Some(sender) = cache_mgr_sender {
-                        let _ = sender.send(CacheMsg::PieceFlushed {
-                            key: GlobalPieceKey { info_hash, index: ji },
-                            result: r
-                                .as_ref()
-                                .map_err(|e| format!("PieceBuf::flush error index {ji:?} {e:?}"))
-                                .map(|_| ()),
-                        });
-                    }
                     if let Some(sender) = msg_sender {
                         let _ = sender.send(TmMsg::FlushComplete(r));
                     }

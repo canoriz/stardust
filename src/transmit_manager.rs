@@ -8,6 +8,7 @@ use crate::connection_manager::{
     ConnectionManagerHandle, CtrlOfRecv, CtrlOfSend, CtrlOfSend as ConnMsg, ReceivedBlocks,
 };
 use crate::dht::DHT;
+use crate::file_tracker::FileTracker;
 use crate::hasher::HashState;
 use crate::metadata::{self, Magnet, Metadata};
 use crate::picker::{BlockPicker, BlockPickerDump, PieceState, RarestPicker};
@@ -15,7 +16,7 @@ use crate::protocol::{
     self, Capability, Conn, ExtendedMetadata, ExtendedMsg, ExtendedPex, HandshakeOption, PexFlag,
     Piece, Request,
 };
-use crate::tracker;
+use crate::tracker::{self, AnnounceResp};
 use bytes::BytesMut;
 
 use bandwidth_mode::BandwidthMode;
@@ -159,6 +160,18 @@ pub(crate) enum Msg {
     CheckFile(oneshot::Sender<bool>),
     ChangeState(RunningCmd, oneshot::Sender<()>),
     WaitDownloaded(oneshot::Sender<watch::Receiver<bool>>),
+
+    FileOpDone {
+        id: u64,
+        result: io::Result<()>,
+    },
+}
+
+type FileIndex = usize;
+enum PieceVerifyResult {
+    Pass(Vec<FileIndex>),
+    Fail,
+    Skip,
 }
 
 #[derive(Debug, Clone)]
@@ -646,6 +659,7 @@ pub struct Downloading {
     pub metadata: Arc<Metadata>,
 
     pub block_picker: BlockPicker,
+    pub file_tracker: FileTracker,
     pub cache_handle: CacheManagerHandle,
     pub hasher: HashMap<u32, HashState<Sha1>>,
 }
@@ -998,10 +1012,11 @@ impl TransmitWorker {
             piece_picker,
             time::Duration::from_secs(120),
         );
-
         for i in 0..block_picker.n_pieces() {
             block_picker.select(i as u32, true);
         }
+
+        let file_tracker = FileTracker::new(&m);
 
         let back_file = Arc::new(std::sync::Mutex::new(
             // TODO: maybe only send metadata to cache manager, and let cache manager create back file when needed?
@@ -1019,6 +1034,7 @@ impl TransmitWorker {
         Downloading {
             metadata: m,
             block_picker,
+            file_tracker,
             cache_handle: cache_handle.clone(),
             hasher: HashMap::new(),
         }
@@ -1188,25 +1204,7 @@ impl TransmitWorker {
                 self.announce_manager.send(m);
                 Ok(())
             }
-            Msg::AnnounceFinish(Ok(a)) => {
-                // self.handle_announce(
-                //     a.peers
-                //         .into_iter()
-                //         .filter_map(|p| (p.ip).parse().map(|ip: IpAddr| (ip, p.port).into()).ok())
-                //         .collect(),
-                // );
-                // TODO
-                info!("announce finish, get peers {:?}", a.peers);
-                for p in a.peers.into_iter().chain(a.peers6) {
-                    // TODO: store peers in a map, if cannot connect this time
-                    // try re-connect later
-                    // TODO: if we already connected to a lot of active peers,
-                    // maybe store available peers in a pool, connect to them when
-                    // running out of peers
-                    self.handle_new_discovered_peer(to_canonical_addr(p.addr));
-                }
-                Ok(())
-            }
+            Msg::AnnounceFinish(Ok(a)) => self.handle_announce(a),
             Msg::AnnounceFinish(Err(e)) => {
                 info!("announce error {}", e);
                 Ok(())
@@ -1327,6 +1325,9 @@ impl TransmitWorker {
                 Ok(())
             }
             Msg::PieceBufReady { index, buf } => self.handle_piecebuf_ready(index, buf),
+            Msg::FileOpDone { id, result } => {
+                todo!()
+            }
             Msg::RequestMetadata(sender) => {
                 self.handle_request_metadata(sender);
                 Ok(())
@@ -1582,14 +1583,17 @@ impl TransmitWorker {
         }
     }
 
-    fn handle_announce(&mut self, addrs: Vec<SocketAddr>) {
-        todo!("use a connect tool to convert SocketAddr to BTConn");
-        // for addr in addrs {
-        //     if self.connected_peers.get(&addr).is_none() {
-        //         self.connected_peers.insert(addr, ());
-        //         tokio::spawn(connect_peer(self.self_handle.clone(), addr));
-        //     }
-        // }
+    fn handle_announce(&mut self, a: AnnounceResp) -> io::Result<()> {
+        info!("announce finish, get peers {:?}", a.peers);
+        for p in a.peers.into_iter().chain(a.peers6) {
+            // TODO: store peers in a map, if cannot connect this time
+            // try re-connect later
+            // TODO: if we already connected to a lot of active peers,
+            // maybe store available peers in a pool, connect to them when
+            // running out of peers
+            self.handle_new_discovered_peer(to_canonical_addr(p.addr));
+        }
+        Ok(())
     }
 
     fn verify_piece(index: usize, metadata: &Metadata, hasher: HashState<Sha1>) -> bool {
@@ -1680,7 +1684,7 @@ impl TransmitWorker {
         ji: JointIndex,
         piecebuf: &mut PieceLease,
         force_check: bool,
-    ) -> io::Result<Option<bool>> {
+    ) -> io::Result<PieceVerifyResult> {
         let Downloading { block_picker, .. } = match &self.torrent_state {
             TorrentState::Metadata(d) => d,
             TorrentState::Fetching(_) => panic!("should not receive piece before metadata"),
@@ -1693,19 +1697,20 @@ impl TransmitWorker {
         // bypasses them.
         let should_hash = block_picker.have_sub(ji) && !block_picker.have(ji.index());
         if !force_check && !should_hash {
-            return Ok(None);
+            return Ok(PieceVerifyResult::Skip);
         }
 
         info!("sub piece of {:?} received, hashing...", ji);
         let full_hashed = self.advance_hash(ji, piecebuf, force_check)?;
 
         if !full_hashed {
-            return Ok(None);
+            return Ok(PieceVerifyResult::Skip);
         }
 
         let Downloading {
             metadata,
             block_picker,
+            file_tracker,
             hasher: piece_hasher,
             ..
         } = match self.torrent_state {
@@ -1716,11 +1721,12 @@ impl TransmitWorker {
         if Self::verify_piece(ji.index() as usize, metadata, hasher) {
             info!("piece {} verify pass", ji.index());
             block_picker.piece_verified(ji.index() as u32, true);
-            Ok(Some(true))
+            let completed_files = file_tracker.piece_verified(ji.index() as u32);
+            Ok(PieceVerifyResult::Pass(completed_files))
         } else {
             info!("piece {} verify failed", ji.index());
             self.invalidate_piece(ji.index());
-            Ok(Some(false))
+            Ok(PieceVerifyResult::Fail)
         }
     }
 
@@ -2308,13 +2314,18 @@ impl TransmitWorker {
                 };
                 info!("sub piece {ji:?} piece loaded",);
                 match self.handle_sub_piece_received(ji, &mut lease, is_checking)? {
-                    Some(passed) => {
+                    PieceVerifyResult::Fail => {
                         if is_checking {
-                            self.handle_checkfile_on_piece_verified(ji.index(), passed)?;
-                            if passed && !had_piece {
+                            self.handle_checkfile_on_piece_verified(ji.index(), false)?;
+                        }
+                    }
+                    PieceVerifyResult::Pass(_files) => {
+                        if is_checking {
+                            self.handle_checkfile_on_piece_verified(ji.index(), true)?;
+                            if !had_piece {
                                 self.broadcast_have(ji.index() as u32);
                             }
-                        } else if passed {
+                        } else {
                             self.broadcast_have(ji.index() as u32);
                             if self.is_downloaded() {
                                 if matches!(
@@ -2328,7 +2339,7 @@ impl TransmitWorker {
                             }
                         }
                     }
-                    None => {}
+                    PieceVerifyResult::Skip => {}
                 }
                 Ok(())
             }

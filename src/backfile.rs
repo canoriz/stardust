@@ -70,6 +70,12 @@ pub trait Access: Sized + Sync {
         P: AsRef<Path>;
     fn write_all_at(&mut self, buf: &[u8], offset: u64) -> Result<()>;
     fn read_exact_at(&mut self, buf: &mut [u8], offset: u64) -> Result<()>;
+
+    // Rename a file at closed state
+    fn rename<P>(from: P, to: P) -> Result<()>
+    where
+        P: AsRef<Path>;
+
     fn metadata(&self) -> Result<FileMetadata>;
 }
 
@@ -80,6 +86,10 @@ where
     fn open_dyn(path: &Path, len: u64) -> Result<Box<dyn FileAt + Send>> {
         let fh = Self::open(path, len)?;
         Ok(Box::new(fh))
+    }
+
+    fn rename_dyn(from: &Path, to: &Path) -> Result<()> {
+        Self::rename(from, to)
     }
 }
 
@@ -112,9 +122,9 @@ impl<A: Access> FileAt for A {
     }
 }
 
-fn open_fn<A: AccessDyn>() -> fn(&Path, u64) -> Result<Box<dyn FileAt + Send>> {
-    A::open_dyn
-}
+// fn open_fn<A: AccessDyn>() -> fn(&Path, u64) -> Result<Box<dyn FileAt + Send>> {
+//     A::open_dyn
+// }
 
 impl Access for NormalFile {
     fn open<P>(path: P, len: u64) -> Result<Self>
@@ -201,6 +211,13 @@ impl Access for NormalFile {
         r
     }
 
+    fn rename<P>(from: P, to: P) -> Result<()>
+    where
+        P: AsRef<Path>,
+    {
+        std::fs::rename(from, to)
+    }
+
     fn metadata(&self) -> Result<FileMetadata> {
         let meta = self.file.metadata()?;
         Ok(FileMetadata { len: meta.len() })
@@ -220,6 +237,13 @@ impl Access for VoidFile {
     }
 
     fn read_exact_at(&mut self, _buf: &mut [u8], _offset: u64) -> Result<()> {
+        Ok(())
+    }
+
+    fn rename<P>(from: P, to: P) -> Result<()>
+    where
+        P: AsRef<Path>,
+    {
         Ok(())
     }
 
@@ -265,7 +289,8 @@ where
                     last += f.length;
                 }
                 BackFile {
-                    opener: open_fn::<T>(),
+                    opener: T::open_dyn,
+                    renamer: T::rename_dyn,
                     file_range,
                 }
             }
@@ -277,7 +302,8 @@ where
                     len: u64::MAX,
                 }];
                 BackFile {
-                    opener: open_fn::<T>(),
+                    opener: T::open_dyn,
+                    renamer: T::rename_dyn,
                     file_range,
                 }
             }
@@ -287,6 +313,7 @@ where
 
 pub struct BackFile {
     opener: fn(path: &Path, len: u64) -> Result<Box<dyn FileAt + Send>>,
+    renamer: fn(from: &Path, to: &Path) -> Result<()>,
     file_range: Vec<FileRange>,
 }
 
@@ -313,23 +340,7 @@ impl BackFile {
     fn find_files(&mut self, offset: u64, buf: &[u8]) -> impl Iterator<Item = FileOp<'_>> {
         let len = buf.len() as u64;
 
-        // find first i that does not satisfy cond, if all i satisfy, return len()
-        // invariant l <= not satisfy < r
-        fn partition(fr: &[FileRange], cond: impl Fn(&FileRange) -> bool) -> usize {
-            let mut r = fr.len();
-            let mut l = 0;
-            while l < r {
-                let mid = (l + r) / 2;
-                let f = &fr[mid];
-                if cond(f) {
-                    l = mid + 1;
-                } else {
-                    r = mid
-                }
-            }
-            l
-        }
-
+        use crate::file_util::partition;
         let lower = partition(&self.file_range, |f| f.begin + f.len <= offset);
         let upper = lower + partition(&self.file_range[lower..], |f| offset + len > f.begin);
         self.file_range[lower..upper]
@@ -409,6 +420,32 @@ impl BackFile {
             }
         }
         Ok(())
+    }
+
+    /// Rename the file at `index`, closing its open handle first, and update
+    /// the tracked path on success.
+    pub fn rename(&mut self, index: usize, to: String) -> Result<()> {
+        if index >= self.file_range.len() {
+            todo!() // return errkind other, out of range
+        }
+        let f = &mut self.file_range[index];
+        let from = f.path.as_ref();
+        let renamer = self.renamer;
+        let r = if f.handle.is_none() {
+            renamer(from, to.as_ref())
+        } else {
+            {
+                // drop closes the file
+                f.handle.take();
+            }
+            renamer(from, to.as_ref())
+        };
+        if r.is_ok() {
+            f.path = to;
+            r
+        } else {
+            r
+        }
     }
 
     #[cfg(test)]
