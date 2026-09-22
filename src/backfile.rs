@@ -340,9 +340,10 @@ impl BackFile {
     fn find_files(&mut self, offset: u64, buf: &[u8]) -> impl Iterator<Item = FileOp<'_>> {
         let len = buf.len() as u64;
 
-        use crate::file_util::partition;
-        let lower = partition(&self.file_range, |f| f.begin + f.len <= offset);
-        let upper = lower + partition(&self.file_range[lower..], |f| offset + len > f.begin);
+        let lower = self
+            .file_range
+            .partition_point(|f| f.begin + f.len <= offset);
+        let upper = lower + self.file_range[lower..].partition_point(|f| offset + len > f.begin);
         self.file_range[lower..upper]
             .iter_mut()
             .filter_map(move |f| {
@@ -391,31 +392,17 @@ impl BackFile {
             );
 
             if r.file.handle.is_none() {
-                r.file.handle = match opener(r.file.path.as_ref(), r.file.len) {
-                    Err(e) => {
-                        // TODO: Propagate this error. Returning Ok after a
-                        // failed open leaves the newly allocated PieceBuf
-                        // zero-filled, which can hide missing on-disk data for
-                        // blocks the restored BlockPicker believes it owns.
-                        warn!("error open file {} {e:?}", r.file.path);
-                        None
-                    }
-                    Ok(fh) => Some(fh),
-                };
+                r.file.handle = Some(opener(r.file.path.as_ref(), r.file.len)?);
             }
 
             if let Some(ref mut fh) = r.file.handle {
-                // TODO: FIXME: one error should not trigger fn call error
                 let meta = fh.file_metadata()?;
                 if r.offset < meta.len {
                     let len_limit = ((meta.len - r.offset).min(r.buf_len as u64)) as usize;
-
-                    if r.offset < meta.len {
-                        fh.file_read_exact_at(
-                            &mut buf[r.buf_begin..r.buf_begin + len_limit],
-                            r.offset,
-                        )?;
-                    }
+                    fh.file_read_exact_at(
+                        &mut buf[r.buf_begin..r.buf_begin + len_limit],
+                        r.offset,
+                    )?;
                 }
             }
         }
@@ -426,7 +413,10 @@ impl BackFile {
     /// the tracked path on success.
     pub fn rename(&mut self, index: usize, to: String) -> Result<()> {
         if index >= self.file_range.len() {
-            todo!() // return errkind other, out of range
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("rename index {index} out of range (len {})", self.file_range.len()),
+            ));
         }
         let f = &mut self.file_range[index];
         let from = f.path.as_ref();

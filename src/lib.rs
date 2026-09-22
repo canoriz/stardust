@@ -18,7 +18,6 @@ pub(crate) mod torrent_manager;
 pub(crate) mod tracker;
 pub(crate) mod transmit_manager;
 
-mod file_util;
 mod hasher;
 mod helper;
 
