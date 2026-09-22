@@ -72,6 +72,7 @@ fn restore_worker(
         state: TorrentStateDump::Metadata {
             metadata: meta,
             picker: picker.dump(),
+            file_tracker: None,
         },
         peers: vec![],
         announce_urls: vec![],

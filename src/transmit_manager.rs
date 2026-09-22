@@ -2,7 +2,7 @@ use crate::announce_manager::{self, AnnounceManagerHandle};
 use crate::backfile::{BackFile, NormalFile, VoidFile};
 use crate::bandwidth::Bandwidth;
 use crate::buffer_pool::{BlockBuf, BufferPool};
-use crate::cache::cache_manager::{CacheManagerHandle, GlobalPieceKey, PieceLease};
+use crate::cache::cache_manager::{CacheManagerHandle, FileOpID, Fop, GlobalPieceKey, PieceLease};
 use crate::cache::simple_buffer::{FlushErr, JointIndex, SUB_PIECE_SIZE};
 use crate::connection_manager::{
     ConnectionManagerHandle, CtrlOfRecv, CtrlOfSend, CtrlOfSend as ConnMsg, ReceivedBlocks,
@@ -512,6 +512,8 @@ pub enum TorrentStateDump {
     Metadata {
         metadata: metadata::Metadata,
         picker: BlockPickerDump,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        file_tracker: Option<FileTracker>,
         // TODO: do we need to store hash state here?
     },
     Fetching(FetchingMetadata),
@@ -779,6 +781,7 @@ impl TransmitWorker {
             TorrentState::Metadata(mut d) => TorrentStateDump::Metadata {
                 metadata: d.metadata.as_ref().clone(),
                 picker: d.block_picker.dump(),
+                file_tracker: Some(d.file_tracker.clone()),
             },
             TorrentState::Fetching(f) => TorrentStateDump::Fetching(f.clone()),
         };
@@ -787,6 +790,56 @@ impl TransmitWorker {
             state,
             announce_urls: self.announce_urls.clone(),
             running_state: self.running_state.into(),
+        }
+    }
+
+    /// Before entering the main loop, rename every not-yet-complete file to
+    /// `<final>.part`, then wait for each rename to finish. Completed files keep
+    /// their final name. The cache holds no dirty pieces at startup, so renames
+    /// need no flush (`flush_all: false`).
+    async fn startup_rename_incomplete_files(&mut self) {
+        let (metadata, incomplete) = {
+            let TorrentState::Metadata(d) = &self.torrent_state else {
+                return;
+            };
+            (d.metadata.clone(), d.file_tracker.incomplete_files())
+        };
+        if incomplete.is_empty() {
+            return;
+        }
+        let info_hash = self.info_hash;
+        let files = metadata.files();
+        let mut ids: HashSet<FileOpID> = HashSet::new();
+        for index in incomplete {
+            let final_path = files[index].path.join("/");
+            let fop = Fop::Rename {
+                file_index: index,
+                to: format!("{final_path}.part"),
+                begin: 0,
+                end: 0,
+                flush_all: false,
+                sender: self.self_handle.sender.clone(),
+            };
+            match self.cache_handle.send_file_op(info_hash, fop).await {
+                Ok(id) => {
+                    ids.insert(id);
+                }
+                Err(e) => warn!("startup rename: send_file_op failed for file {index}: {e}"),
+            }
+        }
+        while !ids.is_empty() {
+            match self.receiver.recv().await {
+                Some(Msg::FileOpDone { id, result }) if ids.contains(&id) => {
+                    ids.remove(&id);
+                    if let Err(e) = result {
+                        warn!("startup rename: file op {id} failed: {e}");
+                    }
+                }
+                Some(other) => {
+                    let _ = self.handle_msg(other);
+                }
+                None => break,
+            }
         }
     }
 }
@@ -874,13 +927,14 @@ impl TransmitWorker {
     ) -> Self {
         let pending_flushes = Arc::new(AtomicU32::new(0));
         let (info_hash, torrent_state) = match dump.state {
-            TorrentStateDump::Metadata { metadata, picker } => {
+            TorrentStateDump::Metadata { metadata, picker, file_tracker } => {
                 let info_hash = metadata.info_hash;
                 let mut downloading = Self::metadata_into_downloading(
                     metadata,
                     &cache_handle,
                     pending_flushes.clone(),
                     cmd_sender.clone(),
+                    file_tracker,
                 );
                 downloading.block_picker.load_progress(picker);
                 (info_hash, TorrentState::Metadata(downloading))
@@ -950,11 +1004,13 @@ impl TransmitWorker {
         let (info_hash, state) = match t {
             TorrentTask::Torrent(m) => {
                 let info_hash = m.info_hash;
+                let file_tracker = FileTracker::new(&m);
                 let state = TorrentState::Metadata(Self::metadata_into_downloading(
                     m,
                     &cache_handle,
                     pending_flushes.clone(),
                     cmd_sender.clone(),
+                    Some(file_tracker),
                 ));
                 (info_hash, state)
             }
@@ -1001,6 +1057,7 @@ impl TransmitWorker {
         cache_handle: &CacheManagerHandle,
         pending_flushes: Arc<AtomicU32>,
         msg_sender: mpsc::UnboundedSender<Msg>,
+        file_tracker: Option<FileTracker>,
     ) -> Downloading {
         let m = Arc::new(m);
         let piece_size = m.regular_piece_size() as u32;
@@ -1016,7 +1073,17 @@ impl TransmitWorker {
             block_picker.select(i as u32, true);
         }
 
-        let file_tracker = FileTracker::new(&m);
+        // If not provided (fresh download), reconstruct from the block picker's
+        // verified pieces so a restored/loaded picker yields the right per-file state.
+        let file_tracker = file_tracker.unwrap_or_else(|| {
+            let mut ft = FileTracker::new(&m);
+            for i in 0..block_picker.n_pieces() as u32 {
+                if block_picker.have(i) {
+                    ft.piece_verified(i);
+                }
+            }
+            ft
+        });
 
         let back_file = Arc::new(std::sync::Mutex::new(
             // TODO: maybe only send metadata to cache manager, and let cache manager create back file when needed?
@@ -2522,11 +2589,13 @@ impl TransmitWorker {
             } => match &mut self.torrent_state {
                 TorrentState::Fetching(f) => {
                     if let Some(m) = f.receive_metadata_part(piece, data, total_size) {
+                        let file_tracker = FileTracker::new(&m);
                         let mut downloading = Self::metadata_into_downloading(
                             m,
                             &self.cache_handle,
                             self.pending_flushes.clone(),
                             self.self_handle.sender.clone(),
+                            Some(file_tracker),
                         );
                         let piece_picker = &mut downloading.block_picker;
                         for (addr, pc) in &mut self.connected_peers {
@@ -2678,6 +2747,10 @@ pub(crate) async fn run_transmit_worker(
     let mut ticker = tokio::time::interval(time::Duration::from_millis(1000));
     let mut dht_ticker = tokio::time::interval(time::Duration::from_secs(60));
     let mut pex_ticker = tokio::time::interval(time::Duration::from_secs(30));
+
+    // Rename not-yet-complete files to `<final>.part` before serving the loop.
+    transmit.startup_rename_incomplete_files().await;
+
     loop {
         // TODO: lets use notify?
         tokio::select! {

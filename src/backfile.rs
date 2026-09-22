@@ -76,6 +76,11 @@ pub trait Access: Sized + Sync {
     where
         P: AsRef<Path>;
 
+    // Whether a file exists at `path` on the backing store.
+    fn exists<P>(path: P) -> bool
+    where
+        P: AsRef<Path>;
+
     fn metadata(&self) -> Result<FileMetadata>;
 }
 
@@ -90,6 +95,10 @@ where
 
     fn rename_dyn(from: &Path, to: &Path) -> Result<()> {
         Self::rename(from, to)
+    }
+
+    fn exists_dyn(path: &Path) -> bool {
+        Self::exists(path)
     }
 }
 
@@ -218,6 +227,13 @@ impl Access for NormalFile {
         std::fs::rename(from, to)
     }
 
+    fn exists<P>(path: P) -> bool
+    where
+        P: AsRef<Path>,
+    {
+        std::fs::metadata(path).is_ok()
+    }
+
     fn metadata(&self) -> Result<FileMetadata> {
         let meta = self.file.metadata()?;
         Ok(FileMetadata { len: meta.len() })
@@ -245,6 +261,13 @@ impl Access for VoidFile {
         P: AsRef<Path>,
     {
         Ok(())
+    }
+
+    fn exists<P>(_path: P) -> bool
+    where
+        P: AsRef<Path>,
+    {
+        false
     }
 
     fn metadata(&self) -> Result<FileMetadata> {
@@ -291,6 +314,7 @@ where
                 BackFile {
                     opener: T::open_dyn,
                     renamer: T::rename_dyn,
+                    exists: T::exists_dyn,
                     file_range,
                 }
             }
@@ -304,6 +328,7 @@ where
                 BackFile {
                     opener: T::open_dyn,
                     renamer: T::rename_dyn,
+                    exists: T::exists_dyn,
                     file_range,
                 }
             }
@@ -314,6 +339,7 @@ where
 pub struct BackFile {
     opener: fn(path: &Path, len: u64) -> Result<Box<dyn FileAt + Send>>,
     renamer: fn(from: &Path, to: &Path) -> Result<()>,
+    exists: fn(path: &Path) -> bool,
     file_range: Vec<FileRange>,
 }
 
@@ -418,23 +444,28 @@ impl BackFile {
                 format!("rename index {index} out of range (len {})", self.file_range.len()),
             ));
         }
-        let f = &mut self.file_range[index];
-        let from = f.path.as_ref();
         let renamer = self.renamer;
-        let r = if f.handle.is_none() {
+        let exists = self.exists;
+        let f = &mut self.file_range[index];
+        {
+            // drop closes the file so the rename can proceed
+            f.handle.take();
+        }
+        let from: &Path = f.path.as_ref();
+        // Only rename on disk if the source exists; otherwise the logical file
+        // was never written, so just switch the tracked path for future writes.
+        // This avoids depending on the renamer's specific error kind.
+        let r = if exists(from) {
             renamer(from, to.as_ref())
         } else {
-            {
-                // drop closes the file
-                f.handle.take();
-            }
-            renamer(from, to.as_ref())
+            Ok(())
         };
-        if r.is_ok() {
-            f.path = to;
-            r
-        } else {
-            r
+        match r {
+            Ok(()) => {
+                f.path = to;
+                Ok(())
+            }
+            Err(e) => Err(e),
         }
     }
 

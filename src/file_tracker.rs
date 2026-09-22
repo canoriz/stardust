@@ -1,11 +1,14 @@
 use crate::metadata::Metadata;
+use serde::{Deserialize, Serialize};
 
 /// Tracks which files have been fully downloaded by counting verified pieces
 /// against each file's piece span.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileTracker {
     files: Vec<FileRange>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct FileRange {
     /// first piece index overlapping this file (inclusive)
     p_start: u64,
@@ -59,6 +62,15 @@ impl FileTracker {
             }
         }
         completed
+    }
+
+    /// Indices of files not yet fully downloaded (`remaining > 0`).
+    pub fn incomplete_files(&self) -> Vec<usize> {
+        self.files
+            .iter()
+            .enumerate()
+            .filter_map(|(i, f)| (f.remaining > 0).then_some(i))
+            .collect()
     }
 }
 
