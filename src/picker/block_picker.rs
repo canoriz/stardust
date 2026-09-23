@@ -7,7 +7,9 @@ use super::{
 };
 use crate::{
     cache::simple_buffer::{JointIndex, POOL_SIZE, SUB_PIECE_SIZE},
+    file_tracker::FileTracker,
     math_helper::piece_total_and_last_size,
+    metadata::Metadata,
     protocol::Request,
 };
 use std::{
@@ -491,6 +493,10 @@ pub struct BlockPicker {
     no_response_timeout: time::Duration,
 
     endgame: bool,
+
+    // tracks per-file completion by counting verified pieces against each
+    // file's piece span; queried for the startup `.part` rename
+    file_tracker: FileTracker,
 }
 
 /// if some piece or sub piece is completed
@@ -503,6 +509,31 @@ pub struct PieceComplete {
 
 impl BlockPicker {
     pub fn new(
+        meta: &Metadata,
+        piece_picker: Box<Picker>,
+        no_response_timeout: time::Duration,
+    ) -> Self {
+        let total_size = meta.len();
+        let piece_size = meta.regular_piece_size();
+        let (n, last_length) = piece_total_and_last_size(total_size, piece_size);
+        Self {
+            n,
+            piece_size,
+            last_length,
+            piece_picker,
+            requesting: BTreeMap::new(),
+            receiving: BTreeMap::new(),
+            prev_time_check: time::Instant::now(),
+            no_response_timeout,
+            endgame: false,
+            file_tracker: FileTracker::new(meta),
+        }
+    }
+
+    /// Test-only constructor for a single logical file spanning `total_size`,
+    /// avoiding the need to build a full `Metadata`.
+    #[cfg(test)]
+    pub fn new_single_file(
         total_size: u64,
         piece_size: usize,
         piece_picker: Box<Picker>,
@@ -519,6 +550,7 @@ impl BlockPicker {
             prev_time_check: time::Instant::now(),
             no_response_timeout,
             endgame: false,
+            file_tracker: FileTracker::from_lengths(piece_size as u64, [total_size]),
         }
     }
 
@@ -1122,11 +1154,27 @@ impl BlockPicker {
         }
     }
 
-    /// Call when some piece is verified
-    pub fn piece_verified(&mut self, index: u32, success: bool) {
+    /// Call when some piece is verified (`success = true`) or invalidated
+    /// (`success = false`). Reconciles per-file completion against the piece's
+    /// actual verified state so the file tracker is never double-counted, and
+    /// returns the indices of files that just became complete.
+    pub fn piece_verified(&mut self, index: u32, success: bool) -> Vec<usize> {
+        let had = self.have(index);
         self.receiving.remove(&index);
         self.requesting.remove(&index);
         self.piece_picker.set_have(index, success);
+        match (had, success) {
+            // genuine transitions drive the tracker exactly once
+            (false, true) => self.file_tracker.piece_verified(index, true),
+            (true, false) => self.file_tracker.piece_verified(index, false),
+            // no real change: don't touch the tracker
+            _ => vec![],
+        }
+    }
+
+    /// Indices of files not yet fully downloaded.
+    pub fn incomplete_files(&self) -> Vec<usize> {
+        self.file_tracker.incomplete_files()
     }
 
     /// Mark blocks as `NotRequested` if they are `Requested` and did not respond
@@ -1288,6 +1336,15 @@ impl BlockPicker {
         for idx in to_return {
             self.requesting.remove(&idx);
             self.piece_picker.set_have(idx, false);
+        }
+
+        // Rebuild the file tracker from the restored have-state; it is derived
+        // state and is not part of the dump.
+        self.file_tracker.reset();
+        for i in 0..self.n as u32 {
+            if self.have(i) {
+                self.file_tracker.piece_verified(i, true);
+            }
         }
     }
 }
@@ -1821,7 +1878,12 @@ mod test {
         const PIECE_SIZE: usize = 16384 * 10;
         const TOTAL_SIZE: usize = 16384 * 10 * 10 + 1500;
         let p = Box::new(RarestPicker::new(TOTAL_SIZE as u64, PIECE_SIZE));
-        let mut b = BlockPicker::new(TOTAL_SIZE as u64, PIECE_SIZE, p, time::Duration::from_secs(10));
+        let mut b = BlockPicker::new_single_file(
+            TOTAL_SIZE as u64,
+            PIECE_SIZE,
+            p,
+            time::Duration::from_secs(10),
+        );
         b.peer_add(PEER1, PieceState::HaveAll);
         b.peer_add(
             PEER2,
@@ -2135,7 +2197,12 @@ mod test {
         use crate::picker::RarestPicker;
         let total_size = n_pieces * piece_size;
         let p = Box::new(RarestPicker::new(total_size as u64, piece_size));
-        let mut bp = BlockPicker::new(total_size as u64, piece_size, p, time::Duration::from_secs(10));
+        let mut bp = BlockPicker::new_single_file(
+            total_size as u64,
+            piece_size,
+            p,
+            time::Duration::from_secs(10),
+        );
 
         let mut peers = Vec::new();
         for i in 0..n_peers {

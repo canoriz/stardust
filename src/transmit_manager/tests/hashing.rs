@@ -42,8 +42,7 @@ fn metadata() -> Metadata {
 // Create a block picker with the test piece selected for download.
 fn picker(meta: &Metadata) -> BlockPicker {
     let mut picker = BlockPicker::new(
-        meta.len(),
-        meta.regular_piece_size(),
+        meta,
         Box::new(RarestPicker::new(meta.len(), meta.regular_piece_size())),
         Duration::from_secs(120),
     );
@@ -72,7 +71,6 @@ fn restore_worker(
         state: TorrentStateDump::Metadata {
             metadata: meta,
             picker: picker.dump(),
-            file_tracker: None,
         },
         peers: vec![],
         announce_urls: vec![],
@@ -175,7 +173,10 @@ async fn cleanup(mut worker: TransmitWorker, cache: tokio::task::JoinHandle<()>)
     cache.abort();
     let _ = cache.await;
     drop(worker);
-    std::fs::remove_file(path).unwrap();
+    // Incomplete files are renamed to `<final>.part` at worker construction, so
+    // clean up whichever name is present.
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path}.part"));
 }
 
 // Verify that restore rebuilds the hasher to the offset after received sub-piece 0.
@@ -469,7 +470,9 @@ async fn force_check_rejects_corrupt_disk_data_with_stale_hasher() {
     let path = downloading_state(&mut worker).metadata.files[0].path[0].clone();
     let mut corrupt = vec![0x5a; 2 * SUB_PIECE_SIZE as usize];
     corrupt[..SUB_PIECE_SIZE as usize].fill(0x33);
-    std::fs::write(path, corrupt).unwrap();
+    // The incomplete file was renamed to `<final>.part` at construction, so
+    // corrupt the backing `.part` file the backfile actually reads.
+    std::fs::write(format!("{path}.part"), corrupt).unwrap();
     let mut stale_hasher = HashState::new(Sha1::new());
     stale_hasher
         .write(&vec![0x5a; SUB_PIECE_SIZE as usize])

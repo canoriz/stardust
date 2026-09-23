@@ -1,14 +1,13 @@
 use crate::metadata::Metadata;
-use serde::{Deserialize, Serialize};
 
 /// Tracks which files have been fully downloaded by counting verified pieces
 /// against each file's piece span.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct FileTracker {
     files: Vec<FileRange>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 struct FileRange {
     /// first piece index overlapping this file (inclusive)
     p_start: u64,
@@ -24,7 +23,7 @@ impl FileTracker {
         Self::from_lengths(piece_size, meta.files().iter().map(|f| f.length))
     }
 
-    fn from_lengths(piece_size: u64, lengths: impl IntoIterator<Item = u64>) -> Self {
+    pub(crate) fn from_lengths(piece_size: u64, lengths: impl IntoIterator<Item = u64>) -> Self {
         let mut files = vec![];
         let mut begin = 0u64;
         for len in lengths {
@@ -41,9 +40,14 @@ impl FileTracker {
         Self { files }
     }
 
-    /// `index` piece is verified.
-    /// Returns indices of files that just became complete.
-    pub fn piece_verified(&mut self, index: u32) -> Vec<usize> {
+    /// Apply a piece's verified-state change to every file overlapping `index`.
+    /// `verified = true` marks the piece done (decrements each file's outstanding
+    /// count, returning files that just reached 0); `verified = false` undoes it
+    /// (increments the count). The change is UNCONDITIONAL: the caller
+    /// (`BlockPicker`) consults the piece's actual verified state and only calls
+    /// on a real transition, so the tracker never double-counts.
+    /// Returns indices of files that just became complete (empty when reverting).
+    pub fn piece_verified(&mut self, index: u32, verified: bool) -> Vec<usize> {
         let index = index as u64;
         let mut completed = vec![];
         // files are sorted by p_start (and p_end) ascending, so the files
@@ -54,14 +58,24 @@ impl FileTracker {
             if f.p_start > index {
                 break;
             }
-            if f.remaining > 0 {
+            if verified {
                 f.remaining -= 1;
                 if f.remaining == 0 {
                     completed.push(i);
                 }
+            } else {
+                f.remaining += 1;
             }
         }
         completed
+    }
+
+    /// Reset every file to fully-incomplete (`remaining = full span`). Used
+    /// before replaying verified pieces when restoring picker progress.
+    pub fn reset(&mut self) {
+        for f in &mut self.files {
+            f.remaining = f.p_end - f.p_start;
+        }
     }
 
     /// Indices of files not yet fully downloaded (`remaining > 0`).
@@ -81,7 +95,7 @@ mod tests {
     fn verify_all(t: &mut FileTracker, pieces: &[u32]) -> Vec<usize> {
         let mut done = vec![];
         for &p in pieces {
-            done.extend(t.piece_verified(p));
+            done.extend(t.piece_verified(p, true));
         }
         done
     }
@@ -90,7 +104,7 @@ mod tests {
     fn single_file_one_piece() {
         // piece_size=10, one file of 10 bytes -> piece [0,1)
         let mut t = FileTracker::from_lengths(10, [10]);
-        assert!(t.piece_verified(0).is_empty() == false);
+        assert!(t.piece_verified(0, true).is_empty() == false);
     }
 
     #[test]
@@ -98,16 +112,16 @@ mod tests {
         // piece_size=10. file0=[0,15) pieces [0,2); file1=[15,20) pieces [1,2)
         // piece 1 is shared by both files.
         let mut t = FileTracker::from_lengths(10, [15, 5]);
-        assert_eq!(t.piece_verified(0), Vec::<usize>::new()); // file0 still needs p1
-        assert_eq!(t.piece_verified(1), vec![0, 1]); // shared piece completes both
+        assert_eq!(t.piece_verified(0, true), Vec::<usize>::new()); // file0 still needs p1
+        assert_eq!(t.piece_verified(1, true), vec![0, 1]); // shared piece completes both
     }
 
     #[test]
     fn file_starts_on_boundary() {
         // piece_size=10. file0=[0,10) pieces [0,1); file1=[10,20) pieces [1,2)
         let mut t = FileTracker::from_lengths(10, [10, 10]);
-        assert_eq!(t.piece_verified(0), vec![0]);
-        assert_eq!(t.piece_verified(1), vec![1]);
+        assert_eq!(t.piece_verified(0, true), vec![0]);
+        assert_eq!(t.piece_verified(1, true), vec![1]);
     }
 
     #[test]
@@ -115,20 +129,26 @@ mod tests {
         // piece_size=10, one file [0,25) -> pieces [0,3)
         let mut t = FileTracker::from_lengths(10, [25]);
         assert_eq!(verify_all(&mut t, &[0, 1]), Vec::<usize>::new());
-        assert_eq!(t.piece_verified(2), vec![0]);
+        assert_eq!(t.piece_verified(2, true), vec![0]);
     }
 
     #[test]
     fn many_small_files_in_one_piece() {
         // piece_size=100, files of 10 bytes each all inside piece 0
         let mut t = FileTracker::from_lengths(100, [10, 10, 10]);
-        assert_eq!(t.piece_verified(0), vec![0, 1, 2]);
+        assert_eq!(t.piece_verified(0, true), vec![0, 1, 2]);
     }
 
     #[test]
-    fn double_verify_does_not_double_report() {
-        let mut t = FileTracker::from_lengths(10, [10]);
-        assert_eq!(t.piece_verified(0), vec![0]);
-        assert_eq!(t.piece_verified(0), Vec::<usize>::new());
+    fn verify_then_revert_round_trips() {
+        // piece_size=10, one file [0,25) -> pieces [0,3)
+        let mut t = FileTracker::from_lengths(10, [25]);
+        assert_eq!(verify_all(&mut t, &[0, 1, 2]), vec![0]);
+        assert_eq!(t.incomplete_files(), Vec::<usize>::new());
+        // reverting the last piece re-opens the file
+        assert_eq!(t.piece_verified(2, false), Vec::<usize>::new());
+        assert_eq!(t.incomplete_files(), vec![0]);
+        // re-verifying completes it again
+        assert_eq!(t.piece_verified(2, true), vec![0]);
     }
 }
