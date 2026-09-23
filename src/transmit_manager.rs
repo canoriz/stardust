@@ -4,6 +4,7 @@ use crate::bandwidth::Bandwidth;
 use crate::buffer_pool::{BlockBuf, BufferPool};
 use crate::cache::cache_manager::{CacheManagerHandle, FileOpID, Fop, GlobalPieceKey, PieceLease};
 use crate::cache::simple_buffer::{FlushErr, JointIndex, SUB_PIECE_SIZE};
+use crate::cache::MutexBackFile;
 use crate::connection_manager::{
     ConnectionManagerHandle, CtrlOfRecv, CtrlOfSend, CtrlOfSend as ConnMsg, ReceivedBlocks,
 };
@@ -423,10 +424,33 @@ pub enum StableState {
 #[derive(Debug, Serialize, Deserialize)]
 enum RunningState {
     StableState(StableState),
+    /// Draining `waiting_for_piecebuf` before a force-recheck: no new writes are
+    /// admitted, buffered blocks are flushed to disk, then a FlushAndClose file
+    /// op abandons the cache and closes fds. Transitions to `Checking` once that
+    /// op completes.
+    Draining {
+        prev_state: StableState,
+        to_check: BTreeSet<u32>,
+        /// Piece count, stored so a dump can rebuild `checked` on restore.
+        n_pieces: usize,
+        /// Messages held by the dispatch gate; carried into Checking and
+        /// replayed once checking completes.
+        #[serde(skip)]
+        deferred: Vec<Msg>,
+        #[serde(skip)]
+        waiter: Vec<oneshot::Sender<bool>>,
+        /// The submitted FlushAndClose op id; None until `waiting_for_piecebuf`
+        /// is empty and the op has been submitted.
+        #[serde(skip)]
+        flush_close_op: Option<FileOpID>,
+    },
     Checking {
         prev_state: StableState,
         to_check: BTreeSet<u32>,
         checked: CheckState,
+        /// Messages held by the dispatch gate; replayed once checking completes.
+        #[serde(skip)]
+        deferred: Vec<Msg>,
         #[serde(skip)]
         waiter: Vec<oneshot::Sender<bool>>,
     }, // checking local file
@@ -438,6 +462,16 @@ impl RunningState {
     pub fn dump(&self) -> RunningStateDump {
         match self {
             RunningState::StableState(s) => RunningStateDump::StableState(s.clone()),
+            RunningState::Draining {
+                prev_state,
+                to_check,
+                n_pieces,
+                ..
+            } => RunningStateDump::Draining {
+                prev_state: prev_state.clone(),
+                to_check: to_check.clone(),
+                n_pieces: *n_pieces,
+            },
             RunningState::Checking {
                 prev_state,
                 to_check,
@@ -456,6 +490,16 @@ impl From<RunningState> for RunningStateDump {
     fn from(state: RunningState) -> Self {
         match state {
             RunningState::StableState(s) => RunningStateDump::StableState(s),
+            RunningState::Draining {
+                prev_state,
+                to_check,
+                n_pieces,
+                ..
+            } => RunningStateDump::Draining {
+                prev_state,
+                to_check,
+                n_pieces,
+            },
             RunningState::Checking {
                 prev_state,
                 to_check,
@@ -473,6 +517,12 @@ impl From<RunningState> for RunningStateDump {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum RunningStateDump {
     StableState(StableState),
+    /// Persisted mid-drain; restored as `Checking` with a fresh `checked`.
+    Draining {
+        prev_state: StableState,
+        to_check: BTreeSet<u32>,
+        n_pieces: usize,
+    },
     Checking {
         prev_state: StableState,
         to_check: BTreeSet<u32>,
@@ -484,6 +534,17 @@ impl From<RunningStateDump> for RunningState {
     fn from(dump: RunningStateDump) -> Self {
         match dump {
             RunningStateDump::StableState(s) => RunningState::StableState(s),
+            RunningStateDump::Draining {
+                prev_state,
+                to_check,
+                n_pieces,
+            } => RunningState::Checking {
+                checked: CheckState::new(n_pieces, &to_check),
+                prev_state,
+                to_check,
+                deferred: Vec::new(),
+                waiter: Vec::new(),
+            },
             RunningStateDump::Checking {
                 prev_state,
                 to_check,
@@ -492,6 +553,7 @@ impl From<RunningStateDump> for RunningState {
                 prev_state,
                 to_check,
                 checked,
+                deferred: Vec::new(),
                 waiter: Vec::new(),
             },
         }
@@ -660,6 +722,9 @@ pub struct Downloading {
     pub block_picker: BlockPicker,
     pub cache_handle: CacheManagerHandle,
     pub hasher: HashMap<u32, HashState<Sha1>>,
+    /// Shared back file (same Arc the cache manager holds). Used to fix tracked
+    /// paths before a force-recheck (choose `<final>` vs `.part` per disk state).
+    pub back_file: MutexBackFile,
 }
 
 pub struct TransmitWorker {
@@ -1046,7 +1111,7 @@ impl TransmitWorker {
             m.info_hash,
             m.regular_piece_size(),
             total_length,
-            back_file,
+            back_file.clone(),
             Some(pending_flushes.clone()),
             Some(msg_sender),
         );
@@ -1056,6 +1121,7 @@ impl TransmitWorker {
             block_picker,
             cache_handle: cache_handle.clone(),
             hasher: HashMap::new(),
+            back_file,
         }
     }
 
@@ -1786,6 +1852,7 @@ impl TransmitWorker {
                 to_check,
                 checked,
                 waiter,
+                ..
             } => {
                 let mut notify_waiter = |r: bool| {
                     for w in waiter.drain(0..) {
@@ -2409,6 +2476,9 @@ impl TransmitWorker {
                                 self.broadcast_have(ji.index() as u32);
                             }
                         } else {
+                            // IMPORTANT: This lease might contains modified part of data
+                            // must return to cache manager before submit rename
+                            drop(lease);
                             // At Pass the file's data is all written to piecebuf and
                             // flushed in advance_hash, so submit the rename directly.
                             for file in files {
@@ -2559,6 +2629,7 @@ impl TransmitWorker {
                         prev_state,
                         checked,
                         to_check,
+                        deferred: Vec::new(),
                         waiter,
                     };
                 }

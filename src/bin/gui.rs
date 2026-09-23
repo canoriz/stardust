@@ -519,6 +519,12 @@ impl eframe::App for GuiApp {
                                         format!("Fatal: {reason}"),
                                     );
                                 }
+                                RunningStateDump::Draining { .. } => {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(255, 200, 80),
+                                        "Draining",
+                                    );
+                                }
                                 RunningStateDump::Checking { checked, .. } => {
                                     let total = checked.total_checking_pieces();
                                     let done = checked.checked_count();

@@ -469,6 +469,28 @@ impl BackFile {
         }
     }
 
+    /// Close every open fd (set handle to None). Reopen is lazy on next
+    /// read/write. Used by the FlushAndClose file op to force disk reads.
+    pub fn close_all(&mut self) {
+        for f in &mut self.file_range {
+            f.handle.take();
+        }
+    }
+
+    /// Switch the tracked path of file `index` without touching disk; the
+    /// current fd is dropped so the next access reopens at the new path.
+    pub fn set_path(&mut self, index: usize, to: String) {
+        if let Some(f) = self.file_range.get_mut(index) {
+            f.handle.take();
+            f.path = to;
+        }
+    }
+
+    /// Whether `path` exists on the backing store (delegates to the `exists` fn).
+    pub fn exists(&self, path: &Path) -> bool {
+        (self.exists)(path)
+    }
+
     #[cfg(test)]
     pub fn get_inner(&mut self, offset: u64, len: usize) -> Option<Result<Vec<u8>>> {
         assert_eq!(self.file_range.len(), 1);

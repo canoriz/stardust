@@ -381,6 +381,14 @@ pub enum Fop {
         flush_all: bool,
         sender: UnboundedSender<TmMsg>,
     },
+    /// Flush all dirty pieces in [begin, end), purge every cached piece for the
+    /// torrent (dirty and clean), then close all back-file fds. Used by
+    /// force-recheck to guarantee subsequent reads hit disk.
+    FlushAndClose {
+        begin: u64,
+        end: u64,
+        sender: UnboundedSender<TmMsg>,
+    },
 }
 
 pub type FileOpID = u64;
@@ -840,7 +848,8 @@ impl CacheManager {
                 }
                 for op in ios.pending_ops.drain(0..) {
                     match op {
-                        (id, Fop::Rename { sender, .. }) => {
+                        (id, Fop::Rename { sender, .. })
+                        | (id, Fop::FlushAndClose { sender, .. }) => {
                             _ = sender.send(TmMsg::FileOpDone {
                                 id,
                                 result: Err(io::Error::new(
@@ -904,9 +913,10 @@ impl CacheManager {
             Fop::Rename {
                 begin,
                 end,
-                flush_all: true,
+                flush_all: true, // TODO:
                 ..
             } => Some((*begin, *end)),
+            Fop::FlushAndClose { begin, end, .. } => Some((*begin, *end)),
             _ => None,
         };
         match self.torrents.get_mut(&info_hash) {
@@ -1005,6 +1015,16 @@ impl CacheManager {
                                 ) => {
                                     let result = file.rename(file_index, to);
                                     _ = sender.send(TmMsg::FileOpDone { id, result });
+                                }
+                                (id, Fop::FlushAndClose { sender, .. }) => {
+                                    file.close_all();
+                                    // drop_fop_related_dirty_pieces already purged
+                                    // dirty pieces; clear clean cached pieces too so
+                                    // the cache is fully abandoned (in_io==0 ⇒ no
+                                    // leases out) and recheck reads real disk bytes.
+                                    self.cache.retain(|k, _| k.info_hash != info_hash);
+                                    self.assume_clear.retain(|k| k.info_hash != info_hash);
+                                    _ = sender.send(TmMsg::FileOpDone { id, result: Ok(()) });
                                 }
                             }
                         }
