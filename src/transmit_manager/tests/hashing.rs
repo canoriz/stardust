@@ -143,33 +143,21 @@ async fn pump(worker: &mut TransmitWorker) {
     while let Ok(Some(msg)) =
         tokio::time::timeout(Duration::from_millis(100), worker.receiver.recv()).await
     {
-        worker.handle_msg(msg).unwrap();
+        worker.handle_msg(msg).await;
     }
 }
 
 // Send a running-state command and wait for the worker acknowledgement.
 async fn change_state(worker: &mut TransmitWorker, cmd: RunningCmd) {
     let (tx, rx) = oneshot::channel();
-    worker.handle_msg(Msg::ChangeState(cmd, tx)).unwrap();
+    worker.handle_msg(Msg::ChangeState(cmd, tx)).await;
     rx.await.unwrap();
 }
 
 // Drain pending buffers, unregister the torrent, stop the cache task, and remove the temp file.
 async fn cleanup(mut worker: TransmitWorker, cache: tokio::task::JoinHandle<()>) {
-    pump(&mut worker).await;
-    assert!(worker.waiting_for_piecebuf.is_empty());
     let path = downloading_state(&mut worker).metadata.files[0].path[0].clone();
-    worker
-        .cache_handle
-        .unregister_torrent(worker.info_hash)
-        .await;
-    while worker.pending_flushes.load(Ordering::Relaxed) > 0 {
-        let msg = tokio::time::timeout(Duration::from_secs(5), worker.receiver.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        worker.handle_msg(msg).unwrap();
-    }
+    worker.cleanup_before_stop().await;
     cache.abort();
     let _ = cache.await;
     drop(worker);
@@ -348,7 +336,7 @@ async fn write_error_clears_hasher_and_waiting_buffers() {
             len: SUB_PIECE_SIZE as usize,
             err: io::Error::other("injected disk error"),
         })))
-        .unwrap();
+        .await;
     assert!(downloading_state(&mut worker).hasher.is_empty());
     assert!(!downloading_state(&mut worker)
         .block_picker
@@ -422,6 +410,7 @@ async fn read_error_clears_hasher_and_waiting_data() {
         });
     worker
         .handle_piecebuf_ready(failed_ji, Err(io::Error::other("injected read error")))
+        .await
         .unwrap();
 
     // worker clears hasher of fatal error piece 0
@@ -433,6 +422,72 @@ async fn read_error_clears_hasher_and_waiting_data() {
         .blocks
         .is_empty());
     assert!(worker.waiting_for_piecebuf[&JointIndex::new(0, 0)].requested);
+    assert!(matches!(
+        worker.running_state,
+        RunningState::StableState(StableState::Fatal(_))
+    ));
+    cleanup(worker, cache).await;
+}
+
+// Verify that a completed file is renamed from `<final>.part` back to `<final>`.
+#[tokio::test]
+async fn completed_file_renamed_from_part_to_final() {
+    let (mut worker, cache) = new_downloading_worker();
+    let path = downloading_state(&mut worker).metadata.files[0].path[0].clone();
+    // The incomplete file was renamed to `<final>.part` at construction.
+    assert!(std::path::Path::new(&format!("{path}.part")).exists());
+    assert!(!std::path::Path::new(&path).exists());
+
+    // Deliver every sub-piece; the single-piece file then verifies and completes.
+    queue_received_subpiece(&mut worker, 0, 0x5a);
+    queue_received_subpiece(&mut worker, 1, 0x5a);
+    pump(&mut worker).await;
+    assert!(downloading_state(&mut worker).block_picker.have(0));
+
+    // Completion submits the rename and pump drains its FileOpDone, leaving the
+    // final name on disk and the torrent seeding.
+    assert!(worker.pending_renames.is_empty());
+    assert!(std::path::Path::new(&path).exists());
+    assert!(!std::path::Path::new(&format!("{path}.part")).exists());
+    assert!(matches!(
+        worker.running_state,
+        RunningState::StableState(StableState::Seeding)
+    ));
+    cleanup(worker, cache).await;
+}
+
+// Verify that stop_cleanup blocks on a submitted-but-unacked rename until its
+// FileOpDone arrives (before unregister would cancel it).
+#[tokio::test]
+async fn stop_cleanup_drains_unacked_rename() {
+    let (mut worker, cache) = new_downloading_worker();
+    let path = downloading_state(&mut worker).metadata.files[0].path[0].clone();
+
+    // Submit a rename but leave its FileOpDone unhandled in the channel.
+    worker.submit_rename(0).await.unwrap();
+    assert!(!worker.pending_renames.is_empty());
+
+    // The real shutdown path must recv the FileOpDone and clear pending_renames,
+    // so the rename runs instead of being cancelled by unregister.
+    worker.cleanup_before_stop().await;
+    assert!(worker.pending_renames.is_empty());
+    assert!(std::path::Path::new(&path).exists());
+    assert!(!std::path::Path::new(&format!("{path}.part")).exists());
+    cleanup(worker, cache).await;
+}
+
+// Verify that a failing rename transitions the worker to Fatal.
+#[tokio::test]
+async fn rename_failure_enters_fatal() {
+    let (mut worker, cache) = new_downloading_worker();
+    worker.pending_renames.insert(7, 0);
+    worker
+        .handle_msg(Msg::FileOpDone {
+            id: 7,
+            result: Err(io::Error::other("injected rename failure")),
+        })
+        .await;
+    assert!(worker.pending_renames.is_empty());
     assert!(matches!(
         worker.running_state,
         RunningState::StableState(StableState::Fatal(_))

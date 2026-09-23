@@ -2,7 +2,7 @@ use crate::announce_manager::{self, AnnounceManagerHandle};
 use crate::backfile::{BackFile, NormalFile, VoidFile};
 use crate::bandwidth::Bandwidth;
 use crate::buffer_pool::{BlockBuf, BufferPool};
-use crate::cache::cache_manager::{CacheManagerHandle, GlobalPieceKey, PieceLease};
+use crate::cache::cache_manager::{CacheManagerHandle, FileOpID, Fop, GlobalPieceKey, PieceLease};
 use crate::cache::simple_buffer::{FlushErr, JointIndex, SUB_PIECE_SIZE};
 use crate::connection_manager::{
     ConnectionManagerHandle, CtrlOfRecv, CtrlOfSend, CtrlOfSend as ConnMsg, ReceivedBlocks,
@@ -686,6 +686,7 @@ pub struct TransmitWorker {
     /// contains sender of receiver
     self_handle: TransmitManagerHandle,
 
+    // TODO: maybe merge these two hashmap
     connected_peers: HashMap<PeerAddr, PeerConn>,
     connecting_peers: HashSet<PeerAddr>,
 
@@ -696,6 +697,11 @@ pub struct TransmitWorker {
     /// received blocks waiting writing to piece buf once
     /// piece buf is ready
     waiting_for_piecebuf: HashMap<JointIndex, PieceWaitState>,
+
+    /// Renames submitted to the cache but not yet acked by FileOpDone.
+    /// id -> file (file kept for the failure log). Drives the shutdown
+    /// rename barrier.
+    pending_renames: HashMap<FileOpID, FileIndex>,
 
     /// Number of in-flight spawn_blocking flush tasks. PieceBuf does
     /// fetch_add(1) before spawn, the worker's main loop does fetch_sub(1)
@@ -911,6 +917,7 @@ impl TransmitWorker {
             connecting_peers: HashSet::new(),
             announce_urls: dump.announce_urls,
             waiting_for_piecebuf: HashMap::new(),
+            pending_renames: HashMap::new(),
             pending_flushes,
             downloaded,
             running_state: dump.running_state.into(),
@@ -987,6 +994,7 @@ impl TransmitWorker {
             connecting_peers: HashSet::new(),
             announce_urls: Vec::new(),
             waiting_for_piecebuf: HashMap::new(),
+            pending_renames: HashMap::new(),
             pending_flushes,
             downloaded,
             running_state: RunningState::StableState(StableState::Stopped),
@@ -1201,8 +1209,8 @@ impl TransmitWorker {
     }
 
     #[instrument(skip_all, fields(hash = crate::helper::to_hex(&self.info_hash)))]
-    fn handle_msg(&mut self, m: Msg) -> io::Result<()> {
-        match m {
+    async fn handle_msg(&mut self, m: Msg) {
+        let r: io::Result<()> = match m {
             Msg::NewDiscoveredPeer { addr, from } => {
                 info!("new discovered peer {addr} from {from:?}");
                 self.handle_new_discovered_peer(addr);
@@ -1215,7 +1223,13 @@ impl TransmitWorker {
                 self.announce_manager.send(m);
                 Ok(())
             }
-            Msg::AnnounceFinish(Ok(a)) => self.handle_announce(a),
+            Msg::AnnounceFinish(Ok(a)) => {
+                // Announce/tracker handling must never be fatal.
+                if let Err(e) = self.handle_announce(a) {
+                    warn!("announce handling error (non-fatal): {e}");
+                }
+                Ok(())
+            }
             Msg::AnnounceFinish(Err(e)) => {
                 info!("announce error {}", e);
                 Ok(())
@@ -1324,7 +1338,14 @@ impl TransmitWorker {
                 // self.remove_unreachable_pieces_from_buf();
                 Ok(())
             }
-            Msg::PeerMsg(pm) => self.handle_peer_msg(pm),
+            Msg::PeerMsg(pm) => {
+                // Peer protocol handling only buffers data / updates bandwidth
+                // state; disk I/O is async (PieceBufReady/FlushComplete). Never fatal.
+                if let Err(e) = self.handle_peer_msg(pm) {
+                    warn!("peer msg handling error (non-fatal): {e}");
+                }
+                Ok(())
+            }
             Msg::FlushComplete(r) => {
                 self.pending_flushes.fetch_sub(1, Ordering::Relaxed);
                 if let Err(e) = r {
@@ -1335,9 +1356,15 @@ impl TransmitWorker {
                 }
                 Ok(())
             }
-            Msg::PieceBufReady { index, buf } => self.handle_piecebuf_ready(index, buf),
+            Msg::PieceBufReady { index, buf } => self.handle_piecebuf_ready(index, buf).await,
             Msg::FileOpDone { id, result } => {
-                todo!()
+                let file = self.pending_renames.remove(&id);
+                result.map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("rename file {file:?} (op {id}) failed: {e}"),
+                    )
+                })
             }
             Msg::RequestMetadata(sender) => {
                 self.handle_request_metadata(sender);
@@ -1379,6 +1406,10 @@ impl TransmitWorker {
                 _ = sender.send(self.downloaded.subscribe());
                 Ok(())
             }
+        };
+        if let Err(e) = r {
+            warn!("handle_msg error, fatal: {e}");
+            self.running_state = RunningState::StableState(StableState::Fatal(format!("{e}")));
         }
     }
 
@@ -2287,7 +2318,45 @@ impl TransmitWorker {
         Ok(())
     }
 
-    fn handle_piecebuf_ready(
+    /// Submit a `<final>.part` -> `<final>` rename for a completed file and
+    /// record it as outstanding.
+    async fn submit_rename(&mut self, file: FileIndex) -> io::Result<()> {
+        let (to, begin, end) = {
+            let metadata = match &self.torrent_state {
+                TorrentState::Metadata(d) => &d.metadata,
+                TorrentState::Fetching(_) => return Ok(()),
+            };
+            let files = metadata.files();
+            // TODO: store each file's byte range in FileTracker so we don't
+            // recompute this cumulative sum on every rename.
+            let begin: u64 = files[..file].iter().map(|f| f.length).sum();
+            let end = begin + files[file].length;
+            (files[file].path.join("/"), begin, end)
+        };
+        let fop = Fop::Rename {
+            file_index: file,
+            to,
+            begin,
+            end,
+
+            // flush_all must be true, though we `flush()`` it in advance_hash
+            // Because in a rare case: A verify failed, but some sub-piece of A
+            // is currently flushing, and a new `flush()` will do nothing if
+            // `flush()` is in progress. So drop that sub-piece to make sure
+            // data are securely written before renaming.
+            flush_all: true,
+            sender: self.self_handle.sender.clone(),
+        };
+        let id = self
+            .cache_handle
+            .send_file_op(self.info_hash, fop)
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        self.pending_renames.insert(id, file);
+        Ok(())
+    }
+
+    async fn handle_piecebuf_ready(
         &mut self,
         ji: JointIndex,
         buf: io::Result<PieceLease>,
@@ -2328,13 +2397,19 @@ impl TransmitWorker {
                             self.handle_checkfile_on_piece_verified(ji.index(), false)?;
                         }
                     }
-                    PieceVerifyResult::Pass(_files) => {
+                    PieceVerifyResult::Pass(files) => {
                         if is_checking {
+                            // TODO: rename completed files on the checking path.
                             self.handle_checkfile_on_piece_verified(ji.index(), true)?;
                             if !had_piece {
                                 self.broadcast_have(ji.index() as u32);
                             }
                         } else {
+                            // At Pass the file's data is all written to piecebuf and
+                            // flushed in advance_hash, so submit the rename directly.
+                            for file in files {
+                                self.submit_rename(file).await?;
+                            }
                             self.broadcast_have(ji.index() as u32);
                             if self.is_downloaded() {
                                 if matches!(
@@ -2650,6 +2725,46 @@ impl TransmitWorker {
             }
         }
     }
+
+    // Flush buffered data and finish outstanding renames before shutdown.
+    async fn cleanup_before_stop(&mut self) {
+        let to_request: Vec<_> = self
+            .waiting_for_piecebuf
+            .iter()
+            .filter_map(|(ji, state)| (!state.requested).then_some(*ji))
+            .collect();
+        for ji in to_request {
+            self.request_piecebuf(ji);
+        }
+        while !self.waiting_for_piecebuf.is_empty() || !self.pending_renames.is_empty() {
+            match self.receiver.recv().await {
+                Some(
+                    msg @ (Msg::PieceBufReady { .. }
+                    | Msg::FlushComplete(_)
+                    | Msg::FileOpDone { .. }),
+                ) => {
+                    self.handle_msg(msg).await;
+                }
+                Some(other) => {
+                    info!("ignored msg during piecebuf drain: {other:?}");
+                }
+                None => break,
+            }
+        }
+
+        self.cache_handle.unregister_torrent(self.info_hash).await;
+        while self.pending_flushes.load(Ordering::Relaxed) > 0 {
+            match self.receiver.recv().await {
+                Some(msg @ Msg::FlushComplete(_)) => {
+                    self.handle_msg(msg).await;
+                }
+                Some(other) => {
+                    info!("ignored msg during flush drain: {other:?}");
+                }
+                None => break,
+            }
+        }
+    }
 }
 
 fn check_received_metadata(
@@ -2694,7 +2809,7 @@ pub(crate) async fn run_transmit_worker(
         tokio::select! {
             Some(msg) = transmit.receiver.recv() => {
                 // debug!("transmit manager received msg {msg:?}");
-                transmit.handle_msg(msg); // TODO: handle result
+                transmit.handle_msg(msg).await;
             }
             _ = dht_ticker.tick() => {
                 info!("dht ticker tick");
@@ -2715,43 +2830,7 @@ pub(crate) async fn run_transmit_worker(
         };
     }
 
-    // Ensure all blocks in waiting_for_piecebuf are written into PieceBufs
-    // before shutdown. For entries not yet requested, send GetPiece now.
-    let to_request: Vec<_> = transmit
-        .waiting_for_piecebuf
-        .iter()
-        .filter_map(|(ji, state)| (!state.requested).then_some(*ji))
-        .collect();
-    for ji in to_request {
-        transmit.request_piecebuf(ji);
-    }
-    while !transmit.waiting_for_piecebuf.is_empty() {
-        match transmit.receiver.recv().await {
-            Some(msg @ (Msg::PieceBufReady { .. } | Msg::FlushComplete(_))) => {
-                let _ = transmit.handle_msg(msg);
-            }
-            Some(other) => {
-                info!("ignored msg during piecebuf drain: {other:?}");
-            }
-            None => break,
-        }
-    }
-
-    transmit
-        .cache_handle
-        .unregister_torrent(transmit.info_hash)
-        .await;
-    while transmit.pending_flushes.load(Ordering::Relaxed) > 0 {
-        match transmit.receiver.recv().await {
-            Some(msg @ Msg::FlushComplete(_)) => {
-                let _ = transmit.handle_msg(msg);
-            }
-            Some(other) => {
-                info!("ignored msg during flush drain: {other:?}");
-            }
-            None => break,
-        }
-    }
+    transmit.cleanup_before_stop().await;
     info!("dump transmit manager of {:02x?}", transmit.info_hash);
     let dump = transmit.handle_dump_status();
     let _ = done.send(dump);
