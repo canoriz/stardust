@@ -1359,12 +1359,16 @@ impl TransmitWorker {
             Msg::PieceBufReady { index, buf } => self.handle_piecebuf_ready(index, buf).await,
             Msg::FileOpDone { id, result } => {
                 let file = self.pending_renames.remove(&id);
-                result.map_err(|e| {
-                    io::Error::new(
+                match result {
+                    Ok(()) => {
+                        self.maybe_signal_downloaded();
+                        Ok(())
+                    }
+                    Err(e) => Err(io::Error::new(
                         io::ErrorKind::Other,
                         format!("rename file {file:?} (op {id}) failed: {e}"),
-                    )
-                })
+                    )),
+                }
             }
             Msg::RequestMetadata(sender) => {
                 self.handle_request_metadata(sender);
@@ -2411,15 +2415,14 @@ impl TransmitWorker {
                                 self.submit_rename(file).await?;
                             }
                             self.broadcast_have(ji.index() as u32);
-                            if self.is_downloaded() {
-                                if matches!(
+                            if self.is_downloaded()
+                                && matches!(
                                     self.running_state,
                                     RunningState::StableState(StableState::Downloading)
-                                ) {
-                                    self.running_state =
-                                        RunningState::StableState(StableState::Seeding);
-                                }
-                                self.downloaded.send(true);
+                                )
+                            {
+                                self.running_state =
+                                    RunningState::StableState(StableState::Seeding);
                             }
                         }
                     }
@@ -2474,6 +2477,14 @@ impl TransmitWorker {
             TorrentState::Fetching(_) => return false,
         };
         block_picker.is_finished()
+    }
+
+    /// Signal completion only once the whole torrent is downloaded and every
+    /// submitted rename has been acked, so the final file exists on disk.
+    fn maybe_signal_downloaded(&mut self) {
+        if self.is_downloaded() && self.pending_renames.is_empty() {
+            let _ = self.downloaded.send(true);
+        }
     }
 
     fn handle_dht_port_msg(&mut self, mut addr: PeerAddr, port: u16) -> io::Result<()> {

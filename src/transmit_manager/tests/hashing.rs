@@ -429,6 +429,51 @@ async fn read_error_clears_hasher_and_waiting_data() {
     cleanup(worker, cache).await;
 }
 
+// Completion is signaled only after the rename is acked. Drive the piece to
+// verify and the rename to be submitted, but withhold its FileOpDone: the
+// `downloaded` watch must stay false. Delivering the ack then completes it.
+#[tokio::test]
+async fn downloaded_signaled_only_after_rename_acked() {
+    let (mut worker, cache) = new_downloading_worker();
+    let path = downloading_state(&mut worker).metadata.files[0].path[0].clone();
+    let mut dl = worker.downloaded.subscribe();
+
+    queue_received_subpiece(&mut worker, 0, 0x5a);
+    queue_received_subpiece(&mut worker, 1, 0x5a);
+
+    // Handle every message except the rename ack, which we stash unhandled.
+    let mut acks = Vec::new();
+    while let Ok(Some(msg)) =
+        tokio::time::timeout(Duration::from_millis(200), worker.receiver.recv()).await
+    {
+        if matches!(msg, Msg::FileOpDone { .. }) {
+            acks.push(msg);
+        } else {
+            worker.handle_msg(msg).await;
+        }
+    }
+
+    // Piece verified and rename submitted, but not yet acked: not complete.
+    assert!(downloading_state(&mut worker).block_picker.have(0));
+    assert!(!worker.pending_renames.is_empty());
+    assert!(!acks.is_empty());
+    assert!(!*dl.borrow());
+
+    // Delivering the rename ack completes the download.
+    for msg in acks {
+        worker.handle_msg(msg).await;
+    }
+    assert!(worker.pending_renames.is_empty());
+    assert!(*dl.borrow_and_update());
+    assert!(std::path::Path::new(&path).exists());
+    assert!(!std::path::Path::new(&format!("{path}.part")).exists());
+    assert!(matches!(
+        worker.running_state,
+        RunningState::StableState(StableState::Seeding)
+    ));
+    cleanup(worker, cache).await;
+}
+
 // Verify that a completed file is renamed from `<final>.part` back to `<final>`.
 #[tokio::test]
 async fn completed_file_renamed_from_part_to_final() {
