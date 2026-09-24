@@ -540,9 +540,10 @@ async fn rename_failure_enters_fatal() {
     cleanup(worker, cache).await;
 }
 
-// Verify that force check accepts correct disk data even when the in-memory hasher is wrong.
+// Verify force check on an incomplete file (backed by `<final>.part`) re-reads
+// the correct disk bytes and passes even when the in-memory hasher is stale/wrong.
 #[tokio::test]
-async fn force_check_accepts_correct_disk_data_with_stale_hasher() {
+async fn force_check_accepts_correct_part_file_ignoring_stale_hasher() {
     // The file contains the correct 0x5a data, but the stale hasher contains a wrong 0x33 prefix.
     let (mut worker, cache) = new_downloading_worker();
     let mut stale_hasher = HashState::new(Sha1::new());
@@ -555,16 +556,17 @@ async fn force_check_accepts_correct_disk_data_with_stale_hasher() {
 
     let (tx, rx) = oneshot::channel();
     // Force check must clear the stale state and reread the correct file contents.
-    worker.handle_check_file(tx).unwrap();
+    worker.handle_check_file(tx).await.unwrap();
     pump(&mut worker).await;
     assert!(rx.await.unwrap());
     assert!(downloading_state(&mut worker).block_picker.have(0));
     cleanup(worker, cache).await;
 }
 
-// Verify that force check rejects corrupt disk data even when the in-memory hasher looks correct.
+// Verify force check on an incomplete file (backed by `<final>.part`) re-reads
+// the corrupt disk bytes and fails even when the stale in-memory hasher looks correct.
 #[tokio::test]
-async fn force_check_rejects_corrupt_disk_data_with_stale_hasher() {
+async fn force_check_rejects_corrupt_part_file_ignoring_stale_hasher() {
     // Corrupt the first sub-piece on disk, but leave a stale hasher built from the original data.
     let (mut worker, cache) = new_downloading_worker();
     let path = downloading_state(&mut worker).metadata.files[0].path[0].clone();
@@ -583,12 +585,67 @@ async fn force_check_rejects_corrupt_disk_data_with_stale_hasher() {
 
     let (tx, rx) = oneshot::channel();
     // Force check must ignore the stale correct-looking prefix and reread the corrupt file.
-    worker.handle_check_file(tx).unwrap();
+    worker.handle_check_file(tx).await.unwrap();
     pump(&mut worker).await;
     assert!(
         !rx.await.unwrap(),
         "force check must detect the corrupt disk range"
     );
     assert!(!downloading_state(&mut worker).block_picker.have(0));
+    cleanup(worker, cache).await;
+}
+
+// Verify force check passes against a completed file at its final name (no
+// `.part`), and the file keeps the final name afterwards.
+#[tokio::test]
+async fn force_check_accepts_completed_file_at_final_name() {
+    let (mut worker, cache) = new_downloading_worker();
+    let path = downloading_state(&mut worker).metadata.files[0].path[0].clone();
+    // Drive the download to completion so the file is renamed to `<final>`.
+    queue_received_subpiece(&mut worker, 0, 0x5a);
+    queue_received_subpiece(&mut worker, 1, 0x5a);
+    pump(&mut worker).await;
+    assert!(std::path::Path::new(&path).exists());
+    assert!(!std::path::Path::new(&format!("{path}.part")).exists());
+
+    let (tx, rx) = oneshot::channel();
+    worker.handle_check_file(tx).await.unwrap();
+    pump(&mut worker).await;
+    assert!(rx.await.unwrap());
+    assert!(downloading_state(&mut worker).block_picker.have(0));
+    // A passing recheck must leave the final name in place.
+    assert!(std::path::Path::new(&path).exists());
+    assert!(!std::path::Path::new(&format!("{path}.part")).exists());
+    cleanup(worker, cache).await;
+}
+
+// Verify force check fails against a corrupted completed file at its final name
+// (no `.part`), and the file is renamed back to `<final>.part` afterwards.
+#[tokio::test]
+async fn force_check_rejects_corrupt_completed_file_at_final_name() {
+    let (mut worker, cache) = new_downloading_worker();
+    let path = downloading_state(&mut worker).metadata.files[0].path[0].clone();
+    // Drive the download to completion so the file is renamed to `<final>`.
+    queue_received_subpiece(&mut worker, 0, 0x5a);
+    queue_received_subpiece(&mut worker, 1, 0x5a);
+    pump(&mut worker).await;
+    assert!(std::path::Path::new(&path).exists());
+
+    // Corrupt the final-named file on disk before rechecking.
+    let mut corrupt = vec![0x5a; 2 * SUB_PIECE_SIZE as usize];
+    corrupt[..SUB_PIECE_SIZE as usize].fill(0x33);
+    std::fs::write(&path, corrupt).unwrap();
+
+    let (tx, rx) = oneshot::channel();
+    worker.handle_check_file(tx).await.unwrap();
+    pump(&mut worker).await;
+    assert!(
+        !rx.await.unwrap(),
+        "force check must detect the corrupt disk range"
+    );
+    assert!(!downloading_state(&mut worker).block_picker.have(0));
+    // A failing recheck marks the file incomplete again: renamed to `<final>.part`.
+    assert!(std::path::Path::new(&format!("{path}.part")).exists());
+    assert!(!std::path::Path::new(&path).exists());
     cleanup(worker, cache).await;
 }

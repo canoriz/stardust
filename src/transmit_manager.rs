@@ -457,6 +457,35 @@ enum RunningState {
 }
 
 impl RunningState {
+    /// Consume a `Draining` state and install the equivalent `Checking` state in
+    /// place (fresh `checked`, carrying `prev_state`/`to_check`/`waiter`/`deferred`).
+    /// No-op for any other state.
+    fn draining_to_checking(&mut self) {
+        if !matches!(self, RunningState::Draining { .. }) {
+            return;
+        }
+        *self = match std::mem::replace(self, RunningState::StableState(StableState::Stopped)) {
+            RunningState::Draining {
+                prev_state,
+                to_check,
+                n_pieces,
+                waiter,
+                deferred,
+                ..
+            } => {
+                let checked = CheckState::new(n_pieces, &to_check);
+                RunningState::Checking {
+                    prev_state,
+                    to_check,
+                    checked,
+                    deferred,
+                    waiter,
+                }
+            }
+            _ => unreachable!(),
+        };
+    }
+
     /// Dump current state to RunningStateDump, a little bit expensive
     /// if don't need RunningState anymore, consider using [RunningStateDump::from]
     pub fn dump(&self) -> RunningStateDump {
@@ -1276,7 +1305,144 @@ impl TransmitWorker {
 
     #[instrument(skip_all, fields(hash = crate::helper::to_hex(&self.info_hash)))]
     async fn handle_msg(&mut self, m: Msg) {
-        let r: io::Result<()> = match m {
+        let r = match &self.running_state {
+            RunningState::StableState(_) => self.handle_msg_normal(m).await,
+            RunningState::Draining { .. } | RunningState::Checking { .. } => {
+                self.handle_msg_checking(m).await
+            }
+        };
+        if let Err(e) = r {
+            warn!("handle_msg error, fatal: {e}");
+            self.running_state = RunningState::StableState(StableState::Fatal(format!("{e}")));
+        }
+    }
+
+    #[instrument(skip_all, fields(hash = crate::helper::to_hex(&self.info_hash)))]
+    async fn handle_msg_checking(&mut self, m: Msg) -> io::Result<()> {
+        match &self.running_state {
+            RunningState::Draining { .. } => self.handle_msg_draining(m).await,
+            RunningState::Checking { .. } => self.handle_msg_checking_phase(m).await,
+            RunningState::StableState(_) => unreachable!(),
+        }
+    }
+
+    /// Dispatch gate while draining `waiting_for_piecebuf` before a recheck.
+    async fn handle_msg_draining(&mut self, m: Msg) -> io::Result<()> {
+        match m {
+            Msg::PieceBufReady { index, buf } => {
+                // Drain through the normal ready path so the picker/hasher/rename
+                // state stays consistent; we just no longer admit new blocks.
+                self.handle_piecebuf_ready(index, buf).await?;
+                // Once nothing is pending, submit the FlushAndClose barrier once.
+                let need_submit = self.waiting_for_piecebuf.is_empty()
+                    && matches!(
+                        &self.running_state,
+                        RunningState::Draining {
+                            flush_close_op: None,
+                            ..
+                        }
+                    );
+                if need_submit {
+                    let id = self.submit_flush_and_close().await?;
+                    if let RunningState::Draining { flush_close_op, .. } = &mut self.running_state {
+                        *flush_close_op = Some(id);
+                    }
+                }
+                Ok(())
+            }
+            Msg::FileOpDone { id, result } => {
+                let is_flush_close = matches!(
+                    &self.running_state,
+                    RunningState::Draining {
+                        flush_close_op: Some(fid),
+                        ..
+                    } if *fid == id
+                );
+                if is_flush_close {
+                    result?;
+                    // Force-recheck must re-hash every byte from disk, so drop any
+                    // partial hash state left over from the drain before checking.
+                    if let TorrentState::Metadata(d) = &mut self.torrent_state {
+                        d.hasher.clear();
+                    }
+                    self.fix_paths();
+                    self.running_state.draining_to_checking();
+                    // Request the first piece to verify; caches are cleared and fds
+                    // closed, so GetPiece reopens from disk at the fixed-up path.
+                    let first = match &self.running_state {
+                        RunningState::Checking { to_check, .. } => to_check.first().copied(),
+                        _ => None,
+                    };
+                    if let Some(first) = first {
+                        self.request_piecebuf(JointIndex::new(first, 0));
+                    }
+                    Ok(())
+                } else {
+                    self.handle_msg_normal(Msg::FileOpDone { id, result }).await
+                }
+            }
+            Msg::PeerMsg(PeerMsg::Pieces(..))
+            | Msg::QueryStatus(_)
+            | Msg::CheckFile(_)
+            | Msg::ChangeState(_, _)
+            | Msg::FlushComplete(_)
+            | Msg::WaitDownloaded(_)
+            | Msg::RequestMetadata(_) => self.handle_msg_normal(m).await,
+            other => {
+                if let RunningState::Draining { deferred, .. } = &mut self.running_state {
+                    deferred.push(other);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Dispatch gate while verifying pieces from disk.
+    async fn handle_msg_checking_phase(&mut self, m: Msg) -> io::Result<()> {
+        match m {
+            Msg::PieceBufReady { index, buf } => {
+                self.handle_piecebuf_ready_checking(index, buf).await
+            }
+            Msg::PeerMsg(PeerMsg::Pieces(peer, blks)) => {
+                self.handle_pieces_while_checking(peer, blks)
+            }
+            Msg::FileOpDone { .. }
+            | Msg::QueryStatus(_)
+            | Msg::CheckFile(_)
+            | Msg::ChangeState(_, _)
+            | Msg::FlushComplete(_)
+            | Msg::WaitDownloaded(_)
+            | Msg::RequestMetadata(_) => self.handle_msg_normal(m).await,
+            other => {
+                if let RunningState::Checking { deferred, .. } = &mut self.running_state {
+                    deferred.push(other);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Submit the FlushAndClose barrier for the whole torrent; returns its op id.
+    async fn submit_flush_and_close(&mut self) -> io::Result<FileOpID> {
+        let end: u64 = match &self.torrent_state {
+            TorrentState::Metadata(d) => d.metadata.files().iter().map(|f| f.length).sum(),
+            TorrentState::Fetching(_) => unreachable!("draining only reachable with metadata"),
+        };
+        self.cache_handle
+            .send_file_op(
+                self.info_hash,
+                Fop::FlushAndClose {
+                    begin: 0,
+                    end,
+                    sender: self.self_handle.sender.clone(),
+                },
+            )
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+    }
+
+    async fn handle_msg_normal(&mut self, m: Msg) -> io::Result<()> {
+        match m {
             Msg::NewDiscoveredPeer { addr, from } => {
                 info!("new discovered peer {addr} from {from:?}");
                 self.handle_new_discovered_peer(addr);
@@ -1417,10 +1583,13 @@ impl TransmitWorker {
                 if let Err(e) = r {
                     warn!("flush error, fatal: {:?}", e);
                     self.invalidate_piece(e.ji.index());
-                    self.running_state =
-                        RunningState::StableState(StableState::Fatal(format!("{e:?}")));
+                    Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        format! {"flush {e:?}"},
+                    ))
+                } else {
+                    Ok(())
                 }
-                Ok(())
             }
             Msg::PieceBufReady { index, buf } => self.handle_piecebuf_ready(index, buf).await,
             Msg::FileOpDone { id, result } => {
@@ -1444,10 +1613,7 @@ impl TransmitWorker {
                 let _ = sender.send(self.runtime_status());
                 Ok(())
             }
-            Msg::CheckFile(sender) => {
-                self.handle_check_file(sender);
-                Ok(())
-            }
+            Msg::CheckFile(sender) => self.handle_check_file(sender).await,
             Msg::ChangeState(cmd, sender) => {
                 match cmd {
                     RunningCmd::Resume => {
@@ -1476,10 +1642,6 @@ impl TransmitWorker {
                 _ = sender.send(self.downloaded.subscribe());
                 Ok(())
             }
-        };
-        if let Err(e) = r {
-            warn!("handle_msg error, fatal: {e}");
-            self.running_state = RunningState::StableState(StableState::Fatal(format!("{e}")));
         }
     }
 
@@ -1841,30 +2003,34 @@ impl TransmitWorker {
     }
 
     /// called when checking file and a piece is checked
-    fn handle_checkfile_on_piece_verified(&mut self, index: u32, passed: bool) -> io::Result<()> {
+    async fn handle_checkfile_on_piece_verified(
+        &mut self,
+        index: u32,
+        passed: bool,
+    ) -> io::Result<()> {
         info!(
             "piece {index} check {}",
             if passed { "passed" } else { "failed" }
         );
-        match &mut self.running_state {
+        // Some => checking finished: carries the stable state to restore and the
+        // peer-state messages deferred during draining/checking. None => more
+        // pieces still pending, next one already requested.
+        let finished: Option<(RunningState, Vec<Msg>)> = match &mut self.running_state {
             RunningState::Checking {
                 prev_state,
                 to_check,
                 checked,
                 waiter,
-                ..
+                deferred,
             } => {
-                let mut notify_waiter = |r: bool| {
-                    for w in waiter.drain(0..) {
-                        w.send(r);
-                    }
-                };
                 checked.check(index as usize, passed);
                 to_check.remove(&index);
                 if to_check.is_empty() {
                     let r = checked.state.iter().all(|s| *s != CheckState::CORRUPT);
-                    notify_waiter(r);
-                    self.running_state = match prev_state {
+                    for w in waiter.drain(0..) {
+                        w.send(r);
+                    }
+                    let new_state = match prev_state {
                         StableState::Downloading | StableState::Seeding => {
                             let Downloading { block_picker, .. } = match &mut self.torrent_state {
                                 TorrentState::Metadata(d) => d,
@@ -1882,26 +2048,42 @@ impl TransmitWorker {
                         StableState::Stopped => RunningState::StableState(StableState::Stopped),
                         StableState::Fatal(_) => RunningState::StableState(StableState::Paused),
                     };
-
-                    match self.running_state {
-                        RunningState::StableState(StableState::Downloading) => {
-                            // TODO: FIXME: really needed?
-                            self.resume_pending_hashes();
-                        }
-                        RunningState::StableState(StableState::Seeding) => {
-                            self.downloaded.send(true);
-                        }
-                        _ => {}
-                    }
+                    Some((new_state, std::mem::take(deferred)))
                 } else {
                     // load next piece to check
                     let next_piece = *to_check.first().unwrap();
                     self.request_piecebuf(JointIndex::new(next_piece, 0));
+                    None
                 }
-                Ok(())
             }
             _ => unreachable!("called from not checking state"),
+        };
+
+        let Some((new_state, deferred)) = finished else {
+            return Ok(());
+        };
+        self.running_state = new_state;
+        match self.running_state {
+            RunningState::StableState(StableState::Downloading) => {
+                // TODO: FIXME: really needed?
+                self.resume_pending_hashes();
+            }
+            RunningState::StableState(StableState::Seeding) => {
+                self.downloaded.send(true);
+            }
+            _ => {}
         }
+
+        // Now stable again: fix file names to match the checked have-state and
+        // replay the messages we deferred while draining/checking.
+        self.restore_part().await?;
+        for msg in deferred {
+            // Re-enqueue instead of calling handle_msg here, which would form an
+            // async recursion cycle; the worker processes these next, now in a
+            // stable state.
+            let _ = self.self_handle.sender.send(msg);
+        }
+        Ok(())
     }
 
     // fn remove_unreachable_pieces_from_buf(&mut self) {
@@ -2427,14 +2609,111 @@ impl TransmitWorker {
         Ok(())
     }
 
+    /// Point each file's tracked path at whichever name exists on disk
+    /// (`<final>` if present, else `<final>.part`), so checking reads real
+    /// bytes. Only switches the tracked path, never touches disk.
+    fn fix_paths(&self) {
+        let Downloading {
+            metadata,
+            back_file,
+            ..
+        } = match &self.torrent_state {
+            TorrentState::Metadata(d) => d,
+            TorrentState::Fetching(_) => return,
+        };
+        let mut bf = back_file.lock().unwrap();
+        for (i, f) in metadata.files().iter().enumerate() {
+            let final_name = f.path.join("/");
+            // TODO: `exists` may be a blocking syscall; consider making it async.
+            let path = if bf.exists(std::path::Path::new(&final_name)) {
+                final_name
+            } else {
+                format!("{final_name}.part")
+            };
+            bf.set_path(i, path);
+        }
+    }
+
+    /// After checking finishes, restore file names to match the have-state:
+    /// completed files to `<final>`, still-incomplete files to `<final>.part`.
+    /// `fix_paths` already pointed each tracked path at the real on-disk file,
+    /// so we only pick the target name here; `bf.rename` no-ops when unchanged.
+    /// Renames directly on the backfile: FlushAndClose already flushed+dropped
+    /// the cache and checking only reads, so there is no dirty data to flush.
+    async fn restore_part(&mut self) -> io::Result<()> {
+        let Downloading {
+            block_picker,
+            metadata,
+            back_file,
+            ..
+        } = match &self.torrent_state {
+            TorrentState::Metadata(d) => d,
+            TorrentState::Fetching(_) => return Ok(()),
+        };
+        let incomplete: HashSet<usize> = block_picker.incomplete_files().into_iter().collect();
+        let files = metadata.files();
+        let mut bf = back_file.lock().unwrap();
+        for i in 0..files.len() {
+            let final_name = files[i].path.join("/");
+            let to = if incomplete.contains(&i) {
+                format!("{final_name}.part")
+            } else {
+                final_name
+            };
+            if let Err(e) = bf.rename(i, to) {
+                warn!("restore_part rename file {i}: {e}");
+            }
+        }
+        Ok(())
+    }
+
+    // TODO: maybe typestate for different state
+    async fn handle_piecebuf_ready_checking(
+        &mut self,
+        ji: JointIndex,
+        buf: io::Result<PieceLease>,
+    ) -> io::Result<()> {
+        // Checking does not accumulate blocks in these entries, but each
+        // requested sub-piece leaves a `requested=true` entry behind.
+        self.waiting_for_piecebuf.remove(&ji);
+        match buf {
+            Ok(mut lease) => {
+                let had_piece = match &self.torrent_state {
+                    TorrentState::Metadata(d) => d.block_picker.have(ji.index()),
+                    TorrentState::Fetching(_) => false,
+                };
+                info!("sub piece {ji:?} piece loaded",);
+                match self.handle_sub_piece_received(ji, &mut lease, true)? {
+                    PieceVerifyResult::Fail => {
+                        self.handle_checkfile_on_piece_verified(ji.index(), false)
+                            .await?;
+                    }
+                    PieceVerifyResult::Pass(_files) => {
+                        self.handle_checkfile_on_piece_verified(ji.index(), true)
+                            .await?;
+                        if !had_piece {
+                            self.broadcast_have(ji.index() as u32);
+                        }
+                    }
+                    PieceVerifyResult::Skip => {}
+                }
+                Ok(())
+            }
+            Err(e) => {
+                self.invalidate_piece(ji.index());
+                Err(e)
+            }
+        }
+    }
+
     async fn handle_piecebuf_ready(
         &mut self,
         ji: JointIndex,
         buf: io::Result<PieceLease>,
     ) -> io::Result<()> {
+        let pending = self.waiting_for_piecebuf.remove(&ji);
         match buf {
             Ok(mut lease) => {
-                let pending = self.waiting_for_piecebuf.remove(&ji);
                 if let Some(ps) = pending {
                     info!(
                         "piecebuf {ji:?} now ready, flushing {} blocks into it",
@@ -2445,55 +2724,26 @@ impl TransmitWorker {
                     }
                 }
 
-                // TODO: remove immediate if that piece is no longer available among peers
-                // if block_picker.piece_availability(ji.index()) > 0 {
-                //     storage.add_piece(buf);
-                // } else {
-                //     // storage.forget_piece(buf);
-                // }
-                // TODO: FIXME: It's difficult to correctly handling
-                // mixed downloading and checking pieces
-                let is_checking = match &self.running_state {
-                    RunningState::Checking { .. } => true,
-                    _ => false,
-                };
-                let had_piece = match &self.torrent_state {
-                    TorrentState::Metadata(d) => d.block_picker.have(ji.index()),
-                    TorrentState::Fetching(_) => false,
-                };
                 info!("sub piece {ji:?} piece loaded",);
-                match self.handle_sub_piece_received(ji, &mut lease, is_checking)? {
-                    PieceVerifyResult::Fail => {
-                        if is_checking {
-                            self.handle_checkfile_on_piece_verified(ji.index(), false)?;
-                        }
-                    }
+                match self.handle_sub_piece_received(ji, &mut lease, false)? {
+                    PieceVerifyResult::Fail => {}
                     PieceVerifyResult::Pass(files) => {
-                        if is_checking {
-                            // TODO: rename completed files on the checking path.
-                            self.handle_checkfile_on_piece_verified(ji.index(), true)?;
-                            if !had_piece {
-                                self.broadcast_have(ji.index() as u32);
-                            }
-                        } else {
-                            // IMPORTANT: This lease might contains modified part of data
-                            // must return to cache manager before submit rename
-                            drop(lease);
-                            // At Pass the file's data is all written to piecebuf and
-                            // flushed in advance_hash, so submit the rename directly.
-                            for file in files {
-                                self.submit_rename(file).await?;
-                            }
-                            self.broadcast_have(ji.index() as u32);
-                            if self.is_downloaded()
-                                && matches!(
-                                    self.running_state,
-                                    RunningState::StableState(StableState::Downloading)
-                                )
-                            {
-                                self.running_state =
-                                    RunningState::StableState(StableState::Seeding);
-                            }
+                        // IMPORTANT: This lease might contains modified part of data
+                        // must return to cache manager before submit rename
+                        drop(lease);
+                        // At Pass the file's data is all written to piecebuf and
+                        // flushed in advance_hash, so submit the rename directly.
+                        for file in files {
+                            self.submit_rename(file).await?;
+                        }
+                        self.broadcast_have(ji.index() as u32);
+                        if self.is_downloaded()
+                            && matches!(
+                                self.running_state,
+                                RunningState::StableState(StableState::Downloading)
+                            )
+                        {
+                            self.running_state = RunningState::StableState(StableState::Seeding);
                         }
                     }
                     PieceVerifyResult::Skip => {}
@@ -2504,10 +2754,8 @@ impl TransmitWorker {
                 // This sub-piece may already contain blocks marked Received
                 // in BlockPicker, but the bytes were not copied into PieceBuf.
                 // Roll back the entire piece in the picker so that blocks are
-                // re-requested on resume, and clear waiting_for_piecebuf to
-                // prevent shutdown hang.
+                // re-requested on resume.
                 warn!("piecebuf ready error for {ji:?}: {e}");
-                self.waiting_for_piecebuf.remove(&ji);
 
                 // TODO: FIXME: only abandon that sub-piece and preserve other
                 // existing sub-pieces, so that no need to remove hasher and re-
@@ -2531,6 +2779,27 @@ impl TransmitWorker {
         if let Some(h) = self.connected_peers.get_mut(&peer) {
             h.inflight.reject(req);
         }
+    }
+
+    /// Reject every PIECE block arriving during the Checking phase: checking
+    /// only reads from disk, so incoming blocks are rolled back in the picker +
+    /// inflight and their buffers dropped, admitting no new writes.
+    fn handle_pieces_while_checking(
+        &mut self,
+        peer: SocketAddr,
+        receive_blks: Option<ReceivedBlocks>,
+    ) -> io::Result<()> {
+        if !matches!(self.torrent_state, TorrentState::Metadata(_)) {
+            return Ok(());
+        }
+        let Some(blks) = receive_blks else {
+            return Ok(());
+        };
+        for p in blks.blocks {
+            let req = p.piece.to_request();
+            self.handle_reject_msg(peer, req);
+        }
+        Ok(())
     }
 
     fn handle_request_metadata(&mut self, sender: oneshot::Sender<Option<Arc<Metadata>>>) {
@@ -2577,12 +2846,8 @@ impl TransmitWorker {
         }
     }
 
-    fn handle_check_file(&mut self, sender: oneshot::Sender<bool>) -> io::Result<()> {
-        let Downloading {
-            block_picker,
-            hasher,
-            ..
-        } = match &mut self.torrent_state {
+    async fn handle_check_file(&mut self, sender: oneshot::Sender<bool>) -> io::Result<()> {
+        let Downloading { block_picker, .. } = match &mut self.torrent_state {
             TorrentState::Metadata(d) => d,
             TorrentState::Fetching(_) => {
                 info!("check file when fetching metadata, maybe unreachable");
@@ -2591,16 +2856,12 @@ impl TransmitWorker {
             }
         };
         match &mut self.running_state {
-            RunningState::Checking { waiter, .. } => {
+            RunningState::Checking { waiter, .. } | RunningState::Draining { waiter, .. } => {
                 waiter.push(sender);
                 return Ok(());
             }
             _ => (),
         };
-
-        // A force check must hash every byte again, not reuse an incremental
-        // prefix from the previous download or from before a disk error.
-        hasher.clear();
 
         // arrange for loading pieces not in buffer
         let mut selected = block_picker
@@ -2608,38 +2869,37 @@ impl TransmitWorker {
             .iter()
             .enumerate()
             .filter_map(|(i, selected)| selected.then(|| i as u32));
-        if let Some(first) = selected.next() {
-            info!("piece {first} scheduled for checking",);
-            match &mut self.running_state {
-                RunningState::Checking { .. } => {
-                    unreachable!("should not be checking when handle check file")
-                }
-
-                s => {
-                    let prev_state = match s {
-                        RunningState::StableState(st) => st.clone(),
-                        _ => unreachable!(),
-                    };
-                    let waiter = vec![sender];
-                    let to_check = selected
-                        .chain(std::iter::once(first))
-                        .collect::<BTreeSet<_>>();
-                    let checked = CheckState::new(block_picker.n_pieces(), &to_check);
-                    *s = RunningState::Checking {
-                        prev_state,
-                        checked,
-                        to_check,
-                        deferred: Vec::new(),
-                        waiter,
-                    };
-                }
-            }
-            self.request_piecebuf(JointIndex::new(first, 0));
-        } else {
+        let Some(first) = selected.next() else {
             info!("no piece selected for checking, check file complete");
             // TODO: MAYBE FIXME: we did not select any piece, but we return true here
             let _ = sender.send(true);
             return Ok(());
+        };
+        info!("piece {first} scheduled for checking",);
+        let prev_state = match &self.running_state {
+            RunningState::StableState(st) => st.clone(),
+            _ => unreachable!("should not be Checking|Draining when handle check file"),
+        };
+        let to_check = selected
+            .chain(std::iter::once(first))
+            .collect::<BTreeSet<_>>();
+        self.running_state = RunningState::Draining {
+            prev_state,
+            n_pieces: block_picker.n_pieces(),
+            to_check,
+            deferred: Vec::new(),
+            flush_close_op: None,
+            waiter: vec![sender],
+        };
+
+        // Every pending sub-piece already has an outstanding GetPiece, so its
+        // PieceBufReady will drain it and then submit the barrier. If nothing is
+        // pending, submit right now (no PieceBufReady would arrive to do it).
+        if self.waiting_for_piecebuf.is_empty() {
+            let id = self.submit_flush_and_close().await?;
+            if let RunningState::Draining { flush_close_op, .. } = &mut self.running_state {
+                *flush_close_op = Some(id);
+            }
         }
         Ok(())
     }
