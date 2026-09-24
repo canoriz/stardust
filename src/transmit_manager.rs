@@ -1,5 +1,5 @@
 use crate::announce_manager::{self, AnnounceManagerHandle};
-use crate::backfile::{BackFile, NormalFile, VoidFile};
+use crate::backfile::{BackFile, NormalFile};
 use crate::bandwidth::Bandwidth;
 use crate::buffer_pool::{BlockBuf, BufferPool};
 use crate::cache::cache_manager::{CacheManagerHandle, FileOpID, Fop, GlobalPieceKey, PieceLease};
@@ -421,6 +421,32 @@ pub enum StableState {
     Fatal(String), // unrecoverable error, torrent halted; string is the reason
 }
 
+/// Sub-state within `Draining`: buffers → FlushAndClose → per-file FixPath ops.
+#[derive(Debug, Default)]
+enum DrainPhase {
+    /// Draining `waiting_for_piecebuf`; no file op submitted yet.
+    #[default]
+    DrainingBuffers,
+    /// FlushAndClose submitted, awaiting its ack.
+    FlushingClose(FileOpID),
+    /// Per-file FixPath ops submitted, awaiting all acks before Checking.
+    FixingPaths(HashSet<FileOpID>),
+}
+
+/// Sub-state within `Checking`: verifying pieces → per-file restore renames.
+#[derive(Debug, Default)]
+enum CheckPhase {
+    /// Hashing pieces from disk.
+    #[default]
+    Verifying,
+    /// All pieces verified; per-file Rename ops in flight. `new_state` is
+    /// installed once every rename acks.
+    RestoringNames {
+        pending: HashSet<FileOpID>,
+        new_state: StableState,
+    },
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 enum RunningState {
     StableState(StableState),
@@ -439,10 +465,9 @@ enum RunningState {
         deferred: Vec<Msg>,
         #[serde(skip)]
         waiter: Vec<oneshot::Sender<bool>>,
-        /// The submitted FlushAndClose op id; None until `waiting_for_piecebuf`
-        /// is empty and the op has been submitted.
+        /// Where we are in the drain sub-state machine.
         #[serde(skip)]
-        flush_close_op: Option<FileOpID>,
+        phase: DrainPhase,
     },
     Checking {
         prev_state: StableState,
@@ -453,6 +478,9 @@ enum RunningState {
         deferred: Vec<Msg>,
         #[serde(skip)]
         waiter: Vec<oneshot::Sender<bool>>,
+        /// Where we are in the checking sub-state machine.
+        #[serde(skip)]
+        phase: CheckPhase,
     }, // checking local file
 }
 
@@ -480,6 +508,7 @@ impl RunningState {
                     checked,
                     deferred,
                     waiter,
+                    phase: CheckPhase::Verifying,
                 }
             }
             _ => unreachable!(),
@@ -573,6 +602,7 @@ impl From<RunningStateDump> for RunningState {
                 to_check,
                 deferred: Vec::new(),
                 waiter: Vec::new(),
+                phase: CheckPhase::Verifying,
             },
             RunningStateDump::Checking {
                 prev_state,
@@ -584,6 +614,7 @@ impl From<RunningStateDump> for RunningState {
                 checked,
                 deferred: Vec::new(),
                 waiter: Vec::new(),
+                phase: CheckPhase::Verifying,
             },
         }
     }
@@ -1122,18 +1153,14 @@ impl TransmitWorker {
             // TODO: maybe only send metadata to cache manager, and let cache manager create back file when needed?
             BackFile::new::<NormalFile>().metadata(m.clone()).build(),
         ));
-        // Rename every not-yet-complete file to `<final>.part` directly on the
-        // freshly-built backfile, before it is handed to the cache manager.
-        // BackFile::rename no-ops on disk when the source is absent (already
-        // `.part` after a restart) and only updates the tracked path.
+        // Set each file's tracked path based on completeness: not-yet-complete
+        // files point at `<final>.part`. In-memory only, no disk op.
         {
             let mut bf = back_file.lock().unwrap();
             let files = m.files();
             for index in block_picker.incomplete_files() {
                 let to = format!("{}.part", files[index].path.join("/"));
-                if let Err(e) = bf.rename(index, to) {
-                    warn!("startup rename file {index}: {e}");
-                }
+                bf.set_path(index, to);
             }
         }
         cache_handle.register_torrent(
@@ -1338,49 +1365,55 @@ impl TransmitWorker {
                     && matches!(
                         &self.running_state,
                         RunningState::Draining {
-                            flush_close_op: None,
+                            phase: DrainPhase::DrainingBuffers,
                             ..
                         }
                     );
                 if need_submit {
                     let id = self.submit_flush_and_close().await?;
-                    if let RunningState::Draining { flush_close_op, .. } = &mut self.running_state {
-                        *flush_close_op = Some(id);
+                    if let RunningState::Draining { phase, .. } = &mut self.running_state {
+                        *phase = DrainPhase::FlushingClose(id);
                     }
                 }
                 Ok(())
             }
-            Msg::FileOpDone { id, result } => {
-                let is_flush_close = matches!(
-                    &self.running_state,
-                    RunningState::Draining {
-                        flush_close_op: Some(fid),
-                        ..
-                    } if *fid == id
-                );
-                if is_flush_close {
+            Msg::FileOpDone { id, result } => match &mut self.running_state {
+                RunningState::Draining {
+                    phase: DrainPhase::FlushingClose(fid),
+                    ..
+                } if *fid == id => {
                     result?;
                     // Force-recheck must re-hash every byte from disk, so drop any
                     // partial hash state left over from the drain before checking.
                     if let TorrentState::Metadata(d) = &mut self.torrent_state {
                         d.hasher.clear();
                     }
-                    self.fix_paths();
-                    self.running_state.draining_to_checking();
-                    // Request the first piece to verify; caches are cleared and fds
-                    // closed, so GetPiece reopens from disk at the fixed-up path.
-                    let first = match &self.running_state {
-                        RunningState::Checking { to_check, .. } => to_check.first().copied(),
-                        _ => None,
-                    };
-                    if let Some(first) = first {
-                        self.request_piecebuf(JointIndex::new(first, 0));
+                    // Point each tracked path at the real on-disk name off-thread,
+                    // then wait for every FixPath ack before checking.
+                    let ids = self.submit_fix_paths().await?;
+                    if ids.is_empty() {
+                        self.draining_advance_to_checking();
+                    } else if let RunningState::Draining { phase, .. } = &mut self.running_state {
+                        *phase = DrainPhase::FixingPaths(ids);
                     }
                     Ok(())
-                } else {
-                    self.handle_msg_normal(Msg::FileOpDone { id, result }).await
                 }
-            }
+                RunningState::Draining {
+                    phase: DrainPhase::FixingPaths(ids),
+                    ..
+                } => {
+                    if ids.remove(&id) {
+                        result?;
+                        if ids.is_empty() {
+                            self.draining_advance_to_checking();
+                        }
+                        Ok(())
+                    } else {
+                        self.handle_msg_normal(Msg::FileOpDone { id, result }).await
+                    }
+                }
+                _ => self.handle_msg_normal(Msg::FileOpDone { id, result }).await,
+            },
             Msg::PeerMsg(PeerMsg::Pieces(..))
             | Msg::QueryStatus(_)
             | Msg::CheckFile(_)
@@ -1406,8 +1439,19 @@ impl TransmitWorker {
             Msg::PeerMsg(PeerMsg::Pieces(peer, blks)) => {
                 self.handle_pieces_while_checking(peer, blks)
             }
-            Msg::FileOpDone { .. }
-            | Msg::QueryStatus(_)
+            Msg::FileOpDone { id, result } => match self.maybe_recheck_rename_ack(id) {
+                // While restoring file names, absorb the per-file rename acks;
+                // install the resolved stable state once the last one lands.
+                Some(empty) => {
+                    result?;
+                    if empty {
+                        self.finalize_recheck();
+                    }
+                    Ok(())
+                }
+                None => self.handle_msg_normal(Msg::FileOpDone { id, result }).await,
+            },
+            Msg::QueryStatus(_)
             | Msg::CheckFile(_)
             | Msg::ChangeState(_, _)
             | Msg::FlushComplete(_)
@@ -2012,24 +2056,19 @@ impl TransmitWorker {
             "piece {index} check {}",
             if passed { "passed" } else { "failed" }
         );
-        // Some => checking finished: carries the stable state to restore and the
-        // peer-state messages deferred during draining/checking. None => more
-        // pieces still pending, next one already requested.
-        let finished: Option<(RunningState, Vec<Msg>)> = match &mut self.running_state {
+        // Some => checking finished: carries the resolved stable state to
+        // restore once file names are fixed. None => more pieces still pending,
+        // next one already requested.
+        let finished: Option<StableState> = match &mut self.running_state {
             RunningState::Checking {
                 prev_state,
                 to_check,
                 checked,
-                waiter,
-                deferred,
+                ..
             } => {
                 checked.check(index as usize, passed);
                 to_check.remove(&index);
                 if to_check.is_empty() {
-                    let r = checked.state.iter().all(|s| *s != CheckState::CORRUPT);
-                    for w in waiter.drain(0..) {
-                        w.send(r);
-                    }
                     let new_state = match prev_state {
                         StableState::Downloading | StableState::Seeding => {
                             let Downloading { block_picker, .. } = match &mut self.torrent_state {
@@ -2039,16 +2078,16 @@ impl TransmitWorker {
                                 }
                             };
                             if block_picker.is_finished() {
-                                RunningState::StableState(StableState::Seeding)
+                                StableState::Seeding
                             } else {
-                                RunningState::StableState(StableState::Downloading)
+                                StableState::Downloading
                             }
                         }
-                        StableState::Paused => RunningState::StableState(StableState::Paused),
-                        StableState::Stopped => RunningState::StableState(StableState::Stopped),
-                        StableState::Fatal(_) => RunningState::StableState(StableState::Paused),
+                        StableState::Paused => StableState::Paused,
+                        StableState::Stopped => StableState::Stopped,
+                        StableState::Fatal(_) => StableState::Paused,
                     };
-                    Some((new_state, std::mem::take(deferred)))
+                    Some(new_state)
                 } else {
                     // load next piece to check
                     let next_piece = *to_check.first().unwrap();
@@ -2059,31 +2098,114 @@ impl TransmitWorker {
             _ => unreachable!("called from not checking state"),
         };
 
-        let Some((new_state, deferred)) = finished else {
+        let Some(new_state) = finished else {
             return Ok(());
         };
-        self.running_state = new_state;
-        match self.running_state {
-            RunningState::StableState(StableState::Downloading) => {
+
+        // All pieces verified. Restore file names to match the have-state
+        // off-thread, then install `new_state` once every rename acks. If there
+        // is nothing to rename, install immediately.
+        let ids = self.submit_restore_names().await?;
+        if ids.is_empty() {
+            let deferred = match &mut self.running_state {
+                RunningState::Checking { deferred, .. } => std::mem::take(deferred),
+                _ => Vec::new(),
+            };
+            self.finish_checking(new_state, deferred);
+        } else if let RunningState::Checking { phase, .. } = &mut self.running_state {
+            *phase = CheckPhase::RestoringNames {
+                pending: ids,
+                new_state,
+            };
+        }
+        Ok(())
+    }
+
+    /// Remove a rename ack `id` from the in-flight restore set. Returns
+    /// `Some(true)` if it was the last outstanding rename, `Some(false)` if more
+    /// remain, or `None` if `id` is not a restore rename (still `Verifying`, or a
+    /// stray ack from another op) — route it to the normal handler.
+    fn maybe_recheck_rename_ack(&mut self, id: FileOpID) -> Option<bool> {
+        match &mut self.running_state {
+            RunningState::Checking {
+                phase: CheckPhase::RestoringNames { pending, .. },
+                ..
+            } => {
+                if pending.remove(&id) {
+                    Some(pending.is_empty())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// All restore renames acked: pull the resolved stable state out of the
+    /// phase and install it (with side effects and deferred replay). Only called
+    /// right after `maybe_recheck_rename_ack` returns `Some(true)`, so the state
+    /// is still `Checking`/`RestoringNames`.
+    fn finalize_recheck(&mut self) {
+        let (new_state, deferred) = match &mut self.running_state {
+            RunningState::Checking {
+                phase, deferred, ..
+            } => {
+                let new_state = match std::mem::replace(phase, CheckPhase::Verifying) {
+                    CheckPhase::RestoringNames { new_state, .. } => new_state,
+                    _ => unreachable!("finalize_recheck requires RestoringNames phase"),
+                };
+                (new_state, std::mem::take(deferred))
+            }
+            _ => unreachable!("finalize_recheck requires Checking state"),
+        };
+        self.finish_checking(new_state, deferred);
+    }
+
+    /// True while a force-recheck is waiting on its restore renames to ack.
+    /// These ops live only in `CheckPhase::RestoringNames`, not in
+    /// `pending_renames`, so the cleanup drain must check this explicitly: a
+    /// dump taken mid-`RestoringNames` loses the phase and restores as a stuck
+    /// `Checking { to_check: {} }` that never renames or transitions.
+    fn recheck_renames_pending(&self) -> bool {
+        matches!(
+            &self.running_state,
+            RunningState::Checking {
+                phase: CheckPhase::RestoringNames { pending, .. },
+                ..
+            } if !pending.is_empty()
+        )
+    }
+
+    /// Install the resolved stable state after checking, run its side effects
+    /// (resume hashes / notify downloaded), and replay messages deferred while
+    /// draining/checking.
+    fn finish_checking(&mut self, new_state: StableState, deferred: Vec<Msg>) {
+        if let RunningState::Checking {
+            checked, waiter, ..
+        } = &mut self.running_state
+        {
+            let passed = checked.state.iter().all(|s| *s != CheckState::CORRUPT);
+            for sender in waiter.drain(..) {
+                let _ = sender.send(passed);
+            }
+        }
+        self.running_state = RunningState::StableState(new_state.clone());
+        match new_state {
+            StableState::Downloading => {
                 // TODO: FIXME: really needed?
                 self.resume_pending_hashes();
             }
-            RunningState::StableState(StableState::Seeding) => {
-                self.downloaded.send(true);
+            StableState::Seeding => {
+                let _ = self.downloaded.send(true);
             }
             _ => {}
         }
-
-        // Now stable again: fix file names to match the checked have-state and
-        // replay the messages we deferred while draining/checking.
-        self.restore_part().await?;
         for msg in deferred {
             // Re-enqueue instead of calling handle_msg here, which would form an
             // async recursion cycle; the worker processes these next, now in a
             // stable state.
             let _ = self.self_handle.sender.send(msg);
         }
-        Ok(())
     }
 
     // fn remove_unreachable_pieces_from_buf(&mut self) {
@@ -2609,62 +2731,99 @@ impl TransmitWorker {
         Ok(())
     }
 
-    /// Point each file's tracked path at whichever name exists on disk
-    /// (`<final>` if present, else `<final>.part`), so checking reads real
-    /// bytes. Only switches the tracked path, never touches disk.
-    fn fix_paths(&self) {
-        let Downloading {
-            metadata,
-            back_file,
-            ..
-        } = match &self.torrent_state {
-            TorrentState::Metadata(d) => d,
-            TorrentState::Fetching(_) => return,
+    /// Install `Checking` from the current `Draining` state and request the
+    /// first piece to verify. Caches are cleared and fds closed, so GetPiece
+    /// reopens from disk at the fixed-up path.
+    fn draining_advance_to_checking(&mut self) {
+        self.running_state.draining_to_checking();
+        let first = match &self.running_state {
+            RunningState::Checking { to_check, .. } => to_check.first().copied(),
+            _ => None,
         };
-        let mut bf = back_file.lock().unwrap();
-        for (i, f) in metadata.files().iter().enumerate() {
-            let final_name = f.path.join("/");
-            // TODO: `exists` may be a blocking syscall; consider making it async.
-            let path = if bf.exists(std::path::Path::new(&final_name)) {
-                final_name
-            } else {
-                format!("{final_name}.part")
-            };
-            bf.set_path(i, path);
+        if let Some(first) = first {
+            self.request_piecebuf(JointIndex::new(first, 0));
         }
     }
 
-    /// After checking finishes, restore file names to match the have-state:
-    /// completed files to `<final>`, still-incomplete files to `<final>.part`.
-    /// `fix_paths` already pointed each tracked path at the real on-disk file,
-    /// so we only pick the target name here; `bf.rename` no-ops when unchanged.
-    /// Renames directly on the backfile: FlushAndClose already flushed+dropped
-    /// the cache and checking only reads, so there is no dirty data to flush.
-    async fn restore_part(&mut self) -> io::Result<()> {
-        let Downloading {
-            block_picker,
-            metadata,
-            back_file,
-            ..
-        } = match &self.torrent_state {
-            TorrentState::Metadata(d) => d,
-            TorrentState::Fetching(_) => return Ok(()),
+    /// Submit one `FixPath` op per file so the cache manager points each tracked
+    /// path at the real on-disk name off-thread. Returns the outstanding op ids.
+    async fn submit_fix_paths(&mut self) -> io::Result<HashSet<FileOpID>> {
+        let names: Vec<String> = match &self.torrent_state {
+            TorrentState::Metadata(d) => d
+                .metadata
+                .files()
+                .iter()
+                .map(|f| f.path.join("/"))
+                .collect(),
+            TorrentState::Fetching(_) => return Ok(HashSet::new()),
         };
-        let incomplete: HashSet<usize> = block_picker.incomplete_files().into_iter().collect();
-        let files = metadata.files();
-        let mut bf = back_file.lock().unwrap();
-        for i in 0..files.len() {
-            let final_name = files[i].path.join("/");
-            let to = if incomplete.contains(&i) {
-                format!("{final_name}.part")
-            } else {
-                final_name
+        let mut ids = HashSet::new();
+        for (file_index, final_name) in names.into_iter().enumerate() {
+            let fop = Fop::FixPath {
+                file_index,
+                final_name,
+                sender: self.self_handle.sender.clone(),
             };
-            if let Err(e) = bf.rename(i, to) {
-                warn!("restore_part rename file {i}: {e}");
-            }
+            let id = self
+                .cache_handle
+                .send_file_op(self.info_hash, fop)
+                .await
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("send fixpath: {e}")))?;
+            ids.insert(id);
         }
-        Ok(())
+        Ok(ids)
+    }
+
+    /// Submit one rename per file to restore names to the checked have-state:
+    /// completed files to `<final>`, still-incomplete files to `<final>.part`.
+    /// Renames run off-thread on the cache manager; `flush_all` is false because
+    /// FlushAndClose already abandoned the cache and checking only reads, so
+    /// there is no dirty data. Returns the outstanding op ids.
+    async fn submit_restore_names(&mut self) -> io::Result<HashSet<FileOpID>> {
+        let ops: Vec<(usize, String, u64, u64)> = {
+            let Downloading {
+                block_picker,
+                metadata,
+                ..
+            } = match &self.torrent_state {
+                TorrentState::Metadata(d) => d,
+                TorrentState::Fetching(_) => return Ok(HashSet::new()),
+            };
+            let incomplete: HashSet<usize> = block_picker.incomplete_files().into_iter().collect();
+            let files = metadata.files();
+            let mut v = Vec::with_capacity(files.len());
+            let mut begin = 0u64;
+            for i in 0..files.len() {
+                let end = begin + files[i].length;
+                let final_name = files[i].path.join("/");
+                let to = if incomplete.contains(&i) {
+                    format!("{final_name}.part")
+                } else {
+                    final_name
+                };
+                v.push((i, to, begin, end));
+                begin = end;
+            }
+            v
+        };
+        let mut ids = HashSet::new();
+        for (file_index, to, begin, end) in ops {
+            let fop = Fop::Rename {
+                file_index,
+                to,
+                begin,
+                end,
+                flush_all: false,
+                sender: self.self_handle.sender.clone(),
+            };
+            let id = self
+                .cache_handle
+                .send_file_op(self.info_hash, fop)
+                .await
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("send rename: {e}")))?;
+            ids.insert(id);
+        }
+        Ok(ids)
     }
 
     // TODO: maybe typestate for different state
@@ -2888,7 +3047,7 @@ impl TransmitWorker {
             n_pieces: block_picker.n_pieces(),
             to_check,
             deferred: Vec::new(),
-            flush_close_op: None,
+            phase: DrainPhase::DrainingBuffers,
             waiter: vec![sender],
         };
 
@@ -2897,8 +3056,8 @@ impl TransmitWorker {
         // pending, submit right now (no PieceBufReady would arrive to do it).
         if self.waiting_for_piecebuf.is_empty() {
             let id = self.submit_flush_and_close().await?;
-            if let RunningState::Draining { flush_close_op, .. } = &mut self.running_state {
-                *flush_close_op = Some(id);
+            if let RunningState::Draining { phase, .. } = &mut self.running_state {
+                *phase = DrainPhase::FlushingClose(id);
             }
         }
         Ok(())
@@ -3078,7 +3237,10 @@ impl TransmitWorker {
         for ji in to_request {
             self.request_piecebuf(ji);
         }
-        while !self.waiting_for_piecebuf.is_empty() || !self.pending_renames.is_empty() {
+        while !self.waiting_for_piecebuf.is_empty()
+            || !self.pending_renames.is_empty()
+            || self.recheck_renames_pending()
+        {
             match self.receiver.recv().await {
                 Some(
                     msg @ (Msg::PieceBufReady { .. }

@@ -317,12 +317,23 @@ fn rename_op(
 }
 
 // Take a single FileOpDone completion if one is queued; panics on any other message.
-fn take_file_op_done(rx: &mut mpsc::UnboundedReceiver<TmMsg>) -> Option<(FileOpID, io::Result<()>)> {
+fn take_file_op_done(
+    rx: &mut mpsc::UnboundedReceiver<TmMsg>,
+) -> Option<(FileOpID, io::Result<()>)> {
     match rx.try_recv() {
         Ok(TmMsg::FileOpDone { id, result }) => Some((id, result)),
         Ok(other) => panic!("unexpected message {other:?}"),
         Err(_) => None,
     }
+}
+
+// Drain every FileOpDone completion currently queued, in arrival order.
+fn drain_file_op_done(rx: &mut mpsc::UnboundedReceiver<TmMsg>) -> Vec<(FileOpID, io::Result<()>)> {
+    let mut done = Vec::new();
+    while let Some(d) = take_file_op_done(rx) {
+        done.push(d);
+    }
+    done
 }
 
 // A storage backend whose rename always fails, so the file op must surface the error.
@@ -414,7 +425,11 @@ async fn file_op_waits_for_dirty_flush_in_range() {
     );
 
     let end = SUB_PIECE_SIZE as u64 * 8;
-    let accept = queue_file_op(&handle, info_hash, rename_op(0, "renamed", 0, end, true, &tx));
+    let accept = queue_file_op(
+        &handle,
+        info_hash,
+        rename_op(0, "renamed", 0, end, true, &tx),
+    );
     // Handle only the Fop: dropping the dirty piece raises flush_count2, so the
     // rename must stay queued and unexecuted until the flush completes.
     let msg = mgr.receiver.try_recv().unwrap();
@@ -457,10 +472,121 @@ async fn file_op_failure_is_reported() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let accept = queue_file_op(&handle, info_hash, rename_op(0, "fail", 0, 0, false, &tx));
     pump(&mut mgr).await;
-    let id = accept.await.unwrap().expect("file op accepted even if the rename will fail");
+    let id = accept
+        .await
+        .unwrap()
+        .expect("file op accepted even if the rename will fail");
     let (done_id, result) = take_file_op_done(&mut rx).expect("failure must be reported");
     assert_eq!(done_id, id);
     assert!(result.is_err());
+}
+
+// A storage backend that reports the final name as present on disk.
+struct FinalPresent;
+impl Access for FinalPresent {
+    fn open<P: AsRef<Path>>(_: P, _: u64) -> io::Result<Self> {
+        Ok(Self)
+    }
+    fn write_all_at(&mut self, _: &[u8], _: u64) -> io::Result<()> {
+        Ok(())
+    }
+    fn read_exact_at(&mut self, buf: &mut [u8], _: u64) -> io::Result<()> {
+        buf.fill(0);
+        Ok(())
+    }
+    fn metadata(&self) -> io::Result<FileMetadata> {
+        Ok(FileMetadata { len: u64::MAX })
+    }
+    fn rename<P: AsRef<Path>>(_: P, _: P) -> io::Result<()> {
+        Ok(())
+    }
+    fn exists<P: AsRef<Path>>(_: P) -> bool {
+        true
+    }
+}
+
+// A storage backend where the final name is absent (only a `.part` exists).
+struct FinalAbsent;
+impl Access for FinalAbsent {
+    fn open<P: AsRef<Path>>(_: P, _: u64) -> io::Result<Self> {
+        Ok(Self)
+    }
+    fn write_all_at(&mut self, _: &[u8], _: u64) -> io::Result<()> {
+        Ok(())
+    }
+    fn read_exact_at(&mut self, buf: &mut [u8], _: u64) -> io::Result<()> {
+        buf.fill(0);
+        Ok(())
+    }
+    fn metadata(&self) -> io::Result<FileMetadata> {
+        Ok(FileMetadata { len: u64::MAX })
+    }
+    fn rename<P: AsRef<Path>>(_: P, _: P) -> io::Result<()> {
+        Ok(())
+    }
+    fn exists<P: AsRef<Path>>(_: P) -> bool {
+        false
+    }
+}
+
+// FixPath points the tracked path at the final name when it exists on disk,
+// and reports completion through FileOpDone.
+#[tokio::test]
+async fn fixpath_uses_final_name_when_present() {
+    let (mut mgr, handle) = CacheManager::with_capacity(1);
+    let info_hash = [31; 20];
+    let bf = Arc::new(Mutex::new(BackFile::new::<FinalPresent>().build()));
+    handle.register_torrent(
+        info_hash,
+        SUB_PIECE_SIZE as usize,
+        2 * SUB_PIECE_SIZE as u64,
+        bf.clone(),
+        None,
+        None,
+    );
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let fop = Fop::FixPath {
+        file_index: 0,
+        final_name: "movie".to_string(),
+        sender: tx.clone(),
+    };
+    let accept = queue_file_op(&handle, info_hash, fop);
+    pump(&mut mgr).await;
+    let id = accept.await.unwrap().expect("fixpath accepted");
+    let (done_id, result) = take_file_op_done(&mut rx).expect("fixpath reports completion");
+    assert_eq!(done_id, id);
+    assert!(result.is_ok());
+    assert_eq!(bf.lock().unwrap().tracked_path(0), Some("movie"));
+    assert!(mgr.torrents[&info_hash].1.pending_ops.is_empty());
+}
+
+// FixPath falls back to the `.part` name when the final name is absent on disk.
+#[tokio::test]
+async fn fixpath_falls_back_to_part_when_absent() {
+    let (mut mgr, handle) = CacheManager::with_capacity(1);
+    let info_hash = [32; 20];
+    let bf = Arc::new(Mutex::new(BackFile::new::<FinalAbsent>().build()));
+    handle.register_torrent(
+        info_hash,
+        SUB_PIECE_SIZE as usize,
+        2 * SUB_PIECE_SIZE as u64,
+        bf.clone(),
+        None,
+        None,
+    );
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let fop = Fop::FixPath {
+        file_index: 0,
+        final_name: "movie".to_string(),
+        sender: tx.clone(),
+    };
+    let accept = queue_file_op(&handle, info_hash, fop);
+    pump(&mut mgr).await;
+    let id = accept.await.unwrap().expect("fixpath accepted");
+    let (done_id, result) = take_file_op_done(&mut rx).expect("fixpath reports completion");
+    assert_eq!(done_id, id);
+    assert!(result.is_ok());
+    assert_eq!(bf.lock().unwrap().tracked_path(0), Some("movie.part"));
 }
 
 // Verify an out-of-range file index reports an error rather than renaming.
@@ -526,4 +652,34 @@ async fn piece_request_deferred_by_pending_file_op_replays() {
         "the deferred request is served after the file op"
     );
     assert_eq!(served[0].0, key(1).index);
+}
+
+// Verify several file ops queued together each run to completion, in order,
+// with distinct ids: the deque keeps its front until the blocking task reports
+// back, so ops are executed one at a time rather than dropped or reordered.
+#[tokio::test]
+async fn multiple_queued_file_ops_all_complete_in_order() {
+    let (mut mgr, handle, info_hash) = registered(1);
+    let (tx, mut rx) = mpsc::unbounded_channel();
+
+    let a = queue_file_op(&handle, info_hash, rename_op(0, "a", 0, 0, false, &tx));
+    let b = queue_file_op(&handle, info_hash, rename_op(0, "b", 0, 0, false, &tx));
+    let c = queue_file_op(&handle, info_hash, rename_op(0, "c", 0, 0, false, &tx));
+    pump(&mut mgr).await;
+
+    let id_a = a.await.unwrap().expect("first op accepted");
+    let id_b = b.await.unwrap().expect("second op accepted");
+    let id_c = c.await.unwrap().expect("third op accepted");
+    assert!(id_a != id_b && id_b != id_c, "each op gets a distinct id");
+
+    let done = drain_file_op_done(&mut rx);
+    assert_eq!(done.len(), 3, "every queued op must complete");
+    assert!(done.iter().all(|(_, r)| r.is_ok()));
+    assert_eq!(
+        done.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        vec![id_a, id_b, id_c],
+        "ops complete in the order they were queued"
+    );
+    assert!(mgr.torrents[&info_hash].1.pending_ops.is_empty());
+    assert!(!mgr.torrents[&info_hash].1.op_executing);
 }

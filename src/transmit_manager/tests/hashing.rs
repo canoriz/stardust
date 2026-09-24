@@ -18,7 +18,9 @@ fn metadata() -> Metadata {
         std::process::id(),
         NEXT_FILE.fetch_add(1, Ordering::Relaxed)
     ));
-    std::fs::write(&path, &bytes).unwrap();
+    // An incomplete download's file lives at its tracked name `<final>.part`
+    // (the on-disk name always matches the tracked name), so seed `.part`.
+    std::fs::write(format!("{}.part", path.display()), &bytes).unwrap();
     let info: Info = serde_json::from_value(serde_json::json!({
         "name": "hash-test", "piece length": len, "length": len,
         "pieces": Sha1::digest(&bytes).to_vec()
@@ -161,8 +163,8 @@ async fn cleanup(mut worker: TransmitWorker, cache: tokio::task::JoinHandle<()>)
     cache.abort();
     let _ = cache.await;
     drop(worker);
-    // Incomplete files are renamed to `<final>.part` at worker construction, so
-    // clean up whichever name is present.
+    // Incomplete files live at `<final>.part` (their tracked name), so clean up
+    // whichever name is present.
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(format!("{path}.part"));
 }
@@ -479,7 +481,7 @@ async fn downloaded_signaled_only_after_rename_acked() {
 async fn completed_file_renamed_from_part_to_final() {
     let (mut worker, cache) = new_downloading_worker();
     let path = downloading_state(&mut worker).metadata.files[0].path[0].clone();
-    // The incomplete file was renamed to `<final>.part` at construction.
+    // The incomplete file lives at `<final>.part` (its tracked name).
     assert!(std::path::Path::new(&format!("{path}.part")).exists());
     assert!(!std::path::Path::new(&path).exists());
 
@@ -572,7 +574,7 @@ async fn force_check_rejects_corrupt_part_file_ignoring_stale_hasher() {
     let path = downloading_state(&mut worker).metadata.files[0].path[0].clone();
     let mut corrupt = vec![0x5a; 2 * SUB_PIECE_SIZE as usize];
     corrupt[..SUB_PIECE_SIZE as usize].fill(0x33);
-    // The incomplete file was renamed to `<final>.part` at construction, so
+    // The incomplete file lives at `<final>.part` (its tracked name), so
     // corrupt the backing `.part` file the backfile actually reads.
     std::fs::write(format!("{path}.part"), corrupt).unwrap();
     let mut stale_hasher = HashState::new(Sha1::new());

@@ -71,6 +71,23 @@ impl WaitingSlots {
         self.queue.retain(|key| key.info_hash != info_hash);
     }
 
+    /// Remove and return this torrent's queued keys (in queue order). Their
+    /// waiters stay parked in `CacheManager::pending`; the caller re-`push`es
+    /// these keys once its file-op barrier clears.
+    fn drain_torrent(&mut self, info_hash: InfoHash) -> Vec<GlobalPieceKey> {
+        let mut drained = Vec::new();
+        self.queue.retain(|key| {
+            if key.info_hash == info_hash {
+                self.keys.remove(key);
+                drained.push(*key);
+                false
+            } else {
+                true
+            }
+        });
+        drained
+    }
+
     fn len(&self) -> usize {
         self.queue.len()
     }
@@ -144,6 +161,13 @@ pub enum CacheMsg {
         key: GlobalPieceKey,
         result: Result<(), String>,
     },
+    /// Internal: the blocking task for the front `pending_ops` entry finished.
+    /// The op's `FileOpID` is recovered by popping the deque front at handling
+    /// time (the front is the op that just ran).
+    FileOpBlockingDone {
+        info_hash: InfoHash,
+        result: io::Result<()>,
+    },
     /// Query current cache statistics
     GetStats(oneshot::Sender<CacheStats>),
     Shutdown(oneshot::Sender<()>),
@@ -186,13 +210,25 @@ impl CacheManagerHandle {
         info_hash: InfoHash,
         fop: Fop,
     ) -> Result<FileOpID, &'static str> {
+        self.queue_file_op(info_hash, fop)
+            .await
+            .expect("should be some")
+    }
+
+    /// Queue without awaiting acceptance, so startup can place file operations
+    /// before its first GetPiece even though worker construction is synchronous.
+    pub(crate) fn queue_file_op(
+        &self,
+        info_hash: InfoHash,
+        fop: Fop,
+    ) -> oneshot::Receiver<Result<FileOpID, &'static str>> {
         let (tx, rx) = oneshot::channel();
         let _ = self.sender.send(CacheMsg::Fop {
             info_hash,
             fop,
             sender: tx,
         });
-        rx.await.expect("should be some")
+        rx
     }
 
     /// Unregister a torrent.
@@ -224,6 +260,13 @@ impl CacheManagerHandle {
     /// Called by the file-read spawn_blocking task.
     fn piece_loaded(&self, key: GlobalPieceKey, buf: io::Result<PieceBuf>) {
         let _ = self.sender.send(CacheMsg::PieceLoaded { key, buf });
+    }
+
+    /// Called by the file-op spawn_blocking task when the blocking part finished.
+    fn file_op_done(&self, info_hash: InfoHash, result: io::Result<()>) {
+        let _ = self
+            .sender
+            .send(CacheMsg::FileOpBlockingDone { info_hash, result });
     }
 
     /// Flush `PieceBuf` and report to the cache at completion
@@ -371,6 +414,7 @@ enum TorrentState {
 
 /// A file-level operation (e.g. rename) deferred behind the cache's I/O barrier.
 pub enum Fop {
+    // TODO: change begin, end and flush_all to option((begin, end))
     Rename {
         file_index: usize,
         to: String,
@@ -389,6 +433,15 @@ pub enum Fop {
         end: u64,
         sender: UnboundedSender<TmMsg>,
     },
+    /// Point one file's tracked path at whichever name exists on disk
+    /// (`<final>` if present, else `<final>.part`) without renaming on disk.
+    /// Runs the blocking `exists` stat off-thread. Used by force-recheck so
+    /// checking reads real bytes.
+    FixPath {
+        file_index: usize,
+        final_name: String,
+        sender: UnboundedSender<TmMsg>,
+    },
 }
 
 pub type FileOpID = u64;
@@ -399,8 +452,18 @@ pub type FileOpID = u64;
 struct IoState {
     /// number of processing io jobs (reading + lease)
     in_io: u32,
-    /// File ops accepted but not yet executed.
-    pending_ops: Vec<(FileOpID, Fop)>,
+    /// File ops accepted but not yet fully executed. The front op may be
+    /// in-flight on a spawn_blocking task (see `op_executing`); it is popped
+    /// only after that task reports back.
+    pending_ops: VecDeque<(FileOpID, Fop)>,
+    /// True while the front `pending_ops` entry is running on a blocking task.
+    /// Keeps `maybe_do_all_file_op` from launching it twice and gates
+    /// unregister finalization.
+    op_executing: bool,
+    /// Keys drained out of `waiting_slot` when the first file op was accepted.
+    /// Their waiters remain in `CacheManager::pending`; re-queued once the whole
+    /// `pending_ops` deque drains.
+    deferred_load_keys: Vec<GlobalPieceKey>,
     /// Piece requests deferred until queued file ops finish.
     pending_req: Vec<CacheMsg>,
 }
@@ -566,6 +629,10 @@ impl CacheManager {
                 self.handle_piece_flushed(key, result);
             }
 
+            CacheMsg::FileOpBlockingDone { info_hash, result } => {
+                self.handle_file_op_blocking_done(info_hash, result);
+            }
+
             CacheMsg::GetStats(reply) => {
                 let _ = reply.send(self.build_stats());
             }
@@ -600,9 +667,9 @@ impl CacheManager {
             Some((
                 _,
                 IoState {
-                    in_io,
                     pending_ops,
                     pending_req,
+                    ..
                 },
             )) if pending_ops.len() > 0 => {
                 pending_req.push(CacheMsg::GetPiece { key, sender });
@@ -684,7 +751,6 @@ impl CacheManager {
                         // Reading -> clean cached.
                         self.cache.insert(key, CacheEntry::Loaded(Some(piece)));
                         self.assume_clear.insert(key);
-                        self.maybe_do_all_file_op(key.info_hash);
                     }
                     _ => {}
                 }
@@ -740,7 +806,10 @@ impl CacheManager {
         // No waiters: re-cache the piece.
         // Only re-cache if the torrent is still registered; if not, just drop the piece.
         // drop piece will auto write back if it's dirty, so we don't need to explicitly flush here.
-        if self.torrents.contains_key(&key.info_hash) {
+        if matches!(
+            self.torrents.get(&key.info_hash),
+            Some((TorrentState::Registed(_), _))
+        ) {
             let is_clear = !piece.is_dirty();
             // lent out -> cached.
             if matches!(
@@ -815,8 +884,21 @@ impl CacheManager {
                 }
             }
         }
+
+        // TODO: notify waiters with "unregisting torrent"
         self.cache.retain(|key, _| key.info_hash != info_hash);
         self.assume_clear.retain(|key| key.info_hash != info_hash);
+        for (k, ws) in self.pending.extract_if(|key, _| key.info_hash != info_hash) {
+            for w in ws {
+                let _ = w.send(TmMsg::PieceBufReady {
+                    index: k.index,
+                    buf: Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("unregisted torrent"),
+                    )),
+                });
+            }
+        }
         self.pending.retain(|key, _| key.info_hash != info_hash);
         self.waiting_slot.remove_torrent(info_hash);
 
@@ -832,41 +914,55 @@ impl CacheManager {
     }
 
     /// Try to finish an in-progress unregister. Safe to call at any time.
+    /// Finalizes (notify waiters, remove torrent, replay deferred requests) only
+    /// once flushes are done AND every queued file op has run — a pending op is
+    /// launched here and re-drives this on completion, so no op is dropped.
     fn handle_unregister_after(&mut self, info_hash: InfoHash) {
-        let (waiters, ti, ios) = match self
-            .torrents
-            .get_mut(&info_hash)
-            .expect("unregisting torrent should exist")
-        {
-            (TorrentState::Registed(_), _) => return,
-            (TorrentState::Unregisting(t), ios) => (&mut t.0, &mut t.1, ios),
-        };
-        match ti.flush_count2.as_ref() {
-            Some(count) if count.load(Ordering::Relaxed) == 0 => {
-                for w in waiters.drain(0..) {
-                    let _ = w.send(());
-                }
-                for op in ios.pending_ops.drain(0..) {
-                    match op {
-                        (id, Fop::Rename { sender, .. })
-                        | (id, Fop::FlushAndClose { sender, .. }) => {
-                            _ = sender.send(TmMsg::FileOpDone {
-                                id,
-                                result: Err(io::Error::new(
-                                    io::ErrorKind::Other,
-                                    "unregisted torrent",
-                                )),
-                            });
-                        }
-                    }
-                }
-                let pending_req = std::mem::take(&mut ios.pending_req);
-                self.torrents.remove(&info_hash);
-                for msg in pending_req {
-                    self.handle_msg(msg);
-                }
+        let (flushed, op_executing, has_pending_ops) = match self.torrents.get(&info_hash) {
+            Some((TorrentState::Registed(_), _)) => return,
+            Some((TorrentState::Unregisting((_, ti)), ios)) => {
+                let flushed = ti
+                    .flush_count2
+                    .as_ref()
+                    .is_none_or(|c| c.load(Ordering::Relaxed) == 0);
+                (flushed, ios.op_executing, !ios.pending_ops.is_empty())
             }
-            _ => {}
+            None => return,
+        };
+        if !flushed || op_executing {
+            // Barrier not clear or an op is in flight; the flush / op completion
+            // handler will re-drive us.
+            return;
+        }
+        if has_pending_ops {
+            // Run remaining ops to completion before finalizing.
+            self.maybe_do_all_file_op(info_hash);
+            return;
+        }
+
+        let (waiters, pending_req) = match self.torrents.get_mut(&info_hash) {
+            Some((TorrentState::Unregisting((waiters, _)), ios)) => {
+                // Drop the keys drained out of waiting_slot at file-op acceptance.
+                // waiting_slot was already purged when unregister arrived and no new
+                // request for this torrent will ever come, so there is nothing to
+                // restore.
+                (
+                    std::mem::take(waiters),
+                    std::mem::take(&mut ios.pending_req),
+                )
+            }
+            _ => return,
+        };
+        for w in waiters {
+            let _ = w.send(());
+        }
+        self.torrents.remove(&info_hash);
+        // Replay requests deferred behind the file ops: with the torrent now
+        // removed, each routes to handle_get_piece's untracked-torrent branch and
+        // its waiter gets an explicit "not registered" error instead of a silently
+        // closed channel.
+        for msg in pending_req {
+            self.handle_msg(msg);
         }
     }
 
@@ -876,13 +972,10 @@ impl CacheManager {
         }
         self.stats.current.flushes += 1;
 
-        let ti = match self
-            .torrents
-            .get(&key.info_hash)
-            .expect("entry of flushing piece should exist")
-        {
-            (TorrentState::Registed(ti), _) => ti,
-            (TorrentState::Unregisting((_, ti)), _) => ti,
+        let ti = match self.torrents.get(&key.info_hash) {
+            Some((TorrentState::Registed(ti), _)) => ti,
+            Some((TorrentState::Unregisting((_, ti)), _)) => ti,
+            None => return,
         };
         if let Some(fc) = &ti.flush_count2 {
             fc.fetch_sub(1, Ordering::Relaxed);
@@ -922,10 +1015,18 @@ impl CacheManager {
         match self.torrents.get_mut(&info_hash) {
             Some((TorrentState::Unregisting(_), _)) => {
                 let _ = sender.send(Err("unregisting torrent"));
+                return;
             }
-            Some((TorrentState::Registed(_), IoState { pending_ops, .. })) => {
+            Some((TorrentState::Registed(_), ios)) => {
                 self.file_op_id += 1;
-                pending_ops.push((self.file_op_id, op));
+                ios.pending_ops.push_back((self.file_op_id, op));
+                // Stop `load_pending_pieces` from starting reads for this torrent
+                // while the op(s) run; their waiters stay parked in `self.pending`
+                // and are re-queued once the deque drains. Idempotent for later
+                // ops (drain returns empty), and new GetPiece during the window
+                // are deferred into `pending_req`, not `waiting_slot`.
+                ios.deferred_load_keys
+                    .extend(self.waiting_slot.drain_torrent(info_hash));
                 let _ = sender.send(Ok(self.file_op_id));
             }
             None => {
@@ -976,66 +1077,136 @@ impl CacheManager {
         }
     }
 
-    /// Run queued file ops if the torrent's I/O barrier is clear, then replay
-    /// any piece requests that were deferred behind them.
+    /// Launch the front queued file op if the torrent's I/O barrier is clear.
+    /// Runs the blocking syscall off-thread via `spawn_blocking`; the front op
+    /// stays in the deque (keeping same-torrent reads deferred) until its
+    /// completion message pops it in `handle_file_op_blocking_done`.
     fn maybe_do_all_file_op(&mut self, info_hash: InfoHash) {
-        match self.torrents.get_mut(&info_hash) {
-            Some((
-                t,
-                IoState {
-                    in_io,
-                    pending_ops,
-                    pending_req,
-                },
-            )) => {
-                let ti = match t {
-                    TorrentState::Registed(ti) => ti,
-                    TorrentState::Unregisting((_, ti)) => ti,
-                };
-
-                let all_flushed = if let Some(fc) = &ti.flush_count2 {
-                    fc.load(Ordering::Relaxed) == 0
-                } else {
-                    true
-                };
-
-                if all_flushed && *in_io == 0 {
-                    {
-                        let mut file = ti.back_file.lock().unwrap();
-                        for op in pending_ops.drain(0..) {
-                            match op {
-                                (
-                                    id,
-                                    Fop::Rename {
-                                        file_index,
-                                        to,
-                                        sender,
-                                        ..
-                                    },
-                                ) => {
-                                    let result = file.rename(file_index, to);
-                                    _ = sender.send(TmMsg::FileOpDone { id, result });
-                                }
-                                (id, Fop::FlushAndClose { sender, .. }) => {
-                                    file.close_all();
-                                    // drop_fop_related_dirty_pieces already purged
-                                    // dirty pieces; clear clean cached pieces too so
-                                    // the cache is fully abandoned (in_io==0 ⇒ no
-                                    // leases out) and recheck reads real disk bytes.
-                                    self.cache.retain(|k, _| k.info_hash != info_hash);
-                                    self.assume_clear.retain(|k| k.info_hash != info_hash);
-                                    _ = sender.send(TmMsg::FileOpDone { id, result: Ok(()) });
-                                }
-                            }
-                        }
-                    }
-                    for req in std::mem::take(pending_req) {
-                        self.handle_msg(req);
-                    }
-                }
-            }
-            None => {}
+        let (t, ios) = match self.torrents.get_mut(&info_hash) {
+            Some(entry) => entry,
+            None => return,
+        };
+        if ios.op_executing {
+            return;
         }
+        let ti = match t {
+            TorrentState::Registed(ti) => ti,
+            TorrentState::Unregisting((_, ti)) => ti,
+        };
+        let all_flushed = ti
+            .flush_count2
+            .as_ref()
+            .is_none_or(|fc| fc.load(Ordering::Relaxed) == 0);
+        if !(all_flushed && ios.in_io == 0) {
+            return;
+        }
+        let back_file = ti.back_file.clone();
+        let handle = self.self_handle.clone();
+        if ios.pending_ops.is_empty() {
+            return;
+        }
+        ios.op_executing = true;
+        match &ios.pending_ops.front().unwrap().1 {
+            Fop::Rename { file_index, to, .. } => {
+                let (file_index, to) = (*file_index, to.clone());
+                tokio::task::spawn_blocking(move || {
+                    let result = back_file.lock().unwrap().rename(file_index, to);
+                    handle.file_op_done(info_hash, result);
+                });
+            }
+            Fop::FlushAndClose { .. } => {
+                tokio::task::spawn_blocking(move || {
+                    back_file.lock().unwrap().close_all();
+                    handle.file_op_done(info_hash, Ok(()));
+                });
+            }
+            Fop::FixPath {
+                file_index,
+                final_name,
+                ..
+            } => {
+                let (file_index, final_name) = (*file_index, final_name.clone());
+                tokio::task::spawn_blocking(move || {
+                    let mut bf = back_file.lock().unwrap();
+                    let path = if bf.exists(final_name.as_ref()) {
+                        final_name
+                    } else {
+                        format!("{final_name}.part")
+                    };
+                    bf.set_path(file_index, path);
+                    handle.file_op_done(info_hash, Ok(()));
+                });
+            }
+        }
+    }
+
+    /// Completion of the front file op's blocking task: pop it, notify its
+    /// waiter, run any actor-thread cleanup, then launch the next queued op. Once
+    /// the deque drains, either finalize a pending unregister or restore the
+    /// reads that were deferred during the op window.
+    fn handle_file_op_blocking_done(&mut self, info_hash: InfoHash, result: io::Result<()>) {
+        let (done_op, is_unregistering) = match self.torrents.get_mut(&info_hash) {
+            Some((t, ios)) => {
+                ios.op_executing = false;
+                // op_executing was set when we launched, so the front op is still
+                // queued (only this handler pops it, and unregister waits for us).
+                let done_op = match ios.pending_ops.pop_front() {
+                    Some(op) => op,
+                    None => unreachable!("op_executing set but deque front missing"),
+                };
+                (done_op, matches!(t, TorrentState::Unregisting(_)))
+            }
+            None => return,
+        };
+
+        let (id, fop) = done_op;
+        match fop {
+            Fop::Rename { sender, .. } => {
+                _ = sender.send(TmMsg::FileOpDone { id, result });
+            }
+            Fop::FlushAndClose { sender, .. } => {
+                // drop_fop_related_dirty_pieces already purged dirty pieces;
+                // clear clean cached pieces too so the cache is fully abandoned
+                // (in_io==0 ⇒ no leases out) and recheck reads real disk bytes.
+                self.cache.retain(|k, _| k.info_hash != info_hash);
+                self.assume_clear.retain(|k| k.info_hash != info_hash);
+                _ = sender.send(TmMsg::FileOpDone { id, result });
+            }
+            Fop::FixPath { sender, .. } => {
+                _ = sender.send(TmMsg::FileOpDone { id, result });
+            }
+        }
+
+        let deque_empty = match self.torrents.get(&info_hash) {
+            Some((_, ios)) => ios.pending_ops.is_empty(),
+            None => return,
+        };
+        if !deque_empty {
+            // More ops queued: run the next before finalizing anything.
+            self.maybe_do_all_file_op(info_hash);
+            return;
+        }
+
+        if is_unregistering {
+            // All queued ops done; now the unregister can finalize.
+            self.handle_unregister_after(info_hash);
+            return;
+        }
+
+        let (keys, reqs) = match self.torrents.get_mut(&info_hash) {
+            Some((_, ios)) => (
+                std::mem::take(&mut ios.deferred_load_keys),
+                std::mem::take(&mut ios.pending_req),
+            ),
+            None => return,
+        };
+        for k in keys {
+            self.waiting_slot.push(k);
+        }
+        for req in reqs {
+            self.handle_msg(req);
+        }
+        self.load_pending_pieces();
     }
 
     /// Swap old pieces out and new pieces in.

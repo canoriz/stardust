@@ -5,8 +5,8 @@ use sha1::{Digest, Sha1};
 use std::io;
 
 mod magnet;
-pub use magnet::Magnet;
 pub use crate::protocol::InfoHash;
+pub use magnet::Magnet;
 
 // Metadata is a universal structure
 #[derive(Debug, Clone, Serialize, Deserialize)]

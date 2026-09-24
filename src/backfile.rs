@@ -441,7 +441,10 @@ impl BackFile {
         if index >= self.file_range.len() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                format!("rename index {index} out of range (len {})", self.file_range.len()),
+                format!(
+                    "rename index {index} out of range (len {})",
+                    self.file_range.len()
+                ),
             ));
         }
         let renamer = self.renamer;
@@ -498,6 +501,11 @@ impl BackFile {
             .handle
             .as_mut()
             .map(|h| h.get_inner(offset, len))
+    }
+
+    #[cfg(test)]
+    pub fn tracked_path(&self, index: usize) -> Option<&str> {
+        self.file_range.get(index).map(|f| f.path.as_str())
     }
 }
 
