@@ -377,7 +377,7 @@ async fn do_change_state(
 
 #[cfg(test)]
 mod tests {
-    use super::{RpcRequest, RpcResponse, RunningStateDump, StableState, TorrentSource};
+    use super::{RpcRequest, RpcResponse, RunningStateDump, TorrentSource};
 
     #[test]
     fn request_deserialize_add_torrent_doc_example() {
@@ -457,12 +457,12 @@ mod tests {
             bandwidth_bps: 12345.0,
             selected: vec![0, 2],
             have: vec![0],
-            state: RunningStateDump::StableState(StableState::Downloading),
+            state: RunningStateDump::Downloading,
         })
         .expect("serialize torrent status");
         assert_eq!(
             status,
-            r#"{"torrent_status":{"info_hash":"001122","process":0.42,"bandwidth_bps":12345.0,"selected":[0,2],"have":[0],"state":{"StableState":"Downloading"}}}"#
+            r#"{"torrent_status":{"info_hash":"001122","process":0.42,"bandwidth_bps":12345.0,"selected":[0,2],"have":[0],"state":"Downloading"}}"#
         );
     }
 

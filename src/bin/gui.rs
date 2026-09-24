@@ -37,7 +37,7 @@ use tracing_subscriber::fmt::format::FmtSpan;
 
 use stardust::api::{
     handle_rpc, ApiCommand, BufferPoolStats, CacheStats, RpcRequest, RpcResponse, RunningStateDump,
-    StableState, TorrentSource,
+    TorrentSource,
 };
 use stardust::{protocol::InfoHash, Session, SessionDump, SessionOpt};
 
@@ -133,7 +133,7 @@ impl Default for TorrentRow {
             name: None,
             progress: 0.0,
             speed_bps: 0.0,
-            state: RunningStateDump::StableState(StableState::Stopped),
+            state: RunningStateDump::Stopped,
         }
     }
 }
@@ -495,25 +495,25 @@ impl eframe::App for GuiApp {
 
                             // Status label
                             match &row.state {
-                                RunningStateDump::StableState(StableState::Paused) => {
+                                RunningStateDump::Paused => {
                                     ui.colored_label(
                                         egui::Color32::from_rgb(220, 140, 0),
                                         "Paused",
                                     );
                                 }
-                                RunningStateDump::StableState(StableState::Stopped) => {
+                                RunningStateDump::Stopped => {
                                     ui.colored_label(egui::Color32::DARK_GRAY, "Stopped");
                                 }
-                                RunningStateDump::StableState(StableState::Seeding) => {
+                                RunningStateDump::Seeding => {
                                     ui.colored_label(egui::Color32::GREEN, "Seeding");
                                 }
-                                RunningStateDump::StableState(StableState::Downloading) => {
+                                RunningStateDump::Downloading => {
                                     ui.colored_label(
                                         egui::Color32::from_rgb(100, 180, 255),
                                         "Downloading",
                                     );
                                 }
-                                RunningStateDump::StableState(StableState::Fatal(reason)) => {
+                                RunningStateDump::Fatal(reason) => {
                                     ui.colored_label(
                                         egui::Color32::RED,
                                         format!("Fatal: {reason}"),
@@ -546,11 +546,9 @@ impl eframe::App for GuiApp {
                             ui.horizontal(|ui| {
                                 let is_paused = matches!(
                                     &row.state,
-                                    RunningStateDump::StableState(
-                                        StableState::Paused
-                                            | StableState::Stopped
-                                            | StableState::Fatal(_)
-                                    )
+                                    RunningStateDump::Paused
+                                        | RunningStateDump::Stopped
+                                        | RunningStateDump::Fatal(_)
                                 );
                                 if is_paused {
                                     if ui.small_button("▶ Resume").clicked() {

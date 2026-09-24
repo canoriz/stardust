@@ -414,15 +414,13 @@ enum TorrentState {
 
 /// A file-level operation (e.g. rename) deferred behind the cache's I/O barrier.
 pub enum Fop {
-    // TODO: change begin, end and flush_all to option((begin, end))
     Rename {
         file_index: usize,
         to: String,
-        /// Logical byte range covered by the rename, expressed as [begin, end).
-        begin: u64,
-        end: u64,
-        /// Drop and flush pieces in the range once when handling the Fop message.
-        flush_all: bool,
+        /// `Some((begin, end))` drops and flushes cache-owned pieces in the
+        /// logical byte range [begin, end) once when the Fop is handled, before
+        /// renaming; `None` renames without touching the cache.
+        flush: Option<(u64, u64)>,
         sender: UnboundedSender<TmMsg>,
     },
     /// Flush all dirty pieces in [begin, end), purge every cached piece for the
@@ -1003,12 +1001,7 @@ impl CacheManager {
         sender: oneshot::Sender<Result<FileOpID, &'static str>>,
     ) {
         let flush_range = match &op {
-            Fop::Rename {
-                begin,
-                end,
-                flush_all: true, // TODO:
-                ..
-            } => Some((*begin, *end)),
+            Fop::Rename { flush, .. } => *flush,
             Fop::FlushAndClose { begin, end, .. } => Some((*begin, *end)),
             _ => None,
         };

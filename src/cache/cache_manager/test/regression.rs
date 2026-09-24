@@ -309,9 +309,7 @@ fn rename_op(
     Fop::Rename {
         file_index,
         to: to.to_string(),
-        begin,
-        end,
-        flush_all,
+        flush: flush_all.then_some((begin, end)),
         sender: sender.clone(),
     }
 }

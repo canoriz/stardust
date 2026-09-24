@@ -76,7 +76,13 @@ fn restore_worker(
         },
         peers: vec![],
         announce_urls: vec![],
-        running_state: RunningStateDump::StableState(running),
+        running_state: match running {
+            StableState::Downloading => RunningStateDump::Downloading,
+            StableState::Seeding => RunningStateDump::Seeding,
+            StableState::Paused => RunningStateDump::Paused,
+            StableState::Stopped => RunningStateDump::Stopped,
+            StableState::Fatal(e) => RunningStateDump::Fatal(e),
+        },
     };
     let dump = serde_json::from_slice(&serde_json::to_vec(&dump).unwrap()).unwrap();
     let (cache, handle) = CacheManager::new();
@@ -109,7 +115,9 @@ fn new_downloading_worker() -> (TransmitWorker, tokio::task::JoinHandle<()>) {
         handle,
         pool,
     );
-    worker.running_state = RunningState::StableState(StableState::Downloading);
+    worker.running_state = RunningState::Downloading {
+        waiter: Default::default(),
+    };
     (worker, task)
 }
 
@@ -190,7 +198,7 @@ async fn restore_received_subpiece0_rebuilds_hasher_to_subpiece1_offset() {
     assert_eq!(worker.runtime_status().process, 1.0);
     assert!(matches!(
         worker.running_state,
-        RunningState::StableState(StableState::Seeding)
+        RunningState::Seeding
     ));
     cleanup(worker, cache).await;
 }
@@ -266,7 +274,7 @@ async fn out_of_order_subpieces_verify_without_rehashing_duplicates() {
     assert!(worker.waiting_for_piecebuf.is_empty());
     assert!(matches!(
         worker.running_state,
-        RunningState::StableState(StableState::Paused)
+        RunningState::Paused
     ));
     cleanup(worker, cache).await;
 }
@@ -281,12 +289,20 @@ async fn piece_verification_preserves_paused_or_fatal_state() {
         mark_subpiece_received(&mut picker, 0);
         mark_subpiece_received(&mut picker, 1);
         let (mut worker, cache) = restore_worker(meta, &mut picker, StableState::Downloading);
-        worker.running_state = RunningState::StableState(running);
+        worker.running_state = match running {
+            StableState::Downloading => RunningState::Downloading {
+                waiter: Default::default(),
+            },
+            StableState::Seeding => RunningState::Seeding,
+            StableState::Paused => RunningState::Paused,
+            StableState::Stopped => RunningState::Stopped,
+            StableState::Fatal(e) => RunningState::Fatal(e),
+        };
         pump(&mut worker).await;
         assert!(downloading_state(&mut worker).block_picker.have(0));
         assert!(matches!(
             worker.running_state,
-            RunningState::StableState(StableState::Paused | StableState::Fatal(_))
+            RunningState::Paused | RunningState::Fatal(_)
         ));
         cleanup(worker, cache).await;
     }
@@ -348,7 +364,7 @@ async fn write_error_clears_hasher_and_waiting_buffers() {
     assert!(pending.requested && pending.blocks.is_empty());
     assert!(matches!(
         worker.running_state,
-        RunningState::StableState(StableState::Fatal(_))
+        RunningState::Fatal(_)
     ));
 
     // Resume and redownload the piece with deliberately corrupt data in
@@ -426,19 +442,20 @@ async fn read_error_clears_hasher_and_waiting_data() {
     assert!(worker.waiting_for_piecebuf[&JointIndex::new(0, 0)].requested);
     assert!(matches!(
         worker.running_state,
-        RunningState::StableState(StableState::Fatal(_))
+        RunningState::Fatal(_)
     ));
     cleanup(worker, cache).await;
 }
 
 // Completion is signaled only after the rename is acked. Drive the piece to
 // verify and the rename to be submitted, but withhold its FileOpDone: the
-// `downloaded` watch must stay false. Delivering the ack then completes it.
+// `WaitDownloaded` reply must stay pending. Delivering the ack then fires it.
 #[tokio::test]
 async fn downloaded_signaled_only_after_rename_acked() {
     let (mut worker, cache) = new_downloading_worker();
     let path = downloading_state(&mut worker).metadata.files[0].path[0].clone();
-    let mut dl = worker.downloaded.subscribe();
+    let (tx, mut rx) = oneshot::channel();
+    worker.handle_msg(Msg::WaitDownloaded(tx)).await;
 
     queue_received_subpiece(&mut worker, 0, 0x5a);
     queue_received_subpiece(&mut worker, 1, 0x5a);
@@ -459,20 +476,17 @@ async fn downloaded_signaled_only_after_rename_acked() {
     assert!(downloading_state(&mut worker).block_picker.have(0));
     assert!(!worker.pending_renames.is_empty());
     assert!(!acks.is_empty());
-    assert!(!*dl.borrow());
+    assert_eq!(rx.try_recv(), Err(oneshot::error::TryRecvError::Empty));
 
     // Delivering the rename ack completes the download.
     for msg in acks {
         worker.handle_msg(msg).await;
     }
     assert!(worker.pending_renames.is_empty());
-    assert!(*dl.borrow_and_update());
+    assert_eq!(rx.await.unwrap(), FinishDownload::Done);
     assert!(std::path::Path::new(&path).exists());
     assert!(!std::path::Path::new(&format!("{path}.part")).exists());
-    assert!(matches!(
-        worker.running_state,
-        RunningState::StableState(StableState::Seeding)
-    ));
+    assert!(matches!(worker.running_state, RunningState::Seeding));
     cleanup(worker, cache).await;
 }
 
@@ -498,7 +512,7 @@ async fn completed_file_renamed_from_part_to_final() {
     assert!(!std::path::Path::new(&format!("{path}.part")).exists());
     assert!(matches!(
         worker.running_state,
-        RunningState::StableState(StableState::Seeding)
+        RunningState::Seeding
     ));
     cleanup(worker, cache).await;
 }
@@ -537,7 +551,7 @@ async fn rename_failure_enters_fatal() {
     assert!(worker.pending_renames.is_empty());
     assert!(matches!(
         worker.running_state,
-        RunningState::StableState(StableState::Fatal(_))
+        RunningState::Fatal(_)
     ));
     cleanup(worker, cache).await;
 }
@@ -560,7 +574,7 @@ async fn force_check_accepts_correct_part_file_ignoring_stale_hasher() {
     // Force check must clear the stale state and reread the correct file contents.
     worker.handle_check_file(tx).await.unwrap();
     pump(&mut worker).await;
-    assert!(rx.await.unwrap());
+    assert_eq!(rx.await.unwrap(), CheckOutcome::Passed);
     assert!(downloading_state(&mut worker).block_picker.have(0));
     cleanup(worker, cache).await;
 }
@@ -589,8 +603,9 @@ async fn force_check_rejects_corrupt_part_file_ignoring_stale_hasher() {
     // Force check must ignore the stale correct-looking prefix and reread the corrupt file.
     worker.handle_check_file(tx).await.unwrap();
     pump(&mut worker).await;
-    assert!(
-        !rx.await.unwrap(),
+    assert_eq!(
+        rx.await.unwrap(),
+        CheckOutcome::Failed,
         "force check must detect the corrupt disk range"
     );
     assert!(!downloading_state(&mut worker).block_picker.have(0));
@@ -613,7 +628,7 @@ async fn force_check_accepts_completed_file_at_final_name() {
     let (tx, rx) = oneshot::channel();
     worker.handle_check_file(tx).await.unwrap();
     pump(&mut worker).await;
-    assert!(rx.await.unwrap());
+    assert_eq!(rx.await.unwrap(), CheckOutcome::Passed);
     assert!(downloading_state(&mut worker).block_picker.have(0));
     // A passing recheck must leave the final name in place.
     assert!(std::path::Path::new(&path).exists());
@@ -641,8 +656,9 @@ async fn force_check_rejects_corrupt_completed_file_at_final_name() {
     let (tx, rx) = oneshot::channel();
     worker.handle_check_file(tx).await.unwrap();
     pump(&mut worker).await;
-    assert!(
-        !rx.await.unwrap(),
+    assert_eq!(
+        rx.await.unwrap(),
+        CheckOutcome::Failed,
         "force check must detect the corrupt disk range"
     );
     assert!(!downloading_state(&mut worker).block_picker.have(0));

@@ -5,7 +5,7 @@ use crate::announce_manager::{self, AnnounceManagerHandle};
 use crate::buffer_pool::BufferPool;
 use crate::cache::cache_manager::CacheManagerHandle;
 use crate::dht::DHT;
-use crate::transmit_manager::{self, TorrentTask, TransmitDump, TransmitManager};
+use crate::transmit_manager::{self, FinishDownload, TorrentTask, TransmitDump, TransmitManager};
 use bytes::BytesMut;
 use tokio::sync::{mpsc, oneshot};
 
@@ -68,7 +68,7 @@ impl TorrentManagerHandle {
         self.sender.0.send(transmit_manager::Msg::AnnounceMsg(m)); // TODO: preserve result type?
     }
 
-    pub async fn wait_downloaded(&mut self) -> io::Result<()> {
+    pub async fn wait_downloaded(&mut self) -> io::Result<FinishDownload> {
         self.sender.wait_downloaded().await
     }
 
@@ -112,30 +112,15 @@ impl TorrentManagerHandle {
 }
 
 impl TransmitManagerSender {
-    pub async fn wait_downloaded(&mut self) -> io::Result<()> {
+    pub async fn wait_downloaded(&mut self) -> io::Result<FinishDownload> {
         let (tx, rx) = oneshot::channel();
         self.0
             .send(transmit_manager::Msg::WaitDownloaded(tx))
             .map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("change state send msg error: {}", e),
-                )
+                io::Error::new(io::ErrorKind::Other, format!("wait download err: {}", e))
             })?;
-        let mut has_downloaded = rx.await.map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!("wait downloaded oneshot recv error: {}", e),
-            )
-        })?;
-
-        has_downloaded.wait_for(|d| *d).await.map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!("wait downloaded watch recv error: {}", e),
-            )
-        })?;
-        Ok(())
+        rx.await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("wait download err: {}", e)))
     }
 
     pub async fn change_state(&mut self, s: transmit_manager::RunningCmd) -> io::Result<()> {
@@ -186,11 +171,11 @@ impl TransmitManagerSender {
 }
 
 pub struct ForceCheck {
-    rx: oneshot::Receiver<bool>,
+    rx: oneshot::Receiver<transmit_manager::CheckOutcome>,
 }
 
 impl ForceCheck {
-    pub async fn wait(self) -> io::Result<bool> {
+    pub async fn wait(self) -> io::Result<transmit_manager::CheckOutcome> {
         self.rx
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("force check error: {}", e)))

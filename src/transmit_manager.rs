@@ -29,7 +29,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot};
 use tokio::time;
 use tokio_util::sync::{CancellationToken, DropGuard as CancelDropGuard};
 use tracing::{debug, info, instrument, trace, warn};
@@ -157,9 +157,9 @@ pub(crate) enum Msg {
 
     RequestMetadata(oneshot::Sender<Option<Arc<Metadata>>>),
     QueryStatus(oneshot::Sender<TorrentRuntimeStatus>),
-    CheckFile(oneshot::Sender<bool>),
+    CheckFile(oneshot::Sender<CheckOutcome>),
     ChangeState(RunningCmd, oneshot::Sender<()>),
-    WaitDownloaded(oneshot::Sender<watch::Receiver<bool>>),
+    WaitDownloaded(oneshot::Sender<FinishDownload>),
 
     FileOpDone {
         id: u64,
@@ -433,6 +433,72 @@ enum DrainPhase {
     FixingPaths(HashSet<FileOpID>),
 }
 
+/// Result delivered to `CheckFile` callers. `Aborted` is the default: if the
+/// responder is dropped without a verdict being set (error/teardown), callers
+/// still get an answer instead of a `RecvError`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CheckOutcome {
+    Passed,
+    Failed,
+    #[default]
+    Aborted,
+}
+
+/// Result delivered to `FinishDownload` callers. `NA` is the default
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FinishDownload {
+    Done,
+    Aborted,
+    #[default]
+    NA,
+}
+
+/// RAII reply channel: holds pending oneshot senders and a value; on drop it
+/// sends `value.clone()` to each sender. `set` adjusts the value before drop.
+/// Generic over the reply type so `CheckFile` (`CheckOutcome`) and
+/// `WaitDownloaded` (`Result<_, _>`) share one leak-proof mechanism.
+struct Responder<T: Clone> {
+    senders: Vec<oneshot::Sender<T>>,
+    value: T,
+}
+
+impl<T: Clone> Responder<T> {
+    fn new(default: T) -> Self {
+        Self {
+            senders: Vec::new(),
+            value: default,
+        }
+    }
+
+    fn push(&mut self, tx: oneshot::Sender<T>) {
+        self.senders.push(tx);
+    }
+
+    fn set(&mut self, v: T) {
+        self.value = v;
+    }
+}
+
+impl<T: Clone> Drop for Responder<T> {
+    fn drop(&mut self) {
+        for tx in self.senders.drain(..) {
+            let _ = tx.send(self.value.clone());
+        }
+    }
+}
+
+impl<T: Clone + Default> Default for Responder<T> {
+    fn default() -> Self {
+        Self::new(T::default())
+    }
+}
+
+impl<T: Clone> std::fmt::Debug for Responder<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Responder({})", self.senders.len())
+    }
+}
+
 /// Sub-state within `Checking`: verifying pieces → per-file restore renames.
 #[derive(Debug, Default)]
 enum CheckPhase {
@@ -449,7 +515,14 @@ enum CheckPhase {
 
 #[derive(Debug, Serialize, Deserialize)]
 enum RunningState {
-    StableState(StableState),
+    Paused,  // maintains connection but do not download
+    Stopped, // all stopped
+    Seeding,
+    Fatal(String), // unrecoverable error, torrent halted; string is the reason
+    Downloading {
+        #[serde(skip)]
+        waiter: Responder<FinishDownload>,
+    },
     /// Draining `waiting_for_piecebuf` before a force-recheck: no new writes are
     /// admitted, buffered blocks are flushed to disk, then a FlushAndClose file
     /// op abandons the cache and closes fds. Transitions to `Checking` once that
@@ -464,7 +537,7 @@ enum RunningState {
         #[serde(skip)]
         deferred: Vec<Msg>,
         #[serde(skip)]
-        waiter: Vec<oneshot::Sender<bool>>,
+        waiter: Responder<CheckOutcome>,
         /// Where we are in the drain sub-state machine.
         #[serde(skip)]
         phase: DrainPhase,
@@ -477,7 +550,7 @@ enum RunningState {
         #[serde(skip)]
         deferred: Vec<Msg>,
         #[serde(skip)]
-        waiter: Vec<oneshot::Sender<bool>>,
+        waiter: Responder<CheckOutcome>,
         /// Where we are in the checking sub-state machine.
         #[serde(skip)]
         phase: CheckPhase,
@@ -492,7 +565,7 @@ impl RunningState {
         if !matches!(self, RunningState::Draining { .. }) {
             return;
         }
-        *self = match std::mem::replace(self, RunningState::StableState(StableState::Stopped)) {
+        *self = match std::mem::replace(self, RunningState::Stopped) {
             RunningState::Draining {
                 prev_state,
                 to_check,
@@ -519,7 +592,11 @@ impl RunningState {
     /// if don't need RunningState anymore, consider using [RunningStateDump::from]
     pub fn dump(&self) -> RunningStateDump {
         match self {
-            RunningState::StableState(s) => RunningStateDump::StableState(s.clone()),
+            RunningState::Downloading { .. } => RunningStateDump::Downloading,
+            RunningState::Paused => RunningStateDump::Paused,
+            RunningState::Stopped => RunningStateDump::Stopped,
+            RunningState::Seeding => RunningStateDump::Seeding,
+            RunningState::Fatal(e) => RunningStateDump::Fatal(e.clone()),
             RunningState::Draining {
                 prev_state,
                 to_check,
@@ -547,7 +624,11 @@ impl RunningState {
 impl From<RunningState> for RunningStateDump {
     fn from(state: RunningState) -> Self {
         match state {
-            RunningState::StableState(s) => RunningStateDump::StableState(s),
+            RunningState::Paused => RunningStateDump::Paused,
+            RunningState::Stopped => RunningStateDump::Stopped,
+            RunningState::Seeding => RunningStateDump::Seeding,
+            RunningState::Fatal(e) => RunningStateDump::Fatal(e),
+            RunningState::Downloading { .. } => RunningStateDump::Downloading,
             RunningState::Draining {
                 prev_state,
                 to_check,
@@ -574,7 +655,11 @@ impl From<RunningState> for RunningStateDump {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum RunningStateDump {
-    StableState(StableState),
+    Seeding,
+    Paused,
+    Stopped,
+    Fatal(String),
+    Downloading,
     /// Persisted mid-drain; restored as `Checking` with a fresh `checked`.
     Draining {
         prev_state: StableState,
@@ -591,7 +676,13 @@ pub enum RunningStateDump {
 impl From<RunningStateDump> for RunningState {
     fn from(dump: RunningStateDump) -> Self {
         match dump {
-            RunningStateDump::StableState(s) => RunningState::StableState(s),
+            RunningStateDump::Seeding => RunningState::Seeding,
+            RunningStateDump::Paused => RunningState::Paused,
+            RunningStateDump::Stopped => RunningState::Stopped,
+            RunningStateDump::Fatal(e) => RunningState::Fatal(e),
+            RunningStateDump::Downloading => RunningState::Downloading {
+                waiter: Default::default(),
+            },
             RunningStateDump::Draining {
                 prev_state,
                 to_check,
@@ -601,7 +692,7 @@ impl From<RunningStateDump> for RunningState {
                 prev_state,
                 to_check,
                 deferred: Vec::new(),
-                waiter: Vec::new(),
+                waiter: Responder::default(),
                 phase: CheckPhase::Verifying,
             },
             RunningStateDump::Checking {
@@ -613,7 +704,7 @@ impl From<RunningStateDump> for RunningState {
                 to_check,
                 checked,
                 deferred: Vec::new(),
-                waiter: Vec::new(),
+                waiter: Responder::default(),
                 phase: CheckPhase::Verifying,
             },
         }
@@ -834,8 +925,6 @@ pub struct TransmitWorker {
     /// reaches 0.
     pending_flushes: Arc<AtomicU32>,
 
-    downloaded: watch::Sender<bool>,
-
     /// Handle to the global CacheManager actor.
     cache_handle: CacheManagerHandle,
 
@@ -1028,7 +1117,6 @@ impl TransmitWorker {
             .port(port)
             .dht_port(dht_client.as_ref().map(|c| c.port()))
             .build();
-        let downloaded = watch::channel(false).0;
         let mut worker = Self {
             id,
             info_hash,
@@ -1044,7 +1132,6 @@ impl TransmitWorker {
             waiting_for_piecebuf: HashMap::new(),
             pending_renames: HashMap::new(),
             pending_flushes,
-            downloaded,
             running_state: dump.running_state.into(),
             cache_handle,
             block_pool,
@@ -1057,7 +1144,7 @@ impl TransmitWorker {
                     worker.request_piecebuf(JointIndex::new(*piece, 0));
                 }
             }
-            RunningState::StableState(StableState::Downloading | StableState::Seeding) => {
+            RunningState::Downloading { .. } | RunningState::Seeding => {
                 worker.resume_pending_hashes();
             }
             _ => {}
@@ -1103,7 +1190,6 @@ impl TransmitWorker {
             .port(port)
             .dht_port(dht_client.as_ref().map(|c| c.port()))
             .build();
-        let downloaded = watch::channel(false).0;
         Self {
             id,
             info_hash,
@@ -1121,8 +1207,7 @@ impl TransmitWorker {
             waiting_for_piecebuf: HashMap::new(),
             pending_renames: HashMap::new(),
             pending_flushes,
-            downloaded,
-            running_state: RunningState::StableState(StableState::Stopped),
+            running_state: RunningState::Stopped,
             cache_handle,
             block_pool,
         }
@@ -1333,14 +1418,18 @@ impl TransmitWorker {
     #[instrument(skip_all, fields(hash = crate::helper::to_hex(&self.info_hash)))]
     async fn handle_msg(&mut self, m: Msg) {
         let r = match &self.running_state {
-            RunningState::StableState(_) => self.handle_msg_normal(m).await,
             RunningState::Draining { .. } | RunningState::Checking { .. } => {
                 self.handle_msg_checking(m).await
             }
+            RunningState::Downloading { .. }
+            | RunningState::Seeding
+            | RunningState::Paused
+            | RunningState::Fatal(_)
+            | RunningState::Stopped => self.handle_msg_normal(m).await,
         };
         if let Err(e) = r {
             warn!("handle_msg error, fatal: {e}");
-            self.running_state = RunningState::StableState(StableState::Fatal(format!("{e}")));
+            self.running_state = RunningState::Fatal(format!("{e}"));
         }
     }
 
@@ -1349,7 +1438,7 @@ impl TransmitWorker {
         match &self.running_state {
             RunningState::Draining { .. } => self.handle_msg_draining(m).await,
             RunningState::Checking { .. } => self.handle_msg_checking_phase(m).await,
-            RunningState::StableState(_) => unreachable!(),
+            _ => unreachable!(),
         }
     }
 
@@ -1638,16 +1727,25 @@ impl TransmitWorker {
             Msg::PieceBufReady { index, buf } => self.handle_piecebuf_ready(index, buf).await,
             Msg::FileOpDone { id, result } => {
                 let file = self.pending_renames.remove(&id);
-                match result {
-                    Ok(()) => {
-                        self.maybe_signal_downloaded();
-                        Ok(())
-                    }
-                    Err(e) => Err(io::Error::new(
+                result.map_err(|e| {
+                    io::Error::new(
                         io::ErrorKind::Other,
                         format!("rename file {file:?} (op {id}) failed: {e}"),
-                    )),
+                    )
+                })?;
+                // Completion is signaled only after the last rename acks: once
+                // every completion rename has drained, move Downloading→Seeding,
+                // which drops the waiter and fires the finish signal.
+                if self.pending_renames.is_empty()
+                    && self.is_downloaded()
+                    && matches!(self.running_state, RunningState::Downloading { .. })
+                {
+                    if let RunningState::Downloading { waiter } = &mut self.running_state {
+                        waiter.set(FinishDownload::Done);
+                    }
+                    self.running_state = RunningState::Seeding;
                 }
+                Ok(())
             }
             Msg::RequestMetadata(sender) => {
                 self.handle_request_metadata(sender);
@@ -1661,20 +1759,22 @@ impl TransmitWorker {
             Msg::ChangeState(cmd, sender) => {
                 match cmd {
                     RunningCmd::Resume => {
-                        self.running_state = RunningState::StableState(StableState::Downloading);
+                        self.running_state = RunningState::Downloading {
+                            waiter: Default::default(),
+                        };
                         self.resume_pending_hashes();
                         if self.is_downloaded() {
-                            self.running_state = RunningState::StableState(StableState::Seeding);
+                            self.running_state = RunningState::Seeding;
                         }
                         self.pick_blocks_for_all_peers(10);
                         self.announce_manager.send(announce_manager::Msg::Resume);
                     }
                     RunningCmd::Pause => {
-                        self.running_state = RunningState::StableState(StableState::Paused);
+                        self.running_state = RunningState::Paused;
                         self.announce_manager.send(announce_manager::Msg::Pause);
                     }
                     RunningCmd::Stop => {
-                        self.running_state = RunningState::StableState(StableState::Stopped);
+                        self.running_state = RunningState::Stopped;
                         self.announce_manager.send(announce_manager::Msg::Pause);
                     }
                     RunningCmd::Check => todo!(),
@@ -1683,7 +1783,12 @@ impl TransmitWorker {
                 Ok(())
             }
             Msg::WaitDownloaded(sender) => {
-                _ = sender.send(self.downloaded.subscribe());
+                // Two-state reply: hand back a receiver only when actually
+                // downloading/seeding, otherwise error immediately. The local
+                // Responder guarantees the caller always gets an answer.
+                if let RunningState::Downloading { waiter } = &mut self.running_state {
+                    waiter.push(sender);
+                }
                 Ok(())
             }
         }
@@ -2185,21 +2290,27 @@ impl TransmitWorker {
         } = &mut self.running_state
         {
             let passed = checked.state.iter().all(|s| *s != CheckState::CORRUPT);
-            for sender in waiter.drain(..) {
-                let _ = sender.send(passed);
-            }
+            waiter.set(if passed {
+                CheckOutcome::Passed
+            } else {
+                CheckOutcome::Failed
+            });
         }
-        self.running_state = RunningState::StableState(new_state.clone());
-        match new_state {
+        // Overwriting running_state drops the old Checking, and with it the
+        // Responder, which delivers the verdict set above to every waiter.
+        self.running_state = match new_state {
             StableState::Downloading => {
                 // TODO: FIXME: really needed?
                 self.resume_pending_hashes();
+                RunningState::Downloading {
+                    waiter: Default::default(),
+                }
             }
-            StableState::Seeding => {
-                let _ = self.downloaded.send(true);
-            }
-            _ => {}
-        }
+            StableState::Seeding => RunningState::Seeding,
+            StableState::Paused => RunningState::Paused,
+            StableState::Stopped => RunningState::Stopped,
+            StableState::Fatal(e) => RunningState::Fatal(e),
+        };
         for msg in deferred {
             // Re-enqueue instead of calling handle_msg here, which would form an
             // async recursion cycle; the worker processes these next, now in a
@@ -2532,10 +2643,7 @@ impl TransmitWorker {
             BandwidthMode::Choked => 0,
         };
 
-        if matches!(
-            self.running_state,
-            RunningState::StableState(StableState::Downloading)
-        ) {
+        if matches!(self.running_state, RunningState::Downloading { .. }) {
             if conn.state.peer_choke_status == ChokeStatus::Unchoked {
                 let really_picked = self.pick_blocks_for_peer(&peer, n_to_pick);
             }
@@ -2711,15 +2819,13 @@ impl TransmitWorker {
         let fop = Fop::Rename {
             file_index: file,
             to,
-            begin,
-            end,
 
-            // flush_all must be true, though we `flush()`` it in advance_hash
+            // flush must be Some, though we `flush()` it in advance_hash.
             // Because in a rare case: A verify failed, but some sub-piece of A
             // is currently flushing, and a new `flush()` will do nothing if
             // `flush()` is in progress. So drop that sub-piece to make sure
             // data are securely written before renaming.
-            flush_all: true,
+            flush: Some((begin, end)),
             sender: self.self_handle.sender.clone(),
         };
         let id = self
@@ -2776,11 +2882,11 @@ impl TransmitWorker {
 
     /// Submit one rename per file to restore names to the checked have-state:
     /// completed files to `<final>`, still-incomplete files to `<final>.part`.
-    /// Renames run off-thread on the cache manager; `flush_all` is false because
+    /// Renames run off-thread on the cache manager; `flush` is `None` because
     /// FlushAndClose already abandoned the cache and checking only reads, so
     /// there is no dirty data. Returns the outstanding op ids.
     async fn submit_restore_names(&mut self) -> io::Result<HashSet<FileOpID>> {
-        let ops: Vec<(usize, String, u64, u64)> = {
+        let ops: Vec<(usize, String)> = {
             let Downloading {
                 block_picker,
                 metadata,
@@ -2792,28 +2898,23 @@ impl TransmitWorker {
             let incomplete: HashSet<usize> = block_picker.incomplete_files().into_iter().collect();
             let files = metadata.files();
             let mut v = Vec::with_capacity(files.len());
-            let mut begin = 0u64;
             for i in 0..files.len() {
-                let end = begin + files[i].length;
                 let final_name = files[i].path.join("/");
                 let to = if incomplete.contains(&i) {
                     format!("{final_name}.part")
                 } else {
                     final_name
                 };
-                v.push((i, to, begin, end));
-                begin = end;
+                v.push((i, to));
             }
             v
         };
         let mut ids = HashSet::new();
-        for (file_index, to, begin, end) in ops {
+        for (file_index, to) in ops {
             let fop = Fop::Rename {
                 file_index,
                 to,
-                begin,
-                end,
-                flush_all: false,
+                flush: None,
                 sender: self.self_handle.sender.clone(),
             };
             let id = self
@@ -2896,14 +2997,6 @@ impl TransmitWorker {
                             self.submit_rename(file).await?;
                         }
                         self.broadcast_have(ji.index() as u32);
-                        if self.is_downloaded()
-                            && matches!(
-                                self.running_state,
-                                RunningState::StableState(StableState::Downloading)
-                            )
-                        {
-                            self.running_state = RunningState::StableState(StableState::Seeding);
-                        }
                     }
                     PieceVerifyResult::Skip => {}
                 }
@@ -2921,7 +3014,7 @@ impl TransmitWorker {
                 // download entire piece.
 
                 self.invalidate_piece(ji.index());
-                self.running_state = RunningState::StableState(StableState::Fatal(format!("{e}")));
+                self.running_state = RunningState::Fatal(format!("{e}"));
                 Ok(())
             }
         }
@@ -2977,14 +3070,6 @@ impl TransmitWorker {
         block_picker.is_finished()
     }
 
-    /// Signal completion only once the whole torrent is downloaded and every
-    /// submitted rename has been acked, so the final file exists on disk.
-    fn maybe_signal_downloaded(&mut self) {
-        if self.is_downloaded() && self.pending_renames.is_empty() {
-            let _ = self.downloaded.send(true);
-        }
-    }
-
     fn handle_dht_port_msg(&mut self, mut addr: PeerAddr, port: u16) -> io::Result<()> {
         use crate::dht::RpcAddr;
         if let Some(c) = self.dht_client.clone() {
@@ -3005,12 +3090,12 @@ impl TransmitWorker {
         }
     }
 
-    async fn handle_check_file(&mut self, sender: oneshot::Sender<bool>) -> io::Result<()> {
+    async fn handle_check_file(&mut self, sender: oneshot::Sender<CheckOutcome>) -> io::Result<()> {
         let Downloading { block_picker, .. } = match &mut self.torrent_state {
             TorrentState::Metadata(d) => d,
             TorrentState::Fetching(_) => {
                 info!("check file when fetching metadata, maybe unreachable");
-                let _ = sender.send(false);
+                let _ = sender.send(CheckOutcome::Aborted);
                 return Ok(());
             }
         };
@@ -3030,25 +3115,30 @@ impl TransmitWorker {
             .filter_map(|(i, selected)| selected.then(|| i as u32));
         let Some(first) = selected.next() else {
             info!("no piece selected for checking, check file complete");
-            // TODO: MAYBE FIXME: we did not select any piece, but we return true here
-            let _ = sender.send(true);
+            let _ = sender.send(CheckOutcome::Passed);
             return Ok(());
         };
         info!("piece {first} scheduled for checking",);
         let prev_state = match &self.running_state {
-            RunningState::StableState(st) => st.clone(),
+            RunningState::Downloading { .. } => StableState::Downloading,
+            RunningState::Seeding => StableState::Seeding,
+            RunningState::Paused => StableState::Paused,
+            RunningState::Stopped => StableState::Stopped,
+            RunningState::Fatal(e) => StableState::Fatal(e.clone()),
             _ => unreachable!("should not be Checking|Draining when handle check file"),
         };
         let to_check = selected
             .chain(std::iter::once(first))
             .collect::<BTreeSet<_>>();
+        let mut waiter = Responder::new(CheckOutcome::Aborted);
+        waiter.push(sender);
         self.running_state = RunningState::Draining {
             prev_state,
             n_pieces: block_picker.n_pieces(),
             to_check,
             deferred: Vec::new(),
             phase: DrainPhase::DrainingBuffers,
-            waiter: vec![sender],
+            waiter,
         };
 
         // Every pending sub-piece already has an outstanding GetPiece, so its
@@ -3509,7 +3599,7 @@ mod tests {
                 6881,
             )],
             announce_urls: vec![],
-            running_state: RunningStateDump::StableState(StableState::Downloading),
+            running_state: RunningStateDump::Downloading,
         };
 
         let ser = serde_json::to_string(&dump).expect("serialize dump");
