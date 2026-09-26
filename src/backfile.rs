@@ -159,7 +159,7 @@ impl Access for NormalFile {
         trace!("write_all begin at offset {offset} len {}", buf.len());
         let r = file_write_all_at_impl(&self.file, buf, offset);
         #[cfg(all(
-            target_arch = "x86_64",
+            any(target_arch = "x86_64", target_arch = "aarch64",),
             any(
                 target_os = "linux",
                 target_os = "android",
@@ -197,7 +197,7 @@ impl Access for NormalFile {
             )
         ))]
         unsafe {
-            use libc::{self, posix_fadvise};
+            use libc;
             use std::os::fd::AsRawFd;
             match libc::posix_fadvise64(
                 self.file.as_raw_fd(),
