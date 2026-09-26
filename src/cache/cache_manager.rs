@@ -883,10 +883,9 @@ impl CacheManager {
             }
         }
 
-        // TODO: notify waiters with "unregisting torrent"
         self.cache.retain(|key, _| key.info_hash != info_hash);
         self.assume_clear.retain(|key| key.info_hash != info_hash);
-        for (k, ws) in self.pending.extract_if(|key, _| key.info_hash != info_hash) {
+        for (k, ws) in self.pending.extract_if(|key, _| key.info_hash == info_hash) {
             for w in ws {
                 let _ = w.send(TmMsg::PieceBufReady {
                     index: k.index,
@@ -897,7 +896,6 @@ impl CacheManager {
                 });
             }
         }
-        self.pending.retain(|key, _| key.info_hash != info_hash);
         self.waiting_slot.remove_torrent(info_hash);
 
         match self
