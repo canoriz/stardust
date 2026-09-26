@@ -738,15 +738,19 @@ impl BlockPicker {
             );
         };
 
-        // pick blocks starting from pieces that have fewest block not requested
-        let piece_index_order = |m: &BTreeMap<u32, PieceBlocks>| {
-            let mut piece_order = m
-                .iter()
-                .map(|(i, b)| (*i, b.received_count))
-                .collect::<Vec<_>>();
-            piece_order.sort_by(|(_, recv_a), (_, recv_b)| recv_a.cmp(recv_b).reverse());
-            piece_order
-        };
+        // produce piece index in the ascending order of mapper(p)
+        fn piece_index_order<F, G>(
+            m: &BTreeMap<u32, PieceBlocks>,
+            mapper: F,
+        ) -> impl Iterator<Item = u32>
+        where
+            F: Fn(&PieceBlocks) -> G,
+            G: std::cmp::Ord,
+        {
+            let mut piece_order = m.iter().map(|(i, b)| (*i, mapper(b))).collect::<Vec<_>>();
+            piece_order.sort_by(|(_, val_a), (_, val_b)| val_a.cmp(val_b));
+            piece_order.into_iter().map(|(i, _)| i)
+        }
 
         // TODO: reuse vector
         let mut ret = Vec::new();
@@ -759,13 +763,15 @@ impl BlockPicker {
              avg_speed: f32,
              rtt: time::Duration,
              piece_size: usize| {
-                for index in piece_index_order(pieces).iter().map(|(i, _)| i) {
-                    let blocks = &mut pieces.get_mut(index).expect("must exist");
+                for index in piece_index_order(pieces, |b| {
+                    b.block_map.len() - b.requested_or_received_count
+                }) {
+                    let blocks = &mut pieces.get_mut(&index).expect("must exist");
                     assert!(!endgame);
                     if *remain == 0 {
                         break;
                     }
-                    if peer_status.have(*index) {
+                    if peer_status.have(index) {
                         while let Some((blks, n_picked)) =
                             blocks.pick(*peer, *remain, n_in_flight, avg_speed, rtt, repick_option)
                         {
@@ -845,12 +851,14 @@ impl BlockPicker {
                         repick_limit: limit,
                         endgame: true,
                     };
-                    for index in piece_index_order(&self.receiving).iter().map(|(i, _)| i) {
-                        let blocks = &mut self.receiving.get_mut(index).expect("must exist");
+                    for index in
+                        piece_index_order(&self.receiving, |b| b.block_map.len() - b.received_count)
+                    {
+                        let blocks = &mut self.receiving.get_mut(&index).expect("must exist");
                         if remain == 0 {
                             break;
                         }
-                        if peer_status.have(*index) {
+                        if peer_status.have(index) {
                             while let Some((blks, n_picked)) = blocks.pick(
                                 *peer,
                                 remain,
@@ -870,12 +878,14 @@ impl BlockPicker {
             }
             info!("remain 1 {remain}");
         } else if remain > 0 && rush_mode {
-            for index in piece_index_order(&self.receiving).iter().map(|(i, _)| i) {
-                let blocks = &mut self.receiving.get_mut(index).expect("must exist");
+            for index in
+                piece_index_order(&self.receiving, |b| b.block_map.len() - b.received_count)
+            {
+                let blocks = &mut self.receiving.get_mut(&index).expect("must exist");
                 if remain == 0 {
                     break;
                 }
-                if peer_status.have(*index) {
+                if peer_status.have(index) {
                     while let Some((blks, n_picked)) = blocks.pick(
                         *peer,
                         remain,
