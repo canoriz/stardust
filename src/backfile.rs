@@ -256,7 +256,7 @@ impl Access for VoidFile {
         Ok(())
     }
 
-    fn rename<P>(from: P, to: P) -> Result<()>
+    fn rename<P>(_from: P, _to: P) -> Result<()>
     where
         P: AsRef<Path>,
     {
@@ -363,7 +363,11 @@ impl BackFile {
         }
     }
 
-    fn find_files(&mut self, offset: u64, buf: &[u8]) -> impl Iterator<Item = FileOp<'_>> {
+    fn find_files<'a, 'b>(
+        &'a mut self,
+        offset: u64,
+        buf: &'b [u8],
+    ) -> impl Iterator<Item = FileOp<'a>> + use<'a> {
         let len = buf.len() as u64;
 
         let lower = self

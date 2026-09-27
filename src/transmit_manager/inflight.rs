@@ -58,7 +58,7 @@ impl Inflight {
             + self
                 .canceled
                 .iter()
-                .filter(|(_, &v)| v.elapsed() < time::Duration::from_secs(5))
+                .filter(|&(_, v)| v.elapsed() < time::Duration::from_secs(5))
                 .count()
     }
 }

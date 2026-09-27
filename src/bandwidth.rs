@@ -2,7 +2,6 @@ use tokio::time::{Duration, Instant};
 
 mod regression;
 mod rtt;
-pub use regression::SlidingWindowRegression;
 pub use rtt::{ALPHA, BETA, RTT};
 use tracing::trace;
 

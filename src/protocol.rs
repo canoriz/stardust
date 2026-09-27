@@ -2321,7 +2321,7 @@ where
             // partial_read is now PartialRead::Piece(p).
             // p.buf is the cancel-safe buffer: lazily allocated on first entry,
             // preserved across cancellation so the next call can append remaining bytes.
-            let PartialRead::Piece(ref mut p) = partial_read else {
+            let PartialRead::Piece(p) = partial_read else {
                 unreachable!("PiecePending implies PartialRead::Piece");
             };
             if p.buf.is_none() {

@@ -14,12 +14,12 @@ use tracing::{info, warn};
 
 use crate::buffer_pool::{BufferPool, BufferPoolStats};
 use crate::cache::cache_manager::{CacheManager, CacheManagerHandle, CacheStats};
-use crate::dht::{DHTOption, DhtDump, DHT};
+use crate::dht::{DHT, DHTOption, DhtDump};
 use crate::metadata::Magnet;
 use crate::protocol::{AcceptOpt, BTStream, HandshakeOption, InfoHash};
 use crate::torrent_manager::{TorrentManagerHandle, TransmitManagerSender};
 use crate::transmit_manager::{RunningCmd, TorrentRuntimeStatus, TorrentTask, TransmitDump};
-use crate::{announce_manager, Reunite, Split};
+use crate::{Reunite, Split, announce_manager};
 
 /// A snapshot of every active torrent task in the session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -197,7 +197,7 @@ impl Session {
     /// The shared parts (listener, cache manager) are already restored, now restoring
     /// dht routes and torrent tasks.
     fn restore_from_dump(self, dump: SessionDump) -> Self {
-        if let (Some(dht), Some(ref nodes)) = (self.dht_client.as_ref(), &dump.dht_nodes) {
+        if let (Some(dht), Some(nodes)) = (self.dht_client.as_ref(), &dump.dht_nodes) {
             dht.seed_from_dump(nodes);
         }
         for torrent_dump in dump.torrents {
@@ -385,7 +385,7 @@ where
         .map_err(|e| {
             io::Error::new(
                 io::ErrorKind::Other,
-                "task dropped during incoming connection processing",
+                format!("task dropped during incoming connection processing {e:?}"),
             )
         })
     } else {
