@@ -1796,7 +1796,7 @@ pub struct ExtendedMetadataWire {
     total_size: Option<usize>,
 }
 
-fn bytes_to_metadata(mut data: BytesMut) -> io::Result<ExtendedMetadata> {
+fn bytes_to_metadata(data: BytesMut) -> io::Result<ExtendedMetadata> {
     let mut de = bt_bencode::Deserializer::from_slice(data.as_ref());
     let bencode_meta = <ExtendedMetadataWire>::deserialize(&mut de)?;
     match bencode_meta {

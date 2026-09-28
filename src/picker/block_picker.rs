@@ -255,7 +255,11 @@ impl PieceBlocks {
     /// Test helper: build a `PieceBlocks` from just `block_map`, deriving every
     /// cursor field automatically so tests need not hand-compute them.
     #[cfg(test)]
-    fn from_block_map(piece_index: u32, last_block_size: usize, block_map: Vec<BlockStatus>) -> Self {
+    fn from_block_map(
+        piece_index: u32,
+        last_block_size: usize,
+        block_map: Vec<BlockStatus>,
+    ) -> Self {
         let mut pb = PieceBlocks {
             piece_index,
             last_block_size,
@@ -326,55 +330,48 @@ impl PieceBlocks {
         avg_speed: f32,
         rtt: time::Duration,
         repick_option: RepickOption,
-    ) -> Option<(BlockRange, usize)> {
-        let mut from = None;
-        let mut to = None;
+        picked_out: &mut Vec<BlockRange>,
+    ) -> usize {
+        // The caller can exhaust its budget and then call again for another range.
+        // Neither fresh picks nor repicks may change state when the budget is zero.
+        if n == 0 {
+            return 0;
+        }
+
         let mut count = 0;
         let n_blocks = self.block_map.len();
         let now = time::Instant::now();
 
-        for (i, b) in self
-            .block_map
-            .iter_mut()
-            .enumerate()
-            .skip(self.all_request_or_received_before)
-        {
-            if count >= n {
-                break;
-            }
-            let req = Some(Request {
-                index: self.piece_index,
-                begin: (i * BLOCK_SIZE) as u32,
-                len: if i + 1 == n_blocks {
-                    self.last_block_size as u32
-                } else {
-                    BLOCK_SIZE as u32
-                },
-            });
-            match b {
-                BlockStatus::NotRequested { revoked } => {
-                    *b = BlockStatus::Requested {
-                        requested: HashMap::from([(
-                            peer,
-                            PickedDetail::new(now, *n_in_flight, avg_speed, rtt),
-                        )]),
-                        revoked: std::mem::take(revoked),
-                    };
-                    *n_in_flight += 1;
-                    if from.is_none() {
-                        from = req;
-                    } else {
-                        to = req;
-                    }
-                    count += 1;
-                    self.requested_or_received_count += 1;
-                    self.all_request_or_received_before = i + 1;
-                    self.repick_deadline
-                        .insert(i, now + REPICK_NO_RESPONSE_TIMEOUT_CAP);
+        while self.all_request_or_received_before < self.block_map.len() && count < n {
+            let mut from = None;
+            let mut to = None;
+            for (i, b) in self
+                .block_map
+                .iter_mut()
+                .enumerate()
+                .skip(self.all_request_or_received_before)
+            {
+                if count >= n {
+                    break;
                 }
-                BlockStatus::Requested { requested, .. } => {
-                    self.all_request_or_received_before = i + 1;
-                    if requested.is_empty() {
+                let req = Some(Request {
+                    index: self.piece_index,
+                    begin: (i * BLOCK_SIZE) as u32,
+                    len: if i + 1 == n_blocks {
+                        self.last_block_size as u32
+                    } else {
+                        BLOCK_SIZE as u32
+                    },
+                });
+                match b {
+                    BlockStatus::NotRequested { revoked } => {
+                        *b = BlockStatus::Requested {
+                            requested: HashMap::from([(
+                                peer,
+                                PickedDetail::new(now, *n_in_flight, avg_speed, rtt),
+                            )]),
+                            revoked: std::mem::take(revoked),
+                        };
                         *n_in_flight += 1;
                         if from.is_none() {
                             from = req;
@@ -382,48 +379,70 @@ impl PieceBlocks {
                             to = req;
                         }
                         count += 1;
-                    } else if from.is_some() {
-                        // not continuous, should break
-                        break;
+                        self.requested_or_received_count += 1;
+                        self.all_request_or_received_before = i + 1;
+                        self.repick_deadline
+                            .insert(i, now + REPICK_NO_RESPONSE_TIMEOUT_CAP);
+                    }
+                    BlockStatus::Requested { requested, .. } => {
+                        self.all_request_or_received_before = i + 1;
+                        if requested.is_empty() {
+                            requested
+                                .insert(peer, PickedDetail::new(now, *n_in_flight, avg_speed, rtt));
+                            *n_in_flight += 1;
+                            if from.is_none() {
+                                from = req;
+                            } else {
+                                to = req;
+                            }
+                            count += 1;
+                            // block is already counted in requested_or_received_count
+                            self.repick_deadline
+                                .insert(i, now + REPICK_NO_RESPONSE_TIMEOUT_CAP);
+                        } else if from.is_some() {
+                            // not continuous, should break
+                            break;
+                        }
+                    }
+                    BlockStatus::Received => {
+                        self.all_request_or_received_before = i + 1;
+                        if from.is_some() {
+                            // not continuous, should break
+                            break;
+                        }
                     }
                 }
-                BlockStatus::Received => {
-                    self.all_request_or_received_before = i + 1;
-                    if from.is_some() {
-                        // not continuous, should break
-                        break;
-                    }
+            }
+            match (from, to) {
+                (None, _) => {
+                    assert!(self.all_request_or_received_before == n_blocks || count == n);
                 }
-            }
-        }
-        match (from, to) {
-            (None, _) => {
-                // TODO: why || count == n
-                assert!(self.all_request_or_received_before == n_blocks || count == n);
-            }
-            (Some(f), None) => {
-                return Some((BlockRange { from: f, to: f }, count));
-            }
-            (Some(f), Some(t)) => {
-                return Some((BlockRange { from: f, to: t }, count));
+                (Some(f), None) => {
+                    picked_out.push(BlockRange { from: f, to: f });
+                }
+                (Some(f), Some(t)) => {
+                    picked_out.push(BlockRange { from: f, to: t });
+                }
             }
         }
 
         let repick_limit = repick_option.repick_limit;
         if repick_limit <= 1 && !repick_option.endgame {
-            return None;
+            return count;
         }
-        assert!(count == 0);
 
+        let repick_begin = picked_out.len();
         // The tree is ordered by deadline. In rush mode `take_while` stops at the
         // first block whose deadline is still in the future; in endgame mode the
         // predicate is always true so every requested block is considered.
-        let mut ret = None;
         for (i, _) in self
             .repick_deadline
             .iter()
             .take_while(|(_, t)| repick_option.endgame || **t <= now)
         {
+            if count >= n {
+                break;
+            }
             let i = *i;
             let b = &mut self.block_map[i];
             match b {
@@ -453,32 +472,20 @@ impl PieceBlocks {
                         requested
                             .insert(peer, PickedDetail::new(now, *n_in_flight, avg_speed, rtt));
                         *n_in_flight += 1;
-                        ret = Some((i, count));
-                        break;
+                        picked_out.push(BlockRange { from: req, to: req });
                     }
                 }
-                _ => unreachable!(
-                    "if we reach rush/endgame mode, we should only see requested blocks"
-                ),
+                _ => unreachable!("should only see requested blocks in repick tree"),
             }
         }
 
-        if let Some((i, count)) = ret {
-            let req = Request {
-                index: self.piece_index,
-                begin: (i * BLOCK_SIZE) as u32,
-                len: if i + 1 == n_blocks {
-                    self.last_block_size as u32
-                } else {
-                    BLOCK_SIZE as u32
-                },
-            };
+        for br in &picked_out[repick_begin..] {
+            let i = br.from.begin / BLOCK_SIZE as u32;
             self.repick_deadline
-                .insert(i, now + REPICK_NO_RESPONSE_TIMEOUT_CAP);
-            Some((BlockRange { from: req, to: req }, count))
-        } else {
-            None
+                .insert(i as usize, now + REPICK_NO_RESPONSE_TIMEOUT_CAP);
         }
+
+        count
     }
 
     /// inform some block is received, returns all being requested peers
@@ -932,17 +939,24 @@ impl BlockPicker {
                         break;
                     }
                     if peer_status.have(index) {
-                        while let Some((blks, n_picked)) =
-                            blocks.pick(*peer, *remain, n_in_flight, avg_speed, rtt, repick_option)
-                        {
-                            *remain -= n_picked;
-                            if tracing::enabled!(tracing::Level::TRACE) {
+                        let before = ret.len();
+                        let n_picked = blocks.pick(
+                            *peer,
+                            *remain,
+                            n_in_flight,
+                            avg_speed,
+                            rtt,
+                            repick_option,
+                            ret,
+                        );
+                        *remain -= n_picked;
+                        if tracing::enabled!(tracing::Level::TRACE) {
+                            for blks in &ret[before..] {
                                 let pb: Vec<_> = blks.iter(piece_size as u32).collect();
                                 trace!(
                                     "pick piece {index} from peer {peer} (requesting), picked blks: {pb:?}"
                                 );
                             }
-                            ret.push(blks);
                         }
                     }
                 }
@@ -1024,20 +1038,24 @@ impl BlockPicker {
                             break;
                         }
                         if peer_status.have(index) {
-                            while let Some((blks, n_picked)) = blocks.pick(
+                            let before = ret.len();
+                            let n_picked = blocks.pick(
                                 *peer,
                                 remain,
                                 &mut n_in_flight,
                                 avg_speed,
                                 rtt,
                                 repick_option,
-                            ) {
-                                remain -= n_picked;
-                                let pb: Vec<_> = blks.iter(self.piece_size as u32).collect();
-                                trace!(
-                                    "pick piece {index} from peer {peer} (requested endgame), picked blks: {pb:?}"
-                                );
-                                ret.push(blks);
+                                &mut ret,
+                            );
+                            remain -= n_picked;
+                            if tracing::enabled!(tracing::Level::TRACE) {
+                                for blks in &ret[before..] {
+                                    let pb: Vec<_> = blks.iter(self.piece_size as u32).collect();
+                                    trace!(
+                                        "pick piece {index} from peer {peer} (requested endgame), picked blks: {pb:?}"
+                                    );
+                                }
                             }
                         }
                     }
@@ -1053,21 +1071,25 @@ impl BlockPicker {
                     break;
                 }
                 if peer_status.have(index) {
-                    while let Some((blks, n_picked)) = blocks.pick(
+                    let before = ret.len();
+                    let n_picked = blocks.pick(
                         *peer,
                         remain,
                         &mut n_in_flight,
                         avg_speed,
                         rtt,
                         repick_option,
-                    ) {
-                        remain -= n_picked;
-                        let pb: Vec<_> = blks.iter(self.piece_size as u32).collect();
+                        &mut ret,
+                    );
+                    remain -= n_picked;
+                    if tracing::enabled!(tracing::Level::TRACE) {
                         trace!("{peer} pick piece {index} (pick_next), inflight {n_in_flight}");
-                        trace!(
-                            "{peer} (pick_next), picked blks: {pb:?}, repick_option: {repick_option:?}"
-                        );
-                        ret.push(blks);
+                        for blks in &ret[before..] {
+                            let pb: Vec<_> = blks.iter(self.piece_size as u32).collect();
+                            trace!(
+                                "{peer} (pick_next), picked blks: {pb:?}, repick_option: {repick_option:?}"
+                            );
+                        }
                     }
                 }
             }
@@ -1147,25 +1169,29 @@ impl BlockPicker {
                 assert!(!endgame);
                 let mut blocks = self.piece_block_of(index);
 
-                if let Some((blks, n_picked)) = blocks.pick(
+                let before = ret.len();
+                let n_picked = blocks.pick(
                     *peer,
                     remain,
                     &mut n_in_flight,
                     avg_speed,
                     rtt,
                     repick_option,
-                ) {
-                    remain -= n_picked;
-                    let pb: Vec<_> = blks.iter(self.piece_size as u32).collect();
+                    &mut ret,
+                );
+                remain -= n_picked;
+                if tracing::enabled!(tracing::Level::TRACE) {
                     trace!(
                         "{peer} rush mode extra {} pick piece {} (pick_next), inflight {}",
                         rush_mode, index, n_in_flight
                     );
-                    trace!(
-                        "{peer} rush mode extra {} picked blks: {pb:?}, {:?}",
-                        rush_mode, blocks.block_map
-                    );
-                    ret.push(blks);
+                    for blks in &ret[before..] {
+                        let pb: Vec<_> = blks.iter(self.piece_size as u32).collect();
+                        trace!(
+                            "{peer} rush mode extra {} picked blks: {pb:?}, {:?}",
+                            rush_mode, blocks.block_map
+                        );
+                    }
                 }
                 assert!(!self.requesting.contains_key(&index));
                 self.requesting.insert(index, blocks);
@@ -1704,7 +1730,8 @@ mod test {
         );
 
         {
-            let picked = b.pick(
+            let mut picked = Vec::new();
+            let count = b.pick(
                 PEER1,
                 30,
                 &mut 0,
@@ -1714,28 +1741,28 @@ mod test {
                     repick_limit: 1,
                     endgame: false,
                 },
+                &mut picked,
             );
-            let exp = Some((
-                BlockRange {
-                    from: Request {
-                        index: 0,
-                        begin: 0,
-                        len: 16384,
-                    },
-                    to: Request {
-                        index: 0,
-                        begin: 29 * 16384,
-                        len: 16384,
-                    },
+            let exp = vec![BlockRange {
+                from: Request {
+                    index: 0,
+                    begin: 0,
+                    len: 16384,
                 },
-                30,
-            ));
+                to: Request {
+                    index: 0,
+                    begin: 29 * 16384,
+                    len: 16384,
+                },
+            }];
             assert_eq!(picked, exp);
+            assert_eq!(count, 30);
             assert_eq!(b.all_request_or_received_before, 30);
             assert_eq!(b.requested_or_received_count, 30);
         }
         {
-            let picked = b.pick(
+            let mut picked = Vec::new();
+            let count = b.pick(
                 PEER1,
                 30,
                 &mut 0,
@@ -1745,23 +1772,22 @@ mod test {
                     repick_limit: 1,
                     endgame: false,
                 },
+                &mut picked,
             );
-            let exp = Some((
-                BlockRange {
-                    from: Request {
-                        index: 0,
-                        begin: 30 * 16384,
-                        len: 16384,
-                    },
-                    to: Request {
-                        index: 0,
-                        begin: 49 * 16384,
-                        len: 4133,
-                    },
+            let exp = vec![BlockRange {
+                from: Request {
+                    index: 0,
+                    begin: 30 * 16384,
+                    len: 16384,
                 },
-                20,
-            ));
+                to: Request {
+                    index: 0,
+                    begin: 49 * 16384,
+                    len: 4133,
+                },
+            }];
             assert_eq!(picked, exp);
+            assert_eq!(count, 20);
             assert_eq!(b.all_request_or_received_before, 50);
             assert_eq!(b.requested_or_received_count, 50);
             assert!(b.is_all_requested_or_received());
@@ -1845,7 +1871,11 @@ mod test {
             ],
         );
         {
-            let picked = b.pick(
+            // A discontinuity (block 1 already requested) no longer ends the
+            // pick early: a single call now walks the whole piece and returns
+            // every contiguous run, so blocks 0 and 2 are both picked here.
+            let mut picked = Vec::new();
+            let count = b.pick(
                 PEER1,
                 30,
                 &mut 0,
@@ -1855,8 +1885,9 @@ mod test {
                     repick_limit: 1,
                     endgame: false,
                 },
+                &mut picked,
             );
-            let exp = Some((
+            let exp = vec![
                 BlockRange {
                     from: Request {
                         index: 0,
@@ -1869,11 +1900,23 @@ mod test {
                         len: 16384,
                     },
                 },
-                1,
-            ));
+                BlockRange {
+                    from: Request {
+                        index: 0,
+                        begin: 2 * 16384,
+                        len: 4133,
+                    },
+                    to: Request {
+                        index: 0,
+                        begin: 2 * 16384,
+                        len: 4133,
+                    },
+                },
+            ];
             assert_eq!(picked, exp);
-            assert_eq!(b.all_request_or_received_before, 2);
-            assert_eq!(b.requested_or_received_count, 2);
+            assert_eq!(count, 2);
+            assert_eq!(b.all_request_or_received_before, 3);
+            assert_eq!(b.requested_or_received_count, 3);
         }
     }
 
@@ -2026,7 +2069,8 @@ mod test {
             }],
         );
 
-        let picked = b.pick(
+        let mut picked = Vec::new();
+        let count = b.pick(
             PEER2,
             1,
             &mut 0,
@@ -2036,9 +2080,10 @@ mod test {
                 repick_limit: 7,
                 endgame: false,
             },
+            &mut picked,
         );
 
-        assert_eq!(picked.map(|(_, n)| n), Some(1));
+        assert_eq!(count, 1);
         match &b.block_map[0] {
             BlockStatus::Requested { requested, .. } => {
                 assert!(requested.contains_key(&PEER1));
@@ -2063,7 +2108,8 @@ mod test {
             }],
         );
 
-        let picked = b.pick(
+        let mut picked = Vec::new();
+        let count = b.pick(
             PEER2,
             1,
             &mut 0,
@@ -2073,15 +2119,141 @@ mod test {
                 repick_limit: 7,
                 endgame: false,
             },
+            &mut picked,
         );
 
-        assert_eq!(picked.map(|(_, n)| n), Some(1));
+        assert_eq!(count, 1);
         match &b.block_map[0] {
             BlockStatus::Requested { requested, .. } => {
                 assert!(requested.contains_key(&PEER1));
                 assert!(requested.contains_key(&PEER2));
             }
             _ => panic!("block should stay requested"),
+        }
+    }
+
+    #[test]
+    fn test_pick_budget_zero_is_noop() {
+        let before = PieceBlocks::from_block_map(
+            0,
+            BLOCK_SIZE,
+            vec![
+                BlockStatus::Requested {
+                    requested: HashMap::from([(
+                        PEER1,
+                        picked_detail_at(time::Instant::now() - time::Duration::from_secs(6), 0),
+                    )]),
+                    revoked: HashMap::new(),
+                };
+                2
+            ],
+        );
+        for option in [
+            RepickOption {
+                repick_limit: 1,
+                endgame: false,
+            },
+            RepickOption {
+                repick_limit: 7,
+                endgame: false,
+            },
+            RepickOption {
+                repick_limit: 1,
+                endgame: true,
+            },
+        ] {
+            let mut blocks = before.clone();
+            let mut inflight = 3;
+            let mut picked = Vec::new();
+            let count = blocks.pick(
+                PEER2,
+                0,
+                &mut inflight,
+                BLOCK_SIZE as f32,
+                time::Duration::ZERO,
+                option,
+                &mut picked,
+            );
+            assert_eq!(count, 0, "zero budget must not repick in {option:?}");
+            assert!(
+                picked.is_empty(),
+                "zero budget must not produce ranges in {option:?}"
+            );
+            assert_eq!(inflight, 3);
+            assert_eq!(blocks, before, "zero budget must not change picker state");
+        }
+    }
+
+    #[test]
+    fn test_pick_budget_bounds_requests_in_rush_and_endgame() {
+        for (endgame, requesting, vacant) in [
+            (false, false, 0),
+            (false, false, POOL_SIZE / 2),
+            (false, true, POOL_SIZE / 2),
+            (true, false, POOL_SIZE),
+        ] {
+            let (mut picker, peers) = make_block_picker_with_state(3, 4 * BLOCK_SIZE, 2, 0, 0);
+            // Endgame must allow repicking even fresh requests; rush needs expired ones.
+            let picked_at = if endgame {
+                time::Instant::now()
+            } else {
+                time::Instant::now() - time::Duration::from_secs(6)
+            };
+            let mut map = vec![
+                BlockStatus::Requested {
+                    requested: HashMap::from([(peers[0], picked_detail_at(picked_at, 0))]),
+                    revoked: HashMap::new(),
+                };
+                4
+            ];
+            if requesting {
+                map[3] = BlockStatus::NotRequested {
+                    revoked: HashMap::new(),
+                };
+            }
+            let blocks = PieceBlocks::from_block_map(0, BLOCK_SIZE, map);
+            picker.piece_picker.set_have(0, true);
+            if requesting {
+                picker.requesting.insert(0, blocks);
+            } else {
+                picker.receiving.insert(0, blocks);
+            }
+            if endgame {
+                picker.piece_picker.set_have(1, true);
+                picker.piece_picker.set_have(2, true);
+            }
+
+            let (requests, picked) = picker.pick_blocks(
+                &peers[1],
+                1,
+                0,
+                BLOCK_SIZE as f32,
+                time::Duration::ZERO,
+                &mut HashMap::new(),
+                vacant,
+            );
+            assert_eq!(
+                picked, 1,
+                "endgame={endgame}, requesting={requesting}, vacant={vacant}"
+            );
+            assert_eq!(
+                requests
+                    .range
+                    .iter()
+                    .flat_map(|r| r.iter(requests.piece_size))
+                    .count(),
+                1
+            );
+            let registered = picker.requesting.values().chain(picker.receiving.values())
+                .flat_map(|p| &p.block_map)
+                .filter(|b| matches!(b, BlockStatus::Requested { requested, .. } if requested.contains_key(&peers[1])))
+                .count();
+            assert_eq!(
+                registered, 1,
+                "must not register requests beyond the budget"
+            );
+            assert!(!picker.requesting.contains_key(&1));
+            assert!(!picker.requesting.contains_key(&2));
         }
     }
 
@@ -2099,7 +2271,8 @@ mod test {
             }],
         );
 
-        let picked = b.pick(
+        let mut picked = Vec::new();
+        let count = b.pick(
             PEER2,
             1,
             &mut 0,
@@ -2109,9 +2282,10 @@ mod test {
                 repick_limit: 7,
                 endgame: false,
             },
+            &mut picked,
         );
 
-        assert_eq!(picked.map(|(_, n)| n), Some(1));
+        assert_eq!(count, 1);
         match &b.block_map[0] {
             BlockStatus::Requested { requested, .. } => {
                 assert!(requested.contains_key(&PEER1));
@@ -2140,7 +2314,8 @@ mod test {
             }],
         );
 
-        let picked = b.pick(
+        let mut picked = Vec::new();
+        let count = b.pick(
             PEER2,
             1,
             &mut 0,
@@ -2150,9 +2325,11 @@ mod test {
                 repick_limit: 7,
                 endgame: false,
             },
+            &mut picked,
         );
 
-        assert_eq!(picked, None);
+        assert_eq!(count, 0);
+        assert!(picked.is_empty());
         match &b.block_map[0] {
             BlockStatus::Requested { requested, .. } => {
                 assert!(requested.contains_key(&PEER1));
