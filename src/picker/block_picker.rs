@@ -20,9 +20,13 @@ use std::{
 const BLOCK_SIZE: usize = 16384;
 const NO_RESPONSE_TIMEOUT: time::Duration = time::Duration::from_secs(90);
 
-/// Repick deadline offset: a requested block becomes eligible for repick
-/// `REPICK_NO_RESPONSE_TIMEOUT_CAP` after it was (last) picked.
+/// Repick deadline for a requester whose expected response time is within
+/// `REPICK_EAGER_EXPECT_THRESHOLD`: only repick after this timeout elapses.
 const REPICK_NO_RESPONSE_TIMEOUT_CAP: time::Duration = time::Duration::from_secs(5);
+
+/// A requester expected to take longer than this is treated as slow: its block
+/// is repick-eligible immediately, without waiting for the timeout.
+const REPICK_EAGER_EXPECT_THRESHOLD: time::Duration = time::Duration::from_millis(2000);
 
 #[derive(Eq, PartialEq, Debug, Clone)]
 pub struct PickedDetail {
@@ -48,6 +52,26 @@ impl PickedDetail {
     fn expected_recv_at(&self) -> time::Instant {
         self.pick_time + self.expected_response_time
     }
+
+    /// The instant the block this detail was picked for becomes repick-eligible:
+    /// a slow requester (expected response time over `REPICK_EAGER_EXPECT_THRESHOLD`)
+    /// is eligible immediately; otherwise wait `REPICK_NO_RESPONSE_TIMEOUT_CAP`.
+    fn repick_eligible_at(&self) -> time::Instant {
+        if self.expected_response_time > REPICK_EAGER_EXPECT_THRESHOLD {
+            self.pick_time
+        } else {
+            self.pick_time + REPICK_NO_RESPONSE_TIMEOUT_CAP
+        }
+    }
+}
+
+/// A block is repick-eligible only once every current requester is overdue, so
+/// its deadline is the latest per-requester `repick_eligible_at`.
+fn repick_deadline_of(requested: &HashMap<PeerAddr, PickedDetail>) -> Option<time::Instant> {
+    requested
+        .values()
+        .map(PickedDetail::repick_eligible_at)
+        .max()
 }
 
 fn expected_response_time(
@@ -276,7 +300,7 @@ impl PieceBlocks {
 
     /// Test helper: recompute every derived cursor field from `block_map`
     /// (`*_count`, the contiguous requested/received prefix, `sub_receive_count`,
-    /// and `repick_deadline` = latest requester `pick_time` + `REPICK_NO_RESPONSE_TIMEOUT_CAP`).
+    /// and `repick_deadline` from each block's requesters).
     #[cfg(test)]
     fn rebuild_cursors(&mut self) {
         self.all_request_or_received_before = self
@@ -304,8 +328,8 @@ impl PieceBlocks {
             match b {
                 BlockStatus::Received => sub_receive_count[i / blocks_per_sub] += 1,
                 BlockStatus::Requested { requested, .. } => {
-                    if let Some(latest) = requested.values().map(|d| d.pick_time).max() {
-                        repick.insert(i, latest + REPICK_NO_RESPONSE_TIMEOUT_CAP);
+                    if let Some(deadline) = repick_deadline_of(requested) {
+                        repick.insert(i, deadline);
                     }
                 }
                 BlockStatus::NotRequested { .. } => {}
@@ -365,11 +389,10 @@ impl PieceBlocks {
                 });
                 match b {
                     BlockStatus::NotRequested { revoked } => {
+                        let detail = PickedDetail::new(now, *n_in_flight, avg_speed, rtt);
+                        let deadline = detail.repick_eligible_at();
                         *b = BlockStatus::Requested {
-                            requested: HashMap::from([(
-                                peer,
-                                PickedDetail::new(now, *n_in_flight, avg_speed, rtt),
-                            )]),
+                            requested: HashMap::from([(peer, detail)]),
                             revoked: std::mem::take(revoked),
                         };
                         *n_in_flight += 1;
@@ -381,14 +404,14 @@ impl PieceBlocks {
                         count += 1;
                         self.requested_or_received_count += 1;
                         self.all_request_or_received_before = i + 1;
-                        self.repick_deadline
-                            .insert(i, now + REPICK_NO_RESPONSE_TIMEOUT_CAP);
+                        self.repick_deadline.insert(i, deadline);
                     }
                     BlockStatus::Requested { requested, .. } => {
                         self.all_request_or_received_before = i + 1;
                         if requested.is_empty() {
-                            requested
-                                .insert(peer, PickedDetail::new(now, *n_in_flight, avg_speed, rtt));
+                            let detail = PickedDetail::new(now, *n_in_flight, avg_speed, rtt);
+                            let deadline = detail.repick_eligible_at();
+                            requested.insert(peer, detail);
                             *n_in_flight += 1;
                             if from.is_none() {
                                 from = req;
@@ -397,8 +420,7 @@ impl PieceBlocks {
                             }
                             count += 1;
                             // block is already counted in requested_or_received_count
-                            self.repick_deadline
-                                .insert(i, now + REPICK_NO_RESPONSE_TIMEOUT_CAP);
+                            self.repick_deadline.insert(i, deadline);
                         } else if from.is_some() {
                             // not continuous, should break
                             break;
@@ -480,9 +502,15 @@ impl PieceBlocks {
         }
 
         for br in &picked_out[repick_begin..] {
-            let i = br.from.begin / BLOCK_SIZE as u32;
-            self.repick_deadline
-                .insert(i as usize, now + REPICK_NO_RESPONSE_TIMEOUT_CAP);
+            let i = (br.from.begin / BLOCK_SIZE as u32) as usize;
+            // Just repicked, so the block is Requested with an extra requester;
+            // its deadline is the latest per-requester eligibility across all.
+            let BlockStatus::Requested { requested, .. } = &self.block_map[i] else {
+                unreachable!("just-repicked block must be Requested");
+            };
+            if let Some(deadline) = repick_deadline_of(requested) {
+                self.repick_deadline.insert(i, deadline);
+            }
         }
 
         count
@@ -540,11 +568,11 @@ impl PieceBlocks {
                     self.requested_or_received_count -= 1;
                     self.repick_deadline.remove(&b_index);
                 } else if did_remove {
-                    // block still has other requesters: keep it repick-eligible by
-                    // re-deriving the deadline from the latest remaining pick
-                    if let Some(latest) = requested.values().map(|d| d.pick_time).max() {
-                        self.repick_deadline
-                            .insert(b_index, latest + REPICK_NO_RESPONSE_TIMEOUT_CAP);
+                    // block still has other requesters: re-derive its deadline
+                    // from the remaining ones (the removed one may or may not
+                    // be the latest-eligible)
+                    if let Some(deadline) = repick_deadline_of(requested) {
+                        self.repick_deadline.insert(b_index, deadline);
                     }
                 }
             }
@@ -607,11 +635,10 @@ impl PieceBlocks {
                         }
                         self.repick_deadline.remove(&i);
                     } else if removed_any {
-                        // some (not all) requesters were revoked: keep the block
-                        // repick-eligible by re-deriving its deadline
-                        if let Some(latest) = requested.values().map(|d| d.pick_time).max() {
-                            self.repick_deadline
-                                .insert(i, latest + REPICK_NO_RESPONSE_TIMEOUT_CAP);
+                        // some (not all) requesters were revoked: re-derive the
+                        // deadline from the remaining ones
+                        if let Some(deadline) = repick_deadline_of(requested) {
+                            self.repick_deadline.insert(i, deadline);
                         }
                     }
                 }
@@ -2055,7 +2082,6 @@ mod test {
     }
 
     #[test]
-    #[ignore = "enable when repick considers expected response time"]
     fn test_fast_peer_can_take_over_slow_requested_block() {
         let mut b = PieceBlocks::from_block_map(
             0,
@@ -2094,7 +2120,6 @@ mod test {
     }
 
     #[test]
-    #[ignore = "enable when repick considers expected response time"]
     fn test_known_slow_peer_triggers_repick() {
         let mut b = PieceBlocks::from_block_map(
             0,
