@@ -39,6 +39,9 @@ eframe = "0.34.2"
 rfd = "0.15"
 nix = { version = "0.31.2", features = ["fs"] }
 cfg-if = "1.0.4"
+metrics = { version = "0.24", optional = true }
+metrics-exporter-prometheus = { version = "0.16", default-features = false, optional = true }
+metrics-process = { version = "2", optional = true }
 
 [[bin]]
 name = "main"
@@ -57,6 +60,7 @@ path = "src/lib.rs"
 
 [features]
 mock_delay = []
+metrics = ["dep:metrics", "dep:metrics-exporter-prometheus", "dep:metrics-process"]
 
 [profile.release]
 debug = true

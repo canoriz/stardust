@@ -1,0 +1,15 @@
+global:
+  scrape_interval: 1s
+
+scrape_configs:
+  - job_name: 'stardust'
+    scrape_interval: 1s
+    metrics_path: '/metrics'
+    static_configs:
+      - targets: ['host.docker.internal:9026']
+
+remote_write:
+  - url: 'remote_write'
+    basic_auth:
+      username: 'avava'
+      password: 'avava'

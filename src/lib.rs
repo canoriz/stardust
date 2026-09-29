@@ -2,6 +2,8 @@ pub mod api;
 pub mod app;
 pub mod dht;
 pub mod metadata;
+#[cfg(feature = "metrics")]
+pub mod metrics;
 pub mod protocol;
 
 pub(crate) mod announce_manager;

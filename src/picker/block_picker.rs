@@ -17,6 +17,9 @@ use std::{
     time,
 };
 
+#[cfg(feature = "metrics")]
+use crate::metrics;
+
 const BLOCK_SIZE: usize = 16384;
 const NO_RESPONSE_TIMEOUT: time::Duration = time::Duration::from_secs(90);
 
@@ -355,6 +358,7 @@ impl PieceBlocks {
         rtt: time::Duration,
         repick_option: RepickOption,
         picked_out: &mut Vec<BlockRange>,
+        #[cfg(feature = "metrics")] torrent: &str,
     ) -> usize {
         // The caller can exhaust its budget and then call again for another range.
         // Neither fresh picks nor repicks may change state when the budget is zero.
@@ -450,6 +454,8 @@ impl PieceBlocks {
 
         let repick_limit = repick_option.repick_limit;
         if repick_limit <= 1 && !repick_option.endgame {
+            #[cfg(feature = "metrics")]
+            metrics::record_requests(torrent, &peer, repick_option.mode_label(), count as u64, 0);
             return count;
         }
 
@@ -511,6 +517,13 @@ impl PieceBlocks {
             if let Some(deadline) = repick_deadline_of(requested) {
                 self.repick_deadline.insert(i, deadline);
             }
+        }
+
+        #[cfg(feature = "metrics")]
+        {
+            let repick = (picked_out.len() - repick_begin) as u64;
+            let new_pick = count as u64 - repick;
+            metrics::record_requests(torrent, &peer, repick_option.mode_label(), new_pick, repick);
         }
 
         count
@@ -661,6 +674,20 @@ struct RepickOption {
     endgame: bool,
 }
 
+#[cfg(feature = "metrics")]
+impl RepickOption {
+    /// Scheduling-mode label for `requests_sent_total`.
+    fn mode_label(&self) -> &'static str {
+        if self.endgame {
+            "endgame"
+        } else if self.repick_limit > 1 {
+            "rush"
+        } else {
+            "normal"
+        }
+    }
+}
+
 type Picker = dyn PiecePicker<T = PeerPieceDetail> + Send;
 type PieceIndex = u32;
 pub struct BlockPicker {
@@ -690,6 +717,9 @@ pub struct BlockPicker {
     // tracks per-file completion by counting verified pieces against each
     // file's piece span; queried for the startup `.part` rename
     file_tracker: FileTracker,
+
+    #[cfg(feature = "metrics")]
+    torrent_hex: String,
 }
 
 /// if some piece or sub piece is completed
@@ -720,6 +750,8 @@ impl BlockPicker {
             no_response_timeout,
             endgame: false,
             file_tracker: FileTracker::new(meta),
+            #[cfg(feature = "metrics")]
+            torrent_hex: hex::encode(meta.info_hash),
         }
     }
 
@@ -744,6 +776,8 @@ impl BlockPicker {
             no_response_timeout,
             endgame: false,
             file_tracker: FileTracker::from_lengths(piece_size as u64, [total_size]),
+            #[cfg(feature = "metrics")]
+            torrent_hex: String::new(),
         }
     }
 
@@ -893,6 +927,9 @@ impl BlockPicker {
         revoked: &mut HashMap<PeerAddr, Vec<Request>>,
         n_cache_vacant: usize,
     ) -> (BlockRequests, usize) {
+        #[cfg(feature = "metrics")]
+        let torrent = self.torrent_hex.clone();
+
         if self.prev_time_check.elapsed() >= time::Duration::from_secs(1) {
             self.revoke_unrespond(revoked);
             self.prev_time_check = time::Instant::now();
@@ -975,6 +1012,8 @@ impl BlockPicker {
                             rtt,
                             repick_option,
                             ret,
+                            #[cfg(feature = "metrics")]
+                            &torrent,
                         );
                         *remain -= n_picked;
                         if tracing::enabled!(tracing::Level::TRACE) {
@@ -1074,6 +1113,8 @@ impl BlockPicker {
                                 rtt,
                                 repick_option,
                                 &mut ret,
+                                #[cfg(feature = "metrics")]
+                                &torrent,
                             );
                             remain -= n_picked;
                             if tracing::enabled!(tracing::Level::TRACE) {
@@ -1107,6 +1148,8 @@ impl BlockPicker {
                         rtt,
                         repick_option,
                         &mut ret,
+                        #[cfg(feature = "metrics")]
+                        &torrent,
                     );
                     remain -= n_picked;
                     if tracing::enabled!(tracing::Level::TRACE) {
@@ -1205,6 +1248,8 @@ impl BlockPicker {
                     rtt,
                     repick_option,
                     &mut ret,
+                    #[cfg(feature = "metrics")]
+                    &torrent,
                 );
                 remain -= n_picked;
                 if tracing::enabled!(tracing::Level::TRACE) {

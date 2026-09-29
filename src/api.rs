@@ -156,6 +156,8 @@ pub struct ApiCommand {
 #[derive(Clone)]
 struct AppState {
     command_tx: mpsc::UnboundedSender<ApiCommand>,
+    #[cfg(feature = "metrics")]
+    metrics: metrics_exporter_prometheus::PrometheusHandle,
 }
 
 // ── public entry point ───────────────────────────────────────────────────────
@@ -169,10 +171,15 @@ pub async fn serve(
     command_tx: mpsc::UnboundedSender<ApiCommand>,
     shutdown: CancellationToken,
 ) {
-    let state = AppState { command_tx };
-    let app = Router::new()
-        .route("/api/rpc", post(rpc_handler))
-        .with_state(state);
+    let state = AppState {
+        command_tx,
+        #[cfg(feature = "metrics")]
+        metrics: crate::metrics::install(),
+    };
+    let app = Router::new().route("/api/rpc", post(rpc_handler));
+    #[cfg(feature = "metrics")]
+    let app = app.route("/metrics", axum::routing::get(metrics_handler));
+    let app = app.with_state(state);
 
     let bind_addr = format!("0.0.0.0:{port}");
     let listener = match tokio::net::TcpListener::bind(&bind_addr).await {
@@ -216,6 +223,11 @@ async fn rpc_handler(
             "session loop dropped response channel: {e}"
         ))),
     }
+}
+
+#[cfg(feature = "metrics")]
+async fn metrics_handler(State(state): State<AppState>) -> String {
+    state.metrics.render()
 }
 
 /// Handle one forwarded RPC command using the session owned by main loop.

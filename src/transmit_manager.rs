@@ -2,9 +2,9 @@ use crate::announce_manager::{self, AnnounceManagerHandle};
 use crate::backfile::{BackFile, NormalFile};
 use crate::bandwidth::Bandwidth;
 use crate::buffer_pool::{BlockBuf, BufferPool};
+use crate::cache::MutexBackFile;
 use crate::cache::cache_manager::{CacheManagerHandle, FileOpID, Fop, GlobalPieceKey, PieceLease};
 use crate::cache::simple_buffer::{FlushErr, JointIndex, SUB_PIECE_SIZE};
-use crate::cache::MutexBackFile;
 use crate::connection_manager::{
     ConnectionManagerHandle, CtrlOfRecv, CtrlOfSend, CtrlOfSend as ConnMsg, ReceivedBlocks,
 };
@@ -23,11 +23,11 @@ use bandwidth_mode::BandwidthMode;
 use inflight::Inflight;
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
-use std::collections::{hash_map, BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, hash_map};
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time;
@@ -35,6 +35,9 @@ use tokio_util::sync::{CancellationToken, DropGuard as CancelDropGuard};
 use tracing::{debug, info, instrument, trace, warn};
 
 pub use crate::protocol::InfoHash;
+
+#[cfg(feature = "metrics")]
+use crate::metrics;
 
 mod bandwidth_mode;
 mod inflight;
@@ -222,6 +225,9 @@ struct PeerConn {
     app_limited: bool,
     // TODO: optimize: use integer type
     max_bw_unlimited: f32, // the max bandwidth when not app-limited
+
+    #[cfg(feature = "metrics")]
+    metrics: metrics::PeerMetrics,
 }
 
 impl PeerConn {
@@ -1042,6 +1048,35 @@ impl TransmitWorker {
         );
     }
 
+    /// Periodic (1s tick) sampler: write per-peer and per-torrent gauges that
+    /// can't be captured on the hot path, plus bw_mode residency.
+    #[cfg(feature = "metrics")]
+    fn sample_metrics(&self) {
+        let torrent_hex = hex::encode(self.info_hash);
+        for (peer, conn) in &self.connected_peers {
+            conn.metrics.set_inflight(conn.inflight.inflight() as f64);
+            conn.metrics.set_min_rtt(conn.min_rtt.as_secs_f64());
+            conn.metrics.set_rtt(conn.bw.get_rtt().as_secs_f64());
+            conn.metrics.set_rtt_var(conn.bw.get_var().as_secs_f64());
+            let mode = match conn.bw_mode {
+                BandwidthMode::Startup { .. } => "startup",
+                BandwidthMode::ProbeBW { .. } => "probe_bw",
+                BandwidthMode::SlowDown { .. } => "slow_down",
+                BandwidthMode::ProbeRTT { .. } => "probe_rtt",
+                BandwidthMode::Choked => "choked",
+            };
+            metrics::add_bw_mode_time(&torrent_hex, peer, mode, 1);
+        }
+        let waiting = self.waiting_for_piecebuf.len() as f64;
+        let pending = self.pending_flushes.load(Ordering::Relaxed) as f64;
+        metrics::set_torrent_gauges(
+            &torrent_hex,
+            self.connected_peers.len() as f64,
+            waiting,
+            pending,
+        );
+    }
+
     /// Resume hashers of partial received pieces
     /// Hashers are not saved when a task is paused, restore them
     fn resume_pending_hashes(&mut self) {
@@ -1668,6 +1703,12 @@ impl TransmitWorker {
 
                             app_limited: false,
                             max_bw_unlimited: 0.0,
+
+                            #[cfg(feature = "metrics")]
+                            metrics: metrics::PeerMetrics::new(
+                                &hex::encode(self.info_hash),
+                                &peer_addr,
+                            ),
                         },
                     );
 
@@ -2143,9 +2184,13 @@ impl TransmitWorker {
         if Self::verify_piece(ji.index() as usize, metadata, hasher) {
             info!("piece {} verify pass", ji.index());
             let completed_files = block_picker.piece_verified(ji.index() as u32, true);
+            #[cfg(feature = "metrics")]
+            metrics::record_piece_verified(&hex::encode(self.info_hash), true);
             Ok(PieceVerifyResult::Pass(completed_files))
         } else {
             info!("piece {} verify failed", ji.index());
+            #[cfg(feature = "metrics")]
+            metrics::record_piece_verified(&hex::encode(self.info_hash), false);
             self.invalidate_piece(ji.index());
             Ok(PieceVerifyResult::Fail)
         }
@@ -2383,7 +2428,12 @@ impl TransmitWorker {
             likely_respond_within,
             likely_recv_next_within
         );
-        info!("peer {peer} estimated max bandwidth {max_bw}, min rtt {:?}, min rtt in period {:?} req in flight: {}", conn.min_rtt, min_rtt_in_period, conn.inflight.inflight());
+        info!(
+            "peer {peer} estimated max bandwidth {max_bw}, min rtt {:?}, min rtt in period {:?} req in flight: {}",
+            conn.min_rtt,
+            min_rtt_in_period,
+            conn.inflight.inflight()
+        );
 
         let n_req_in_flight = conn.inflight.inflight();
 
@@ -2404,7 +2454,14 @@ impl TransmitWorker {
                     let (max_bw_in_rtt, _, _) = conn.bw.count_max_bw_and_min_rtt(cwnd_duration);
                     info!(
                         "{peer} in Startup mode, cwnd {}, inflight {} prev max bw {}, avg-bw {} avg_bw_10s {} new max bw {}, limit count {} app limited {}",
-                        *cwnd, n_req_in_flight, *max_bw, avg_bw, avg_bw_10s, max_bw_in_rtt, *limit_count, conn.app_limited,
+                        *cwnd,
+                        n_req_in_flight,
+                        *max_bw,
+                        avg_bw,
+                        avg_bw_10s,
+                        max_bw_in_rtt,
+                        *limit_count,
+                        conn.app_limited,
                     );
                     info!("{cwnd_probe_interval:?}, {:?}", cwnd_since.elapsed());
                     *cwnd_since = time::Instant::now();
@@ -2413,12 +2470,12 @@ impl TransmitWorker {
                         if max_bw_in_rtt <= *max_bw * 1.2 {
                             *limit_count += 1;
                             info!(
-                            "{peer} Startup stagnation {}, elapsed {:?} max bw in rtt {}, current max bw {}",
-                            *limit_count,
-                            cwnd_since.elapsed(),
-                            max_bw_in_rtt,
-                            max_bw,
-                        );
+                                "{peer} Startup stagnation {}, elapsed {:?} max bw in rtt {}, current max bw {}",
+                                *limit_count,
+                                cwnd_since.elapsed(),
+                                max_bw_in_rtt,
+                                max_bw,
+                            );
                         } else {
                             *limit_count = 0;
                         }
@@ -2432,9 +2489,9 @@ impl TransmitWorker {
                         if *limit_count >= NO_MORE_GAIN_LIMIT {
                             let optimum = (*max_bw * conn.min_rtt.as_secs_f32() / 16384.0) as usize;
                             info!(
-                            "{peer} change from Startup to Slowdown mode, {} {:?} slow down to {optimum}",
-                            *max_bw, conn.min_rtt,
-                        );
+                                "{peer} change from Startup to Slowdown mode, {} {:?} slow down to {optimum}",
+                                *max_bw, conn.min_rtt,
+                            );
                             conn.bw_mode = BandwidthMode::SlowDown {
                                 last_piece_time: time::Instant::now(),
                                 inflight_target: optimum,
@@ -2471,7 +2528,14 @@ impl TransmitWorker {
                     );
                     info!(
                         "{peer} ProbeBW cycle update {}, probe df {}, max bw {}, avg bw {}, avg_bw_10s {}, min rtt {:?}, probe rtt {:?} capacity {}",
-                        *cycle_index, *probe_df, max_bw, avg_bw, avg_bw_10s, conn.min_rtt, probe_bdp_rtt, *capacity,
+                        *cycle_index,
+                        *probe_df,
+                        max_bw,
+                        avg_bw,
+                        avg_bw_10s,
+                        conn.min_rtt,
+                        probe_bdp_rtt,
+                        *capacity,
                     );
                 }
 
@@ -2517,7 +2581,9 @@ impl TransmitWorker {
                         let (max_bw, _, _) = conn.get_max_bw(look_back_duration);
                         let cap =
                             BandwidthMode::compute_probe_bw_capacity(probe_bdp_rtt, max_bw, 0, 4);
-                        info!("{peer} change from Slowdown to ProbeBW mode, because inflight target {inflight_target} > 0");
+                        info!(
+                            "{peer} change from Slowdown to ProbeBW mode, because inflight target {inflight_target} > 0"
+                        );
                         conn.bw_mode = BandwidthMode::ProbeBW {
                             slow_count: 0,
                             probe_df: 1,
@@ -2554,8 +2620,7 @@ impl TransmitWorker {
             } => {
                 info!(
                     "{peer} in ProbeRTT mode cnt {} normal count {} min rtt {:?} avg bw {} avg_bw_10s {} req in flight {}",
-                    cnt, normal_count,
-                    conn.min_rtt, avg_bw, avg_bw_10s, n_req_in_flight
+                    cnt, normal_count, conn.min_rtt, avg_bw, avg_bw_10s, n_req_in_flight
                 );
 
                 if cnt > 4 {
@@ -2612,7 +2677,14 @@ impl TransmitWorker {
                     .max(MIN_IN_FLIGHT.saturating_sub(n_req_in_flight));
                 info!(
                     "{peer} ProbeBW mode cycle {} capacity {} min rtt {:?} probe rtt {:?} avg bw {} avg_bw_10s {} max_bw {} req in flight {}",
-                    cycle_index, *capacity, conn.min_rtt, probe_bdp_rtt, avg_bw, avg_bw_10s, max_bw, n_req_in_flight
+                    cycle_index,
+                    *capacity,
+                    conn.min_rtt,
+                    probe_bdp_rtt,
+                    avg_bw,
+                    avg_bw_10s,
+                    max_bw,
+                    n_req_in_flight
                 );
                 n_to_pick
             }
@@ -2714,6 +2786,9 @@ impl TransmitWorker {
         // }
 
         if let Some(rtt) = rtt {
+            #[cfg(feature = "metrics")]
+            conn.metrics.record_response(rtt.as_secs_f64());
+
             let mean = conn.bw.get_rtt();
             let sigma = conn.bw.get_var();
 
@@ -2766,7 +2841,18 @@ impl TransmitWorker {
                 piece.len,
                 piece.begin >> 14,
             );
+            #[cfg(feature = "metrics")]
+            {
+                conn.metrics.record_duplicate(piece.len as u64);
+                conn.metrics.set_inflight(conn.inflight.inflight() as f64);
+            }
             return Ok(());
+        }
+
+        #[cfg(feature = "metrics")]
+        {
+            conn.metrics.record_block_received(piece.len as u64);
+            conn.metrics.set_inflight(conn.inflight.inflight() as f64);
         }
 
         // TODO: BlockPicker marks this block as Received before the bytes are
@@ -2783,6 +2869,8 @@ impl TransmitWorker {
                     conn.inflight.cancel(req);
                     if conn.conn.capability().have(protocol::Capability::FAST) {
                         conn.conn.send_stream_cmd(ConnMsg::Cancel(req));
+                        #[cfg(feature = "metrics")]
+                        conn.metrics.record_cancel();
                     }
                 }
             }
@@ -3416,6 +3504,8 @@ pub(crate) async fn run_transmit_worker(
             _ = ticker.tick() => {
                 // transmit.pick_blocks_for_all_peers(2);
                 transmit.fetch_metadata();
+                #[cfg(feature = "metrics")]
+                transmit.sample_metrics();
             }
             _ = cancel.cancelled() => {
                 info!("transmit manager cancelled");
