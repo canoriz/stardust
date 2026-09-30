@@ -38,6 +38,8 @@ pub use crate::protocol::InfoHash;
 
 #[cfg(feature = "metrics")]
 use crate::metrics;
+#[cfg(feature = "blocktrace")]
+use crate::blocktrace;
 
 mod bandwidth_mode;
 mod inflight;
@@ -228,6 +230,10 @@ struct PeerConn {
 
     #[cfg(feature = "metrics")]
     metrics: metrics::PeerMetrics,
+
+    /// blocktrace `peer.id` FK, resolved at connect (`None` if the sink is off).
+    #[cfg(feature = "blocktrace")]
+    blocktrace_peer_id: Option<i64>,
 }
 
 impl PeerConn {
@@ -252,6 +258,18 @@ impl PeerConn {
 
 fn compute_probe_bdp_rtt(min_rtt: time::Duration) -> time::Duration {
     (min_rtt * 3 / 2).min(min_rtt + time::Duration::from_millis(50))
+}
+
+#[cfg(feature = "blocktrace")]
+#[inline]
+fn bt_bw_mode(m: &BandwidthMode) -> blocktrace::BwMode {
+    match m {
+        BandwidthMode::Startup { .. } => blocktrace::BwMode::Startup,
+        BandwidthMode::ProbeBW { .. } => blocktrace::BwMode::ProbeBw,
+        BandwidthMode::SlowDown { .. } => blocktrace::BwMode::SlowDown,
+        BandwidthMode::ProbeRTT { .. } => blocktrace::BwMode::ProbeRtt,
+        BandwidthMode::Choked => blocktrace::BwMode::Choked,
+    }
 }
 
 #[derive(Clone)]
@@ -936,6 +954,11 @@ pub struct TransmitWorker {
 
     /// Session-level pool that peer connections draw piece-body buffers from.
     block_pool: Arc<BufferPool<BytesMut>>,
+
+    /// blocktrace `torrent.id` FK, set once before the worker loop starts
+    /// (`None` if the sink is off / registration failed).
+    #[cfg(feature = "blocktrace")]
+    blocktrace_torrent_id: Option<i64>,
 }
 
 // impl std::fmt::Debug for TransmitWorker {
@@ -997,6 +1020,23 @@ fn bw_look_back_window(probe_bdp_rtt: time::Duration) -> time::Duration {
 }
 
 impl TransmitWorker {
+    /// Resolve the blocktrace `torrent.id` FK once full metadata is available
+    /// (no-op for a magnet still fetching, or once already resolved).
+    #[cfg(feature = "blocktrace")]
+    async fn blocktrace_register_torrent(&mut self) {
+        if self.blocktrace_torrent_id.is_some() {
+            return;
+        }
+        let TorrentState::Metadata(d) = &self.torrent_state else {
+            return;
+        };
+        let name = Some(d.metadata.info.name.clone());
+        let total_len = d.metadata.len() as i64;
+        let piece_len = d.metadata.regular_piece_size() as i64;
+        self.blocktrace_torrent_id =
+            blocktrace::register_torrent(self.info_hash, name, total_len, piece_len).await;
+    }
+
     fn handle_dump_status(self) -> TransmitDump {
         let peers: Vec<_> = self.connected_peers.keys().cloned().collect();
         let state = match self.torrent_state {
@@ -1075,6 +1115,29 @@ impl TransmitWorker {
             waiting,
             pending,
         );
+    }
+
+    #[cfg(feature = "blocktrace")]
+    fn sample_blocktrace(&self) {
+        for conn in self.connected_peers.values() {
+            let Some(pid) = conn.blocktrace_peer_id else {
+                continue;
+            };
+            let look_back = bw_look_back_window(compute_probe_bdp_rtt(conn.min_rtt));
+            let (max_bw, _, _) = conn.get_max_bw(look_back);
+            let avg_bw = conn.bw.count_avg_bw_in(look_back);
+            blocktrace::record_bw_sample(blocktrace::BwSampleEvent {
+                peer_id: pid,
+                ts_us: blocktrace::now_us(),
+                rtt_us: Some(conn.bw.get_rtt().as_micros() as i64),
+                rtt_var_us: Some(conn.bw.get_var().as_micros() as i64),
+                min_rtt_us: Some(conn.min_rtt.as_micros() as i64),
+                inflight: Some(conn.inflight.inflight() as i64),
+                avg_bw: Some(avg_bw as f64),
+                max_bw: Some(max_bw as f64),
+                mode: Some(bt_bw_mode(&conn.bw_mode)),
+            });
+        }
     }
 
     /// Resume hashers of partial received pieces
@@ -1170,6 +1233,8 @@ impl TransmitWorker {
             running_state: dump.running_state.into(),
             cache_handle,
             block_pool,
+            #[cfg(feature = "blocktrace")]
+            blocktrace_torrent_id: None,
         };
 
         match &worker.running_state {
@@ -1245,6 +1310,8 @@ impl TransmitWorker {
             running_state: RunningState::Stopped,
             cache_handle,
             block_pool,
+            #[cfg(feature = "blocktrace")]
+            blocktrace_torrent_id: None,
         }
     }
 
@@ -1336,6 +1403,10 @@ impl TransmitWorker {
                     h.min_rtt,
                     &mut revoked,
                     self.cache_handle.vacant_count(),
+                    #[cfg(feature = "blocktrace")]
+                    self.blocktrace_torrent_id,
+                    #[cfg(feature = "blocktrace")]
+                    h.blocktrace_peer_id,
                 );
                 for rg in reqs.range.iter() {
                     for req in rg.iter(reqs.piece_size) {
@@ -1351,6 +1422,19 @@ impl TransmitWorker {
             for req in reqs {
                 if let Some(h) = self.connected_peers.get_mut(&peer) {
                     h.inflight.timeout(req);
+                    #[cfg(feature = "blocktrace")]
+                    if let (Some(tid), Some(pid)) =
+                        (self.blocktrace_torrent_id, h.blocktrace_peer_id)
+                    {
+                        let ev = blocktrace::BlockEvent::at(
+                            tid,
+                            pid,
+                            req.index as i64,
+                            (req.begin >> 14) as i64,
+                            blocktrace::EventKind::Timeout,
+                        );
+                        blocktrace::record_block_event(ev);
+                    }
                 }
             }
         }
@@ -1383,6 +1467,10 @@ impl TransmitWorker {
                     h.min_rtt,
                     &mut revoked,
                     self.cache_handle.vacant_count(),
+                    #[cfg(feature = "blocktrace")]
+                    self.blocktrace_torrent_id,
+                    #[cfg(feature = "blocktrace")]
+                    h.blocktrace_peer_id,
                 );
                 for rg in reqs.range.iter() {
                     for req in rg.iter(reqs.piece_size) {
@@ -1443,6 +1531,19 @@ impl TransmitWorker {
                 debug!("{peer} revoke block request {req:?}");
                 if let Some(h) = self.connected_peers.get_mut(&peer) {
                     h.inflight.timeout(req);
+                    #[cfg(feature = "blocktrace")]
+                    if let (Some(tid), Some(pid)) =
+                        (self.blocktrace_torrent_id, h.blocktrace_peer_id)
+                    {
+                        let ev = blocktrace::BlockEvent::at(
+                            tid,
+                            pid,
+                            req.index as i64,
+                            (req.begin >> 14) as i64,
+                            blocktrace::EventKind::Timeout,
+                        );
+                        blocktrace::record_block_event(ev);
+                    }
                 }
             }
         }
@@ -1641,6 +1742,8 @@ impl TransmitWorker {
                     bt_conn
                 );
                 let peer_addr = to_canonical_addr(bt_conn.peer_addr());
+                #[cfg(feature = "blocktrace")]
+                let peer_bt_id = bt_conn.peer_id();
                 if !self.connected_peers.contains_key(&peer_addr) {
                     let cm = ConnectionManagerHandle::new_dyn(
                         bt_conn,
@@ -1683,6 +1786,20 @@ impl TransmitWorker {
                     }
 
                     cm.send_stream_cmd(CtrlOfSend::Interested);
+
+                    #[cfg(feature = "blocktrace")]
+                    let blocktrace_peer_id = match self.blocktrace_torrent_id {
+                        Some(tid) => {
+                            blocktrace::register_peer(
+                                tid,
+                                peer_bt_id,
+                                peer_addr.to_string(),
+                            )
+                            .await
+                        }
+                        None => None,
+                    };
+
                     self.connected_peers.insert(
                         peer_addr,
                         PeerConn {
@@ -1709,8 +1826,21 @@ impl TransmitWorker {
                                 &hex::encode(self.info_hash),
                                 &peer_addr,
                             ),
+
+                            #[cfg(feature = "blocktrace")]
+                            blocktrace_peer_id,
                         },
                     );
+
+                    #[cfg(feature = "blocktrace")]
+                    if let Some(pid) = blocktrace_peer_id {
+                        blocktrace::record_peer_state(blocktrace::PeerStateEvent {
+                            peer_id: pid,
+                            ts_us: blocktrace::now_us(),
+                            kind: blocktrace::PeerStateKind::Connect,
+                            mode: None,
+                        });
+                    }
 
                     // ensure piece picker has a record for this peer (assume HaveNone until
                     // the peer sends its bitfield/have messages). This prevents
@@ -1739,7 +1869,16 @@ impl TransmitWorker {
                     }
                     TorrentState::Fetching(_) => {}
                 }
-                self.connected_peers.remove(&to_canonical_addr(addr));
+                let _removed = self.connected_peers.remove(&to_canonical_addr(addr));
+                #[cfg(feature = "blocktrace")]
+                if let Some(pid) = _removed.and_then(|c| c.blocktrace_peer_id) {
+                    blocktrace::record_peer_state(blocktrace::PeerStateEvent {
+                        peer_id: pid,
+                        ts_us: blocktrace::now_us(),
+                        kind: blocktrace::PeerStateKind::Disconnect,
+                        mode: None,
+                    });
+                }
                 // TODO: FIXME
                 // self.remove_unreachable_pieces_from_buf();
                 Ok(())
@@ -1747,7 +1886,7 @@ impl TransmitWorker {
             Msg::PeerMsg(pm) => {
                 // Peer protocol handling only buffers data / updates bandwidth
                 // state; disk I/O is async (PieceBufReady/FlushComplete). Never fatal.
-                if let Err(e) = self.handle_peer_msg(pm) {
+                if let Err(e) = self.handle_peer_msg(pm).await {
                     warn!("peer msg handling error (non-fatal): {e}");
                 }
                 Ok(())
@@ -1886,7 +2025,7 @@ impl TransmitWorker {
         }
     }
 
-    fn handle_peer_msg(&mut self, m: PeerMsg) -> io::Result<()> {
+    async fn handle_peer_msg(&mut self, m: PeerMsg) -> io::Result<()> {
         match m {
             PeerMsg::PieceState(addr, state) => {
                 info!("peer {addr} sends state {state:?}");
@@ -2013,6 +2152,9 @@ impl TransmitWorker {
             PeerMsg::DhtPort(addr, port) => self.handle_dht_port_msg(addr, port),
             PeerMsg::ExtendMetadata(pa, m) => {
                 self.handle_extend_metadata(pa, m);
+                // A metadata part may have just completed the magnet's metadata.
+                #[cfg(feature = "blocktrace")]
+                self.blocktrace_register_torrent().await;
                 Ok(())
             }
             PeerMsg::ExtendPex(pa, pex) => {
@@ -2846,6 +2988,19 @@ impl TransmitWorker {
                 conn.metrics.record_duplicate(piece.len as u64);
                 conn.metrics.set_inflight(conn.inflight.inflight() as f64);
             }
+            #[cfg(feature = "blocktrace")]
+            if let (Some(tid), Some(pid)) = (self.blocktrace_torrent_id, conn.blocktrace_peer_id) {
+                let mut ev = blocktrace::BlockEvent::at(
+                    tid,
+                    pid,
+                    req.index as i64,
+                    (req.begin >> 14) as i64,
+                    blocktrace::EventKind::Duplicate,
+                );
+                ev.n_inflight = Some(conn.inflight.inflight() as i64);
+                ev.bytes = Some(piece.len as i64);
+                blocktrace::record_block_event(ev);
+            }
             return Ok(());
         }
 
@@ -2853,6 +3008,20 @@ impl TransmitWorker {
         {
             conn.metrics.record_block_received(piece.len as u64);
             conn.metrics.set_inflight(conn.inflight.inflight() as f64);
+        }
+        #[cfg(feature = "blocktrace")]
+        if let (Some(tid), Some(pid)) = (self.blocktrace_torrent_id, conn.blocktrace_peer_id) {
+            let mut ev = blocktrace::BlockEvent::at(
+                tid,
+                pid,
+                req.index as i64,
+                (req.begin >> 14) as i64,
+                blocktrace::EventKind::Receive,
+            );
+            ev.rtt_us = rtt.map(|d| d.as_micros() as i64);
+            ev.n_inflight = Some(conn.inflight.inflight() as i64);
+            ev.bytes = Some(piece.len as i64);
+            blocktrace::record_block_event(ev);
         }
 
         // TODO: BlockPicker marks this block as Received before the bytes are
@@ -2871,6 +3040,20 @@ impl TransmitWorker {
                         conn.conn.send_stream_cmd(ConnMsg::Cancel(req));
                         #[cfg(feature = "metrics")]
                         conn.metrics.record_cancel();
+                    }
+                    #[cfg(feature = "blocktrace")]
+                    if let (Some(tid), Some(pid)) =
+                        (self.blocktrace_torrent_id, conn.blocktrace_peer_id)
+                    {
+                        let mut ev = blocktrace::BlockEvent::at(
+                            tid,
+                            pid,
+                            req.index as i64,
+                            (req.begin >> 14) as i64,
+                            blocktrace::EventKind::Cancel,
+                        );
+                        ev.n_inflight = Some(conn.inflight.inflight() as i64);
+                        blocktrace::record_block_event(ev);
                     }
                 }
             }
@@ -3118,6 +3301,17 @@ impl TransmitWorker {
         block_picker.peer_reject_block(&peer, req);
         if let Some(h) = self.connected_peers.get_mut(&peer) {
             h.inflight.reject(req);
+            #[cfg(feature = "blocktrace")]
+            if let (Some(tid), Some(pid)) = (self.blocktrace_torrent_id, h.blocktrace_peer_id) {
+                let ev = blocktrace::BlockEvent::at(
+                    tid,
+                    pid,
+                    req.index as i64,
+                    (req.begin >> 14) as i64,
+                    blocktrace::EventKind::Reject,
+                );
+                blocktrace::record_block_event(ev);
+            }
         }
     }
 
@@ -3486,6 +3680,9 @@ pub(crate) async fn run_transmit_worker(
     let mut dht_ticker = tokio::time::interval(time::Duration::from_secs(60));
     let mut pex_ticker = tokio::time::interval(time::Duration::from_secs(30));
 
+    #[cfg(feature = "blocktrace")]
+    transmit.blocktrace_register_torrent().await;
+
     loop {
         // TODO: lets use notify?
         tokio::select! {
@@ -3506,6 +3703,8 @@ pub(crate) async fn run_transmit_worker(
                 transmit.fetch_metadata();
                 #[cfg(feature = "metrics")]
                 transmit.sample_metrics();
+                #[cfg(feature = "blocktrace")]
+                transmit.sample_blocktrace();
             }
             _ = cancel.cancelled() => {
                 info!("transmit manager cancelled");

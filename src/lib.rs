@@ -1,5 +1,7 @@
 pub mod api;
 pub mod app;
+#[cfg(feature = "blocktrace")]
+pub mod blocktrace;
 pub mod dht;
 pub mod metadata;
 #[cfg(feature = "metrics")]

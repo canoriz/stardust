@@ -42,6 +42,7 @@ cfg-if = "1.0.4"
 metrics = { version = "0.24", optional = true }
 metrics-exporter-prometheus = { version = "0.16", default-features = false, optional = true }
 metrics-process = { version = "2", optional = true }
+rusqlite = { version = "0.40", features = ["bundled"], optional = true }
 
 [[bin]]
 name = "main"
@@ -61,6 +62,7 @@ path = "src/lib.rs"
 [features]
 mock_delay = []
 metrics = ["dep:metrics", "dep:metrics-exporter-prometheus", "dep:metrics-process"]
+blocktrace = ["dep:rusqlite"]
 
 [profile.release]
 debug = true

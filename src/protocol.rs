@@ -243,6 +243,11 @@ impl BTStream<Box<dyn Conn>> {
         self.inner.remote_addr()
     }
 
+    /// Remote peer's 20-byte handshake peer id.
+    pub fn peer_id(&self) -> InfoHash {
+        self.peer_id
+    }
+
     pub async fn send_keepalive(&mut self) -> io::Result<()> {
         send_keepalive(&mut self.inner).await
     }

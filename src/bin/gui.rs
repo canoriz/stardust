@@ -847,6 +847,18 @@ fn main() {
         )
         .init();
 
+    #[cfg(feature = "blocktrace")]
+    let _blocktrace = {
+        let db = std::env::var("BLOCKTRACE_DB").unwrap_or_else(|_| "./blocktrace.db".to_string());
+        match stardust::blocktrace::install(&db) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                tracing::error!("blocktrace install failed: {e}");
+                None
+            }
+        }
+    };
+
     let shared: Arc<Mutex<Vec<TorrentRow>>> = Arc::new(Mutex::new(Vec::new()));
     let cache_shared: Arc<Mutex<Option<CacheStats>>> = Arc::new(Mutex::new(None));
     let pool_shared: Arc<Mutex<Option<BufferPoolStats>>> = Arc::new(Mutex::new(None));

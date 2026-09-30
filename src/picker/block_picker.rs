@@ -20,6 +20,9 @@ use std::{
 #[cfg(feature = "metrics")]
 use crate::metrics;
 
+#[cfg(feature = "blocktrace")]
+use crate::blocktrace;
+
 const BLOCK_SIZE: usize = 16384;
 const NO_RESPONSE_TIMEOUT: time::Duration = time::Duration::from_secs(90);
 
@@ -359,6 +362,8 @@ impl PieceBlocks {
         repick_option: RepickOption,
         picked_out: &mut Vec<BlockRange>,
         #[cfg(feature = "metrics")] torrent: &str,
+        #[cfg(feature = "blocktrace")] bt_torrent_id: Option<i64>,
+        #[cfg(feature = "blocktrace")] bt_peer_id: Option<i64>,
     ) -> usize {
         // The caller can exhaust its budget and then call again for another range.
         // Neither fresh picks nor repicks may change state when the budget is zero.
@@ -395,6 +400,19 @@ impl PieceBlocks {
                     BlockStatus::NotRequested { revoked } => {
                         let detail = PickedDetail::new(now, *n_in_flight, avg_speed, rtt);
                         let deadline = detail.repick_eligible_at();
+                        #[cfg(feature = "blocktrace")]
+                        if let (Some(tid), Some(pid)) = (bt_torrent_id, bt_peer_id) {
+                            let mut ev = blocktrace::BlockEvent::at(
+                                tid,
+                                pid,
+                                self.piece_index as i64,
+                                i as i64,
+                                blocktrace::EventKind::Pick,
+                            );
+                            ev.exp_us = Some(detail.expected_response_time.as_micros() as i64);
+                            ev.n_inflight = Some(detail.n_in_flight_when_picked as i64);
+                            blocktrace::record_block_event(ev);
+                        }
                         *b = BlockStatus::Requested {
                             requested: HashMap::from([(peer, detail)]),
                             revoked: std::mem::take(revoked),
@@ -415,6 +433,20 @@ impl PieceBlocks {
                         if requested.is_empty() {
                             let detail = PickedDetail::new(now, *n_in_flight, avg_speed, rtt);
                             let deadline = detail.repick_eligible_at();
+                            #[cfg(feature = "blocktrace")]
+                            if let (Some(tid), Some(pid)) = (bt_torrent_id, bt_peer_id) {
+                                let mut ev = blocktrace::BlockEvent::at(
+                                    tid,
+                                    pid,
+                                    self.piece_index as i64,
+                                    i as i64,
+                                    blocktrace::EventKind::Pick,
+                                );
+                                ev.exp_us =
+                                    Some(detail.expected_response_time.as_micros() as i64);
+                                ev.n_inflight = Some(detail.n_in_flight_when_picked as i64);
+                                blocktrace::record_block_event(ev);
+                            }
                             requested.insert(peer, detail);
                             *n_in_flight += 1;
                             if from.is_none() {
@@ -497,8 +529,26 @@ impl PieceBlocks {
                             );
                         }
                         count += 1;
-                        requested
-                            .insert(peer, PickedDetail::new(now, *n_in_flight, avg_speed, rtt));
+                        let detail = PickedDetail::new(now, *n_in_flight, avg_speed, rtt);
+                        #[cfg(feature = "blocktrace")]
+                        if let (Some(tid), Some(pid)) = (bt_torrent_id, bt_peer_id) {
+                            let mut ev = blocktrace::BlockEvent::at(
+                                tid,
+                                pid,
+                                self.piece_index as i64,
+                                i as i64,
+                                blocktrace::EventKind::Repick,
+                            );
+                            ev.reason = Some(if repick_option.endgame {
+                                blocktrace::RepickReason::Endgame
+                            } else {
+                                blocktrace::RepickReason::Faster
+                            });
+                            ev.exp_us = Some(detail.expected_response_time.as_micros() as i64);
+                            ev.n_inflight = Some(detail.n_in_flight_when_picked as i64);
+                            blocktrace::record_block_event(ev);
+                        }
+                        requested.insert(peer, detail);
                         *n_in_flight += 1;
                         picked_out.push(BlockRange { from: req, to: req });
                     }
@@ -926,6 +976,8 @@ impl BlockPicker {
         rtt: time::Duration,
         revoked: &mut HashMap<PeerAddr, Vec<Request>>,
         n_cache_vacant: usize,
+        #[cfg(feature = "blocktrace")] bt_torrent_id: Option<i64>,
+        #[cfg(feature = "blocktrace")] bt_peer_id: Option<i64>,
     ) -> (BlockRequests, usize) {
         #[cfg(feature = "metrics")]
         let torrent = self.torrent_hex.clone();
@@ -1014,6 +1066,10 @@ impl BlockPicker {
                             ret,
                             #[cfg(feature = "metrics")]
                             &torrent,
+                            #[cfg(feature = "blocktrace")]
+                            bt_torrent_id,
+                            #[cfg(feature = "blocktrace")]
+                            bt_peer_id,
                         );
                         *remain -= n_picked;
                         if tracing::enabled!(tracing::Level::TRACE) {
@@ -1115,6 +1171,10 @@ impl BlockPicker {
                                 &mut ret,
                                 #[cfg(feature = "metrics")]
                                 &torrent,
+                                #[cfg(feature = "blocktrace")]
+                                bt_torrent_id,
+                                #[cfg(feature = "blocktrace")]
+                                bt_peer_id,
                             );
                             remain -= n_picked;
                             if tracing::enabled!(tracing::Level::TRACE) {
@@ -1150,6 +1210,10 @@ impl BlockPicker {
                         &mut ret,
                         #[cfg(feature = "metrics")]
                         &torrent,
+                        #[cfg(feature = "blocktrace")]
+                        bt_torrent_id,
+                        #[cfg(feature = "blocktrace")]
+                        bt_peer_id,
                     );
                     remain -= n_picked;
                     if tracing::enabled!(tracing::Level::TRACE) {
@@ -1250,6 +1314,10 @@ impl BlockPicker {
                     &mut ret,
                     #[cfg(feature = "metrics")]
                     &torrent,
+                    #[cfg(feature = "blocktrace")]
+                    bt_torrent_id,
+                    #[cfg(feature = "blocktrace")]
+                    bt_peer_id,
                 );
                 remain -= n_picked;
                 if tracing::enabled!(tracing::Level::TRACE) {
