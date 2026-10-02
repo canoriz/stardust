@@ -882,37 +882,6 @@ impl BlockPicker {
         }
     }
 
-    pub fn get_rtt(
-        &self,
-        peer: &PeerAddr,
-        req: &Request,
-        recv_time: time::Instant,
-    ) -> Option<time::Duration> {
-        if let Some(b) = self.get_block_status(req) {
-            match b {
-                BlockStatus::NotRequested { revoked } => {
-                    if let Some(p) = revoked.get(peer) {
-                        Some(recv_time.duration_since(p.pick_time))
-                    } else {
-                        None
-                    }
-                }
-                BlockStatus::Requested { requested, revoked } => {
-                    if let Some(p) = revoked.get(peer) {
-                        Some(recv_time.duration_since(p.pick_time))
-                    } else if let Some(p) = requested.get(peer) {
-                        Some(recv_time.duration_since(p.pick_time))
-                    } else {
-                        None
-                    }
-                }
-                BlockStatus::Received => None,
-            }
-        } else {
-            None
-        }
-    }
-
     pub fn get_inflight_when_sent(&self, peer: &PeerAddr, req: &Request) -> Option<usize> {
         if let Some(b) = self.get_block_status(req) {
             match b {

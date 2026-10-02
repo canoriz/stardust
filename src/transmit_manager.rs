@@ -36,10 +36,10 @@ use tracing::{debug, info, instrument, trace, warn};
 
 pub use crate::protocol::InfoHash;
 
-#[cfg(feature = "metrics")]
-use crate::metrics;
 #[cfg(feature = "blocktrace")]
 use crate::blocktrace;
+#[cfg(feature = "metrics")]
+use crate::metrics;
 
 mod bandwidth_mode;
 mod inflight;
@@ -253,6 +253,38 @@ impl PeerConn {
         } else {
             self.bw.count_max_bw_and_min_rtt(look_back_duration)
         }
+    }
+
+    /// receives a block, returns rtt
+    fn receive(&mut self, req: Request) -> Option<time::Duration> {
+        let Some((rtt, inflight_at_pick)) = self.inflight.receive(req) else {
+            self.bw.add_sample(req.len as usize, None, None);
+            return None;
+        };
+        self.bw
+            .add_sample(req.len as usize, Some(rtt), Some(inflight_at_pick));
+
+        self.bw.add_rtt(rtt);
+
+        #[cfg(feature = "metrics")]
+        conn.metrics.record_response(rtt.as_secs_f64());
+
+        if rtt < self.min_rtt {
+            self.min_rtt = rtt;
+            self.since_min_rtt = time::Instant::now();
+        }
+
+        // let mean = self.bw.get_rtt();
+        // let sigma = self.bw.get_var();
+        Some(rtt)
+    }
+
+    fn request(&mut self, req: Request) {
+        self.request(req)
+    }
+
+    fn cancel(&mut self, req: Request) {
+        self.inflight.cancel(req)
     }
 }
 
@@ -1391,7 +1423,7 @@ impl TransmitWorker {
         for (addr, h) in &mut self.connected_peers {
             info!("peer status {addr}: {:?}", h.state);
             if h.state.peer_choke_status == ChokeStatus::Unchoked {
-                let in_flight = h.inflight.inflight();
+                let in_flight = h.inflight.inflight(h.bw.get_rtt_4var());
                 let probe_bdp_rtt = compute_probe_bdp_rtt(h.min_rtt);
                 let look_back_duration = bw_look_back_window(probe_bdp_rtt);
                 let avg_bw = h.bw.count_avg_bw_in(look_back_duration);
@@ -1410,7 +1442,7 @@ impl TransmitWorker {
                 );
                 for rg in reqs.range.iter() {
                     for req in rg.iter(reqs.piece_size) {
-                        h.inflight.request(req);
+                        h.request(req);
                     }
                 }
 
@@ -1455,7 +1487,7 @@ impl TransmitWorker {
         let mut revoked = HashMap::new();
         let picked_n = if let Some(h) = self.connected_peers.get_mut(addr) {
             if h.state.peer_choke_status == ChokeStatus::Unchoked {
-                let n_in_flight = h.inflight.inflight();
+                let n_in_flight = h.inflight.inflight(h.bw.get_rtt_4var());
                 let probe_bdp_rtt = compute_probe_bdp_rtt(h.min_rtt);
                 let look_back_duration = bw_look_back_window(probe_bdp_rtt);
                 let avg_bw = h.bw.count_avg_bw_in(look_back_duration);
@@ -1474,7 +1506,7 @@ impl TransmitWorker {
                 );
                 for rg in reqs.range.iter() {
                     for req in rg.iter(reqs.piece_size) {
-                        h.inflight.request(req);
+                        h.request(req);
                         debug!("{addr} pick block request {req:?}");
                     }
                 }
@@ -1790,12 +1822,7 @@ impl TransmitWorker {
                     #[cfg(feature = "blocktrace")]
                     let blocktrace_peer_id = match self.blocktrace_torrent_id {
                         Some(tid) => {
-                            blocktrace::register_peer(
-                                tid,
-                                peer_bt_id,
-                                peer_addr.to_string(),
-                            )
-                            .await
+                            blocktrace::register_peer(tid, peer_bt_id, peer_addr.to_string()).await
                         }
                         None => None,
                     };
@@ -2574,10 +2601,17 @@ impl TransmitWorker {
             "peer {peer} estimated max bandwidth {max_bw}, min rtt {:?}, min rtt in period {:?} req in flight: {}",
             conn.min_rtt,
             min_rtt_in_period,
-            conn.inflight.inflight()
+            conn.inflight.inflight(conn.bw.get_rtt_4var())
         );
 
-        let n_req_in_flight = conn.inflight.inflight();
+        let n_req_in_flight = conn.inflight.inflight(conn.bw.get_rtt_4var());
+        const MIN_IN_FLIGHT: usize = 5;
+        const MAX_IN_FLIGHT: usize = 500;
+        let max_in_flight = if conn.conn.info().reqq_limit > 0 {
+            conn.conn.info().reqq_limit
+        } else {
+            MAX_IN_FLIGHT
+        };
 
         match conn.bw_mode {
             BandwidthMode::Startup {
@@ -2623,10 +2657,9 @@ impl TransmitWorker {
                         }
 
                         *max_bw = (*max_bw).max(max_bw_in_rtt);
-                        let bdp =
-                            (conn.min_rtt.as_secs_f32() * (*max_bw).max(0.0) / 16384.0) as usize;
-                        let startup_cwnd_cap = 4usize.max(bdp.saturating_mul(3));
-                        *cwnd = (*cwnd * 2).min(startup_cwnd_cap);
+                        let bdp = conn.min_rtt.as_secs_f32() * (*max_bw).max(0.0) / 16384.0;
+                        let startup_cwnd_cap = 4f32.max(bdp * 1.25) as usize;
+                        *cwnd = (*cwnd * 2).min(startup_cwnd_cap).min(max_in_flight);
 
                         if *limit_count >= NO_MORE_GAIN_LIMIT {
                             let optimum = (*max_bw * conn.min_rtt.as_secs_f32() / 16384.0) as usize;
@@ -2795,13 +2828,6 @@ impl TransmitWorker {
                 // For peers with small bandwidth, we don't request too much from them
                 // to avoid mark these blocks as in-flight and not requesting from other peers.
                 // preventing accumulating too much partial downloaded pieces.
-                const MIN_IN_FLIGHT: usize = 5;
-                const MAX_IN_FLIGHT: usize = 500;
-                let max_in_flight = if conn.conn.info().reqq_limit > 0 {
-                    conn.conn.info().reqq_limit
-                } else {
-                    MAX_IN_FLIGHT
-                };
 
                 // TODO: OPTIMIZE: pre-calculate, do not calculate every time
                 let limit = {
@@ -2884,9 +2910,12 @@ impl TransmitWorker {
             len: piece.len,
         };
 
-        if let Some(conn) = self.connected_peers.get_mut(peer) {
-            conn.inflight.receive(req);
-        }
+        let conn = self
+            .connected_peers
+            .get_mut(&to_canonical_addr(*peer))
+            .expect("should exist");
+
+        let rtt = conn.receive(req);
 
         let Downloading { block_picker, .. } = match &mut self.torrent_state {
             TorrentState::Metadata(d) => d,
@@ -2902,18 +2931,7 @@ impl TransmitWorker {
             }
         };
 
-        let conn = self
-            .connected_peers
-            .get_mut(&to_canonical_addr(*peer))
-            .expect("should exist");
-        let rtt = block_picker.get_rtt(peer, &req, recv_time);
         let inflight_when_sent = block_picker.get_inflight_when_sent(peer, &req);
-        conn.bw
-            .add_sample(piece.len as usize, rtt, inflight_when_sent);
-        trace!(
-            "{peer} add bw sample {rtt:?}, inflight {} inflight when sent {inflight_when_sent:?}",
-            conn.inflight.inflight()
-        );
 
         // let expected_response_time = block_picker.get_expected_response_time(peer, &req);
         // if let (Some(real_recv_time), Some(expected_recv_time)) = (rtt, expected_response_time) {
@@ -2927,26 +2945,8 @@ impl TransmitWorker {
         //     );
         // }
 
-        if let Some(rtt) = rtt {
-            #[cfg(feature = "metrics")]
-            conn.metrics.record_response(rtt.as_secs_f64());
-
-            let mean = conn.bw.get_rtt();
-            let sigma = conn.bw.get_var();
-
-            if rtt < conn.min_rtt {
-                conn.min_rtt = rtt;
-                conn.since_min_rtt = time::Instant::now();
-                trace!("{peer} new min rtt = {:?}", conn.min_rtt);
-            }
-        }
-
         match &mut conn.bw_mode {
-            BandwidthMode::Startup { .. } => {
-                if let Some(rtt) = rtt {
-                    conn.bw.add_rtt(rtt);
-                }
-            }
+            BandwidthMode::Startup { .. } => {}
             BandwidthMode::ProbeBW {
                 last_piece_time,
                 slow_count,
@@ -2955,9 +2955,6 @@ impl TransmitWorker {
             } => {
                 trace!("{peer} add rtt sample {rtt:?}, inflight when sent {inflight_when_sent:?}");
                 *last_piece_time = time::Instant::now();
-                if let Some(rtt) = rtt {
-                    conn.bw.add_rtt(rtt);
-                }
             }
             BandwidthMode::SlowDown {
                 last_piece_time, ..
@@ -3035,7 +3032,7 @@ impl TransmitWorker {
                 // if this block come from peer we did not request, cancel old request
                 // TODO: remove pending requests if not sent
                 if let Some(conn) = self.connected_peers.get_mut(&addr) {
-                    conn.inflight.cancel(req);
+                    conn.cancel(req);
                     if conn.conn.capability().have(protocol::Capability::FAST) {
                         conn.conn.send_stream_cmd(ConnMsg::Cancel(req));
                         #[cfg(feature = "metrics")]

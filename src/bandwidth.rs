@@ -82,12 +82,7 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
     /// how many new bytes received
     /// if given rtt, use this rtt
     /// if not given, will use an average rtt
-    pub fn add_sample(
-        &mut self,
-        n_bytes: usize,
-        rtt: Option<Duration>,
-        n_in_flight: Option<usize>,
-    ) {
+    pub fn add_sample(&mut self, n_bytes: usize, rtt: Option<Duration>, n_in_flight: Option<u32>) {
         let before_rtt = self.circular[self.head].rtt.get_rtt();
 
         let cur_dur = self.current_slot_duration();
