@@ -16,8 +16,8 @@ use tokio::sync::oneshot;
 use tracing::{error, info};
 
 const CHANNEL_CAP: usize = 65536;
-const BATCH_MAX: usize = 1024;
-const BATCH_MS: u64 = 50;
+const BATCH_MAX: usize = 10240;
+const BATCH_MS: u64 = 1000;
 
 /// A block lifecycle event kind. The explicit discriminant IS the
 /// `event_kind.id` FK stored in `block_event`.
@@ -358,17 +358,18 @@ fn handle_register(
         } => {
             let id = match torrents.get(&info_hash) {
                 Some(id) => Some(*id),
-                None => match upsert_torrent(conn, &info_hash, name.as_deref(), total_len, piece_len)
-                {
-                    Ok(id) => {
-                        torrents.insert(info_hash, id);
-                        Some(id)
+                None => {
+                    match upsert_torrent(conn, &info_hash, name.as_deref(), total_len, piece_len) {
+                        Ok(id) => {
+                            torrents.insert(info_hash, id);
+                            Some(id)
+                        }
+                        Err(e) => {
+                            error!("blocktrace register torrent: {e}");
+                            None
+                        }
                     }
-                    Err(e) => {
-                        error!("blocktrace register torrent: {e}");
-                        None
-                    }
-                },
+                }
             };
             // On failure, drop `reply` unsent: the caller's `rx.await` errors
             // and `register_torrent` returns None (no sentinel value).
@@ -462,7 +463,12 @@ fn insert_peer_state(conn: &Connection, e: &PeerStateEvent) -> rusqlite::Result<
     conn.prepare_cached(
         "INSERT INTO peer_state_event(peer_id, ts_us, kind, mode) VALUES (?1, ?2, ?3, ?4)",
     )?
-    .execute(params![e.peer_id, e.ts_us, e.kind.id(), e.mode.map(|m| m.id())])
+    .execute(params![
+        e.peer_id,
+        e.ts_us,
+        e.kind.id(),
+        e.mode.map(|m| m.id())
+    ])
 }
 
 fn insert_bw(conn: &Connection, e: &BwSampleEvent) -> rusqlite::Result<usize> {
@@ -542,8 +548,9 @@ pub fn record_bw_sample(ev: BwSampleEvent) {
 }
 
 const SCHEMA: &str = "
-PRAGMA journal_mode = WAL;
-PRAGMA synchronous = NORMAL;
+PRAGMA journal_size_limit = 8388608;
+PRAGMA journal_mode = OFF;
+PRAGMA synchronous = OFF;
 
 CREATE TABLE IF NOT EXISTS torrent(
   id INTEGER PRIMARY KEY,

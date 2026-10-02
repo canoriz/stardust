@@ -442,8 +442,7 @@ impl PieceBlocks {
                                     i as i64,
                                     blocktrace::EventKind::Pick,
                                 );
-                                ev.exp_us =
-                                    Some(detail.expected_response_time.as_micros() as i64);
+                                ev.exp_us = Some(detail.expected_response_time.as_micros() as i64);
                                 ev.n_inflight = Some(detail.n_in_flight_when_picked as i64);
                                 blocktrace::record_block_event(ev);
                             }
@@ -987,7 +986,7 @@ impl BlockPicker {
             self.prev_time_check = time::Instant::now();
         }
 
-        let rush_mode = n_cache_vacant < POOL_SIZE * 3 / 4;
+        let rush_mode = n_cache_vacant < POOL_SIZE * 1 / 4;
         let endgame = self.update_endgame();
         let repick_option = if endgame {
             RepickOption {

@@ -90,13 +90,13 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
     ) {
         let before_rtt = self.circular[self.head].rtt.get_rtt();
 
-        let cur_rtt = self.current_slot_duration();
+        let cur_dur = self.current_slot_duration();
         let elapsed = self.circular[self.head].since.elapsed();
         let pre_dur = self.circular[self.head].dur;
 
-        let rtt_changed = elapsed > cur_rtt && elapsed < pre_dur;
-        if elapsed > pre_dur || rtt_changed {
-            if rtt_changed {
+        let rtt_smaller_than_expect = cur_dur < elapsed && elapsed < pre_dur;
+        if elapsed > pre_dur || rtt_smaller_than_expect {
+            if rtt_smaller_than_expect {
                 // update old slot's duration
                 self.circular[self.head].dur = elapsed;
             }
@@ -108,7 +108,7 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
                 self.head += 1;
             }
             let mut p = Period::new();
-            p.dur = cur_rtt;
+            p.dur = cur_dur;
             self.circular[self.head] = p;
         }
 
@@ -262,9 +262,9 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
     /// compute current slot duration based on RTT estimator with clamping
     fn current_slot_duration(&self) -> Duration {
         let est = self.rtt.get_rtt();
-        let min = Duration::from_millis(50);
+        let min = Duration::from_millis(250);
         let max = Duration::from_millis(500);
-        est.min(max).max(min)
+        est.clamp(min, max)
     }
 }
 
