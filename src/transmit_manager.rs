@@ -43,6 +43,7 @@ use crate::metrics;
 
 mod bandwidth_mode;
 mod inflight;
+mod windowed_max;
 
 const PROBE_TO_AUTO_NORMAL_RTT_LIMIT: u32 = 2;
 const PROBE_TO_SLOWDOWN_SLOW_RTT_LIMIT: u32 = 2;
@@ -225,8 +226,6 @@ struct PeerConn {
     bw_mode: BandwidthMode,
 
     app_limited: bool,
-    // TODO: optimize: use integer type
-    max_bw_unlimited: f32, // the max bandwidth when not app-limited
 
     #[cfg(feature = "metrics")]
     metrics: metrics::PeerMetrics,
@@ -237,42 +236,38 @@ struct PeerConn {
 }
 
 impl PeerConn {
-    /// returns max_bw, min_rtt_in_period, min_rtt_in_period_at
-    fn get_max_bw(
-        &self,
-        look_back_duration: time::Duration,
-    ) -> (f32, time::Duration, time::Instant) {
-        if self.app_limited {
-            let (_, min_rtt_in_period, min_rtt_in_period_at) =
-                self.bw.count_max_bw_and_min_rtt(look_back_duration);
-            (
-                self.max_bw_unlimited,
-                min_rtt_in_period,
-                min_rtt_in_period_at,
-            )
-        } else {
-            self.bw.count_max_bw_and_min_rtt(look_back_duration)
-        }
+    /// returns max_bw, min_rtt, min_rtt_at
+    fn get_max_bw(&self) -> (f32, time::Duration, time::Instant) {
+        let (min_rtt, min_rtt_at) = self.inflight.min_rtt();
+        (self.inflight.max_bw(), min_rtt, min_rtt_at)
     }
 
     /// receives a block, returns rtt
     fn receive(&mut self, req: Request) -> Option<time::Duration> {
-        let Some((rtt, inflight_at_pick)) = self.inflight.receive(req) else {
+        let Some(recv) = self.inflight.receive(req) else {
             self.bw.add_sample(req.len as usize, None, None);
             return None;
         };
+        let rtt = recv.rtt;
         self.bw
-            .add_sample(req.len as usize, Some(rtt), Some(inflight_at_pick));
+            .add_sample(req.len as usize, Some(rtt), Some(recv.inflight_at_pick));
 
         self.bw.add_rtt(rtt);
 
-        #[cfg(feature = "metrics")]
-        conn.metrics.record_response(rtt.as_secs_f64());
+        trace!(
+            "delivery-rate sample: {:.0} B/s, delivered {} over {:?}, app_limited {}",
+            recv.rate.delivery_rate,
+            recv.rate.delivered,
+            recv.rate.interval,
+            recv.rate.is_app_limited
+        );
 
-        if rtt < self.min_rtt {
-            self.min_rtt = rtt;
-            self.since_min_rtt = time::Instant::now();
-        }
+        #[cfg(feature = "metrics")]
+        self.metrics.record_response(rtt.as_secs_f64());
+
+        let (m, at) = self.inflight.min_rtt();
+        self.min_rtt = m;
+        self.since_min_rtt = at;
 
         // let mean = self.bw.get_rtt();
         // let sigma = self.bw.get_var();
@@ -280,7 +275,7 @@ impl PeerConn {
     }
 
     fn request(&mut self, req: Request) {
-        self.request(req)
+        self.inflight.request(req, self.app_limited)
     }
 
     fn cancel(&mut self, req: Request) {
@@ -1126,7 +1121,8 @@ impl TransmitWorker {
     fn sample_metrics(&self) {
         let torrent_hex = hex::encode(self.info_hash);
         for (peer, conn) in &self.connected_peers {
-            conn.metrics.set_inflight(conn.inflight.inflight() as f64);
+            conn.metrics
+                .set_inflight(conn.inflight.inflight(conn.bw.get_rtt_4var()) as f64);
             conn.metrics.set_min_rtt(conn.min_rtt.as_secs_f64());
             conn.metrics.set_rtt(conn.bw.get_rtt().as_secs_f64());
             conn.metrics.set_rtt_var(conn.bw.get_var().as_secs_f64());
@@ -1164,7 +1160,7 @@ impl TransmitWorker {
                 rtt_us: Some(conn.bw.get_rtt().as_micros() as i64),
                 rtt_var_us: Some(conn.bw.get_var().as_micros() as i64),
                 min_rtt_us: Some(conn.min_rtt.as_micros() as i64),
-                inflight: Some(conn.inflight.inflight() as i64),
+                inflight: Some(conn.inflight.inflight(conn.bw.get_rtt_4var()) as i64),
                 avg_bw: Some(avg_bw as f64),
                 max_bw: Some(max_bw as f64),
                 mode: Some(bt_bw_mode(&conn.bw_mode)),
@@ -1516,13 +1512,6 @@ impl TransmitWorker {
                 if pick_n > 0 {
                     trace!("really picked {picked_n} blocks");
                     if picked_n < pick_n {
-                        h.max_bw_unlimited = h.max_bw_unlimited.max({
-                            // TODO: FIXME: optimize
-                            let probe_bdp_rtt = compute_probe_bdp_rtt(h.min_rtt);
-                            let look_back_duration = bw_look_back_window(probe_bdp_rtt);
-                            let (max_bw, _, _) = h.get_max_bw(look_back_duration);
-                            max_bw
-                        });
                         if !h.app_limited {
                             debug!(
                                 "{addr} only picked {picked_n} blocks from {addr:?} app limited"
@@ -1846,7 +1835,6 @@ impl TransmitWorker {
                             inflight: Inflight::new(time::Duration::from_secs(90)),
 
                             app_limited: false,
-                            max_bw_unlimited: 0.0,
 
                             #[cfg(feature = "metrics")]
                             metrics: metrics::PeerMetrics::new(
@@ -2154,13 +2142,6 @@ impl TransmitWorker {
                     if !h.app_limited {
                         info!("peer {peer} waiting for block buffer — marking app_limited");
                     }
-                    h.max_bw_unlimited = h.max_bw_unlimited.max({
-                        // TODO: FIXME: optimize
-                        let probe_bdp_rtt = compute_probe_bdp_rtt(h.min_rtt);
-                        let look_back_duration = bw_look_back_window(probe_bdp_rtt);
-                        let (max_bw, _, _) = h.get_max_bw(look_back_duration);
-                        max_bw
-                    });
                     h.app_limited = true;
                 }
                 Ok(())
@@ -2571,7 +2552,7 @@ impl TransmitWorker {
         let probe_bdp_rtt = compute_probe_bdp_rtt(conn.min_rtt);
 
         let look_back_duration = bw_look_back_window(probe_bdp_rtt);
-        let (max_bw, min_rtt_in_period, min_rtt_in_period_at) = conn.get_max_bw(look_back_duration);
+        let (max_bw, min_rtt_in_period, min_rtt_in_period_at) = conn.get_max_bw();
         let probe_rtt_interval = (probe_bdp_rtt * 10).max(time::Duration::from_secs(6));
 
         const TEN_SECS: time::Duration = time::Duration::from_secs(10);
@@ -2623,11 +2604,8 @@ impl TransmitWorker {
                 const NO_MORE_GAIN_LIMIT: u32 = 2;
                 let cwnd_probe_interval =
                     (probe_bdp_rtt * 10).max(time::Duration::from_millis(1500));
-                let cwnd_duration = cwnd_since.elapsed().max(time::Duration::from_millis(1500));
                 if cwnd_since.elapsed() > cwnd_probe_interval {
-                    // TODO: call count_max_bw_and_min_rtt or get_max_bw?
-                    // get_max_bw auto deals with app_limited
-                    let (max_bw_in_rtt, _, _) = conn.bw.count_max_bw_and_min_rtt(cwnd_duration);
+                    let max_bw_in_rtt = conn.inflight.max_bw();
                     info!(
                         "{peer} in Startup mode, cwnd {}, inflight {} prev max bw {}, avg-bw {} avg_bw_10s {} new max bw {}, limit count {} app limited {}",
                         *cwnd,
@@ -2669,7 +2647,7 @@ impl TransmitWorker {
                             );
                             conn.bw_mode = BandwidthMode::SlowDown {
                                 last_piece_time: time::Instant::now(),
-                                inflight_target: optimum,
+                                inflight_target: optimum / 2,
                             }
                         }
                     }
@@ -2753,7 +2731,7 @@ impl TransmitWorker {
             } => {
                 if n_req_in_flight <= inflight_target {
                     if inflight_target > 0 {
-                        let (max_bw, _, _) = conn.get_max_bw(look_back_duration);
+                        let (max_bw, _, _) = conn.get_max_bw();
                         let cap =
                             BandwidthMode::compute_probe_bw_capacity(probe_bdp_rtt, max_bw, 0, 4);
                         info!(
@@ -2983,7 +2961,8 @@ impl TransmitWorker {
             #[cfg(feature = "metrics")]
             {
                 conn.metrics.record_duplicate(piece.len as u64);
-                conn.metrics.set_inflight(conn.inflight.inflight() as f64);
+                conn.metrics
+                    .set_inflight(conn.inflight.inflight(conn.bw.get_rtt_4var()) as f64);
             }
             #[cfg(feature = "blocktrace")]
             if let (Some(tid), Some(pid)) = (self.blocktrace_torrent_id, conn.blocktrace_peer_id) {
@@ -2994,7 +2973,7 @@ impl TransmitWorker {
                     (req.begin >> 14) as i64,
                     blocktrace::EventKind::Duplicate,
                 );
-                ev.n_inflight = Some(conn.inflight.inflight() as i64);
+                ev.n_inflight = Some(conn.inflight.inflight(conn.bw.get_rtt_4var()) as i64);
                 ev.bytes = Some(piece.len as i64);
                 blocktrace::record_block_event(ev);
             }
@@ -3004,7 +2983,8 @@ impl TransmitWorker {
         #[cfg(feature = "metrics")]
         {
             conn.metrics.record_block_received(piece.len as u64);
-            conn.metrics.set_inflight(conn.inflight.inflight() as f64);
+            conn.metrics
+                .set_inflight(conn.inflight.inflight(conn.bw.get_rtt_4var()) as f64);
         }
         #[cfg(feature = "blocktrace")]
         if let (Some(tid), Some(pid)) = (self.blocktrace_torrent_id, conn.blocktrace_peer_id) {
@@ -3016,7 +2996,7 @@ impl TransmitWorker {
                 blocktrace::EventKind::Receive,
             );
             ev.rtt_us = rtt.map(|d| d.as_micros() as i64);
-            ev.n_inflight = Some(conn.inflight.inflight() as i64);
+            ev.n_inflight = Some(conn.inflight.inflight(conn.bw.get_rtt_4var()) as i64);
             ev.bytes = Some(piece.len as i64);
             blocktrace::record_block_event(ev);
         }
@@ -3049,7 +3029,7 @@ impl TransmitWorker {
                             (req.begin >> 14) as i64,
                             blocktrace::EventKind::Cancel,
                         );
-                        ev.n_inflight = Some(conn.inflight.inflight() as i64);
+                        ev.n_inflight = Some(conn.inflight.inflight(conn.bw.get_rtt_4var()) as i64);
                         blocktrace::record_block_event(ev);
                     }
                 }

@@ -39,6 +39,7 @@ pub struct PickedDetail {
     pub pick_time: time::Instant,
     pub n_in_flight_when_picked: usize,
     pub expected_response_time: time::Duration,
+    pub rtt: time::Duration,
 }
 
 impl PickedDetail {
@@ -52,6 +53,7 @@ impl PickedDetail {
             pick_time,
             n_in_flight_when_picked,
             expected_response_time: expected_response_time(avg_speed, n_in_flight_when_picked, rtt),
+            rtt,
         }
     }
 
@@ -60,13 +62,12 @@ impl PickedDetail {
     }
 
     /// The instant the block this detail was picked for becomes repick-eligible:
-    /// a slow requester (expected response time over `REPICK_EAGER_EXPECT_THRESHOLD`)
-    /// is eligible immediately; otherwise wait `REPICK_NO_RESPONSE_TIMEOUT_CAP`.
     fn repick_eligible_at(&self) -> time::Instant {
-        if self.expected_response_time > REPICK_EAGER_EXPECT_THRESHOLD {
-            self.pick_time
+        if self.rtt > REPICK_NO_RESPONSE_TIMEOUT_CAP {
+            time::Instant::now()
         } else {
-            self.pick_time + REPICK_NO_RESPONSE_TIMEOUT_CAP
+            (self.expected_recv_at() + REPICK_EAGER_EXPECT_THRESHOLD)
+                .min(self.pick_time + REPICK_NO_RESPONSE_TIMEOUT_CAP)
         }
     }
 }
@@ -2292,10 +2293,12 @@ mod test {
 
     #[test]
     fn test_pick_budget_bounds_requests_in_rush_and_endgame() {
+        // rush_mode kicks in when vacant < POOL_SIZE/4; 0 is strict rush, POOL_SIZE/8
+        // is non-strict rush, POOL_SIZE is non-rush (endgame handles that case).
         for (endgame, requesting, vacant) in [
             (false, false, 0),
-            (false, false, POOL_SIZE / 2),
-            (false, true, POOL_SIZE / 2),
+            (false, false, POOL_SIZE / 8),
+            (false, true, POOL_SIZE / 8),
             (true, false, POOL_SIZE),
         ] {
             let (mut picker, peers) = make_block_picker_with_state(3, 4 * BLOCK_SIZE, 2, 0, 0);

@@ -485,7 +485,7 @@ where
                         to_canonical_addr(self.read_stream.peer_addr()),
                         blks,
                     )))
-                    .unwrap();
+                    .unwrap(); // TODO: this panics
                 // TODO: handle get blocks command
             }
         }
