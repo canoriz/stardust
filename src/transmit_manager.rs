@@ -220,8 +220,10 @@ struct PeerConn {
     state: PeerStatus,
     bitmap: Option<PieceState>,
     bw: Bandwidth<50>,
-    min_rtt: time::Duration,
-    since_min_rtt: time::Instant,
+
+    min_rtt_phase: time::Duration,
+    since_min_rtt_phase: time::Instant,
+
     inflight: Inflight,
     bw_mode: BandwidthMode,
 
@@ -236,19 +238,6 @@ struct PeerConn {
 }
 
 impl PeerConn {
-    /// returns max_bw, min_rtt, min_rtt_at
-    fn get_max_bw(&self) -> (f32, time::Duration, time::Instant) {
-        // CC-only consumer: before the first sample `max_bw ≈ 0` so BDP ≈ 0 regardless,
-        // and the sentinel fallback reproduces the pre-Option behavior exactly. The
-        // measured/unmeasured distinction only matters for repick, which reads
-        // `inflight.min_rtt()` directly rather than through here.
-        let (min_rtt, min_rtt_at) = self
-            .inflight
-            .min_rtt()
-            .unwrap_or((self.min_rtt, self.since_min_rtt));
-        (self.inflight.max_bw(), min_rtt, min_rtt_at)
-    }
-
     /// receives a block, returns rtt
     fn receive(&mut self, req: Request) -> Option<time::Duration> {
         let Some(recv) = self.inflight.receive(req) else {
@@ -272,9 +261,10 @@ impl PeerConn {
         #[cfg(feature = "metrics")]
         self.metrics.record_response(rtt.as_secs_f64());
 
-        let (m, at) = self.inflight.min_rtt().unwrap_or((self.min_rtt, self.since_min_rtt));
-        self.min_rtt = m;
-        self.since_min_rtt = at;
+        if rtt < self.min_rtt_phase {
+            self.min_rtt_phase = rtt;
+            self.since_min_rtt_phase = time::Instant::now();
+        }
 
         // let mean = self.bw.get_rtt();
         // let sigma = self.bw.get_var();
@@ -1130,7 +1120,7 @@ impl TransmitWorker {
         for (peer, conn) in &self.connected_peers {
             conn.metrics
                 .set_inflight(conn.inflight.inflight(conn.bw.get_rtt_4var()) as f64);
-            conn.metrics.set_min_rtt(conn.min_rtt.as_secs_f64());
+            conn.metrics.set_min_rtt(conn.min_rtt_phase.as_secs_f64());
             conn.metrics.set_rtt(conn.bw.get_rtt().as_secs_f64());
             conn.metrics.set_rtt_var(conn.bw.get_var().as_secs_f64());
             let mode = match conn.bw_mode {
@@ -1158,15 +1148,15 @@ impl TransmitWorker {
             let Some(pid) = conn.blocktrace_peer_id else {
                 continue;
             };
-            let look_back = bw_look_back_window(compute_probe_bdp_rtt(conn.min_rtt));
-            let (max_bw, _, _) = conn.get_max_bw();
+            let look_back = bw_look_back_window(compute_probe_bdp_rtt(conn.min_rtt_phase));
+            let max_bw = conn.inflight.max_bw();
             let avg_bw = conn.bw.count_avg_bw_in(look_back);
             blocktrace::record_bw_sample(blocktrace::BwSampleEvent {
                 peer_id: pid,
                 ts_us: blocktrace::now_us(),
                 rtt_us: Some(conn.bw.get_rtt().as_micros() as i64),
                 rtt_var_us: Some(conn.bw.get_var().as_micros() as i64),
-                min_rtt_us: Some(conn.min_rtt.as_micros() as i64),
+                min_rtt_us: Some(conn.min_rtt_phase.as_micros() as i64),
                 inflight: Some(conn.inflight.inflight(conn.bw.get_rtt_4var()) as i64),
                 avg_bw: Some(avg_bw as f64),
                 max_bw: Some(max_bw as f64),
@@ -1427,7 +1417,7 @@ impl TransmitWorker {
             info!("peer status {addr}: {:?}", h.state);
             if h.state.peer_choke_status == ChokeStatus::Unchoked {
                 let in_flight = h.inflight.inflight(h.bw.get_rtt_4var());
-                let probe_bdp_rtt = compute_probe_bdp_rtt(h.min_rtt);
+                let probe_bdp_rtt = compute_probe_bdp_rtt(h.min_rtt_phase);
                 let look_back_duration = bw_look_back_window(probe_bdp_rtt);
                 let avg_bw = h.bw.count_avg_bw_in(look_back_duration);
                 let (reqs, pick_n) = block_picker.pick_blocks(
@@ -1491,7 +1481,7 @@ impl TransmitWorker {
         let picked_n = if let Some(h) = self.connected_peers.get_mut(addr) {
             if h.state.peer_choke_status == ChokeStatus::Unchoked {
                 let n_in_flight = h.inflight.inflight(h.bw.get_rtt_4var());
-                let probe_bdp_rtt = compute_probe_bdp_rtt(h.min_rtt);
+                let probe_bdp_rtt = compute_probe_bdp_rtt(h.min_rtt_phase);
                 let look_back_duration = bw_look_back_window(probe_bdp_rtt);
                 let avg_bw = h.bw.count_avg_bw_in(look_back_duration);
                 let (reqs, picked_n) = block_picker.pick_blocks(
@@ -1836,8 +1826,8 @@ impl TransmitWorker {
                             },
                             bitmap: None,
                             bw: Bandwidth::new(),
-                            min_rtt: INIT_RTT_STARTUP,
-                            since_min_rtt: time::Instant::now(),
+                            min_rtt_phase: INIT_RTT_STARTUP,
+                            since_min_rtt_phase: time::Instant::now(),
                             bw_mode: BandwidthMode::new_choked(),
                             inflight: Inflight::new(time::Duration::from_secs(90)),
 
@@ -2110,8 +2100,8 @@ impl TransmitWorker {
                 warn!("{peer} unchoked us");
                 self.connected_peers.entry(peer).and_modify(|st| {
                     st.state.peer_choke_status = ChokeStatus::Unchoked;
-                    st.min_rtt = INIT_RTT_STARTUP;
-                    st.since_min_rtt = time::Instant::now();
+                    st.min_rtt_phase = INIT_RTT_STARTUP;
+                    st.since_min_rtt_phase = time::Instant::now();
                     st.app_limited = false;
                     st.bw_mode = BandwidthMode::new_auto();
                 });
@@ -2556,16 +2546,15 @@ impl TransmitWorker {
         }
 
         // For Probe mode BDP estimation, use a conservative RTT baseline under jitter:
-        let probe_bdp_rtt = compute_probe_bdp_rtt(conn.min_rtt);
+        let probe_bdp_rtt = compute_probe_bdp_rtt(conn.min_rtt_phase);
 
         let look_back_duration = bw_look_back_window(probe_bdp_rtt);
-        let (max_bw, min_rtt_in_period, min_rtt_in_period_at) = conn.get_max_bw();
+
         // fixed wall-clock interval (BBR RTpropFilterLen), never scaled by min_rtt:
         // a queue-inflated min_rtt would push this out of reach and lock in the bloat.
         const PROBE_RTT_INTERVAL: time::Duration = time::Duration::from_secs(10);
-        let probe_rtt_interval = PROBE_RTT_INTERVAL;
-
         const TEN_SECS: time::Duration = time::Duration::from_secs(10);
+
         let bytes_10sec = conn.bw.count_bytes_within_period(TEN_SECS).0;
         let avg_bw_10s = conn.bw.count_avg_bw_in(TEN_SECS);
         let avg_bw = conn.bw.count_avg_bw_in(look_back_duration);
@@ -2588,10 +2577,11 @@ impl TransmitWorker {
             likely_respond_within,
             likely_recv_next_within
         );
+        let max_bw = conn.inflight.max_bw();
         info!(
             "peer {peer} estimated max bandwidth {max_bw}, min rtt {:?}, min rtt in period {:?} req in flight: {}",
-            conn.min_rtt,
-            min_rtt_in_period,
+            conn.min_rtt_phase,
+            conn.inflight.min_rtt().unzip().0,
             conn.inflight.inflight(conn.bw.get_rtt_4var())
         );
 
@@ -2635,25 +2625,23 @@ impl TransmitWorker {
                             *limit_count += 1;
                             info!(
                                 "{peer} Startup stagnation {}, round {}, max bw in rtt {}, current max bw {}",
-                                *limit_count,
-                                round,
-                                max_bw_in_rtt,
-                                max_bw,
+                                *limit_count, round, max_bw_in_rtt, max_bw,
                             );
                         } else {
                             *limit_count = 0;
                         }
 
                         *max_bw = (*max_bw).max(max_bw_in_rtt);
-                        let bdp = conn.min_rtt.as_secs_f32() * (*max_bw).max(0.0) / 16384.0;
+                        let bdp = conn.min_rtt_phase.as_secs_f32() * (*max_bw).max(0.0) / 16384.0;
                         let startup_cwnd_cap = 4f32.max(bdp * 1.25) as usize;
                         *cwnd = (*cwnd * 2).min(startup_cwnd_cap).min(max_in_flight);
 
                         if *limit_count >= NO_MORE_GAIN_LIMIT {
-                            let optimum = (*max_bw * conn.min_rtt.as_secs_f32() / 16384.0) as usize;
+                            let optimum =
+                                (*max_bw * conn.min_rtt_phase.as_secs_f32() / 16384.0) as usize;
                             info!(
                                 "{peer} change from Startup to Slowdown mode, {} {:?} slow down to {optimum}",
-                                *max_bw, conn.min_rtt,
+                                *max_bw, conn.min_rtt_phase,
                             );
                             conn.bw_mode = BandwidthMode::SlowDown {
                                 last_piece_time: time::Instant::now(),
@@ -2682,6 +2670,7 @@ impl TransmitWorker {
 
                     *cycle_index = (*cycle_index + 1) & 0x7;
                     *since_cycle = time::Instant::now();
+                    let max_bw = conn.inflight.max_bw();
 
                     *capacity = BandwidthMode::compute_probe_bw_capacity(
                         probe_bdp_rtt,
@@ -2696,17 +2685,17 @@ impl TransmitWorker {
                         max_bw,
                         avg_bw,
                         avg_bw_10s,
-                        conn.min_rtt,
+                        conn.min_rtt_phase,
                         probe_bdp_rtt,
                         *capacity,
                     );
                 }
 
                 const SLOW_LIMIT: u32 = 2;
-                if conn.since_min_rtt.elapsed() > probe_rtt_interval {
+                if conn.since_min_rtt_phase.elapsed() > PROBE_RTT_INTERVAL {
                     info!(
                         "{peer} change from ProbeBW to SlowDown mode because no smaller rtt after {:?}",
-                        probe_rtt_interval,
+                        PROBE_RTT_INTERVAL,
                     );
                     conn.bw_mode = BandwidthMode::SlowDown {
                         last_piece_time: *last_piece_time,
@@ -2741,7 +2730,7 @@ impl TransmitWorker {
             } => {
                 if n_req_in_flight <= inflight_target {
                     if inflight_target > 0 {
-                        let (max_bw, _, _) = conn.get_max_bw();
+                        let max_bw = conn.inflight.max_bw();
                         let cap =
                             BandwidthMode::compute_probe_bw_capacity(probe_bdp_rtt, max_bw, 0, 4);
                         info!(
@@ -2783,12 +2772,14 @@ impl TransmitWorker {
             } => {
                 info!(
                     "{peer} in ProbeRTT mode cnt {} normal count {} min rtt {:?} avg bw {} avg_bw_10s {} req in flight {}",
-                    cnt, normal_count, conn.min_rtt, avg_bw, avg_bw_10s, n_req_in_flight
+                    cnt, normal_count, conn.min_rtt_phase, avg_bw, avg_bw_10s, n_req_in_flight
                 );
+                let max_bw = conn.inflight.max_bw();
 
                 if cnt > 4 {
-                    conn.min_rtt = min_rtt_in_period;
-                    conn.since_min_rtt = min_rtt_in_period_at;
+                    let (min_rtt, min_rtt_at) = conn.inflight.min_rtt().unwrap();
+                    conn.min_rtt_phase = min_rtt;
+                    conn.since_min_rtt_phase = min_rtt_at;
                     let cap = BandwidthMode::compute_probe_bw_capacity(probe_bdp_rtt, max_bw, 0, 4);
                     info!("{peer} change from ProbeRTT to ProbeBW mode");
                     conn.bw_mode = BandwidthMode::ProbeBW {
@@ -2822,6 +2813,8 @@ impl TransmitWorker {
                     let bdp = BandwidthMode::compute_probe_bw_capacity(probe_bdp_rtt, max_bw, 3, 4);
                     bdp + bdp / 2
                 };
+                let max_bw = conn.inflight.max_bw();
+
                 info!(
                     "{peer} ProbeBW mode max bw {}, avg bw {}, avg_bw_10s {}, limit {}",
                     max_bw, avg_bw, avg_bw_10s, limit
@@ -2835,7 +2828,7 @@ impl TransmitWorker {
                     "{peer} ProbeBW mode cycle {} capacity {} min rtt {:?} probe rtt {:?} avg bw {} avg_bw_10s {} max_bw {} req in flight {}",
                     cycle_index,
                     *capacity,
-                    conn.min_rtt,
+                    conn.min_rtt_phase,
                     probe_bdp_rtt,
                     avg_bw,
                     avg_bw_10s,
@@ -2855,7 +2848,7 @@ impl TransmitWorker {
                 );
                 info!(
                     "{peer} Slowdown mode min rtt {:?} avg bw {} avg_bw_10s {} req in flight {}",
-                    conn.min_rtt, avg_bw, avg_bw_10s, n_req_in_flight
+                    conn.min_rtt_phase, avg_bw, avg_bw_10s, n_req_in_flight
                 );
                 0
             }
@@ -2864,7 +2857,7 @@ impl TransmitWorker {
             } => {
                 info!(
                     "{peer} ProbeRTT mode min rtt {:?} avg bw {} avg_bw_10s {} inflight_target {} req in flight {}",
-                    conn.min_rtt, avg_bw, avg_bw_10s, inflight_target, n_req_in_flight
+                    conn.min_rtt_phase, avg_bw, avg_bw_10s, inflight_target, n_req_in_flight
                 );
                 inflight_target.saturating_sub(n_req_in_flight)
             }

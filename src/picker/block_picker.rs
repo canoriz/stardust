@@ -39,8 +39,8 @@ pub struct PickedDetail {
     pub pick_time: time::Instant,
     pub n_in_flight_when_picked: usize,
     pub expected_response_time: time::Duration,
-    // None until the holder has a real RTT sample; gates repick branch-A so a
-    // never-measured peer (min_rtt still at the startup sentinel) isn't stolen from on sight
+
+    // None until the holder has a real RTT sample
     pub rtt: Option<time::Duration>,
 }
 

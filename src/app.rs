@@ -1,3 +1,6 @@
+#[cfg(feature = "mock_delay")]
+use crate::api::InfoHash;
+
 /// Add the hardcoded test torrent to `session` for mock-delay testing.
 ///
 /// Only compiled when the `mock_delay` Cargo feature is enabled.
