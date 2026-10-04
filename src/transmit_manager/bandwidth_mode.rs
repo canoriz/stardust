@@ -5,7 +5,8 @@ use tokio::time;
 #[derive(Debug)]
 pub enum BandwidthMode {
     Startup {
-        cwnd_since: time::Instant,
+        // BBR round at which cwnd was last doubled; grow once per round (≈ per RTT)
+        last_round: u64,
         cwnd: usize,
         max_bw: f32,
         limit_count: u32,
@@ -80,7 +81,7 @@ impl BandwidthMode {
 
     pub fn new_auto() -> Self {
         BandwidthMode::Startup {
-            cwnd_since: time::Instant::now(),
+            last_round: 0,
             cwnd: 4,
             max_bw: 0.0,
             limit_count: 0,

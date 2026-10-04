@@ -65,6 +65,10 @@ pub struct Inflight {
     min_rtt: WindowMin<time::Duration>,
     anchor: time::Instant,
 
+    // false until the first real RTT sample lands; while false, `min_rtt` only
+    // holds its startup sentinel, so callers must treat the value as unknown
+    has_rtt_sample: bool,
+
     timeout: time::Duration,
 }
 
@@ -83,6 +87,7 @@ impl Inflight {
             btlbw: WindowMax::new(BTLBW_WIN_ROUNDS, 0.0),
             min_rtt: WindowMin::new(MIN_RTT_WIN_MS, time::Duration::from_secs(50)),
             anchor: now,
+            has_rtt_sample: false,
             timeout,
         }
     }
@@ -181,6 +186,7 @@ impl Inflight {
         let rtt = fr.sent_time.elapsed();
         let ms = self.anchor.elapsed().as_millis() as u64;
         self.min_rtt.update(ms, rtt);
+        self.has_rtt_sample = true;
 
         Some(Received {
             rtt,
@@ -194,13 +200,22 @@ impl Inflight {
         self.btlbw.get()
     }
 
-    /// current RTprop estimate (windowed min RTT) and the instant that sample was taken
-    pub fn min_rtt(&self) -> (time::Duration, time::Instant) {
+    /// BBR round counter; advances ~once per RTT as acks cross the round bookmark
+    pub fn round_count(&self) -> u64 {
+        self.round_count
+    }
+
+    /// current RTprop estimate (windowed min RTT) and the instant that sample was
+    /// taken; `None` until a real sample lands (the window still holds only its sentinel)
+    pub fn min_rtt(&self) -> Option<(time::Duration, time::Instant)> {
+        if !self.has_rtt_sample {
+            return None;
+        }
         let v = self.min_rtt.get();
-        (
+        Some((
             v,
             self.anchor + time::Duration::from_millis(self.min_rtt.key()),
-        )
+        ))
     }
 
     /// compute the delivery-rate sample for a just-acked request (read-only)

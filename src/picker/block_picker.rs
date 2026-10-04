@@ -39,7 +39,9 @@ pub struct PickedDetail {
     pub pick_time: time::Instant,
     pub n_in_flight_when_picked: usize,
     pub expected_response_time: time::Duration,
-    pub rtt: time::Duration,
+    // None until the holder has a real RTT sample; gates repick branch-A so a
+    // never-measured peer (min_rtt still at the startup sentinel) isn't stolen from on sight
+    pub rtt: Option<time::Duration>,
 }
 
 impl PickedDetail {
@@ -47,7 +49,7 @@ impl PickedDetail {
         pick_time: time::Instant,
         n_in_flight_when_picked: usize,
         avg_speed: f32,
-        rtt: time::Duration,
+        rtt: Option<time::Duration>,
     ) -> Self {
         Self {
             pick_time,
@@ -63,11 +65,12 @@ impl PickedDetail {
 
     /// The instant the block this detail was picked for becomes repick-eligible:
     fn repick_eligible_at(&self) -> time::Instant {
-        if self.rtt > REPICK_NO_RESPONSE_TIMEOUT_CAP {
-            time::Instant::now()
-        } else {
-            (self.expected_recv_at() + REPICK_EAGER_EXPECT_THRESHOLD)
-                .min(self.pick_time + REPICK_NO_RESPONSE_TIMEOUT_CAP)
+        match self.rtt {
+            // measured and genuinely slow: eligible immediately
+            Some(rtt) if rtt > REPICK_NO_RESPONSE_TIMEOUT_CAP => time::Instant::now(),
+            // measured-and-fast, or never measured: grace until expected (+threshold), capped at 5s
+            _ => (self.expected_recv_at() + REPICK_EAGER_EXPECT_THRESHOLD)
+                .min(self.pick_time + REPICK_NO_RESPONSE_TIMEOUT_CAP),
         }
     }
 }
@@ -84,8 +87,11 @@ fn repick_deadline_of(requested: &HashMap<PeerAddr, PickedDetail>) -> Option<tim
 fn expected_response_time(
     avg_speed: f32,
     n_in_flight: usize,
-    rtt: time::Duration,
+    rtt: Option<time::Duration>,
 ) -> time::Duration {
+    let Some(rtt) = rtt else {
+        return NO_RESPONSE_TIMEOUT;
+    };
     if avg_speed <= f32::EPSILON {
         return NO_RESPONSE_TIMEOUT;
     }
@@ -359,7 +365,7 @@ impl PieceBlocks {
         n: usize,
         n_in_flight: &mut usize,
         avg_speed: f32,
-        rtt: time::Duration,
+        rtt: Option<time::Duration>,
         repick_option: RepickOption,
         picked_out: &mut Vec<BlockRange>,
         #[cfg(feature = "metrics")] torrent: &str,
@@ -942,7 +948,7 @@ impl BlockPicker {
         n: usize,
         mut n_in_flight: usize,
         avg_speed: f32,
-        rtt: time::Duration,
+        rtt: Option<time::Duration>,
         revoked: &mut HashMap<PeerAddr, Vec<Request>>,
         n_cache_vacant: usize,
         #[cfg(feature = "blocktrace")] bt_torrent_id: Option<i64>,
@@ -1013,7 +1019,7 @@ impl BlockPicker {
              remain: &mut usize,
              n_in_flight: &mut usize,
              avg_speed: f32,
-             rtt: time::Duration,
+             rtt: Option<time::Duration>,
              piece_size: usize| {
                 for index in piece_index_order(pieces, |b| {
                     b.block_map.len() - b.requested_or_received_count
@@ -1821,7 +1827,7 @@ mod test {
             pick_time,
             n_in_flight_when_picked,
             BLOCK_SIZE as f32,
-            time::Duration::ZERO,
+            Some(time::Duration::ZERO),
         )
     }
 
@@ -1845,7 +1851,7 @@ mod test {
                 30,
                 &mut 0,
                 BLOCK_SIZE as f32,
-                time::Duration::ZERO,
+                Some(time::Duration::ZERO),
                 RepickOption {
                     repick_limit: 1,
                     endgame: false,
@@ -1876,7 +1882,7 @@ mod test {
                 30,
                 &mut 0,
                 BLOCK_SIZE as f32,
-                time::Duration::ZERO,
+                Some(time::Duration::ZERO),
                 RepickOption {
                     repick_limit: 1,
                     endgame: false,
@@ -1989,7 +1995,7 @@ mod test {
                 30,
                 &mut 0,
                 BLOCK_SIZE as f32,
-                time::Duration::ZERO,
+                Some(time::Duration::ZERO),
                 RepickOption {
                     repick_limit: 1,
                     endgame: false,
@@ -2061,7 +2067,7 @@ mod test {
                 15,
                 15,
                 BLOCK_SIZE as f32,
-                time::Duration::ZERO,
+                Some(time::Duration::ZERO),
                 &mut revoked,
                 POOL_SIZE,
             );
@@ -2106,7 +2112,7 @@ mod test {
                 1,
                 1,
                 BLOCK_SIZE as f32,
-                time::Duration::ZERO,
+                Some(time::Duration::ZERO),
                 &mut revoked,
                 POOL_SIZE,
             );
@@ -2137,7 +2143,7 @@ mod test {
                 5,
                 5,
                 BLOCK_SIZE as f32,
-                time::Duration::ZERO,
+                Some(time::Duration::ZERO),
                 &mut revoked,
                 POOL_SIZE,
             );
@@ -2171,7 +2177,7 @@ mod test {
             vec![BlockStatus::Requested {
                 requested: HashMap::from([(
                     PEER1,
-                    PickedDetail::new(time::Instant::now(), 4, 1024.0, time::Duration::ZERO),
+                    PickedDetail::new(time::Instant::now(), 4, 1024.0, Some(time::Duration::ZERO)),
                 )]),
                 revoked: HashMap::new(),
             }],
@@ -2183,7 +2189,7 @@ mod test {
             1,
             &mut 0,
             BLOCK_SIZE as f32 * 64.0,
-            time::Duration::ZERO,
+            Some(time::Duration::ZERO),
             RepickOption {
                 repick_limit: 7,
                 endgame: false,
@@ -2209,7 +2215,12 @@ mod test {
             vec![BlockStatus::Requested {
                 requested: HashMap::from([(
                     PEER1,
-                    PickedDetail::new(time::Instant::now(), 0, 4096.0, time::Duration::ZERO),
+                    PickedDetail::new(
+                        time::Instant::now(),
+                        0,
+                        4096.0,
+                        Some(time::Duration::from_secs(10)),
+                    ),
                 )]),
                 revoked: HashMap::new(),
             }],
@@ -2221,7 +2232,7 @@ mod test {
             1,
             &mut 0,
             BLOCK_SIZE as f32,
-            time::Duration::ZERO,
+            Some(time::Duration::ZERO),
             RepickOption {
                 repick_limit: 7,
                 endgame: false,
@@ -2277,7 +2288,7 @@ mod test {
                 0,
                 &mut inflight,
                 BLOCK_SIZE as f32,
-                time::Duration::ZERO,
+                Some(time::Duration::ZERO),
                 option,
                 &mut picked,
             );
@@ -2337,7 +2348,7 @@ mod test {
                 1,
                 0,
                 BLOCK_SIZE as f32,
-                time::Duration::ZERO,
+                Some(time::Duration::ZERO),
                 &mut HashMap::new(),
                 vacant,
             );
@@ -2386,7 +2397,7 @@ mod test {
             1,
             &mut 0,
             BLOCK_SIZE as f32,
-            time::Duration::ZERO,
+            Some(time::Duration::ZERO),
             RepickOption {
                 repick_limit: 7,
                 endgame: false,
@@ -2416,7 +2427,7 @@ mod test {
                         time::Instant::now(),
                         0,
                         BLOCK_SIZE as f32,
-                        time::Duration::ZERO,
+                        Some(time::Duration::ZERO),
                     ),
                 )]),
                 revoked: HashMap::new(),
@@ -2429,7 +2440,7 @@ mod test {
             1,
             &mut 0,
             BLOCK_SIZE as f32,
-            time::Duration::ZERO,
+            Some(time::Duration::ZERO),
             RepickOption {
                 repick_limit: 7,
                 endgame: false,
@@ -2503,7 +2514,7 @@ mod test {
                 n_requesting * (piece_size / BLOCK_SIZE + 1),
                 0,
                 BLOCK_SIZE as f32,
-                time::Duration::from_millis(100),
+                Some(time::Duration::from_millis(100)),
                 &mut revoked,
                 POOL_SIZE,
             );
@@ -2543,7 +2554,7 @@ mod test {
                 0, // ticker only: n=0
                 100,
                 BLOCK_SIZE as f32,
-                time::Duration::from_millis(100),
+                Some(time::Duration::from_millis(100)),
                 &mut revoked,
                 POOL_SIZE,
             );
@@ -2582,7 +2593,7 @@ mod test {
             N_PREPICK,
             0,
             BLOCK_SIZE as f32,
-            time::Duration::from_millis(100),
+            Some(time::Duration::from_millis(100)),
             &mut revoked,
             POOL_SIZE,
         );
@@ -2602,7 +2613,7 @@ mod test {
                 0,
                 N_PREPICK,
                 BLOCK_SIZE as f32,
-                time::Duration::from_millis(100),
+                Some(time::Duration::from_millis(100)),
                 &mut revoked,
                 POOL_SIZE,
             );
@@ -2623,7 +2634,7 @@ mod test {
                 1,
                 200,
                 BLOCK_SIZE as f32,
-                time::Duration::from_millis(100),
+                Some(time::Duration::from_millis(100)),
                 &mut revoked,
                 POOL_SIZE,
             );
@@ -2670,7 +2681,7 @@ mod test {
                 1000,
                 0,
                 BLOCK_SIZE as f32,
-                time::Duration::from_millis(100),
+                Some(time::Duration::from_millis(100)),
                 &mut revoked,
                 POOL_SIZE,
             );
@@ -2724,7 +2735,7 @@ mod test {
                 500,
                 0,
                 BLOCK_SIZE as f32,
-                time::Duration::from_millis(100),
+                Some(time::Duration::from_millis(100)),
                 &mut revoked,
                 POOL_SIZE,
             );

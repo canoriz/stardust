@@ -238,7 +238,14 @@ struct PeerConn {
 impl PeerConn {
     /// returns max_bw, min_rtt, min_rtt_at
     fn get_max_bw(&self) -> (f32, time::Duration, time::Instant) {
-        let (min_rtt, min_rtt_at) = self.inflight.min_rtt();
+        // CC-only consumer: before the first sample `max_bw ≈ 0` so BDP ≈ 0 regardless,
+        // and the sentinel fallback reproduces the pre-Option behavior exactly. The
+        // measured/unmeasured distinction only matters for repick, which reads
+        // `inflight.min_rtt()` directly rather than through here.
+        let (min_rtt, min_rtt_at) = self
+            .inflight
+            .min_rtt()
+            .unwrap_or((self.min_rtt, self.since_min_rtt));
         (self.inflight.max_bw(), min_rtt, min_rtt_at)
     }
 
@@ -265,7 +272,7 @@ impl PeerConn {
         #[cfg(feature = "metrics")]
         self.metrics.record_response(rtt.as_secs_f64());
 
-        let (m, at) = self.inflight.min_rtt();
+        let (m, at) = self.inflight.min_rtt().unwrap_or((self.min_rtt, self.since_min_rtt));
         self.min_rtt = m;
         self.since_min_rtt = at;
 
@@ -1152,7 +1159,7 @@ impl TransmitWorker {
                 continue;
             };
             let look_back = bw_look_back_window(compute_probe_bdp_rtt(conn.min_rtt));
-            let (max_bw, _, _) = conn.get_max_bw(look_back);
+            let (max_bw, _, _) = conn.get_max_bw();
             let avg_bw = conn.bw.count_avg_bw_in(look_back);
             blocktrace::record_bw_sample(blocktrace::BwSampleEvent {
                 peer_id: pid,
@@ -1428,7 +1435,7 @@ impl TransmitWorker {
                     n_blocks,
                     in_flight,
                     avg_bw,
-                    h.min_rtt,
+                    h.inflight.min_rtt().map(|(m, _)| m),
                     &mut revoked,
                     self.cache_handle.vacant_count(),
                     #[cfg(feature = "blocktrace")]
@@ -1492,7 +1499,7 @@ impl TransmitWorker {
                     pick_n,
                     n_in_flight,
                     avg_bw,
-                    h.min_rtt,
+                    h.inflight.min_rtt().map(|(m, _)| m),
                     &mut revoked,
                     self.cache_handle.vacant_count(),
                     #[cfg(feature = "blocktrace")]
@@ -2553,7 +2560,10 @@ impl TransmitWorker {
 
         let look_back_duration = bw_look_back_window(probe_bdp_rtt);
         let (max_bw, min_rtt_in_period, min_rtt_in_period_at) = conn.get_max_bw();
-        let probe_rtt_interval = (probe_bdp_rtt * 10).max(time::Duration::from_secs(6));
+        // fixed wall-clock interval (BBR RTpropFilterLen), never scaled by min_rtt:
+        // a queue-inflated min_rtt would push this out of reach and lock in the bloat.
+        const PROBE_RTT_INTERVAL: time::Duration = time::Duration::from_secs(10);
+        let probe_rtt_interval = PROBE_RTT_INTERVAL;
 
         const TEN_SECS: time::Duration = time::Duration::from_secs(10);
         let bytes_10sec = conn.bw.count_bytes_within_period(TEN_SECS).0;
@@ -2598,13 +2608,13 @@ impl TransmitWorker {
             BandwidthMode::Startup {
                 ref mut cwnd,
                 ref mut max_bw,
-                ref mut cwnd_since,
+                ref mut last_round,
                 ref mut limit_count,
             } => {
                 const NO_MORE_GAIN_LIMIT: u32 = 2;
-                let cwnd_probe_interval =
-                    (probe_bdp_rtt * 10).max(time::Duration::from_millis(1500));
-                if cwnd_since.elapsed() > cwnd_probe_interval {
+                // BBR: double cwnd once per round (≈ per RTT), ack-clocked, not wall-clock
+                let round = conn.inflight.round_count();
+                if round > *last_round {
                     let max_bw_in_rtt = conn.inflight.max_bw();
                     info!(
                         "{peer} in Startup mode, cwnd {}, inflight {} prev max bw {}, avg-bw {} avg_bw_10s {} new max bw {}, limit count {} app limited {}",
@@ -2617,16 +2627,16 @@ impl TransmitWorker {
                         *limit_count,
                         conn.app_limited,
                     );
-                    info!("{cwnd_probe_interval:?}, {:?}", cwnd_since.elapsed());
-                    *cwnd_since = time::Instant::now();
+                    info!("startup round {} -> {}", *last_round, round);
+                    *last_round = round;
 
                     if !conn.app_limited {
                         if max_bw_in_rtt <= *max_bw * 1.2 {
                             *limit_count += 1;
                             info!(
-                                "{peer} Startup stagnation {}, elapsed {:?} max bw in rtt {}, current max bw {}",
+                                "{peer} Startup stagnation {}, round {}, max bw in rtt {}, current max bw {}",
                                 *limit_count,
-                                cwnd_since.elapsed(),
+                                round,
                                 max_bw_in_rtt,
                                 max_bw,
                             );
