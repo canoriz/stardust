@@ -1117,21 +1117,6 @@ impl TransmitWorker {
     #[cfg(feature = "metrics")]
     fn sample_metrics(&self) {
         let torrent_hex = hex::encode(self.info_hash);
-        for (peer, conn) in &self.connected_peers {
-            conn.metrics
-                .set_inflight(conn.inflight.inflight(conn.bw.get_rtt_4var()) as f64);
-            conn.metrics.set_min_rtt(conn.min_rtt_phase.as_secs_f64());
-            conn.metrics.set_rtt(conn.bw.get_rtt().as_secs_f64());
-            conn.metrics.set_rtt_var(conn.bw.get_var().as_secs_f64());
-            let mode = match conn.bw_mode {
-                BandwidthMode::Startup { .. } => "startup",
-                BandwidthMode::ProbeBW { .. } => "probe_bw",
-                BandwidthMode::SlowDown { .. } => "slow_down",
-                BandwidthMode::ProbeRTT { .. } => "probe_rtt",
-                BandwidthMode::Choked => "choked",
-            };
-            metrics::add_bw_mode_time(&torrent_hex, peer, mode, 1);
-        }
         let waiting = self.waiting_for_piecebuf.len() as f64;
         let pending = self.pending_flushes.load(Ordering::Relaxed) as f64;
         metrics::set_torrent_gauges(
@@ -2594,6 +2579,7 @@ impl TransmitWorker {
             MAX_IN_FLIGHT
         };
 
+        let now = time::Instant::now();
         match conn.bw_mode {
             BandwidthMode::Startup {
                 ref mut cwnd,
@@ -2604,7 +2590,12 @@ impl TransmitWorker {
                 const NO_MORE_GAIN_LIMIT: u32 = 2;
                 // BBR: double cwnd once per round (≈ per RTT), ack-clocked, not wall-clock
                 let round = conn.inflight.round_count();
-                if round > *last_round {
+                if conn.since_min_rtt_phase.elapsed() > PROBE_RTT_INTERVAL {
+                    conn.bw_mode = BandwidthMode::SlowDown {
+                        last_piece_time: now,
+                        inflight_target: 0,
+                    }
+                } else if round > *last_round {
                     let max_bw_in_rtt = conn.inflight.max_bw();
                     info!(
                         "{peer} in Startup mode, cwnd {}, inflight {} prev max bw {}, avg-bw {} avg_bw_10s {} new max bw {}, limit count {} app limited {}",
@@ -2644,7 +2635,7 @@ impl TransmitWorker {
                                 *max_bw, conn.min_rtt_phase,
                             );
                             conn.bw_mode = BandwidthMode::SlowDown {
-                                last_piece_time: time::Instant::now(),
+                                last_piece_time: now,
                                 inflight_target: optimum / 2,
                             }
                         }
@@ -2661,7 +2652,7 @@ impl TransmitWorker {
                 ref mut capacity,
             } => {
                 let last_recv_time = *last_piece_time;
-                *last_piece_time = time::Instant::now();
+                *last_piece_time = now;
 
                 if since_cycle.elapsed() > probe_bdp_rtt {
                     if *capacity > 0 {
@@ -2669,7 +2660,7 @@ impl TransmitWorker {
                     }
 
                     *cycle_index = (*cycle_index + 1) & 0x7;
-                    *since_cycle = time::Instant::now();
+                    *since_cycle = now;
                     let max_bw = conn.inflight.max_bw();
 
                     *capacity = BandwidthMode::compute_probe_bw_capacity(
@@ -2742,14 +2733,14 @@ impl TransmitWorker {
                             slow_down_to: 0,
                             last_piece_time,
                             cycle_index: 0,
-                            since_cycle: time::Instant::now(),
+                            since_cycle: now,
                             capacity: cap,
                         };
                     } else {
                         info!("{peer} change from Slowdown to ProbeRTT mode");
                         conn.bw.reset_var();
                         conn.bw_mode = BandwidthMode::ProbeRTT {
-                            since: time::Instant::now(),
+                            since: now,
                             cnt: 0,
                             last_piece_time,
                             inflight_target: 4,
@@ -2777,13 +2768,13 @@ impl TransmitWorker {
                 let max_bw = conn.inflight.max_bw();
 
                 if cnt > 4 {
-                    let (min_rtt, min_rtt_at) = conn.inflight.min_rtt().unwrap();
-                    conn.min_rtt_phase = min_rtt;
-                    conn.since_min_rtt_phase = min_rtt_at;
+                    let (min_rtt, min_rtt_at) = conn.inflight.min_rtt().unzip();
+                    conn.min_rtt_phase = min_rtt.unwrap_or(INIT_RTT_STARTUP);
+                    conn.since_min_rtt_phase = min_rtt_at.unwrap_or(now);
                     let cap = BandwidthMode::compute_probe_bw_capacity(probe_bdp_rtt, max_bw, 0, 4);
                     info!("{peer} change from ProbeRTT to ProbeBW mode");
                     conn.bw_mode = BandwidthMode::ProbeBW {
-                        since_cycle: time::Instant::now(),
+                        since_cycle: now,
                         slow_count: 0,
                         probe_df: 1,
                         slow_down_to: 0,
@@ -2895,6 +2886,7 @@ impl TransmitWorker {
             .connected_peers
             .get_mut(&to_canonical_addr(*peer))
             .expect("should exist");
+        let now = time::Instant::now();
 
         let rtt = conn.receive(req);
 
@@ -2935,12 +2927,12 @@ impl TransmitWorker {
                 ..
             } => {
                 trace!("{peer} add rtt sample {rtt:?}, inflight when sent {inflight_when_sent:?}");
-                *last_piece_time = time::Instant::now();
+                *last_piece_time = now;
             }
             BandwidthMode::SlowDown {
                 last_piece_time, ..
             } => {
-                *last_piece_time = time::Instant::now();
+                *last_piece_time = now;
             }
             BandwidthMode::ProbeRTT {
                 cnt,
@@ -2948,7 +2940,7 @@ impl TransmitWorker {
                 ..
             } => {
                 *cnt += 1;
-                *last_piece_time = time::Instant::now();
+                *last_piece_time = now;
             }
             BandwidthMode::Choked => {}
         };

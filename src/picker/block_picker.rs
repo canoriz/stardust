@@ -26,13 +26,11 @@ use crate::blocktrace;
 const BLOCK_SIZE: usize = 16384;
 const NO_RESPONSE_TIMEOUT: time::Duration = time::Duration::from_secs(90);
 
-/// Repick deadline for a requester whose expected response time is within
-/// `REPICK_EAGER_EXPECT_THRESHOLD`: only repick after this timeout elapses.
-const REPICK_NO_RESPONSE_TIMEOUT_CAP: time::Duration = time::Duration::from_secs(5);
+/// Repick deadline for a any requester if cache is above water level
+const REPICK_AFTER_PICK: time::Duration = time::Duration::from_secs(5);
 
-/// A requester expected to take longer than this is treated as slow: its block
-/// is repick-eligible immediately, without waiting for the timeout.
-const REPICK_EAGER_EXPECT_THRESHOLD: time::Duration = time::Duration::from_millis(2000);
+/// Repick available for a peer does not respond after delay of expectation
+const REPICK_RESPONSE_DELAY: time::Duration = time::Duration::from_millis(2000);
 
 #[derive(Eq, PartialEq, Debug, Clone)]
 pub struct PickedDetail {
@@ -65,13 +63,7 @@ impl PickedDetail {
 
     /// The instant the block this detail was picked for becomes repick-eligible:
     fn repick_eligible_at(&self) -> time::Instant {
-        match self.rtt {
-            // measured and genuinely slow: eligible immediately
-            Some(rtt) if rtt > REPICK_NO_RESPONSE_TIMEOUT_CAP => time::Instant::now(),
-            // measured-and-fast, or never measured: grace until expected (+threshold), capped at 5s
-            _ => (self.expected_recv_at() + REPICK_EAGER_EXPECT_THRESHOLD)
-                .min(self.pick_time + REPICK_NO_RESPONSE_TIMEOUT_CAP),
-        }
+        (self.expected_recv_at() + REPICK_RESPONSE_DELAY).min(self.pick_time + REPICK_AFTER_PICK)
     }
 }
 
@@ -90,7 +82,8 @@ fn expected_response_time(
     rtt: Option<time::Duration>,
 ) -> time::Duration {
     let Some(rtt) = rtt else {
-        return NO_RESPONSE_TIMEOUT;
+        // just optimistically expect response will come quickly
+        return REPICK_AFTER_PICK;
     };
     if avg_speed <= f32::EPSILON {
         return NO_RESPONSE_TIMEOUT;
@@ -493,7 +486,7 @@ impl PieceBlocks {
         let repick_limit = repick_option.repick_limit;
         if repick_limit <= 1 && !repick_option.endgame {
             #[cfg(feature = "metrics")]
-            metrics::record_requests(torrent, &peer, repick_option.mode_label(), count as u64, 0);
+            metrics::record_requests(torrent, repick_option.mode_label(), count as u64, 0);
             return count;
         }
 
@@ -579,7 +572,7 @@ impl PieceBlocks {
         {
             let repick = (picked_out.len() - repick_begin) as u64;
             let new_pick = count as u64 - repick;
-            metrics::record_requests(torrent, &peer, repick_option.mode_label(), new_pick, repick);
+            metrics::record_requests(torrent, repick_option.mode_label(), new_pick, repick);
         }
 
         count

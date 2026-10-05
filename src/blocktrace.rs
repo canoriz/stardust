@@ -549,8 +549,8 @@ pub fn record_bw_sample(ev: BwSampleEvent) {
 
 const SCHEMA: &str = "
 PRAGMA journal_size_limit = 8388608;
-PRAGMA journal_mode = OFF;
-PRAGMA synchronous = OFF;
+PRAGMA journal_mode = WAL;
+PRAGMA synchronous = NORMAL;
 
 CREATE TABLE IF NOT EXISTS torrent(
   id INTEGER PRIMARY KEY,
