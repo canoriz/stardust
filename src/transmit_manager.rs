@@ -2623,9 +2623,7 @@ impl TransmitWorker {
                         }
 
                         *max_bw = (*max_bw).max(max_bw_in_rtt);
-                        let bdp = conn.min_rtt_phase.as_secs_f32() * (*max_bw).max(0.0) / 16384.0;
-                        let startup_cwnd_cap = 4f32.max(bdp * 1.25) as usize;
-                        *cwnd = (*cwnd * 2).min(startup_cwnd_cap).min(max_in_flight);
+                        *cwnd = (*cwnd * 2).min(max_in_flight).max(4);
 
                         if *limit_count >= NO_MORE_GAIN_LIMIT {
                             let optimum =
@@ -2667,7 +2665,7 @@ impl TransmitWorker {
                         probe_bdp_rtt,
                         max_bw,
                         *cycle_index,
-                        6, // 1.5
+                        4, // 1.0
                     );
                     info!(
                         "{peer} ProbeBW cycle update {}, probe df {}, max bw {}, avg bw {}, avg_bw_10s {}, min rtt {:?}, probe rtt {:?} capacity {}",
@@ -2739,6 +2737,9 @@ impl TransmitWorker {
                     } else {
                         info!("{peer} change from Slowdown to ProbeRTT mode");
                         conn.bw.reset_var();
+                        let (min_rtt, min_rtt_at) = conn.inflight.min_rtt().unzip();
+                        conn.min_rtt_phase = min_rtt.unwrap_or(INIT_RTT_STARTUP);
+                        conn.since_min_rtt_phase = min_rtt_at.unwrap_or(now);
                         conn.bw_mode = BandwidthMode::ProbeRTT {
                             since: now,
                             cnt: 0,
@@ -2800,10 +2801,11 @@ impl TransmitWorker {
                 // preventing accumulating too much partial downloaded pieces.
 
                 // TODO: OPTIMIZE: pre-calculate, do not calculate every time
-                let limit = {
-                    let bdp = BandwidthMode::compute_probe_bw_capacity(probe_bdp_rtt, max_bw, 3, 4);
-                    bdp + bdp / 2
-                };
+                let limit =
+                    BandwidthMode::compute_probe_bw_capacity(probe_bdp_rtt, max_bw, cycle_index, 4)
+                        .min(max_in_flight)
+                        .min(*capacity)
+                        .max(MIN_IN_FLIGHT);
                 let max_bw = conn.inflight.max_bw();
 
                 info!(
@@ -2811,10 +2813,7 @@ impl TransmitWorker {
                     max_bw, avg_bw, avg_bw_10s, limit
                 );
 
-                let n_to_pick = (*capacity)
-                    .min(max_in_flight.saturating_sub(n_req_in_flight))
-                    .min(limit.saturating_sub(n_req_in_flight))
-                    .max(MIN_IN_FLIGHT.saturating_sub(n_req_in_flight));
+                let n_to_pick = limit.saturating_sub(n_req_in_flight);
                 info!(
                     "{peer} ProbeBW mode cycle {} capacity {} min rtt {:?} probe rtt {:?} avg bw {} avg_bw_10s {} max_bw {} req in flight {}",
                     cycle_index,

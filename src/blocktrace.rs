@@ -79,9 +79,11 @@ impl RepickReason {
         Self::Reject,
         Self::ReceivedElsewhere,
     ];
+
     pub fn id(self) -> i64 {
         self as i64
     }
+
     fn name(self) -> &'static str {
         match self {
             Self::Faster => "faster",
@@ -125,8 +127,26 @@ pub enum BwMode {
 }
 
 impl BwMode {
+    const ALL: [BwMode; 5] = [
+        Self::Startup,
+        Self::ProbeBw,
+        Self::SlowDown,
+        Self::ProbeRtt,
+        Self::Choked,
+    ];
+
     pub fn id(self) -> i64 {
         self as i64
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Startup => "Startup",
+            Self::ProbeBw => "ProbeBw",
+            Self::SlowDown => "SlowDown",
+            Self::ProbeRtt => "ProbeRtt",
+            Self::Choked => "Choked",
+        }
     }
 }
 
@@ -260,6 +280,12 @@ pub fn install(db_path: &str) -> rusqlite::Result<TraceHandle> {
     for r in RepickReason::ALL {
         conn.execute(
             "INSERT OR IGNORE INTO repick_reason(id, name) VALUES (?1, ?2)",
+            params![r.id(), r.name()],
+        )?;
+    }
+    for r in BwMode::ALL {
+        conn.execute(
+            "INSERT OR IGNORE INTO bw_mode(id, name) VALUES (?1, ?2)",
             params![r.id(), r.name()],
         )?;
     }
@@ -571,6 +597,7 @@ CREATE INDEX IF NOT EXISTS ix_peer_torrent ON peer(torrent_id);
 
 CREATE TABLE IF NOT EXISTS event_kind(id INTEGER PRIMARY KEY, name TEXT UNIQUE);
 CREATE TABLE IF NOT EXISTS repick_reason(id INTEGER PRIMARY KEY, name TEXT UNIQUE);
+CREATE TABLE IF NOT EXISTS bw_mode(id INTEGER PRIMARY KEY, name TEXT UNIQUE);
 
 CREATE TABLE IF NOT EXISTS block_event(
   id INTEGER PRIMARY KEY,

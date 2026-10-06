@@ -68,7 +68,7 @@ impl BandwidthMode {
         rtt: time::Duration,
         max_bw: f32,
         cycle_index: usize,
-        gain: usize, //
+        gain: usize,
     ) -> usize {
         let base = (rtt.as_secs_f32() * max_bw.max(0.0)) as usize;
         let capacity = base * Self::PACING[cycle_index] as usize * gain / 4 / 4 / 16384;
