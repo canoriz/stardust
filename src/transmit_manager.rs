@@ -3004,8 +3004,7 @@ impl TransmitWorker {
         let (complete, peers_revoked) = block_picker.receive_block(req);
         for addr in peers_revoked {
             if addr != *peer {
-                // if this block come from peer we did not request, cancel old request
-                // TODO: remove pending requests if not sent
+                // if we requested this block from many peers, cancel other requests
                 if let Some(conn) = self.connected_peers.get_mut(&addr) {
                     conn.cancel(req);
                     if conn.conn.capability().have(protocol::Capability::FAST) {

@@ -118,24 +118,21 @@ impl Inflight {
     /// A request is cancelled by us
     pub fn cancel(&mut self, req: Request) {
         if let Some(request_ts) = self.requested.remove(&req) {
-            self.inflight = self.inflight.saturating_sub(1);
             self.canceled.insert(req, request_ts);
         }
     }
 
     /// A request is rejected
     pub fn reject(&mut self, req: Request) {
-        if self.requested.remove(&req).is_some() {
-            self.inflight = self.inflight.saturating_sub(1);
-        }
+        self.inflight = self.inflight.saturating_sub(1);
+        self.requested.remove(&req);
         self.canceled.remove(&req);
     }
 
     /// A request is timeout
     pub fn timeout(&mut self, req: Request) {
-        if self.requested.remove(&req).is_some() {
-            self.inflight = self.inflight.saturating_sub(1);
-        }
+        self.inflight = self.inflight.saturating_sub(1);
+        self.requested.remove(&req);
         self.canceled.remove(&req);
     }
 
@@ -145,9 +142,9 @@ impl Inflight {
         self.delivered += req.len as u64;
         self.delivered_time = time::Instant::now();
 
+        self.inflight = self.inflight.saturating_sub(1);
         let fr = if let Some(fr) = self.requested.remove(&req) {
             self.canceled.remove(&req);
-            self.inflight = self.inflight.saturating_sub(1);
             fr
         } else {
             self.canceled.remove(&req)?
@@ -249,7 +246,7 @@ impl Inflight {
                 .canceled
                 .iter()
                 .filter(|&(_, v)| {
-                    v.sent_time.elapsed() < rtt.mul_f32(1.5).max(time::Duration::from_secs(10))
+                    v.sent_time.elapsed() < rtt.mul_f32(1.5).max(time::Duration::from_secs(20))
                 })
                 .count()
     }
