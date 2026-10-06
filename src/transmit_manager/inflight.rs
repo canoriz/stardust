@@ -6,7 +6,7 @@ use tokio::time;
 use tracing::info;
 
 /// BtlBw filter window, in BBR rounds (≈ RTTs)
-const BTLBW_WIN_ROUNDS: u64 = 10;
+const BTLBW_WIN_ROUNDS: u64 = 16;
 
 /// RTprop (min RTT) filter window, in wall-clock ms
 const MIN_RTT_WIN_MS: u64 = 10_000;

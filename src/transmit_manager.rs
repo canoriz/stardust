@@ -1508,17 +1508,8 @@ impl TransmitWorker {
                         // if we are in startup|probeBW mode
                         if h.app_limited {
                             debug!("{addr} exit app limited");
+                            h.app_limited = false;
                         }
-                        h.app_limited = false;
-                    }
-
-                    match h.bw_mode {
-                        BandwidthMode::ProbeBW {
-                            ref mut capacity, ..
-                        } => {
-                            *capacity = capacity.saturating_sub(picked_n);
-                        }
-                        _ => {}
                     }
                 }
                 picked_n
@@ -2123,8 +2114,8 @@ impl TransmitWorker {
                 if let Some(h) = self.connected_peers.get_mut(&to_canonical_addr(peer)) {
                     if !h.app_limited {
                         info!("peer {peer} waiting for block buffer — marking app_limited");
+                        h.app_limited = true;
                     }
-                    h.app_limited = true;
                 }
                 Ok(())
             }
@@ -2580,6 +2571,10 @@ impl TransmitWorker {
         };
 
         let now = time::Instant::now();
+
+        #[cfg(feature = "blocktrace")]
+        let mut need_sample = false;
+
         match conn.bw_mode {
             BandwidthMode::Startup {
                 ref mut cwnd,
@@ -2635,6 +2630,12 @@ impl TransmitWorker {
                             conn.bw_mode = BandwidthMode::SlowDown {
                                 last_piece_time: now,
                                 inflight_target: optimum / 2,
+                            };
+                            conn.app_limited = true;
+
+                            #[cfg(feature = "blocktrace")]
+                            {
+                                need_sample = true;
                             }
                         }
                     }
@@ -2649,9 +2650,6 @@ impl TransmitWorker {
                 ref mut cycle_index,
                 ref mut capacity,
             } => {
-                let last_recv_time = *last_piece_time;
-                *last_piece_time = now;
-
                 if since_cycle.elapsed() > probe_bdp_rtt {
                     if *capacity > 0 {
                         info!("{peer} ProbeBW capacity remains {capacity}");
@@ -2689,6 +2687,12 @@ impl TransmitWorker {
                     conn.bw_mode = BandwidthMode::SlowDown {
                         last_piece_time: *last_piece_time,
                         inflight_target: 0,
+                    };
+                    conn.app_limited = true;
+
+                    #[cfg(feature = "blocktrace")]
+                    {
+                        need_sample = true;
                     }
                     // } else if *slow_count >= SLOW_LIMIT {
                     //     info!("{peer} change from ProbeBW to Slowdown mode because {SLOW_LIMIT} times of slow rtt");
@@ -2721,7 +2725,8 @@ impl TransmitWorker {
                     if inflight_target > 0 {
                         let max_bw = conn.inflight.max_bw();
                         let cap =
-                            BandwidthMode::compute_probe_bw_capacity(probe_bdp_rtt, max_bw, 0, 4);
+                            BandwidthMode::compute_probe_bw_capacity(probe_bdp_rtt, max_bw, 0, 4)
+                                .min(max_in_flight);
                         info!(
                             "{peer} change from Slowdown to ProbeBW mode, because inflight target {inflight_target} > 0"
                         );
@@ -2734,6 +2739,11 @@ impl TransmitWorker {
                             since_cycle: now,
                             capacity: cap,
                         };
+
+                        #[cfg(feature = "blocktrace")]
+                        {
+                            need_sample = true;
+                        }
                     } else {
                         info!("{peer} change from Slowdown to ProbeRTT mode");
                         conn.bw.reset_var();
@@ -2749,6 +2759,11 @@ impl TransmitWorker {
                             normal_count: 0,
                             slow_count: 0,
                         };
+
+                        #[cfg(feature = "blocktrace")]
+                        {
+                            need_sample = true;
+                        }
                     }
                 }
             }
@@ -2772,7 +2787,8 @@ impl TransmitWorker {
                     let (min_rtt, min_rtt_at) = conn.inflight.min_rtt().unzip();
                     conn.min_rtt_phase = min_rtt.unwrap_or(INIT_RTT_STARTUP);
                     conn.since_min_rtt_phase = min_rtt_at.unwrap_or(now);
-                    let cap = BandwidthMode::compute_probe_bw_capacity(probe_bdp_rtt, max_bw, 0, 4);
+                    let cap = BandwidthMode::compute_probe_bw_capacity(probe_bdp_rtt, max_bw, 0, 4)
+                        .min(max_in_flight);
                     info!("{peer} change from ProbeRTT to ProbeBW mode");
                     conn.bw_mode = BandwidthMode::ProbeBW {
                         since_cycle: now,
@@ -2782,6 +2798,12 @@ impl TransmitWorker {
                         last_piece_time,
                         cycle_index: 0,
                         capacity: cap,
+                    };
+                    conn.app_limited = false;
+
+                    #[cfg(feature = "blocktrace")]
+                    {
+                        need_sample = true;
                     }
                 }
             }
@@ -2792,7 +2814,7 @@ impl TransmitWorker {
             BandwidthMode::Startup { cwnd, .. } => cwnd.saturating_sub(n_req_in_flight),
             BandwidthMode::ProbeBW {
                 cycle_index,
-                ref mut capacity,
+                capacity,
                 ..
             } => {
                 // Only can pick more blocks if we received some or no requests in flight.
@@ -2804,7 +2826,7 @@ impl TransmitWorker {
                 let limit =
                     BandwidthMode::compute_probe_bw_capacity(probe_bdp_rtt, max_bw, cycle_index, 4)
                         .min(max_in_flight)
-                        .min(*capacity)
+                        .min(capacity)
                         .max(MIN_IN_FLIGHT);
                 let max_bw = conn.inflight.max_bw();
 
@@ -2817,7 +2839,7 @@ impl TransmitWorker {
                 info!(
                     "{peer} ProbeBW mode cycle {} capacity {} min rtt {:?} probe rtt {:?} avg bw {} avg_bw_10s {} max_bw {} req in flight {}",
                     cycle_index,
-                    *capacity,
+                    capacity,
                     conn.min_rtt_phase,
                     probe_bdp_rtt,
                     avg_bw,
@@ -2858,6 +2880,11 @@ impl TransmitWorker {
             if conn.state.peer_choke_status == ChokeStatus::Unchoked {
                 let really_picked = self.pick_blocks_for_peer(&peer, n_to_pick);
             }
+        }
+
+        #[cfg(feature = "blocktrace")]
+        if need_sample {
+            self.sample_blocktrace();
         }
         Ok(())
     }
