@@ -281,7 +281,7 @@ impl PeerConn {
 }
 
 fn compute_probe_bdp_rtt(min_rtt: time::Duration) -> time::Duration {
-    (min_rtt * 3 / 2).min(min_rtt + time::Duration::from_millis(50))
+    min_rtt + time::Duration::from_millis(50)
 }
 
 #[cfg(feature = "blocktrace")]
