@@ -1145,6 +1145,7 @@ impl TransmitWorker {
                 inflight: Some(conn.inflight.inflight(conn.bw.get_rtt_4var()) as i64),
                 avg_bw: Some(avg_bw as f64),
                 max_bw: Some(max_bw as f64),
+                app_limited: conn.app_limited,
                 mode: Some(bt_bw_mode(&conn.bw_mode)),
             });
         }

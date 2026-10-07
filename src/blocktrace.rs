@@ -205,6 +205,7 @@ pub struct BwSampleEvent {
     pub inflight: Option<i64>,
     pub avg_bw: Option<f64>,
     pub max_bw: Option<f64>,
+    pub app_limited: bool,
     pub mode: Option<BwMode>,
 }
 
@@ -500,8 +501,8 @@ fn insert_peer_state(conn: &Connection, e: &PeerStateEvent) -> rusqlite::Result<
 fn insert_bw(conn: &Connection, e: &BwSampleEvent) -> rusqlite::Result<usize> {
     conn.prepare_cached(
         "INSERT INTO bw_sample
-         (peer_id, ts_us, rtt_us, rtt_var_us, min_rtt_us, inflight, avg_bw, max_bw, mode)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+         (peer_id, ts_us, rtt_us, rtt_var_us, min_rtt_us, inflight, avg_bw, max_bw, app_limited, mode)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
     )?
     .execute(params![
         e.peer_id,
@@ -512,6 +513,7 @@ fn insert_bw(conn: &Connection, e: &BwSampleEvent) -> rusqlite::Result<usize> {
         e.inflight,
         e.avg_bw,
         e.max_bw,
+        e.app_limited,
         e.mode.map(|m| m.id()),
     ])
 }
@@ -634,6 +636,7 @@ CREATE TABLE IF NOT EXISTS bw_sample(
   inflight INTEGER,
   avg_bw REAL,
   max_bw REAL,
+  app_limited INTEGER,
   mode INTEGER);
 CREATE INDEX IF NOT EXISTS ix_bw_peer ON bw_sample(peer_id, ts_us);
 ";
