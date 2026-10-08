@@ -27,7 +27,7 @@ const BLOCK_SIZE: usize = 16384;
 const NO_RESPONSE_TIMEOUT: time::Duration = time::Duration::from_secs(90);
 
 /// Repick deadline for a any requester if cache is above water level
-const REPICK_AFTER_PICK: time::Duration = time::Duration::from_secs(5);
+const REPICK_AFTER_PICK: time::Duration = time::Duration::from_secs(4);
 
 /// Repick available for a peer does not respond after delay of expectation
 const REPICK_RESPONSE_DELAY: time::Duration = time::Duration::from_millis(2000);

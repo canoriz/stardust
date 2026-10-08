@@ -281,7 +281,7 @@ impl PeerConn {
 }
 
 fn compute_probe_bdp_rtt(min_rtt: time::Duration) -> time::Duration {
-    min_rtt + time::Duration::from_millis(100)
+    min_rtt + time::Duration::from_millis(50)
 }
 
 #[cfg(feature = "blocktrace")]
@@ -1128,7 +1128,7 @@ impl TransmitWorker {
     }
 
     #[cfg(feature = "blocktrace")]
-    fn sample_blocktrace(&self) {
+    fn sample_blocktrace(&self, n_blocks_received: usize) {
         for conn in self.connected_peers.values() {
             let Some(pid) = conn.blocktrace_peer_id else {
                 continue;
@@ -1142,6 +1142,7 @@ impl TransmitWorker {
                 rtt_us: Some(conn.bw.get_rtt().as_micros() as i64),
                 rtt_var_us: Some(conn.bw.get_var().as_micros() as i64),
                 min_rtt_us: Some(conn.min_rtt_phase.as_micros() as i64),
+                n_received: n_blocks_received as i32,
                 inflight: Some(conn.inflight.inflight(conn.bw.get_rtt_4var()) as i64),
                 avg_bw: Some(avg_bw as f64),
                 max_bw: Some(max_bw as f64),
@@ -2733,8 +2734,8 @@ impl TransmitWorker {
                         let cap = BandwidthMode::compute_probe_bw_capacity(
                             probe_bdp_rtt,
                             max_bw,
-                            n_blocks_received,
                             0,
+                            2,
                             4,
                         )
                         .min(max_in_flight);
@@ -2748,7 +2749,7 @@ impl TransmitWorker {
                             last_piece_time,
                             cycle_index: 0,
                             since_cycle: now,
-                            capacity: cap,
+                            capacity: cap * 2,
                         };
 
                         #[cfg(feature = "blocktrace")]
@@ -2799,7 +2800,7 @@ impl TransmitWorker {
                     conn.min_rtt_phase = min_rtt.unwrap_or(INIT_RTT_STARTUP);
                     conn.since_min_rtt_phase = min_rtt_at.unwrap_or(now);
                     let cap =
-                        BandwidthMode::compute_probe_bw_capacity(probe_bdp_rtt, max_bw, 0, 0, 4)
+                        BandwidthMode::compute_probe_bw_capacity(probe_bdp_rtt, max_bw, 0, 2, 4)
                             .min(max_in_flight);
                     info!("{peer} change from ProbeRTT to ProbeBW mode");
                     conn.bw_mode = BandwidthMode::ProbeBW {
@@ -2826,7 +2827,7 @@ impl TransmitWorker {
             BandwidthMode::Startup { cwnd, .. } => cwnd.saturating_sub(n_req_in_flight),
             BandwidthMode::ProbeBW {
                 cycle_index,
-                capacity,
+                ref mut capacity,
                 ..
             } => {
                 // Only can pick more blocks if we received some or no requests in flight.
@@ -2835,6 +2836,15 @@ impl TransmitWorker {
                 // preventing accumulating too much partial downloaded pieces.
 
                 // TODO: OPTIMIZE: pre-calculate, do not calculate every time
+                let bdp = BandwidthMode::compute_probe_bw_capacity(
+                    probe_bdp_rtt,
+                    max_bw,
+                    n_blocks_received,
+                    2,
+                    4,
+                );
+                *capacity = (*capacity).max(bdp * 2);
+
                 let limit = BandwidthMode::compute_probe_bw_capacity(
                     probe_bdp_rtt,
                     max_bw,
@@ -2843,7 +2853,7 @@ impl TransmitWorker {
                     4,
                 )
                 .min(max_in_flight)
-                .min(capacity)
+                .min(*capacity)
                 .max(MIN_IN_FLIGHT);
                 let max_bw = conn.inflight.max_bw();
 
@@ -2901,7 +2911,7 @@ impl TransmitWorker {
 
         #[cfg(feature = "blocktrace")]
         if need_sample {
-            self.sample_blocktrace();
+            self.sample_blocktrace(n_blocks_received);
         }
         Ok(())
     }
@@ -3718,7 +3728,7 @@ pub(crate) async fn run_transmit_worker(
                 #[cfg(feature = "metrics")]
                 transmit.sample_metrics();
                 #[cfg(feature = "blocktrace")]
-                transmit.sample_blocktrace();
+                transmit.sample_blocktrace(0);
             }
             _ = cancel.cancelled() => {
                 info!("transmit manager cancelled");

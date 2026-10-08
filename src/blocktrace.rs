@@ -202,6 +202,7 @@ pub struct BwSampleEvent {
     pub rtt_us: Option<i64>,
     pub rtt_var_us: Option<i64>,
     pub min_rtt_us: Option<i64>,
+    pub n_received: i32,
     pub inflight: Option<i64>,
     pub avg_bw: Option<f64>,
     pub max_bw: Option<f64>,
@@ -501,8 +502,8 @@ fn insert_peer_state(conn: &Connection, e: &PeerStateEvent) -> rusqlite::Result<
 fn insert_bw(conn: &Connection, e: &BwSampleEvent) -> rusqlite::Result<usize> {
     conn.prepare_cached(
         "INSERT INTO bw_sample
-         (peer_id, ts_us, rtt_us, rtt_var_us, min_rtt_us, inflight, avg_bw, max_bw, app_limited, mode)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+         (peer_id, ts_us, rtt_us, rtt_var_us, min_rtt_us, n_received, inflight, avg_bw, max_bw, app_limited, mode)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
     )?
     .execute(params![
         e.peer_id,
@@ -510,6 +511,7 @@ fn insert_bw(conn: &Connection, e: &BwSampleEvent) -> rusqlite::Result<usize> {
         e.rtt_us,
         e.rtt_var_us,
         e.min_rtt_us,
+        e.n_received,
         e.inflight,
         e.avg_bw,
         e.max_bw,
@@ -633,6 +635,7 @@ CREATE TABLE IF NOT EXISTS bw_sample(
   rtt_us INTEGER,
   rtt_var_us INTEGER,
   min_rtt_us INTEGER,
+  n_received INTEGER,
   inflight INTEGER,
   avg_bw REAL,
   max_bw REAL,
