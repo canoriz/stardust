@@ -281,7 +281,7 @@ impl PeerConn {
 }
 
 fn compute_probe_bdp_rtt(min_rtt: time::Duration) -> time::Duration {
-    min_rtt + time::Duration::from_millis(50)
+    min_rtt + time::Duration::from_millis(100)
 }
 
 #[cfg(feature = "blocktrace")]
@@ -2129,7 +2129,7 @@ impl TransmitWorker {
                     }
                 }
                 debug!("handled {count} piece messages");
-                self.handle_blocks_received(peer)
+                self.handle_blocks_received(peer, count)
             }
             PeerMsg::DhtPort(addr, port) => self.handle_dht_port_msg(addr, port),
             PeerMsg::ExtendMetadata(pa, m) => {
@@ -2503,7 +2503,11 @@ impl TransmitWorker {
     // }
 
     #[instrument(skip_all)]
-    fn handle_blocks_received(&mut self, peer: PeerAddr) -> io::Result<()> {
+    fn handle_blocks_received(
+        &mut self,
+        peer: PeerAddr,
+        n_blocks_received: usize,
+    ) -> io::Result<()> {
         let peer = to_canonical_addr(peer);
         info!("get BlockReceived from {peer}");
         // TODO: OPTIMIZE: return connection handle to reduce map search
@@ -2663,6 +2667,7 @@ impl TransmitWorker {
                     *capacity = BandwidthMode::compute_probe_bw_capacity(
                         probe_bdp_rtt,
                         max_bw,
+                        n_blocks_received,
                         *cycle_index,
                         4, // 1.0
                     );
@@ -2725,9 +2730,14 @@ impl TransmitWorker {
                 if n_req_in_flight <= inflight_target {
                     if inflight_target > 0 {
                         let max_bw = conn.inflight.max_bw();
-                        let cap =
-                            BandwidthMode::compute_probe_bw_capacity(probe_bdp_rtt, max_bw, 0, 4)
-                                .min(max_in_flight);
+                        let cap = BandwidthMode::compute_probe_bw_capacity(
+                            probe_bdp_rtt,
+                            max_bw,
+                            n_blocks_received,
+                            0,
+                            4,
+                        )
+                        .min(max_in_flight);
                         info!(
                             "{peer} change from Slowdown to ProbeBW mode, because inflight target {inflight_target} > 0"
                         );
@@ -2788,8 +2798,9 @@ impl TransmitWorker {
                     let (min_rtt, min_rtt_at) = conn.inflight.min_rtt().unzip();
                     conn.min_rtt_phase = min_rtt.unwrap_or(INIT_RTT_STARTUP);
                     conn.since_min_rtt_phase = min_rtt_at.unwrap_or(now);
-                    let cap = BandwidthMode::compute_probe_bw_capacity(probe_bdp_rtt, max_bw, 0, 4)
-                        .min(max_in_flight);
+                    let cap =
+                        BandwidthMode::compute_probe_bw_capacity(probe_bdp_rtt, max_bw, 0, 0, 4)
+                            .min(max_in_flight);
                     info!("{peer} change from ProbeRTT to ProbeBW mode");
                     conn.bw_mode = BandwidthMode::ProbeBW {
                         since_cycle: now,
@@ -2798,7 +2809,7 @@ impl TransmitWorker {
                         slow_down_to: 0,
                         last_piece_time,
                         cycle_index: 0,
-                        capacity: cap,
+                        capacity: cap * 2,
                     };
                     conn.app_limited = false;
 
@@ -2824,11 +2835,16 @@ impl TransmitWorker {
                 // preventing accumulating too much partial downloaded pieces.
 
                 // TODO: OPTIMIZE: pre-calculate, do not calculate every time
-                let limit =
-                    BandwidthMode::compute_probe_bw_capacity(probe_bdp_rtt, max_bw, cycle_index, 4)
-                        .min(max_in_flight)
-                        .min(capacity)
-                        .max(MIN_IN_FLIGHT);
+                let limit = BandwidthMode::compute_probe_bw_capacity(
+                    probe_bdp_rtt,
+                    max_bw,
+                    n_blocks_received,
+                    cycle_index,
+                    4,
+                )
+                .min(max_in_flight)
+                .min(capacity)
+                .max(MIN_IN_FLIGHT);
                 let max_bw = conn.inflight.max_bw();
 
                 info!(

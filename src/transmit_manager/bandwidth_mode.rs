@@ -67,12 +67,15 @@ impl BandwidthMode {
     pub fn compute_probe_bw_capacity(
         rtt: time::Duration,
         max_bw: f32,
+        n_blocks_received: usize,
         cycle_index: usize,
         gain: usize,
     ) -> usize {
         let base = (rtt.as_secs_f32() * max_bw.max(0.0)) as usize;
         let capacity = base * Self::PACING[cycle_index] as usize * gain / 4 / 4 / 16384;
-        capacity.max(Self::MIN_PROBE_BW_CAPACITY)
+        capacity
+            .max(2 * n_blocks_received)
+            .max(Self::MIN_PROBE_BW_CAPACITY)
     }
 
     pub fn new_choked() -> Self {
