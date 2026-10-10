@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
-use super::windowed_max::{WindowMin, WindowTimeMax};
-use crate::protocol::Request;
+use crate::{
+    protocol::Request,
+    util::{WindowMin, WindowTimeMax},
+};
 use tokio::time;
 use tracing::info;
 
@@ -38,6 +40,7 @@ pub struct Received {
     pub rtt: time::Duration,
     pub inflight_at_pick: u32,
     pub rate: RateSample,
+    pub canceled: bool,
 }
 
 /// outcome of acking one inflight request
@@ -154,11 +157,11 @@ impl Inflight {
         self.delivered_time = time::Instant::now();
 
         self.inflight = self.inflight.saturating_sub(1);
-        let fr = if let Some(fr) = self.requested.remove(&req) {
+        let (fr, canceled) = if let Some(fr) = self.requested.remove(&req) {
             self.canceled.remove(&req);
-            fr
+            (fr, true)
         } else {
-            self.canceled.remove(&req)?
+            (self.canceled.remove(&req)?, false)
         };
 
         // advance only on the ack of a later-sent packet; an out-of-order
@@ -201,6 +204,7 @@ impl Inflight {
             rtt,
             inflight_at_pick: fr.inflight_at_pick,
             rate,
+            canceled,
         })
     }
 

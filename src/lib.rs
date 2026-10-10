@@ -13,6 +13,7 @@ pub(crate) mod backfile;
 pub(crate) mod bandwidth;
 pub(crate) mod buffer_pool;
 pub(crate) mod cache;
+pub(crate) mod conn;
 pub(crate) mod connection_manager;
 pub(crate) mod file_tracker;
 pub(crate) mod math_helper;
@@ -21,6 +22,7 @@ pub(crate) mod session;
 pub(crate) mod torrent_manager;
 pub(crate) mod tracker;
 pub(crate) mod transmit_manager;
+pub(crate) mod util;
 
 mod hasher;
 mod helper;
