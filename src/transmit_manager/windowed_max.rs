@@ -8,10 +8,22 @@
 //! directions share them; only the three value comparisons flip.
 
 use std::marker::PhantomData;
+use tokio::time;
 
 /// comparator: true if `new` should replace `cur` as the extremum
 pub trait Compare<T> {
     fn better(new: &T, cur: &T) -> bool;
+}
+
+pub trait Instant {
+    type Duration;
+    fn saturating_sub(&self, rhs: Self) -> Self::Duration;
+    fn init() -> Self;
+}
+
+pub trait DivWindow {
+    fn div(self, rhs: u32) -> Self;
+    fn greater(&self, rhs: &Self) -> bool;
 }
 
 /// keeps the larger value
@@ -32,29 +44,88 @@ impl<T: PartialOrd> Compare<T> for Min {
     }
 }
 
+type TimeAndRound = (time::Instant, u64);
+
+impl DivWindow for u64 {
+    fn div(self, rhs: u32) -> Self {
+        self / rhs as u64
+    }
+
+    fn greater(&self, rhs: &Self) -> bool {
+        *self > *rhs
+    }
+}
+
+impl Instant for u64 {
+    type Duration = u64;
+
+    fn saturating_sub(&self, rhs: Self) -> Self::Duration {
+        u64::saturating_sub(*self, rhs)
+    }
+
+    fn init() -> Self {
+        0
+    }
+}
+
+impl DivWindow for (time::Duration, u64) {
+    fn div(self, rhs: u32) -> Self {
+        (self.0 / rhs, self.1 / rhs as u64)
+    }
+
+    fn greater(&self, rhs: &Self) -> bool {
+        self.0 > rhs.0 || self.1 > rhs.1
+    }
+}
+
+impl Instant for TimeAndRound {
+    type Duration = (time::Duration, u64);
+
+    fn saturating_sub(&self, rhs: Self) -> Self::Duration {
+        (
+            self.0.saturating_duration_since(rhs.0),
+            u64::saturating_sub(self.1, rhs.1),
+        )
+    }
+
+    fn init() -> Self {
+        (time::Instant::now(), 0)
+    }
+}
+
 /// one tracked candidate: window key `t` and measured value `v`
 #[derive(Clone, Copy)]
-struct Sample<T> {
-    t: u64,
+struct Sample<T, I> {
+    t: I,
     v: T,
 }
 
 /// windowed running extremum over the last `win` keys
-pub struct Window<T, C> {
-    win: u64,
-    s: [Sample<T>; 3],
+pub struct Window<T, C, I, W> {
+    win: W,
+    s: [Sample<T, I>; 3],
     _c: PhantomData<C>,
 }
 
-pub type WindowMax<T> = Window<T, Max>;
-pub type WindowMin<T> = Window<T, Min>;
+pub type WindowMax<T> = Window<T, Max, u64, u64>;
+pub type WindowMin<T> = Window<T, Min, u64, u64>;
+pub type WindowTimeMax<T> = Window<T, Max, TimeAndRound, <TimeAndRound as Instant>::Duration>;
 
-impl<T: Copy, C: Compare<T>> Window<T, C> {
+impl<T, C, I, W> Window<T, C, I, W>
+where
+    T: Copy,
+    C: Compare<T>,
+    I: Instant<Duration = W> + Copy + PartialEq,
+    W: DivWindow + PartialOrd + Copy,
+{
     /// `init` is the seed value, which any real sample must beat
-    pub fn new(win: u64, init: T) -> Self {
+    pub fn new(win: W, init: T) -> Self {
         Self {
             win,
-            s: [Sample { t: 0, v: init }; 3],
+            s: [Sample {
+                t: I::init(),
+                v: init,
+            }; 3],
             _c: PhantomData,
         }
     }
@@ -65,14 +136,14 @@ impl<T: Copy, C: Compare<T>> Window<T, C> {
     }
 
     /// key of the current extremum sample
-    pub fn key(&self) -> u64 {
+    pub fn key(&self) -> I {
         self.s[0].t
     }
 
     /// record sample `v` at key `t`, evicting values older than `win`; returns new extremum
-    pub fn update(&mut self, t: u64, v: T) -> T {
+    pub fn update(&mut self, t: I, v: T) -> T {
         let val = Sample { t, v };
-        if C::better(&val.v, &self.s[0].v) || t.saturating_sub(self.s[2].t) > self.win {
+        if C::better(&val.v, &self.s[0].v) || t.saturating_sub(self.s[2].t).greater(&self.win) {
             return self.reset(val);
         }
         if C::better(&val.v, &self.s[1].v) {
@@ -85,7 +156,7 @@ impl<T: Copy, C: Compare<T>> Window<T, C> {
     }
 
     /// new all-time extremum (or empty window): collapse all three slots onto it
-    fn reset(&mut self, val: Sample<T>) -> T {
+    fn reset(&mut self, val: Sample<T, I>) -> T {
         self.s = [val; 3];
         self.s[0].v
     }
@@ -94,21 +165,21 @@ impl<T: Copy, C: Compare<T>> Window<T, C> {
     /// across the sub-windows after `win/4` and `win/2`. the shift runs at most
     /// twice: the top-level reset guard keeps `s[2]` in-window, so two promotions
     /// always land an in-window sample in `s[0]`.
-    fn subwin_update(&mut self, val: Sample<T>) -> T {
+    fn subwin_update(&mut self, val: Sample<T, I>) -> T {
         let dt = val.t.saturating_sub(self.s[0].t);
-        if dt > self.win {
+        if dt.greater(&self.win) {
             self.s[0] = self.s[1];
             self.s[1] = self.s[2];
             self.s[2] = val;
-            if val.t.saturating_sub(self.s[0].t) > self.win {
+            if val.t.saturating_sub(self.s[0].t).greater(&self.win) {
                 self.s[0] = self.s[1];
                 self.s[1] = self.s[2];
                 self.s[2] = val;
             }
-        } else if self.s[1].t == self.s[0].t && dt > self.win / 4 {
+        } else if self.s[1].t == self.s[0].t && dt.greater(&self.win.div(4)) {
             self.s[1] = val;
             self.s[2] = val;
-        } else if self.s[2].t == self.s[1].t && dt > self.win / 2 {
+        } else if self.s[2].t == self.s[1].t && dt.greater(&self.win.div(2)) {
             self.s[2] = val;
         }
         self.s[0].v

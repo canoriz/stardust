@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use super::windowed_max::{WindowMax, WindowMin};
+use super::windowed_max::{WindowMin, WindowTimeMax};
 use crate::protocol::Request;
 use tokio::time;
 use tracing::info;
@@ -40,6 +40,13 @@ pub struct Received {
     pub rate: RateSample,
 }
 
+/// outcome of acking one inflight request
+#[derive(Debug, Clone, Copy)]
+pub struct Rejected {
+    pub rtt: time::Duration,
+    pub inflight_at_pick: u32,
+}
+
 /// manages states of a peer's inflight requests
 pub struct Inflight {
     requested: HashMap<Request, FlightReq>,
@@ -59,7 +66,7 @@ pub struct Inflight {
     round_count: u64,
 
     // BtlBw: windowed max of delivery-rate samples, keyed by round
-    btlbw: WindowMax<f32>,
+    btlbw: WindowTimeMax<f32>,
 
     // RTprop: windowed min of RTT, keyed by ms since `anchor`
     min_rtt: WindowMin<time::Duration>,
@@ -84,7 +91,7 @@ impl Inflight {
             first_sent_time: now,
             next_round_delivered: 0,
             round_count: 0,
-            btlbw: WindowMax::new(BTLBW_WIN_ROUNDS, 0.0),
+            btlbw: WindowTimeMax::new((time::Duration::from_secs(10), BTLBW_WIN_ROUNDS), 0.0),
             min_rtt: WindowMin::new(MIN_RTT_WIN_MS, time::Duration::from_secs(50)),
             anchor: now,
             has_rtt_sample: false,
@@ -123,10 +130,14 @@ impl Inflight {
     }
 
     /// A request is rejected
-    pub fn reject(&mut self, req: Request) {
+    pub fn reject(&mut self, req: Request) -> Option<Rejected> {
         self.inflight = self.inflight.saturating_sub(1);
-        self.requested.remove(&req);
-        self.canceled.remove(&req);
+        let r = self.requested.remove(&req);
+        let c = self.canceled.remove(&req);
+        r.or(c).map(|fr| Rejected {
+            rtt: fr.sent_time.elapsed(),
+            inflight_at_pick: fr.inflight_at_pick,
+        })
     }
 
     /// A request is timeout
@@ -166,7 +177,8 @@ impl Inflight {
         let rate = self.rate_sample(&fr);
         // app-limited samples may raise BtlBw but never lower it
         if !rate.is_app_limited || rate.delivery_rate >= self.btlbw.get() {
-            self.btlbw.update(self.round_count, rate.delivery_rate);
+            self.btlbw
+                .update((self.delivered_time, self.round_count), rate.delivery_rate);
         }
 
         // TODO: ideal app-limited recovery — on unchoke or a new `have` (peer was

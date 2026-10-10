@@ -23,14 +23,20 @@ use bandwidth_mode::BandwidthMode;
 use inflight::Inflight;
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, hash_map};
-use std::io;
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
-use tokio::net::TcpStream;
-use tokio::sync::{mpsc, oneshot};
-use tokio::time;
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, hash_map},
+    io,
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
+};
+use tokio::{
+    net::TcpStream,
+    sync::{mpsc, oneshot},
+    time,
+};
 use tokio_util::sync::{CancellationToken, DropGuard as CancelDropGuard};
 use tracing::{debug, info, instrument, trace, warn};
 
@@ -2528,9 +2534,10 @@ impl TransmitWorker {
         }
 
         // For Probe mode BDP estimation, use a conservative RTT baseline under jitter:
-        let probe_bdp_rtt = compute_probe_bdp_rtt(conn.min_rtt_phase);
+        let probe_bw_cycle = compute_probe_bdp_rtt(conn.min_rtt_phase);
+        let rtt_for_capacity = conn.bw.get_rtt() + conn.bw.get_var();
 
-        let look_back_duration = bw_look_back_window(probe_bdp_rtt);
+        let look_back_duration = bw_look_back_window(probe_bw_cycle);
 
         // fixed wall-clock interval (BBR RTpropFilterLen), never scaled by min_rtt:
         // a queue-inflated min_rtt would push this out of reach and lock in the bloat.
@@ -2656,7 +2663,7 @@ impl TransmitWorker {
                 ref mut cycle_index,
                 ref mut capacity,
             } => {
-                if since_cycle.elapsed() > probe_bdp_rtt {
+                if since_cycle.elapsed() > probe_bw_cycle {
                     if *capacity > 0 {
                         info!("{peer} ProbeBW capacity remains {capacity}");
                     }
@@ -2666,9 +2673,9 @@ impl TransmitWorker {
                     let max_bw = conn.inflight.max_bw();
 
                     *capacity = BandwidthMode::compute_probe_bw_capacity(
-                        probe_bdp_rtt,
+                        probe_bw_cycle,
+                        rtt_for_capacity,
                         max_bw,
-                        n_blocks_received,
                         *cycle_index,
                         4, // 1.0
                     );
@@ -2680,7 +2687,7 @@ impl TransmitWorker {
                         avg_bw,
                         avg_bw_10s,
                         conn.min_rtt_phase,
-                        probe_bdp_rtt,
+                        probe_bw_cycle,
                         *capacity,
                     );
                 }
@@ -2732,9 +2739,9 @@ impl TransmitWorker {
                     if inflight_target > 0 {
                         let max_bw = conn.inflight.max_bw();
                         let cap = BandwidthMode::compute_probe_bw_capacity(
-                            probe_bdp_rtt,
+                            probe_bw_cycle,
+                            rtt_for_capacity,
                             max_bw,
-                            0,
                             2,
                             4,
                         )
@@ -2799,9 +2806,14 @@ impl TransmitWorker {
                     let (min_rtt, min_rtt_at) = conn.inflight.min_rtt().unzip();
                     conn.min_rtt_phase = min_rtt.unwrap_or(INIT_RTT_STARTUP);
                     conn.since_min_rtt_phase = min_rtt_at.unwrap_or(now);
-                    let cap =
-                        BandwidthMode::compute_probe_bw_capacity(probe_bdp_rtt, max_bw, 0, 2, 4)
-                            .min(max_in_flight);
+                    let cap = BandwidthMode::compute_probe_bw_capacity(
+                        probe_bw_cycle,
+                        rtt_for_capacity,
+                        max_bw,
+                        2,
+                        4,
+                    )
+                    .min(max_in_flight);
                     info!("{peer} change from ProbeRTT to ProbeBW mode");
                     conn.bw_mode = BandwidthMode::ProbeBW {
                         since_cycle: now,
@@ -2827,7 +2839,7 @@ impl TransmitWorker {
             BandwidthMode::Startup { cwnd, .. } => cwnd.saturating_sub(n_req_in_flight),
             BandwidthMode::ProbeBW {
                 cycle_index,
-                ref mut capacity,
+                capacity,
                 ..
             } => {
                 // Only can pick more blocks if we received some or no requests in flight.
@@ -2836,26 +2848,16 @@ impl TransmitWorker {
                 // preventing accumulating too much partial downloaded pieces.
 
                 // TODO: OPTIMIZE: pre-calculate, do not calculate every time
-                let bdp = BandwidthMode::compute_probe_bw_capacity(
-                    probe_bdp_rtt,
-                    max_bw,
-                    n_blocks_received,
-                    2,
-                    4,
-                );
-                *capacity = (*capacity).max(bdp * 2);
 
                 let limit = BandwidthMode::compute_probe_bw_capacity(
-                    probe_bdp_rtt,
+                    probe_bw_cycle,
+                    rtt_for_capacity,
                     max_bw,
-                    n_blocks_received,
                     cycle_index,
                     4,
                 )
                 .min(max_in_flight)
-                .min(*capacity)
                 .max(MIN_IN_FLIGHT);
-                let max_bw = conn.inflight.max_bw();
 
                 info!(
                     "{peer} ProbeBW mode max bw {}, avg bw {}, avg_bw_10s {}, limit {}",
@@ -2868,7 +2870,7 @@ impl TransmitWorker {
                     cycle_index,
                     capacity,
                     conn.min_rtt_phase,
-                    probe_bdp_rtt,
+                    probe_bw_cycle,
                     avg_bw,
                     avg_bw_10s,
                     max_bw,
@@ -3021,6 +3023,7 @@ impl TransmitWorker {
                     (req.begin >> 14) as i64,
                     blocktrace::EventKind::Duplicate,
                 );
+                ev.rtt_us = rtt.map(|d| d.as_micros() as i64);
                 ev.n_inflight = Some(conn.inflight.inflight(conn.bw.get_rtt_4var()) as i64);
                 ev.bytes = Some(piece.len as i64);
                 blocktrace::record_block_event(ev);
@@ -3324,16 +3327,18 @@ impl TransmitWorker {
         };
         block_picker.peer_reject_block(&peer, req);
         if let Some(h) = self.connected_peers.get_mut(&peer) {
-            h.inflight.reject(req);
+            let _rtt = h.inflight.reject(req).map(|r| r.rtt);
             #[cfg(feature = "blocktrace")]
             if let (Some(tid), Some(pid)) = (self.blocktrace_torrent_id, h.blocktrace_peer_id) {
-                let ev = blocktrace::BlockEvent::at(
+                let mut ev = blocktrace::BlockEvent::at(
                     tid,
                     pid,
                     req.index as i64,
                     (req.begin >> 14) as i64,
                     blocktrace::EventKind::Reject,
                 );
+                ev.rtt_us = _rtt.map(|d| d.as_micros() as i64);
+                ev.n_inflight = Some(h.inflight.inflight(h.bw.get_rtt_4var()) as i64);
                 blocktrace::record_block_event(ev);
             }
         }
@@ -3576,7 +3581,7 @@ impl TransmitWorker {
             TorrentState::Fetching(f) => &mut f.meta_buf,
         };
 
-        let now = tokio::time::Instant::now();
+        let now = time::Instant::now();
         let timeout = tokio::time::Duration::from_secs(5);
         meta_buf.requesting.retain(|_, v| v.elapsed() < timeout);
 
