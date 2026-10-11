@@ -1912,6 +1912,8 @@ impl TransmitWorker {
                 self.connected_peers.entry(peer).and_modify(|st| {
                     st.choke();
                 });
+
+                // TODO: FIXME: no entry found for key
                 assert_eq!(
                     self.connected_peers[&peer].state.peer_choke_status,
                     Some(true),
