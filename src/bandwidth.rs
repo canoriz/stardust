@@ -215,7 +215,7 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
     }
 
     /// returns how many bytes received in back_interval, and min RTT
-    pub fn count_bytes_within_period(&self, back_interval: Duration) -> (usize, Duration) {
+    pub fn count_bytes_within_period(&self, back_interval: Duration) -> (u64, Duration) {
         let map_f = |begin: Instant, end: Instant, p: &Period| {
             let ratio = if begin <= p.since {
                 1.0
@@ -223,10 +223,10 @@ impl<const SLOT_SIZE: usize> Bandwidth<SLOT_SIZE> {
                 (end - begin).div_duration_f32(end - p.since)
             };
             let (min_rtt, _) = p.rtt.get_min_rtt_with_timestamp();
-            ((ratio * (p.bytes_count as f32)) as usize, min_rtt)
+            ((ratio * (p.bytes_count as f32)) as u64, min_rtt)
         };
 
-        let reduce_f = |acc: (usize, Duration), this: (usize, Duration)| -> (usize, Duration) {
+        let reduce_f = |acc: (u64, Duration), this: (u64, Duration)| -> (u64, Duration) {
             let (n, min_rtt) = this;
             (acc.0 + n, acc.1.min(min_rtt))
         };

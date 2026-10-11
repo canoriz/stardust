@@ -40,6 +40,9 @@ pub struct Stat {
     pub total_timeout: u64,
     pub last_recv: time::Instant,
     pub last_req: time::Instant,
+
+    /// Creation time of this connection
+    pub create_time: time::Instant,
 }
 
 impl Default for Stat {
@@ -54,6 +57,8 @@ impl Default for Stat {
             total_timeout: Default::default(),
             last_recv: time::Instant::now(),
             last_req: time::Instant::now(),
+
+            create_time: time::Instant::now(),
         }
     }
 }
@@ -173,6 +178,7 @@ impl PeerConn {
             .add_sample(req.len as usize, Some(rtt), Some(recv.inflight_at_pick));
 
         self.bw.add_rtt(rtt);
+        self.stat.last_recv = time::Instant::now();
 
         trace!(
             "delivery-rate sample: {:.0} B/s, delivered {} over {:?}, app_limited {}",
@@ -203,6 +209,7 @@ impl PeerConn {
         self.stat.total_discard += req.len as u64;
     }
 
+    #[inline]
     pub fn request_timeout(&mut self, req: Request) {
         self.stat.total_timeout += req.len as u64;
     }

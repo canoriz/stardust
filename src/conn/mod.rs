@@ -4,7 +4,7 @@ mod inflight;
 
 pub use bandwidth_mode::BandwidthMode;
 use conn::INIT_RTT_STARTUP;
-pub use conn::PeerConn;
+pub use conn::{PeerConn, Stat};
 pub use inflight::Inflight;
 
 #[cfg(feature = "blocktrace")]

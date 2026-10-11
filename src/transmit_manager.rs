@@ -1,3 +1,5 @@
+mod kick;
+
 #[cfg(feature = "blocktrace")]
 use crate::conn::BandwidthMode;
 use crate::{
@@ -3135,6 +3137,79 @@ impl TransmitWorker {
             }
         }
     }
+
+    fn kick_out_burden_peers(&mut self) {
+        const ONE_MIN: time::Duration = time::Duration::from_mins(1);
+        let mut value = BTreeMap::new();
+
+        let long_peers: HashMap<_, _> = self
+            .connected_peers
+            .iter()
+            .filter(|(_, c)| c.stat.create_time.elapsed() > ONE_MIN)
+            .collect();
+
+        let no_response: Vec<_> = long_peers
+            .iter()
+            .filter_map(|(a, c)| {
+                if c.stat.last_recv.elapsed() > ONE_MIN {
+                    Some(**a)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let lots_discard: Vec<_> = long_peers
+            .iter()
+            .filter_map(|(a, c)| {
+                let s = &c.stat;
+                if s.total_discard as f32 / s.total_recv as f32 > 0.3 {
+                    Some(**a)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let lots_cancel: Vec<_> = long_peers
+            .iter()
+            .filter_map(|(a, c)| {
+                let s = &c.stat;
+                if s.total_cancel as f32 / s.total_recv as f32 > 0.3 {
+                    Some(**a)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for (addr, c) in long_peers.iter() {
+            value.insert(**addr, c.bw.count_bytes_within_period(ONE_MIN).0);
+        }
+
+        let mut long_peers: HashSet<_> = long_peers.into_iter().map(|(a, _)| *a).collect();
+        const LIMIT: usize = 20;
+
+        for a in no_response
+            .into_iter()
+            .chain(lots_discard.into_iter())
+            .chain(lots_cancel.into_iter())
+        {
+            if long_peers.len() > LIMIT {
+                let s = self.connected_peers.remove(&a);
+                long_peers.remove(&a);
+                warn!("kick out {a} of {:?}", s.map(|x| x.stat));
+            }
+        }
+
+        while let Some((addr, _)) = value.pop_first()
+            && long_peers.len() > LIMIT
+        {
+            let s = self.connected_peers.remove(&addr);
+            long_peers.remove(&addr);
+            warn!("kick out {addr} of {:?}", s.map(|x| x.stat));
+        }
+    }
 }
 
 fn check_received_metadata(
@@ -3195,6 +3270,7 @@ pub(crate) async fn run_transmit_worker(
             _ = ticker.tick() => {
                 // transmit.pick_blocks_for_all_peers(2);
                 transmit.fetch_metadata();
+                transmit.kick_out_burden_peers();
                 #[cfg(feature = "metrics")]
                 transmit.sample_metrics();
                 #[cfg(feature = "blocktrace")]
