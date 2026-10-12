@@ -1,26 +1,29 @@
 use bytes::BytesMut;
-use std::io;
-use std::net::SocketAddr;
-use std::sync::atomic::AtomicU32;
-use std::sync::Arc;
-use tokio::io::{BufReader, BufWriter};
+use std::{
+    io,
+    net::SocketAddr,
+    sync::{Arc, atomic::AtomicU32},
+};
 #[cfg(feature = "mock_delay")]
 use tokio::sync::mpsc::UnboundedSender;
-use tokio::sync::{mpsc, oneshot};
-use tokio::time;
-
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, BufReader, BufWriter},
+    sync::{mpsc, oneshot},
+    time,
+};
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{debug, info, instrument, trace, warn};
 
-use crate::buffer_pool::{BlockBuf, BufferPool, PooledBuf};
-use crate::picker::{BlockRequests, PieceState};
-use crate::protocol::{
-    self, BTStream, BitField, Capability, Conn, ConnInfo, ExtendedMsg, Message, Piece, ReadStream,
-    RecvResult, Request, Split, WriteStream,
+use crate::{
+    buffer_pool::{BlockBuf, BufferPool, PooledBuf},
+    conn,
+    picker::{BlockRequests, PieceState},
+    protocol::{
+        self, BTStream, BitField, Capability, Conn, ConnInfo, ExtendedMsg, Message, Piece,
+        ReadStream, RecvResult, Request, Split, WriteStream,
+    },
+    transmit_manager::{Msg as TransmitMsg, PeerMsg, TransmitManagerHandle},
 };
-use crate::transmit_manager::Msg as TransmitMsg;
-use crate::transmit_manager::{PeerMsg, TransmitManagerHandle};
 
 #[derive(Debug)]
 pub(crate) enum CtrlOfSend {
@@ -75,6 +78,7 @@ impl ConnectionManagerHandle {
     pub fn new<T>(
         conn: BTStream<T>,
         trh: TransmitManagerHandle,
+        conn_id: conn::Version,
         block_pool: Arc<BufferPool<BytesMut>>,
     ) -> Self
     where
@@ -82,23 +86,39 @@ impl ConnectionManagerHandle {
     {
         let conn_info = conn.info();
         let (read_stream, write_stream) = conn.split_buffered();
-        Self::from_splitted_buffered(read_stream, write_stream, trh, conn_info, block_pool)
+        Self::from_splitted_buffered(
+            read_stream,
+            write_stream,
+            trh,
+            conn_id,
+            conn_info,
+            block_pool,
+        )
     }
 
     pub fn new_dyn(
         conn: BTStream<Box<dyn Conn>>,
         trh: TransmitManagerHandle,
+        conn_id: conn::Version,
         block_pool: Arc<BufferPool<BytesMut>>,
     ) -> Self {
         let conn_info = conn.info();
         let (read_stream, write_stream) = conn.split_buffered();
-        Self::from_splitted_buffered(read_stream, write_stream, trh, conn_info, block_pool)
+        Self::from_splitted_buffered(
+            read_stream,
+            write_stream,
+            trh,
+            conn_id,
+            conn_info,
+            block_pool,
+        )
     }
 
     fn from_splitted_buffered<R, W>(
         read_stream: ReadStream<BufReader<R>>,
         write_stream: WriteStream<BufWriter<W>>,
         trh: TransmitManagerHandle,
+        conn_id: conn::Version,
         conn_info: ConnInfo,
         block_pool: Arc<BufferPool<BytesMut>>,
     ) -> Self
@@ -112,6 +132,7 @@ impl ConnectionManagerHandle {
         let addr = to_canonical_addr(read_stream.peer_addr());
         let conn_break_guard = Arc::new(NotifyTransmitGuard {
             addr,
+            conn_id,
             transmit_handle: trh.clone(),
         });
 
@@ -276,6 +297,7 @@ impl ConnectionManagerHandle {
 type PeerAddr = SocketAddr;
 struct NotifyTransmitGuard {
     addr: PeerAddr,
+    conn_id: conn::Version,
     transmit_handle: TransmitManagerHandle,
 }
 
@@ -284,7 +306,7 @@ impl Drop for NotifyTransmitGuard {
         info!("both send and recv end of {} stopped", self.addr);
         self.transmit_handle
             .sender
-            .send(TransmitMsg::PeerLeave(self.addr));
+            .send(TransmitMsg::PeerLeave(self.addr, self.conn_id));
     }
 }
 
@@ -782,7 +804,7 @@ fn to_canonical_addr(s: SocketAddr) -> SocketAddr {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::protocol::{tests::make_ends_tune, HandshakeOption};
+    use crate::protocol::{HandshakeOption, tests::make_ends_tune};
     use crate::transmit_manager::Msg;
 
     #[tokio::test]
@@ -802,8 +824,8 @@ mod test {
         let tmh2 = TransmitManagerHandle { sender: tx };
 
         let pool = BufferPool::new(4, || BytesMut::with_capacity(16384));
-        let _c1 = ConnectionManagerHandle::new(end1, tmh1.clone(), pool.clone());
-        let _c2 = ConnectionManagerHandle::new(end2, tmh2.clone(), pool.clone());
+        let _c1 = ConnectionManagerHandle::new(end1, tmh1.clone(), 0, pool.clone());
+        let _c2 = ConnectionManagerHandle::new(end2, tmh2.clone(), 0, pool.clone());
         let first1 = rx1.recv().await.unwrap();
         let first2 = rx2.recv().await.unwrap();
         let inner1 = match first1 {
@@ -834,13 +856,13 @@ mod test {
         let tmh2 = TransmitManagerHandle { sender: tx };
 
         let pool = BufferPool::new(4, || BytesMut::with_capacity(16384));
-        let _c1 = ConnectionManagerHandle::new(end1, tmh1.clone(), pool.clone());
-        let c2 = ConnectionManagerHandle::new(end2, tmh2.clone(), pool.clone());
+        let _c1 = ConnectionManagerHandle::new(end1, tmh1.clone(), 0, pool.clone());
+        let c2 = ConnectionManagerHandle::new(end2, tmh2.clone(), 0, pool.clone());
 
         drop(c2);
         // after drop, c1 recv should fail, and generate a PeerLeave to transmit handle
         match rx1.recv().await {
-            Some(Msg::PeerLeave(_)) => {}
+            Some(Msg::PeerLeave(_, _)) => {}
             _ => unreachable!(),
         }
     }

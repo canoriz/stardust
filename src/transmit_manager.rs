@@ -9,7 +9,7 @@ use crate::{
         cache_manager::{CacheManagerHandle, FileOpID, Fop, GlobalPieceKey, PieceLease},
         simple_buffer::{FlushErr, JointIndex, SUB_PIECE_SIZE},
     },
-    conn::PeerConn,
+    conn::{self, PeerConn},
     connection_manager::{
         ConnectionManagerHandle, CtrlOfRecv, CtrlOfSend, CtrlOfSend as ConnMsg, ReceivedBlocks,
     },
@@ -150,7 +150,7 @@ pub(crate) enum Msg {
         addr: SocketAddr,
         from: PeerFrom,
     },
-    PeerLeave(PeerAddr),
+    PeerLeave(PeerAddr, conn::Version),
 
     PieceBufReady {
         index: JointIndex,
@@ -853,6 +853,10 @@ pub struct TransmitWorker {
     connected_peers: HashMap<PeerAddr, PeerConn>,
     connecting_peers: HashSet<PeerAddr>,
 
+    /// Next id handed to a connection. Distinguishes a new connection to an
+    /// address from the one a stale `PeerLeave` belongs to.
+    next_conn_id: conn::Version,
+
     // TODO: support tier
     /// Announce URLs that have been registered with the announce manager.
     announce_urls: Vec<String>,
@@ -1137,6 +1141,7 @@ impl TransmitWorker {
             receiver: cmd_receiver,
             self_handle: TransmitManagerHandle { sender: cmd_sender },
             connected_peers: HashMap::new(),
+            next_conn_id: 0,
             connecting_peers: HashSet::new(),
             announce_urls: dump.announce_urls,
             waiting_for_piecebuf: HashMap::new(),
@@ -1214,6 +1219,7 @@ impl TransmitWorker {
             // announce_handle: None,
             // announce_tx: None,
             connected_peers: HashMap::new(),
+            next_conn_id: 0,
             connecting_peers: HashSet::new(),
             announce_urls: Vec::new(),
             waiting_for_piecebuf: HashMap::new(),
@@ -1609,9 +1615,12 @@ impl TransmitWorker {
                 #[cfg(feature = "blocktrace")]
                 let peer_bt_id = bt_conn.peer_id();
                 if !self.connected_peers.contains_key(&peer_addr) {
+                    let conn_id = self.next_conn_id;
+                    self.next_conn_id += 1;
                     let cm = ConnectionManagerHandle::new_dyn(
                         bt_conn,
                         self.self_handle.clone(),
+                        conn_id,
                         self.block_pool.clone(),
                     );
                     let state = match &mut self.torrent_state {
@@ -1663,6 +1672,7 @@ impl TransmitWorker {
                         peer_addr,
                         PeerConn::new(
                             cm,
+                            conn_id,
                             #[cfg(feature = "metrics")]
                             self.info_hash,
                             #[cfg(feature = "metrics")]
@@ -1700,29 +1710,7 @@ impl TransmitWorker {
                 self.connecting_peers.remove(&addr);
                 Ok(())
             }
-            Msg::PeerLeave(addr) => {
-                info!("peer leave {addr}");
-                // notify piece picker this peer left so it can update rarity and internal state
-                match &mut self.torrent_state {
-                    TorrentState::Metadata(d) => {
-                        d.block_picker.peer_leave(&to_canonical_addr(addr))
-                    }
-                    TorrentState::Fetching(_) => {}
-                }
-                let _removed = self.connected_peers.remove(&to_canonical_addr(addr));
-                #[cfg(feature = "blocktrace")]
-                if let Some(pid) = _removed.and_then(|c| c.blocktrace_peer_id) {
-                    blocktrace::record_peer_state(blocktrace::PeerStateEvent {
-                        peer_id: pid,
-                        ts_us: blocktrace::now_us(),
-                        kind: blocktrace::PeerStateKind::Disconnect,
-                        mode: None,
-                    });
-                }
-                // TODO: FIXME
-                // self.remove_unreachable_pieces_from_buf();
-                Ok(())
-            }
+            Msg::PeerLeave(addr, conn_id) => self.handle_peer_leave(addr, conn_id),
             Msg::PeerMsg(pm) => {
                 // Peer protocol handling only buffers data / updates bandwidth
                 // state; disk I/O is async (PieceBufReady/FlushComplete). Never fatal.
@@ -1907,15 +1895,9 @@ impl TransmitWorker {
                     }
                 };
                 piece_picker.peer_choke(&peer);
-                self.connected_peers.entry(peer).and_modify(|st| {
+                if let Some(st) = self.connected_peers.get_mut(&peer) {
                     st.choke();
-                });
-
-                // TODO: FIXME: no entry found for key
-                assert_eq!(
-                    self.connected_peers[&peer].state.peer_choke_status,
-                    Some(true),
-                );
+                }
                 // TODO: record the ?stable transmit rate/ i.e. how many packets is in flight
                 // so we can recover to max speed (hopefully) once they unchoked us
                 // TODO: shall we remove immediately, or wait for a while in case peer
@@ -1925,15 +1907,10 @@ impl TransmitWorker {
                 Ok(())
             }
             PeerMsg::Unchoke(peer) => {
-                let n_first_pick = 3;
                 warn!("{peer} unchoked us");
-                self.connected_peers.entry(peer).and_modify(|st| {
+                if let Some(st) = self.connected_peers.get_mut(&peer) {
                     st.unchoke();
-                });
-                assert_eq!(
-                    self.connected_peers[&peer].state.peer_choke_status,
-                    Some(false),
-                );
+                }
                 // TODO: are we interested in this peer?
                 // self.pick_blocks_for_peer(&peer, 0);
                 Ok(())
@@ -2017,6 +1994,34 @@ impl TransmitWorker {
                 Ok(())
             }
         }
+    }
+
+    /// Drop the connection `conn_id` at `addr`. A leave whose id does not match the
+    /// live connection is stale and ignored, so it cannot remove a newer one.
+    fn handle_peer_leave(&mut self, addr: PeerAddr, conn_id: conn::Version) -> io::Result<()> {
+        info!("peer leave {addr}");
+        let addr = to_canonical_addr(addr);
+        if self.connected_peers.get(&addr).map(|c| c.conn_id) != Some(conn_id) {
+            return Ok(());
+        }
+        // notify piece picker this peer left so it can update rarity and internal state
+        match &mut self.torrent_state {
+            TorrentState::Metadata(d) => d.block_picker.peer_leave(&addr),
+            TorrentState::Fetching(_) => {}
+        }
+        let _removed = self.connected_peers.remove(&addr);
+        #[cfg(feature = "blocktrace")]
+        if let Some(pid) = _removed.and_then(|c| c.blocktrace_peer_id) {
+            blocktrace::record_peer_state(blocktrace::PeerStateEvent {
+                peer_id: pid,
+                ts_us: blocktrace::now_us(),
+                kind: blocktrace::PeerStateKind::Disconnect,
+                mode: None,
+            });
+        }
+        // TODO: FIXME
+        // self.remove_unreachable_pieces_from_buf();
+        Ok(())
     }
 
     fn handle_announce(&mut self, a: AnnounceResp) -> io::Result<()> {
@@ -2358,15 +2363,9 @@ impl TransmitWorker {
     ) -> io::Result<()> {
         let peer = to_canonical_addr(peer);
         info!("get BlockReceived from {peer}");
-        // TODO: OPTIMIZE: return connection handle to reduce map search
-        if !self.connected_peers.contains_key(&peer) {
-            use tracing::error;
-            error!(
-                "block received from unknown peer {peer} connected peers: {:?}",
-                self.connected_peers.keys()
-            );
-        }
-        let conn = self.connected_peers.get_mut(&peer).expect("should exist");
+        let Some(conn) = self.connected_peers.get_mut(&peer) else {
+            return Ok(());
+        };
         match &self.torrent_state {
             TorrentState::Fetching(_) => {
                 return Ok(());
@@ -2430,13 +2429,10 @@ impl TransmitWorker {
             len: piece.len,
         };
 
-        let conn = self
+        let rtt = self
             .connected_peers
             .get_mut(&to_canonical_addr(*peer))
-            .expect("should exist");
-        let now = time::Instant::now();
-
-        let rtt = conn.receive(req);
+            .and_then(|conn| conn.receive(req));
 
         let Downloading { block_picker, .. } = match &mut self.torrent_state {
             TorrentState::Metadata(d) => d,
@@ -2467,17 +2463,49 @@ impl TransmitWorker {
         // }
 
         if !block_picker.want_block(req) {
-            conn.discard(req);
-            warn!(
+            // TODO: peer already left the map (kicked or disconnected); its blocktrace
+            // peer id is gone with the PeerConn, so this duplicate is not recorded.
+            if let Some(conn) = self.connected_peers.get_mut(&to_canonical_addr(*peer)) {
+                conn.discard(req);
+                #[cfg(feature = "metrics")]
+                {
+                    conn.metrics.record_duplicate(piece.len as u64);
+                    conn.metrics
+                        .set_inflight(conn.inflight.inflight(conn.bw.get_rtt_4var()) as f64);
+                }
+                #[cfg(feature = "blocktrace")]
+                if let (Some(tid), Some(pid)) =
+                    (self.blocktrace_torrent_id, conn.blocktrace_peer_id)
+                {
+                    let mut ev = blocktrace::BlockEvent::at(
+                        tid,
+                        pid,
+                        req.index as i64,
+                        (req.begin >> 14) as i64,
+                        blocktrace::EventKind::Duplicate,
+                    );
+                    ev.rtt_us = rtt.map(|d| d.as_micros() as i64);
+                    ev.n_inflight = Some(conn.inflight.inflight(conn.bw.get_rtt_4var()) as i64);
+                    ev.bytes = Some(piece.len as i64);
+                    blocktrace::record_block_event(ev);
+                }
+            }
+            info!(
                 "discard PIECE msg {} {} {} block index {}",
                 piece.index,
                 piece.begin,
                 piece.len,
                 piece.begin >> 14,
             );
+            return Ok(());
+        }
+
+        // TODO: if peer already left the map; blocktrace peer id is gone, so this receive is not recorded.
+        #[cfg(any(feature = "metrics", feature = "blocktrace"))]
+        if let Some(conn) = self.connected_peers.get(&to_canonical_addr(*peer)) {
             #[cfg(feature = "metrics")]
             {
-                conn.metrics.record_duplicate(piece.len as u64);
+                conn.metrics.record_block_received(piece.len as u64);
                 conn.metrics
                     .set_inflight(conn.inflight.inflight(conn.bw.get_rtt_4var()) as f64);
             }
@@ -2488,35 +2516,13 @@ impl TransmitWorker {
                     pid,
                     req.index as i64,
                     (req.begin >> 14) as i64,
-                    blocktrace::EventKind::Duplicate,
+                    blocktrace::EventKind::Receive,
                 );
                 ev.rtt_us = rtt.map(|d| d.as_micros() as i64);
                 ev.n_inflight = Some(conn.inflight.inflight(conn.bw.get_rtt_4var()) as i64);
                 ev.bytes = Some(piece.len as i64);
                 blocktrace::record_block_event(ev);
             }
-            return Ok(());
-        }
-
-        #[cfg(feature = "metrics")]
-        {
-            conn.metrics.record_block_received(piece.len as u64);
-            conn.metrics
-                .set_inflight(conn.inflight.inflight(conn.bw.get_rtt_4var()) as f64);
-        }
-        #[cfg(feature = "blocktrace")]
-        if let (Some(tid), Some(pid)) = (self.blocktrace_torrent_id, conn.blocktrace_peer_id) {
-            let mut ev = blocktrace::BlockEvent::at(
-                tid,
-                pid,
-                req.index as i64,
-                (req.begin >> 14) as i64,
-                blocktrace::EventKind::Receive,
-            );
-            ev.rtt_us = rtt.map(|d| d.as_micros() as i64);
-            ev.n_inflight = Some(conn.inflight.inflight(conn.bw.get_rtt_4var()) as i64);
-            ev.bytes = Some(piece.len as i64);
-            blocktrace::record_block_event(ev);
         }
 
         // TODO: BlockPicker marks this block as Received before the bytes are
@@ -3138,6 +3144,13 @@ impl TransmitWorker {
         }
     }
 
+    // TODO: skip while Draining/Checking, and reset last_recv when checking
+    // finishes. last_recv only moves in receive, so a recheck longer than a
+    // minute marks every old peer no_response and kicks it for not downloading.
+    // TODO: a kicked conn stays alive until its handle drops, but the addr is
+    // free at once, so discovery reconnects it and two conns overlap.
+    // TODO: nothing stops dialing a kicked addr immediately, so a slow peer is
+    // kicked again next tick and loops through reconnect and slow start.
     fn kick_out_burden_peers(&mut self) {
         const ONE_MIN: time::Duration = time::Duration::from_mins(1);
         let mut slowest_first = BTreeSet::new();
@@ -3196,18 +3209,24 @@ impl TransmitWorker {
             .chain(lots_cancel.into_iter())
         {
             if long_peers.len() > LIMIT {
-                let s = self.connected_peers.remove(&a);
+                let conn_id = self.connected_peers.get(&a).map(|c| c.conn_id);
                 long_peers.remove(&a);
-                warn!("kick out {a} of {:?}", s.map(|x| x.stat));
+                if let Some(conn_id) = conn_id {
+                    warn!("kick out {a}");
+                    let _ = self.handle_peer_leave(a, conn_id);
+                }
             }
         }
 
         while long_peers.len() > LIMIT
             && let Some((_, addr)) = slowest_first.pop_first()
         {
-            let s = self.connected_peers.remove(&addr);
+            let conn_id = self.connected_peers.get(&addr).map(|c| c.conn_id);
             long_peers.remove(&addr);
-            warn!("kick out {addr} of {:?}", s.map(|x| x.stat));
+            if let Some(conn_id) = conn_id {
+                warn!("kick out {addr}");
+                let _ = self.handle_peer_leave(addr, conn_id);
+            }
         }
     }
 }

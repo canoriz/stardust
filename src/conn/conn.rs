@@ -65,6 +65,8 @@ impl Default for Stat {
 
 pub type Bandwidth = crate::bandwidth::Bandwidth<50>;
 
+pub type Version = u64;
+
 pub struct PeerConn {
     pub conn: ConnectionManagerHandle,
     /// PEX state: peers we have already advertised to this peer.
@@ -86,11 +88,16 @@ pub struct PeerConn {
     /// blocktrace `peer.id` FK, resolved at connect (`None` if the sink is off).
     #[cfg(feature = "blocktrace")]
     pub blocktrace_peer_id: Option<i64>,
+
+    /// Id of this connection, not of the peer address. A later connection to the
+    /// same address gets a new one, so a stale `PeerLeave` can be told apart.
+    pub conn_id: Version,
 }
 
 impl PeerConn {
     pub fn new(
         cm: ConnectionManagerHandle,
+        conn_id: Version,
         #[cfg(feature = "metrics")] info_hash: InfoHash,
         #[cfg(feature = "metrics")] peer_addr: SocketAddr,
         #[cfg(feature = "blocktrace")] blocktrace_peer_id: Option<i64>,
@@ -116,6 +123,7 @@ impl PeerConn {
 
             #[cfg(feature = "blocktrace")]
             blocktrace_peer_id,
+            conn_id,
         }
     }
 
