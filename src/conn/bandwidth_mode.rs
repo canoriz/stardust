@@ -1,11 +1,9 @@
-use std::net::SocketAddr;
-
 use tokio::time;
 use tracing::info;
 
 #[cfg(feature = "blocktrace")]
 use crate::blocktrace;
-use crate::conn::{INIT_RTT_STARTUP, Inflight, conn::Bandwidth};
+use crate::conn::{INIT_RTT_STARTUP, Inflight, PeerAddr, conn::Bandwidth};
 
 // fixed wall-clock interval (BBR RTpropFilterLen), never scaled by min_rtt:
 // a queue-inflated min_rtt would push this out of reach and lock in the bloat.
@@ -168,7 +166,7 @@ impl BandwidthMode {
 
     pub fn on_blocks_received(
         &mut self,
-        peer: SocketAddr,
+        peer: PeerAddr,
         inflight: &Inflight,
         bw: &mut Bandwidth,
         app_limited: &mut bool,
@@ -205,7 +203,7 @@ impl BandwidthMode {
                 } else if round > *last_round {
                     let max_bw_in_rtt = inflight.max_bw();
                     info!(
-                        "{peer} in Startup mode, cwnd {}, inflight {} prev max bw {}, avg-bw {} avg_bw_10s {} new max bw {}, limit count {} app limited {}",
+                        "{peer:?} in Startup mode, cwnd {}, inflight {} prev max bw {}, avg-bw {} avg_bw_10s {} new max bw {}, limit count {} app limited {}",
                         *cwnd,
                         n_req_in_flight,
                         *max_bw,
@@ -222,7 +220,7 @@ impl BandwidthMode {
                         if max_bw_in_rtt <= *max_bw * 1.2 {
                             *limit_count += 1;
                             info!(
-                                "{peer} Startup stagnation {}, round {}, max bw in rtt {}, current max bw {}",
+                                "{peer:?} Startup stagnation {}, round {}, max bw in rtt {}, current max bw {}",
                                 *limit_count, round, max_bw_in_rtt, max_bw,
                             );
                         } else {
@@ -235,7 +233,7 @@ impl BandwidthMode {
                         if *limit_count >= NO_MORE_GAIN_LIMIT {
                             let optimum = (*max_bw * (*min_rtt).as_secs_f32() / 16384.0) as usize;
                             // info!(
-                            //     "{peer} change from Startup to Slowdown mode, {} {:?} slow down to {optimum}",
+                            //     "{peer:?} change from Startup to Slowdown mode, {} {:?} slow down to {optimum}",
                             //     *max_bw, conn.min_rtt_phase,
                             // );
                             *self = BandwidthMode::SlowDown {
@@ -278,7 +276,7 @@ impl BandwidthMode {
                         4, // 1.0
                     );
                     info!(
-                        "{peer} ProbeBW cycle update {}, probe df {}, max bw {}, avg bw {}, avg_bw_10s {}, min rtt {:?}, probe rtt {:?} capacity {}",
+                        "{peer:?} ProbeBW cycle update {}, probe df {}, max bw {}, avg bw {}, avg_bw_10s {}, min rtt {:?}, probe rtt {:?} capacity {}",
                         *cycle_index,
                         *probe_df,
                         max_bw,
@@ -293,7 +291,7 @@ impl BandwidthMode {
                 const SLOW_LIMIT: u32 = 2;
                 if min_rtt_at.elapsed() > PROBE_RTT_INTERVAL {
                     info!(
-                        "{peer} change from ProbeBW to SlowDown mode because no smaller rtt after {:?}",
+                        "{peer:?} change from ProbeBW to SlowDown mode because no smaller rtt after {:?}",
                         PROBE_RTT_INTERVAL,
                     );
                     *self = BandwidthMode::SlowDown {
@@ -309,7 +307,7 @@ impl BandwidthMode {
                         *need_sample = true;
                     }
                     // } else if *slow_count >= SLOW_LIMIT {
-                    //     info!("{peer} change from ProbeBW to Slowdown mode because {SLOW_LIMIT} times of slow rtt");
+                    //     info!("{peer:?} change from ProbeBW to Slowdown mode because {SLOW_LIMIT} times of slow rtt");
                     //     conn.bw_mode = BandwidthMode::SlowDown {
                     //         since_min_rtt,
                     //         last_piece_time: *last_piece_time,
@@ -320,7 +318,7 @@ impl BandwidthMode {
                     //     // either it's a small probability event
                     //     // or the peer is slowing the send rate
                     //     info!(
-                    //         "{peer} change from ProbeBW to Slowdown mode because no packet in {:?}",
+                    //         "{peer:?} change from ProbeBW to Slowdown mode because no packet in {:?}",
                     //         likely_recv_next_within,
                     //     );
                     //     conn.bw_mode = BandwidthMode::SlowDown {
@@ -349,7 +347,7 @@ impl BandwidthMode {
                         )
                         .min(max_in_flight);
                         // info!(
-                        //     "{peer} change from Slowdown to ProbeBW mode, because inflight target {inflight_target} > 0"
+                        //     "{peer:?} change from Slowdown to ProbeBW mode, because inflight target {inflight_target} > 0"
                         // );
                         *self = BandwidthMode::ProbeBW {
                             slow_count: 0,
@@ -368,7 +366,7 @@ impl BandwidthMode {
                             *need_sample = true;
                         }
                     } else {
-                        info!("{peer} change from Slowdown to ProbeRTT mode");
+                        info!("{peer:?} change from Slowdown to ProbeRTT mode");
                         bw.reset_var();
                         let (inflight_min_rtt, inflight_min_rtt_at) = inflight.min_rtt().unzip();
                         *min_rtt = inflight_min_rtt.unwrap_or(INIT_RTT_STARTUP);
@@ -404,7 +402,7 @@ impl BandwidthMode {
                 min_rtt_at,
             } => {
                 info!(
-                    "{peer} in ProbeRTT mode cnt {} normal count {} min rtt {:?} avg bw {} avg_bw_10s {} req in flight {}",
+                    "{peer:?} in ProbeRTT mode cnt {} normal count {} min rtt {:?} avg bw {} avg_bw_10s {} req in flight {}",
                     cnt, normal_count, *min_rtt, avg_bw, avg_bw_10s, n_req_in_flight
                 );
                 let max_bw = inflight.max_bw();
@@ -421,7 +419,7 @@ impl BandwidthMode {
                         4,
                     )
                     .min(max_in_flight);
-                    // info!("{peer} change from ProbeRTT to ProbeBW mode");
+                    // info!("{peer:?} change from ProbeRTT to ProbeBW mode");
                     *self = BandwidthMode::ProbeBW {
                         since_cycle: now,
                         slow_count: 0,
@@ -447,7 +445,7 @@ impl BandwidthMode {
 
     pub fn fill_capacity(
         &mut self,
-        peer: SocketAddr,
+        peer: PeerAddr,
         inflight: &Inflight,
         bw: &Bandwidth,
         max_in_flight: usize,
@@ -485,13 +483,13 @@ impl BandwidthMode {
                 .max(MIN_IN_FLIGHT);
 
                 info!(
-                    "{peer} ProbeBW mode max bw {}, avg bw {}, avg_bw_10s {}, limit {}",
+                    "{peer:?} ProbeBW mode max bw {}, avg bw {}, avg_bw_10s {}, limit {}",
                     max_bw, avg_bw, avg_bw_10s, limit
                 );
 
                 let n_to_pick = limit.saturating_sub(n_req_in_flight);
                 info!(
-                    "{peer} ProbeBW mode cycle {} capacity {} min rtt {:?} probe rtt {:?} avg bw {} avg_bw_10s {} max_bw {} req in flight {}",
+                    "{peer:?} ProbeBW mode cycle {} capacity {} min rtt {:?} probe rtt {:?} avg bw {} avg_bw_10s {} max_bw {} req in flight {}",
                     cycle_index,
                     capacity,
                     *min_rtt,
@@ -510,11 +508,11 @@ impl BandwidthMode {
                 ..
             } => {
                 info!(
-                    "{peer} slow down mode {} to recv",
+                    "{peer:?} slow down mode {} to recv",
                     n_req_in_flight.saturating_sub(*inflight_target)
                 );
                 info!(
-                    "{peer} Slowdown mode min rtt {:?} avg bw {} avg_bw_10s {} req in flight {}",
+                    "{peer:?} Slowdown mode min rtt {:?} avg bw {} avg_bw_10s {} req in flight {}",
                     *min_rtt, avg_bw, avg_bw_10s, n_req_in_flight
                 );
                 0
@@ -525,7 +523,7 @@ impl BandwidthMode {
                 ..
             } => {
                 info!(
-                    "{peer} ProbeRTT mode min rtt {:?} avg bw {} avg_bw_10s {} inflight_target {} req in flight {}",
+                    "{peer:?} ProbeRTT mode min rtt {:?} avg bw {} avg_bw_10s {} inflight_target {} req in flight {}",
                     *min_rtt, avg_bw, avg_bw_10s, inflight_target, n_req_in_flight
                 );
                 inflight_target.saturating_sub(n_req_in_flight)

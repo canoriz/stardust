@@ -517,10 +517,10 @@ impl PieceBlocks {
                             },
                         };
                         if repick_option.endgame {
-                            trace!("{peer} in endgame mode, repick {req:?}",);
+                            trace!("{peer:?} in endgame mode, repick {req:?}",);
                         } else {
                             trace!(
-                                "{peer} repick {req:?} because we are faster {:?}",
+                                "{peer:?} repick {req:?} because we are faster {:?}",
                                 requested
                                     .iter()
                                     .map(|(p, t)| (p, t.pick_time.elapsed()))
@@ -672,7 +672,7 @@ impl PieceBlocks {
                     requested.retain(|p, t| {
                         if remove(p, &t.pick_time) {
                             info!(
-                                "revoke block {req:?} from {p}, after {:?}",
+                                "revoke block {req:?} from {p:?}, after {:?}",
                                 t.pick_time.elapsed()
                             );
                             revoked_reqs
@@ -973,13 +973,13 @@ impl BlockPicker {
                 endgame: false,
             }
         };
-        info!("{peer} endgame {endgame}, rush {}", rush_mode);
+        info!("{peer:?} endgame {endgame}, rush {}", rush_mode);
 
         let mut remain = n;
         let peer_status = if let Some(h) = self.piece_picker.peer_detail(peer) {
             h
         } else {
-            info!("pick_blocks: peer {peer} not registered in piece_picker, skipping");
+            info!("pick_blocks: peer {peer:?} not registered in piece_picker, skipping");
             return (
                 BlockRequests {
                     piece_size: self.piece_size as u32,
@@ -1044,7 +1044,7 @@ impl BlockPicker {
                             for blks in &ret[before..] {
                                 let pb: Vec<_> = blks.iter(piece_size as u32).collect();
                                 trace!(
-                                    "pick piece {index} from peer {peer} (requesting), picked blks: {pb:?}"
+                                    "pick piece {index} from peer {peer:?} (requesting), picked blks: {pb:?}"
                                 );
                             }
                         }
@@ -1078,7 +1078,7 @@ impl BlockPicker {
             h
         } else {
             info!(
-                "pick_blocks: peer {peer} not registered in piece_picker after initial picks; returning {} picked",
+                "pick_blocks: peer {peer:?} not registered in piece_picker after initial picks; returning {} picked",
                 n - remain
             );
             return (
@@ -1149,7 +1149,7 @@ impl BlockPicker {
                                 for blks in &ret[before..] {
                                     let pb: Vec<_> = blks.iter(self.piece_size as u32).collect();
                                     trace!(
-                                        "pick piece {index} from peer {peer} (requested endgame), picked blks: {pb:?}"
+                                        "pick piece {index} from peer {peer:?} (requested endgame), picked blks: {pb:?}"
                                     );
                                 }
                             }
@@ -1185,11 +1185,11 @@ impl BlockPicker {
                     );
                     remain -= n_picked;
                     if tracing::enabled!(tracing::Level::TRACE) {
-                        trace!("{peer} pick piece {index} (pick_next), inflight {n_in_flight}");
+                        trace!("{peer:?} pick piece {index} (pick_next), inflight {n_in_flight}");
                         for blks in &ret[before..] {
                             let pb: Vec<_> = blks.iter(self.piece_size as u32).collect();
                             trace!(
-                                "{peer} (pick_next), picked blks: {pb:?}, repick_option: {repick_option:?}"
+                                "{peer:?} (pick_next), picked blks: {pb:?}, repick_option: {repick_option:?}"
                             );
                         }
                     }
@@ -1290,13 +1290,13 @@ impl BlockPicker {
                 remain -= n_picked;
                 if tracing::enabled!(tracing::Level::TRACE) {
                     trace!(
-                        "{peer} rush mode extra {} pick piece {} (pick_next), inflight {}",
+                        "{peer:?} rush mode extra {} pick piece {} (pick_next), inflight {}",
                         rush_mode, index, n_in_flight
                     );
                     for blks in &ret[before..] {
                         let pb: Vec<_> = blks.iter(self.piece_size as u32).collect();
                         trace!(
-                            "{peer} rush mode extra {} picked blks: {pb:?}, {:?}",
+                            "{peer:?} rush mode extra {} picked blks: {pb:?}, {:?}",
                             rush_mode, blocks.block_map
                         );
                     }
@@ -1310,18 +1310,18 @@ impl BlockPicker {
         }
         if (rush_mode || endgame) && remain > 0 {
             info!(
-                "{peer} rush mode {} endgame {} causing less picking, remain {remain}",
+                "{peer:?} rush mode {} endgame {} causing less picking, remain {remain}",
                 rush_mode, endgame
             );
             for (index, blocks) in &self.receiving {
                 trace!(
-                    "{peer} rush mode, receiving piece {index}, blocks: {:?}",
+                    "{peer:?} rush mode, receiving piece {index}, blocks: {:?}",
                     blocks.block_map
                 );
             }
             for (index, blocks) in &self.requesting {
                 trace!(
-                    "{peer} rush mode {}, endgame {} requesting piece {index}, blocks: {:?}",
+                    "{peer:?} rush mode {}, endgame {} requesting piece {index}, blocks: {:?}",
                     rush_mode, endgame, blocks.block_map,
                 );
             }
@@ -1811,9 +1811,9 @@ mod test {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-    const PEER1: PeerAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 1);
-    const PEER2: PeerAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 2);
-    const PEER3: PeerAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 3);
+    const PEER1: PeerAddr = (SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 1), 1);
+    const PEER2: PeerAddr = (SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 2), 2);
+    const PEER3: PeerAddr = (SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 3), 3);
 
     fn picked_detail_at(pick_time: time::Instant, n_in_flight_when_picked: usize) -> PickedDetail {
         PickedDetail::new(
@@ -2487,9 +2487,12 @@ mod test {
 
         let mut peers = Vec::new();
         for i in 0..n_peers {
-            let addr = SocketAddr::new(
-                IpAddr::V4(Ipv4Addr::new(10, 0, (i / 256) as u8, (i % 256) as u8)),
-                (6881 + i) as u16,
+            let addr = (
+                SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::new(10, 0, (i / 256) as u8, (i % 256) as u8)),
+                    (6881 + i) as u16,
+                ),
+                i as u64,
             );
             bp.peer_add(addr, PieceState::HaveAll);
             peers.push(addr);

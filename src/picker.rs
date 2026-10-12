@@ -102,7 +102,7 @@ impl PeerPieceDetail {
     }
 }
 
-pub type PeerAddr = SocketAddr;
+pub type PeerAddr = crate::conn::PeerAddr;
 
 pub trait PiecePicker {
     type T;

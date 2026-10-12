@@ -7,7 +7,7 @@ use tracing::{debug, trace};
 use crate::{api::InfoHash, metrics};
 
 use crate::{
-    conn::{BandwidthMode, Inflight, inflight::Rejected},
+    conn::{BandwidthMode, Inflight, PeerAddr, inflight::Rejected},
     connection_manager::{ConnectionManagerHandle, CtrlOfSend},
     picker::{BlockRequests, PieceState},
     protocol::{PexFlag, Request},
@@ -163,11 +163,11 @@ impl PeerConn {
         }
     }
 
-    pub fn request_batch(&mut self, peer: SocketAddr, reqs: BlockRequests) {
+    pub fn request_batch(&mut self, peer: PeerAddr, reqs: BlockRequests) {
         for rg in reqs.range.iter() {
             for req in rg.iter(reqs.piece_size) {
                 self.request(req);
-                debug!("{peer} pick block request {req:?}",);
+                debug!("{peer:?} pick block request {req:?}",);
             }
         }
 

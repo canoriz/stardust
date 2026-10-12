@@ -16,7 +16,7 @@ use tracing::{debug, info, instrument, trace, warn};
 
 use crate::{
     buffer_pool::{BlockBuf, BufferPool, PooledBuf},
-    conn,
+    conn::{self, PeerAddr},
     picker::{BlockRequests, PieceState},
     protocol::{
         self, BTStream, BitField, Capability, Conn, ConnInfo, ExtendedMsg, Message, Piece,
@@ -140,6 +140,7 @@ impl ConnectionManagerHandle {
             receiver: recv_rx,
             read_stream,
             transmit_handle: trh.clone(),
+            conn_id,
             _drop_guard: conn_break_guard.clone(),
             current_buf: None,
             received_blocks: None,
@@ -294,9 +295,8 @@ impl ConnectionManagerHandle {
     }
 }
 
-type PeerAddr = SocketAddr;
 struct NotifyTransmitGuard {
-    addr: PeerAddr,
+    addr: SocketAddr,
     conn_id: conn::Version,
     transmit_handle: TransmitManagerHandle,
 }
@@ -306,7 +306,7 @@ impl Drop for NotifyTransmitGuard {
         info!("both send and recv end of {} stopped", self.addr);
         self.transmit_handle
             .sender
-            .send(TransmitMsg::PeerLeave(self.addr, self.conn_id));
+            .send(TransmitMsg::PeerLeave((self.addr, self.conn_id)));
     }
 }
 
@@ -320,6 +320,7 @@ struct RecvStream<T> {
     receiver: mpsc::UnboundedReceiver<CtrlOfRecv>,
     read_stream: ReadStream<T>,
     transmit_handle: TransmitManagerHandle,
+    conn_id: conn::Version,
     _drop_guard: Arc<NotifyTransmitGuard>,
 
     /// Holds the partially-filled block buffer across a cancel inside `recv_piece_body`.
@@ -372,6 +373,7 @@ async fn run_recv_stream<T>(
     let report_interval = time::Duration::from_secs(1);
     let mut ticker = tokio::time::interval(report_interval);
     let addr = to_canonical_addr(conn.read_stream.peer_addr());
+    let peer = (addr, conn.conn_id);
 
     let pending_recvs = conn.read_stream.maybe_recv_pending_msg().await;
     for mut m in pending_recvs {
@@ -380,7 +382,7 @@ async fn run_recv_stream<T>(
         } else {
             None
         };
-        conn.handle_peer_msg(addr, m, block_buf);
+        conn.handle_peer_msg(peer, m, block_buf);
     }
 
     loop {
@@ -406,13 +408,13 @@ async fn run_recv_stream<T>(
                 &mut conn.current_buf,
                 &mut conn.transmit_handle,
                 &conn.block_pool,
-                addr,
+                peer,
             ) => {
                 trace!("{addr} received {:?}", r);
                 ticker.reset();
                 match r {
                     Ok((msg, block_buf)) => {
-                        conn.handle_peer_msg(addr, msg, block_buf);
+                        conn.handle_peer_msg(peer, msg, block_buf);
                     }
                     Err(e) => {
                         warn!("{addr} recv stream read header error {e}");
@@ -435,14 +437,17 @@ where
     T: AsyncRead + Unpin,
 {
     fn handle_report_tick(&mut self) {
-        let peer = to_canonical_addr(self.read_stream.peer_addr());
-        trace!("{peer} handle report tick");
+        let peer = (
+            to_canonical_addr(self.read_stream.peer_addr()),
+            self.conn_id,
+        );
+        trace!("{peer:?} handle report tick");
         if let Err(e) = self
             .transmit_handle
             .sender
             .send(TransmitMsg::PeerMsg(PeerMsg::BlockReceived { peer }))
         {
-            info!("{peer} handle report tick error {e:?}");
+            info!("{peer:?} handle report tick error {e:?}");
         }
     }
 
@@ -456,7 +461,7 @@ where
         current_buf: &mut Option<PooledBuf<BytesMut>>,
         transmit_handle: &mut TransmitManagerHandle,
         block_pool: &Arc<BufferPool<BytesMut>>,
-        addr: SocketAddr,
+        addr: PeerAddr,
     ) -> io::Result<(Message, Option<BlockBuf>)> {
         match read_stream.recv_msg_header().await? {
             RecvResult::Message(msg) => Ok((msg, None)),
@@ -504,7 +509,10 @@ where
                 self.transmit_handle
                     .sender
                     .send(TransmitMsg::PeerMsg(PeerMsg::Pieces(
-                        to_canonical_addr(self.read_stream.peer_addr()),
+                        (
+                            to_canonical_addr(self.read_stream.peer_addr()),
+                            self.conn_id,
+                        ),
                         blks,
                     )))
                     .unwrap(); // TODO: this panics
@@ -513,7 +521,7 @@ where
         }
     }
 
-    fn handle_peer_msg(&mut self, addr: SocketAddr, m: Message, block_buf: Option<BlockBuf>) {
+    fn handle_peer_msg(&mut self, peer: PeerAddr, m: Message, block_buf: Option<BlockBuf>) {
         // TODO: send statistics to transmit handle
 
         // TODO: shall we use mpsc or just lock the manager and set it
@@ -530,7 +538,7 @@ where
                 info!("ck");
                 // TODO: drop all pending requests
                 // stop sending all requests
-                let r = tmh.sender.send(TransmitMsg::PeerMsg(PeerMsg::Choke(addr)));
+                let r = tmh.sender.send(TransmitMsg::PeerMsg(PeerMsg::Choke(peer)));
                 if let Err(e) = r {
                     warn!("error send unchoke to transmit manager {e}")
                 }
@@ -538,33 +546,33 @@ where
             Message::Unchoke => {
                 info!("uck");
                 tmh.sender
-                    .send(TransmitMsg::PeerMsg(PeerMsg::Unchoke(addr)));
+                    .send(TransmitMsg::PeerMsg(PeerMsg::Unchoke(peer)));
             }
             Message::Interested => {
                 // TODO: update peer state
                 tmh.sender
-                    .send(TransmitMsg::PeerMsg(PeerMsg::Interested(addr)));
+                    .send(TransmitMsg::PeerMsg(PeerMsg::Interested(peer)));
             }
             Message::NotInterested => {
                 // TODO: update peer state
                 tmh.sender
-                    .send(TransmitMsg::PeerMsg(PeerMsg::Uninterested(addr)));
+                    .send(TransmitMsg::PeerMsg(PeerMsg::Uninterested(peer)));
             }
             Message::Have(i) => {
                 tmh.sender
-                    .send(TransmitMsg::PeerMsg(PeerMsg::Have(addr, i)));
+                    .send(TransmitMsg::PeerMsg(PeerMsg::Have(peer, i)));
             }
             Message::BitField(bf) => {
                 info!("bf");
                 // TODO: handle error
                 tmh.sender.send(TransmitMsg::PeerMsg(PeerMsg::PieceState(
-                    addr,
+                    peer,
                     PieceState::Bitfield(bf),
                 )));
             }
             Message::Request(req) => {
                 tmh.sender
-                    .send(TransmitMsg::PeerMsg(PeerMsg::Request(addr, req)));
+                    .send(TransmitMsg::PeerMsg(PeerMsg::Request(peer, req)));
             }
             Message::Piece(piece) => {
                 let new = if self.received_blocks.is_none() {
@@ -588,38 +596,38 @@ where
             }
             Message::Cancel(req) => {
                 tmh.sender
-                    .send(TransmitMsg::PeerMsg(PeerMsg::Cancel(addr, req)));
+                    .send(TransmitMsg::PeerMsg(PeerMsg::Cancel(peer, req)));
             }
             Message::Port(port) => {
                 tmh.sender
-                    .send(TransmitMsg::PeerMsg(PeerMsg::DhtPort(addr, port)));
+                    .send(TransmitMsg::PeerMsg(PeerMsg::DhtPort(peer, port)));
             }
             Message::Extended(extend) => {
-                handle_extended_msg(&addr, tmh, extend);
+                handle_extended_msg(peer, tmh, extend);
             }
             Message::SuggestPiece(index) => {
                 tmh.sender
-                    .send(TransmitMsg::PeerMsg(PeerMsg::SuggestPiece(addr, index)));
+                    .send(TransmitMsg::PeerMsg(PeerMsg::SuggestPiece(peer, index)));
             }
             Message::AllowedFast(index) => {
                 tmh.sender
-                    .send(TransmitMsg::PeerMsg(PeerMsg::AllowedFast(addr, index)));
+                    .send(TransmitMsg::PeerMsg(PeerMsg::AllowedFast(peer, index)));
             }
             Message::HaveAll => {
                 tmh.sender.send(TransmitMsg::PeerMsg(PeerMsg::PieceState(
-                    addr,
+                    peer,
                     PieceState::HaveAll,
                 )));
             }
             Message::HaveNone => {
                 tmh.sender.send(TransmitMsg::PeerMsg(PeerMsg::PieceState(
-                    addr,
+                    peer,
                     PieceState::HaveNone,
                 )));
             }
             Message::Reject(req) => {
                 tmh.sender
-                    .send(TransmitMsg::PeerMsg(PeerMsg::Reject(addr, req)));
+                    .send(TransmitMsg::PeerMsg(PeerMsg::Reject(peer, req)));
             }
         }
     }
@@ -766,9 +774,9 @@ where
 }
 */
 
-#[instrument(skip_all, fields(peer = %peer))]
+#[instrument(skip_all, fields(peer = ?peer))]
 fn handle_extended_msg(
-    peer: &SocketAddr,
+    peer: PeerAddr,
     tmh: &mut TransmitManagerHandle,
     extended: protocol::ExtendedMsg,
 ) -> io::Result<()> {
@@ -781,13 +789,13 @@ fn handle_extended_msg(
             info!("received pex from, {pex:?}");
             _ = tmh
                 .sender
-                .send(TransmitMsg::PeerMsg(PeerMsg::ExtendPex(*peer, pex)));
+                .send(TransmitMsg::PeerMsg(PeerMsg::ExtendPex(peer, pex)));
             Ok(())
         }
         ExtendedMsg::Metadata(m) => {
             _ = tmh
                 .sender
-                .send(TransmitMsg::PeerMsg(PeerMsg::ExtendMetadata(*peer, m)));
+                .send(TransmitMsg::PeerMsg(PeerMsg::ExtendMetadata(peer, m)));
             Ok(())
         }
         ExtendedMsg::Unknown(id) => {
@@ -829,11 +837,11 @@ mod test {
         let first1 = rx1.recv().await.unwrap();
         let first2 = rx2.recv().await.unwrap();
         let inner1 = match first1 {
-            Msg::PeerMsg(PeerMsg::DhtPort(sa, p)) => (sa, p),
+            Msg::PeerMsg(PeerMsg::DhtPort((sa, _), p)) => (sa, p),
             e => unreachable!("{e:?}"),
         };
         let inner2 = match first2 {
-            Msg::PeerMsg(PeerMsg::DhtPort(sa, p)) => (sa, p),
+            Msg::PeerMsg(PeerMsg::DhtPort((sa, _), p)) => (sa, p),
             _ => unreachable!(),
         };
         assert_eq!(inner1, inner2);
@@ -862,7 +870,7 @@ mod test {
         drop(c2);
         // after drop, c1 recv should fail, and generate a PeerLeave to transmit handle
         match rx1.recv().await {
-            Some(Msg::PeerLeave(_, _)) => {}
+            Some(Msg::PeerLeave(_)) => {}
             _ => unreachable!(),
         }
     }
