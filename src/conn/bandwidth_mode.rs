@@ -580,13 +580,11 @@ impl BandwidthMode {
     }
 
     fn probe_bw_cycle(&self) -> time::Duration {
-        match self {
-            BandwidthMode::Choked => time::Duration::ZERO,
-            BandwidthMode::Startup { min_rtt, .. } => *min_rtt,
-            BandwidthMode::ProbeBW { min_rtt, .. } => *min_rtt,
-            BandwidthMode::SlowDown { min_rtt, .. } => *min_rtt,
-            BandwidthMode::ProbeRTT { min_rtt, .. } => *min_rtt,
-        }
+        compute_probe_bdp_rtt(self.min_rtt())
+    }
+
+    pub fn look_back_window(&self) -> time::Duration {
+        bw_look_back_window(self.probe_bw_cycle())
     }
 }
 

@@ -212,6 +212,7 @@ impl PeerConn {
     #[inline]
     pub fn request_timeout(&mut self, req: Request) {
         self.stat.total_timeout += req.len as u64;
+        self.inflight.timeout(req)
     }
 
     #[inline]

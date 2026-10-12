@@ -159,9 +159,9 @@ impl Inflight {
         self.inflight = self.inflight.saturating_sub(1);
         let (fr, canceled) = if let Some(fr) = self.requested.remove(&req) {
             self.canceled.remove(&req);
-            (fr, true)
+            (fr, false)
         } else {
-            (self.canceled.remove(&req)?, false)
+            (self.canceled.remove(&req)?, true)
         };
 
         // advance only on the ack of a later-sent packet; an out-of-order

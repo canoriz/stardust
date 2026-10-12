@@ -1,5 +1,3 @@
-mod kick;
-
 #[cfg(feature = "blocktrace")]
 use crate::conn::BandwidthMode;
 use crate::{
@@ -1030,7 +1028,7 @@ impl TransmitWorker {
             let Some(pid) = conn.blocktrace_peer_id else {
                 continue;
             };
-            let look_back = 10 * conn.bw_mode.min_rtt();
+            let look_back = conn.bw_mode.look_back_window();
             let max_bw = conn.inflight.max_bw();
             let avg_bw = conn.bw.count_avg_bw_in(look_back);
             blocktrace::record_bw_sample(blocktrace::BwSampleEvent {
@@ -1306,7 +1304,7 @@ impl TransmitWorker {
             info!("peer status {addr}: {:?}", h.state);
             if h.is_choked() == Some(false) {
                 let in_flight = h.inflight.inflight(h.bw.get_rtt_4var());
-                let look_back_duration = 10 * h.bw_mode.min_rtt();
+                let look_back_duration = h.bw_mode.look_back_window();
                 let avg_bw = h.bw.count_avg_bw_in(look_back_duration);
                 let (reqs, _) = block_picker.pick_blocks(
                     addr,
@@ -1363,7 +1361,7 @@ impl TransmitWorker {
         let picked_n = if let Some(h) = self.connected_peers.get_mut(addr) {
             if h.is_choked() == Some(false) {
                 let n_in_flight = h.inflight.inflight(h.bw.get_rtt_4var());
-                let look_back_duration = 10 * h.bw_mode.min_rtt();
+                let look_back_duration = h.bw_mode.look_back_window();
                 let avg_bw = h.bw.count_avg_bw_in(look_back_duration);
                 let (reqs, picked_n) = block_picker.pick_blocks(
                     addr,
@@ -1396,7 +1394,7 @@ impl TransmitWorker {
             for req in reqs {
                 debug!("{peer} revoke block request {req:?}");
                 if let Some(h) = self.connected_peers.get_mut(&peer) {
-                    h.inflight.timeout(req);
+                    h.request_timeout(req);
                     #[cfg(feature = "blocktrace")]
                     if let (Some(tid), Some(pid)) =
                         (self.blocktrace_torrent_id, h.blocktrace_peer_id)
@@ -3142,7 +3140,7 @@ impl TransmitWorker {
 
     fn kick_out_burden_peers(&mut self) {
         const ONE_MIN: time::Duration = time::Duration::from_mins(1);
-        let mut value = BTreeMap::new();
+        let mut slowest_first = BTreeSet::new();
 
         let long_peers: HashMap<_, _> = self
             .connected_peers
@@ -3186,7 +3184,7 @@ impl TransmitWorker {
             .collect();
 
         for (addr, c) in long_peers.iter() {
-            value.insert(**addr, c.bw.count_bytes_within_period(ONE_MIN).0);
+            slowest_first.insert((c.bw.count_bytes_within_period(ONE_MIN).0, **addr));
         }
 
         let mut long_peers: HashSet<_> = long_peers.into_iter().map(|(a, _)| *a).collect();
@@ -3204,8 +3202,8 @@ impl TransmitWorker {
             }
         }
 
-        while let Some((addr, _)) = value.pop_first()
-            && long_peers.len() > LIMIT
+        while long_peers.len() > LIMIT
+            && let Some((_, addr)) = slowest_first.pop_first()
         {
             let s = self.connected_peers.remove(&addr);
             long_peers.remove(&addr);
