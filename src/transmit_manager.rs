@@ -955,23 +955,6 @@ impl TransmitDump {
 }
 
 impl TransmitWorker {
-    /// Resolve the blocktrace `torrent.id` FK once full metadata is available
-    /// (no-op for a magnet still fetching, or once already resolved).
-    #[cfg(feature = "blocktrace")]
-    async fn blocktrace_register_torrent(&mut self) {
-        if self.blocktrace_torrent_id.is_some() {
-            return;
-        }
-        let TorrentState::Metadata(d) = &self.torrent_state else {
-            return;
-        };
-        let name = Some(d.metadata.info.name.clone());
-        let total_len = d.metadata.len() as i64;
-        let piece_len = d.metadata.regular_piece_size() as i64;
-        self.blocktrace_torrent_id =
-            blocktrace::register_torrent(self.info_hash, name, total_len, piece_len).await;
-    }
-
     fn handle_dump_status(self) -> TransmitDump {
         let peers: Vec<_> = self.connected_peers.keys().map(|(addr, _)| *addr).collect();
         let state = match self.torrent_state {
@@ -1117,6 +1100,11 @@ impl TransmitWorker {
         block_pool: Arc<BufferPool<BytesMut>>,
     ) -> Self {
         let pending_flushes = Arc::new(AtomicU32::new(0));
+        #[cfg(feature = "blocktrace")]
+        let blocktrace_torrent_id = match &dump.state {
+            TorrentStateDump::Metadata { metadata, .. } => resolve_blocktrace_tid(metadata),
+            TorrentStateDump::Fetching(_) => None,
+        };
         let (info_hash, torrent_state) = match dump.state {
             TorrentStateDump::Metadata { metadata, picker } => {
                 let info_hash = metadata.info_hash;
@@ -1126,6 +1114,8 @@ impl TransmitWorker {
                     pending_flushes.clone(),
                     cmd_sender.clone(),
                     Some(picker),
+                    #[cfg(feature = "blocktrace")]
+                    blocktrace_torrent_id,
                 );
                 (info_hash, TorrentState::Metadata(downloading))
             }
@@ -1163,7 +1153,7 @@ impl TransmitWorker {
             cache_handle,
             block_pool,
             #[cfg(feature = "blocktrace")]
-            blocktrace_torrent_id: None,
+            blocktrace_torrent_id,
         };
 
         match &worker.running_state {
@@ -1193,6 +1183,11 @@ impl TransmitWorker {
         block_pool: Arc<BufferPool<BytesMut>>,
     ) -> Self {
         let pending_flushes = Arc::new(AtomicU32::new(0));
+        #[cfg(feature = "blocktrace")]
+        let blocktrace_torrent_id = match &t {
+            TorrentTask::Torrent(m) => resolve_blocktrace_tid(m),
+            TorrentTask::Magnet(_) => None,
+        };
         let (info_hash, state) = match t {
             TorrentTask::Torrent(m) => {
                 let info_hash = m.info_hash;
@@ -1202,6 +1197,8 @@ impl TransmitWorker {
                     pending_flushes.clone(),
                     cmd_sender.clone(),
                     None,
+                    #[cfg(feature = "blocktrace")]
+                    blocktrace_torrent_id,
                 ));
                 (info_hash, state)
             }
@@ -1241,7 +1238,7 @@ impl TransmitWorker {
             cache_handle,
             block_pool,
             #[cfg(feature = "blocktrace")]
-            blocktrace_torrent_id: None,
+            blocktrace_torrent_id,
         }
     }
 
@@ -1251,6 +1248,7 @@ impl TransmitWorker {
         pending_flushes: Arc<AtomicU32>,
         msg_sender: mpsc::UnboundedSender<Msg>,
         picker_dump: Option<BlockPickerDump>,
+        #[cfg(feature = "blocktrace")] torrent_id: Option<i64>,
     ) -> Downloading {
         let m = Arc::new(m);
         let piece_size = m.regular_piece_size() as u32;
@@ -1287,6 +1285,8 @@ impl TransmitWorker {
             back_file.clone(),
             Some(pending_flushes.clone()),
             Some(msg_sender),
+            #[cfg(feature = "blocktrace")]
+            torrent_id,
         );
 
         Downloading {
@@ -1997,9 +1997,6 @@ impl TransmitWorker {
             PeerMsg::DhtPort(addr, port) => self.handle_dht_port_msg(addr.0, port),
             PeerMsg::ExtendMetadata(pa, m) => {
                 self.handle_extend_metadata(pa, m);
-                // A metadata part may have just completed the magnet's metadata.
-                #[cfg(feature = "blocktrace")]
-                self.blocktrace_register_torrent().await;
                 Ok(())
             }
             PeerMsg::ExtendPex(pa, pex) => {
@@ -3031,12 +3028,18 @@ impl TransmitWorker {
             } => match &mut self.torrent_state {
                 TorrentState::Fetching(f) => {
                     if let Some(m) = f.receive_metadata_part(piece, data, total_size) {
+                        #[cfg(feature = "blocktrace")]
+                        {
+                            self.blocktrace_torrent_id = resolve_blocktrace_tid(&m);
+                        }
                         let mut downloading = Self::metadata_into_downloading(
                             m,
                             &self.cache_handle,
                             self.pending_flushes.clone(),
                             self.self_handle.sender.clone(),
                             None,
+                            #[cfg(feature = "blocktrace")]
+                            self.blocktrace_torrent_id,
                         );
                         let piece_picker = &mut downloading.block_picker;
                         for (addr, pc) in &mut self.connected_peers {
@@ -3309,6 +3312,20 @@ fn check_received_metadata(
     }
 }
 
+/// Resolve the blocktrace `torrent.id` FK on the current thread. `futures`'
+/// `block_on` only parks this thread and the awaited oneshot is woken by the
+/// writer thread, so it works on any runtime flavor; tokio's equivalent
+/// (`block_in_place` + `Handle::block_on`) panics on the current_thread runtime.
+#[cfg(feature = "blocktrace")]
+fn resolve_blocktrace_tid(m: &Metadata) -> Option<i64> {
+    futures::executor::block_on(blocktrace::register_torrent(
+        m.info_hash,
+        Some(m.info.name.clone()),
+        m.len() as i64,
+        m.regular_piece_size() as i64,
+    ))
+}
+
 pub(crate) async fn run_transmit_worker(
     mut transmit: TransmitWorker,
     cancel: CancellationToken,
@@ -3317,9 +3334,6 @@ pub(crate) async fn run_transmit_worker(
     let mut ticker = tokio::time::interval(time::Duration::from_millis(1000));
     let mut dht_ticker = tokio::time::interval(time::Duration::from_secs(60));
     let mut pex_ticker = tokio::time::interval(time::Duration::from_secs(30));
-
-    #[cfg(feature = "blocktrace")]
-    transmit.blocktrace_register_torrent().await;
 
     loop {
         // TODO: lets use notify?

@@ -15,6 +15,8 @@ use tokio::{
 use tracing::warn;
 
 use super::MutexBackFile;
+#[cfg(feature = "blocktrace")]
+use crate::blocktrace;
 use crate::cache::simple_buffer::{
     read_from_file, FlushErr, JointIndex, PieceBuf, Pool, POOL_SIZE, SUB_PIECE_SIZE,
 };
@@ -115,6 +117,21 @@ struct TorrentInfo {
 
     /// Sends FlushComplete to the worker's main loop after each flush.
     msg_sender: Option<mpsc::UnboundedSender<TmMsg>>,
+
+    /// blocktrace `torrent.id` FK, resolved before registration so write paths
+    /// never depend on async registration order.
+    #[cfg(feature = "blocktrace")]
+    torrent_id: Option<i64>,
+}
+
+/// Who initiated a flush; recorded as `cache_reason` in `cache_slot_event`.
+#[cfg(feature = "blocktrace")]
+#[derive(Clone, Copy, Debug)]
+pub enum FlushOrigin {
+    Cache,
+    Lease,
+    Drop,
+    Shutdown,
 }
 
 /// Messages handled by the CacheManager actor.
@@ -126,6 +143,8 @@ pub enum CacheMsg {
         back_file: MutexBackFile,
         flush_count: Option<Arc<AtomicU32>>,
         msg_sender: Option<mpsc::UnboundedSender<TmMsg>>,
+        #[cfg(feature = "blocktrace")]
+        torrent_id: Option<i64>,
     },
     UnregisterTorrent(InfoHash, oneshot::Sender<()>),
     /// Request a piece; the sender receives `TmMsg::PieceBufReady` when it is ready.
@@ -160,6 +179,12 @@ pub enum CacheMsg {
     PieceFlushed {
         key: GlobalPieceKey,
         result: Result<(), String>,
+        #[cfg(feature = "blocktrace")]
+        origin: FlushOrigin,
+        #[cfg(feature = "blocktrace")]
+        dst_us: i64,
+        #[cfg(feature = "blocktrace")]
+        buf_id: u64,
     },
     /// Internal: the blocking task for the front `pending_ops` entry finished.
     /// The op's `FileOpID` is recovered by popping the deque front at handling
@@ -194,6 +219,7 @@ impl CacheManagerHandle {
         back_file: MutexBackFile,
         flush_count: Option<Arc<AtomicU32>>,
         msg_sender: Option<mpsc::UnboundedSender<TmMsg>>,
+        #[cfg(feature = "blocktrace")] torrent_id: Option<i64>,
     ) {
         let _ = self.sender.send(CacheMsg::RegisterTorrent {
             info_hash,
@@ -202,6 +228,8 @@ impl CacheManagerHandle {
             back_file,
             flush_count,
             msg_sender,
+            #[cfg(feature = "blocktrace")]
+            torrent_id,
         });
     }
 
@@ -270,16 +298,31 @@ impl CacheManagerHandle {
     }
 
     /// Flush `PieceBuf` and report to the cache at completion
-    fn flush_piece<F>(&self, key: GlobalPieceKey, piece: &mut PieceBuf, callback: F)
-    where
+    fn flush_piece<F>(
+        &self,
+        key: GlobalPieceKey,
+        piece: &mut PieceBuf,
+        #[cfg(feature = "blocktrace")] origin: FlushOrigin,
+        callback: F,
+    ) where
         F: FnOnce(&Result<(), FlushErr>) + Send + 'static,
     {
         let sender = self.sender.clone();
+        #[cfg(feature = "blocktrace")]
+        let start = time::Instant::now();
+        #[cfg(feature = "blocktrace")]
+        let buf_id = piece.buf_id();
         piece.flush(move |result| {
             callback(result);
             let _ = sender.send(CacheMsg::PieceFlushed {
                 key,
                 result: result.as_ref().map(|_| ()).map_err(|e| format!("{e:?}")),
+                #[cfg(feature = "blocktrace")]
+                origin,
+                #[cfg(feature = "blocktrace")]
+                dst_us: start.elapsed().as_micros() as i64,
+                #[cfg(feature = "blocktrace")]
+                buf_id,
             });
         });
     }
@@ -309,8 +352,13 @@ impl PieceLease {
     where
         F: FnOnce(&Result<(), FlushErr>) + Send + 'static,
     {
-        self.return_tx
-            .flush_piece(self.key, self.inner.as_mut().unwrap(), result_callback);
+        self.return_tx.flush_piece(
+            self.key,
+            self.inner.as_mut().unwrap(),
+            #[cfg(feature = "blocktrace")]
+            FlushOrigin::Lease,
+            result_callback,
+        );
     }
 }
 
@@ -573,6 +621,8 @@ impl CacheManager {
                 back_file,
                 flush_count,
                 msg_sender,
+                #[cfg(feature = "blocktrace")]
+                torrent_id,
             } => {
                 let (piece_total, last_piece_size) =
                     piece_total_and_last_size(total_length, piece_size);
@@ -593,6 +643,8 @@ impl CacheManager {
                             flush_count,
                             flush_count2,
                             msg_sender,
+                            #[cfg(feature = "blocktrace")]
+                            torrent_id,
                         }),
                         IoState::default(),
                     ),
@@ -623,8 +675,26 @@ impl CacheManager {
                 self.handle_return_piece(key, piece);
             }
 
-            CacheMsg::PieceFlushed { key, result } => {
-                self.handle_piece_flushed(key, result);
+            CacheMsg::PieceFlushed {
+                key,
+                result,
+                #[cfg(feature = "blocktrace")]
+                origin,
+                #[cfg(feature = "blocktrace")]
+                dst_us,
+                #[cfg(feature = "blocktrace")]
+                buf_id,
+            } => {
+                self.handle_piece_flushed(
+                    key,
+                    result,
+                    #[cfg(feature = "blocktrace")]
+                    origin,
+                    #[cfg(feature = "blocktrace")]
+                    dst_us,
+                    #[cfg(feature = "blocktrace")]
+                    buf_id,
+                );
             }
 
             CacheMsg::FileOpBlockingDone { info_hash, result } => {
@@ -638,7 +708,13 @@ impl CacheManager {
             CacheMsg::Shutdown(tx) => {
                 for (key, entry) in self.cache.iter_mut() {
                     if let CacheEntry::Loaded(Some(p)) = entry {
-                        self.self_handle.flush_piece(*key, p, |_| {});
+                        self.self_handle.flush_piece(
+                            *key,
+                            p,
+                            #[cfg(feature = "blocktrace")]
+                            FlushOrigin::Shutdown,
+                            |_| {},
+                        );
                     }
                 }
                 let _ = tx.send(());
@@ -722,7 +798,11 @@ impl CacheManager {
         self.stats.reading -= 1;
         match result {
             Ok(piece) => {
+                #[cfg(feature = "blocktrace")]
+                let buf_id = piece.buf_id();
                 if let Some(q) = self.pending.get_mut(&key) {
+                    #[cfg(feature = "blocktrace")]
+                    let n_waiters = q.len() as i64;
                     if let Some(first_sender) = q.pop_front() {
                         // Reading -> lent out.
                         self.stats.lent += 1;
@@ -736,6 +816,16 @@ impl CacheManager {
                         if q.is_empty() {
                             self.pending.remove(&key);
                         }
+                        #[cfg(feature = "blocktrace")]
+                        self.trace_load_end(
+                            key,
+                            Some(blocktrace::CacheSlotState::Lent),
+                            Some(buf_id),
+                            None,
+                            None,
+                            true,
+                            Some(n_waiters),
+                        );
                         return;
                     }
                 }
@@ -749,8 +839,22 @@ impl CacheManager {
                         // Reading -> clean cached.
                         self.cache.insert(key, CacheEntry::Loaded(Some(piece)));
                         self.assume_clear.insert(key);
+                        #[cfg(feature = "blocktrace")]
+                        self.trace_load_end(
+                            key,
+                            Some(blocktrace::CacheSlotState::Cached),
+                            Some(buf_id),
+                            Some(0),
+                            Some(0),
+                            true,
+                            Some(0),
+                        );
                     }
-                    _ => {}
+                    _ => {
+                        // Loaded but discarded: no cache slot to describe.
+                        #[cfg(feature = "blocktrace")]
+                        self.trace_load_end(key, None, Some(buf_id), None, None, true, Some(0));
+                    }
                 }
             }
             Err(e) => {
@@ -761,6 +865,8 @@ impl CacheManager {
                 }
                 let msg = format!("{e}");
                 let kind = e.kind();
+                #[cfg(feature = "blocktrace")]
+                let n_waiters = self.pending.get(&key).map_or(0, |q| q.len()) as i64;
                 if let Some(waiters) = self.pending.remove(&key) {
                     for s in waiters {
                         let _ = s.send(TmMsg::PieceBufReady {
@@ -769,6 +875,8 @@ impl CacheManager {
                         });
                     }
                 }
+                #[cfg(feature = "blocktrace")]
+                self.trace_load_end(key, None, None, None, None, false, Some(n_waiters));
                 self.maybe_do_all_file_op(key.info_hash);
                 self.load_pending_pieces();
             }
@@ -962,7 +1070,17 @@ impl CacheManager {
         }
     }
 
-    fn handle_piece_flushed(&mut self, key: GlobalPieceKey, result: Result<(), String>) {
+    fn handle_piece_flushed(
+        &mut self,
+        key: GlobalPieceKey,
+        result: Result<(), String>,
+        #[cfg(feature = "blocktrace")] origin: FlushOrigin,
+        #[cfg(feature = "blocktrace")] dst_us: i64,
+        #[cfg(feature = "blocktrace")] buf_id: u64,
+    ) {
+        #[cfg(feature = "blocktrace")]
+        self.trace_flush_end(key, result.is_ok(), origin, dst_us, buf_id);
+
         if let Err(e) = result {
             warn!("cache flush error for {key:?}: {e}");
         }
@@ -1211,6 +1329,8 @@ impl CacheManager {
         self.stats.last = self.stats.current;
         self.stats.current = StatCounts::default();
         self.update_vacant_count();
+        #[cfg(feature = "blocktrace")]
+        self.trace_tick();
     }
 
     fn spawn_piece_read(&mut self, key: GlobalPieceKey) {
@@ -1287,6 +1407,8 @@ impl CacheManager {
             msg_sender,
             Some(self.self_handle.sender.clone()),
         );
+        #[cfg(feature = "blocktrace")]
+        self.trace_load_begin(key, piece.buf_id());
 
         tokio::task::spawn_blocking(move || match read_from_file(piece, file) {
             Ok(p) => handle.piece_loaded(key, Ok(p)),
@@ -1312,10 +1434,13 @@ impl CacheManager {
         for (_, k) in clear_pieces.into_iter().take(n_evict) {
             let removed = self.cache.remove(&k);
             self.assume_clear.remove(&k);
-            match removed {
-                Some(CacheEntry::Loaded(Some(p))) => assert!(!p.is_dirty()),
+            let p = match removed {
+                Some(CacheEntry::Loaded(Some(p))) => p,
                 _ => unreachable!(),
-            }
+            };
+            assert!(!p.is_dirty());
+            #[cfg(feature = "blocktrace")]
+            self.trace_evict(k, p.access_time().elapsed().as_micros() as i64, p.buf_id());
             n += 1;
         }
         self.stats.current.evicts += n as u64;
@@ -1342,7 +1467,13 @@ impl CacheManager {
             .collect();
         let mut flushed = 0;
         for ((_, key), p) in to_flush.into_iter().take(n_flush) {
-            self.self_handle.flush_piece(key, p, |_| {});
+            self.self_handle.flush_piece(
+                key,
+                p,
+                #[cfg(feature = "blocktrace")]
+                FlushOrigin::Cache,
+                |_| {},
+            );
             flushed += 1;
         }
         self.stats.current.cache_flushes += flushed as u64;
@@ -1359,6 +1490,186 @@ impl CacheManager {
         self.self_handle
             .vacant_count
             .store(self.available_slots(), Ordering::Relaxed);
+    }
+
+    /// blocktrace `torrent.id` FK for a registered or unregistering torrent.
+    #[cfg(feature = "blocktrace")]
+    fn trace_torrent_id(&self, info_hash: InfoHash) -> Option<i64> {
+        let (state, _) = self.torrents.get(&info_hash)?;
+        let ti = match state {
+            TorrentState::Registed(ti) => ti,
+            TorrentState::Unregisting((_, ti)) => ti,
+        };
+        ti.torrent_id
+    }
+
+    #[cfg(feature = "blocktrace")]
+    fn trace_event(
+        &self,
+        key: GlobalPieceKey,
+        kind: blocktrace::CacheEventKind,
+    ) -> Option<blocktrace::CacheSlotEvent> {
+        let torrent_id = self.trace_torrent_id(key.info_hash)?;
+        Some(blocktrace::CacheSlotEvent::at(
+            torrent_id,
+            key.index.index() as i64,
+            key.index.sub_index() as i64,
+            kind,
+        ))
+    }
+
+    #[cfg(feature = "blocktrace")]
+    fn trace_load_begin(&self, key: GlobalPieceKey, buf_id: u64) {
+        if let Some(mut ev) = self.trace_event(key, blocktrace::CacheEventKind::LoadBegin) {
+            ev.buf_id = Some(buf_id as i64);
+            ev.state = Some(blocktrace::CacheSlotState::Reading);
+            blocktrace::record_cache_event(ev);
+        }
+    }
+
+    /// `n_waiters` is the number of waiters queued for `key` when the load finished.
+    #[cfg(feature = "blocktrace")]
+    fn trace_load_end(
+        &self,
+        key: GlobalPieceKey,
+        state: Option<blocktrace::CacheSlotState>,
+        buf_id: Option<u64>,
+        dirty: Option<i64>,
+        flushing: Option<i64>,
+        ok: bool,
+        n_waiters: Option<i64>,
+    ) {
+        if let Some(mut ev) = self.trace_event(key, blocktrace::CacheEventKind::LoadEnd) {
+            ev.state = state;
+            ev.buf_id = buf_id.map(|b| b as i64);
+            ev.dirty = dirty;
+            ev.flushing = flushing;
+            ev.ok = Some(ok as i64);
+            ev.n_waiters = n_waiters;
+            blocktrace::record_cache_event(ev);
+        }
+    }
+
+    #[cfg(feature = "blocktrace")]
+    fn trace_evict(&self, key: GlobalPieceKey, age_us: i64, buf_id: u64) {
+        if let Some(mut ev) = self.trace_event(key, blocktrace::CacheEventKind::Evict) {
+            ev.buf_id = Some(buf_id as i64);
+            ev.reason = Some(blocktrace::CacheReason::LeastAccessed);
+            ev.state = Some(blocktrace::CacheSlotState::Cached);
+            ev.dirty = Some(0);
+            ev.flushing = Some(0);
+            ev.age_us = Some(age_us);
+            blocktrace::record_cache_event(ev);
+        }
+    }
+
+    #[cfg(feature = "blocktrace")]
+    fn trace_flush_end(
+        &self,
+        key: GlobalPieceKey,
+        ok: bool,
+        origin: FlushOrigin,
+        dst_us: i64,
+        buf_id: u64,
+    ) {
+        let Some(mut ev) = self.trace_event(key, blocktrace::CacheEventKind::FlushEnd) else {
+            return;
+        };
+        ev.buf_id = Some(buf_id as i64);
+        ev.ok = Some(ok as i64);
+        ev.dst_us = Some(dst_us);
+        ev.reason = Some(match origin {
+            FlushOrigin::Cache => blocktrace::CacheReason::CacheFlush,
+            FlushOrigin::Lease => blocktrace::CacheReason::LeaseFlush,
+            FlushOrigin::Drop => blocktrace::CacheReason::DropFlush,
+            FlushOrigin::Shutdown => blocktrace::CacheReason::Shutdown,
+        });
+        // Attribute the bits only to this buffer instance: a reload may have
+        // replaced the slot while the flush was in flight.
+        if let Some(CacheEntry::Loaded(Some(p))) = self.cache.get(&key) {
+            if p.buf_id() == buf_id {
+                let (dirty, flushing) = p.state_bits();
+                ev.state = Some(blocktrace::CacheSlotState::Cached);
+                ev.dirty = Some(dirty as i64);
+                ev.flushing = Some(flushing as i64);
+            }
+        }
+        blocktrace::record_cache_event(ev);
+    }
+
+    /// Per-tick exact scan of every slot plus the just-rolled window rates.
+    #[cfg(feature = "blocktrace")]
+    fn cache_slot_snapshot(
+        &self,
+    ) -> (
+        i64,
+        blocktrace::CacheSampleEvent,
+        Vec<blocktrace::CacheSlotSample>,
+    ) {
+        let ts_us = blocktrace::now_us();
+        let mut sample = blocktrace::CacheSampleEvent {
+            capacity: self.capacity as i64,
+            waiting_keys: self.waiting_slot.len() as i64,
+            pending_waiters: self.pending.values().map(|q| q.len() as i64).sum(),
+            ..Default::default()
+        };
+        let w = TIMER_INTERVAL.as_secs_f64();
+        let last = &self.stats.last;
+        sample.request_rate = last.requests as f64 / w;
+        sample.lend_rate = last.lends as f64 / w;
+        sample.return_rate = last.returns as f64 / w;
+        sample.flush_rate = last.flushes as f64 / w;
+        sample.cache_flush_rate = last.cache_flushes as f64 / w;
+        sample.evict_rate = last.evicts as f64 / w;
+
+        let mut slots = Vec::with_capacity(self.cache.len());
+        for (key, entry) in self.cache.iter() {
+            let Some(torrent_id) = self.trace_torrent_id(key.info_hash) else {
+                continue;
+            };
+            let (state, dirty, flushing, age_us) = match entry {
+                CacheEntry::Loaded(Some(p)) => {
+                    let (d, f) = p.state_bits();
+                    (
+                        blocktrace::CacheSlotState::Cached,
+                        Some(d as i64),
+                        Some(f as i64),
+                        Some(p.access_time().elapsed().as_micros() as i64),
+                    )
+                }
+                CacheEntry::Loaded(None) => (blocktrace::CacheSlotState::Lent, None, None, None),
+                CacheEntry::Reading => (blocktrace::CacheSlotState::Reading, None, None, None),
+            };
+            match state {
+                blocktrace::CacheSlotState::Cached => {
+                    if dirty == Some(0) && flushing == Some(0) {
+                        sample.cached_clean += 1;
+                    } else {
+                        sample.cached_dirty += 1;
+                    }
+                }
+                blocktrace::CacheSlotState::Lent => sample.lent += 1,
+                blocktrace::CacheSlotState::Reading => sample.reading += 1,
+            }
+            slots.push(blocktrace::CacheSlotSample {
+                ts_us,
+                torrent_id,
+                piece: key.index.index() as i64,
+                sub: key.index.sub_index() as i64,
+                state,
+                dirty,
+                flushing,
+                age_us,
+            });
+        }
+        (ts_us, sample, slots)
+    }
+
+    /// Emit the per-tick snapshot; must run after the rate window is rolled.
+    #[cfg(feature = "blocktrace")]
+    fn trace_tick(&self) {
+        let (ts_us, sample, slots) = self.cache_slot_snapshot();
+        blocktrace::record_cache_tick(ts_us, sample, slots);
     }
 
     /// Build a statistics snapshot in O(1): gauges are derived from the

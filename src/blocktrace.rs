@@ -17,7 +17,8 @@ use tracing::{error, info};
 
 const CHANNEL_CAP: usize = 65536;
 const BATCH_MAX: usize = 10240;
-const BATCH_MS: u64 = 1000;
+/// Longest an event may sit in the batch before it is committed.
+const BATCH_MS: u64 = 2000;
 
 /// A block lifecycle event kind. The explicit discriminant IS the
 /// `event_kind.id` FK stored in `block_event`.
@@ -150,6 +151,93 @@ impl BwMode {
     }
 }
 
+/// One cache-slot event kind. The explicit discriminant IS the
+/// `cache_event_kind.id` FK stored in `cache_slot_event`.
+#[derive(Clone, Copy, Debug)]
+pub enum CacheEventKind {
+    LoadBegin = 1,
+    LoadEnd = 2,
+    Evict = 3,
+    FlushEnd = 4,
+}
+
+impl CacheEventKind {
+    const ALL: [CacheEventKind; 4] = [Self::LoadBegin, Self::LoadEnd, Self::Evict, Self::FlushEnd];
+
+    pub fn id(self) -> i64 {
+        self as i64
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::LoadBegin => "load_begin",
+            Self::LoadEnd => "load_end",
+            Self::Evict => "evict",
+            Self::FlushEnd => "flush_end",
+        }
+    }
+}
+
+/// Why a cache slot was evicted / flushed. The explicit discriminant IS the
+/// `cache_reason.id` FK.
+#[derive(Clone, Copy, Debug)]
+pub enum CacheReason {
+    LeastAccessed = 1,
+    CacheFlush = 2,
+    LeaseFlush = 3,
+    DropFlush = 4,
+    Shutdown = 5,
+}
+
+impl CacheReason {
+    const ALL: [CacheReason; 5] = [
+        Self::LeastAccessed,
+        Self::CacheFlush,
+        Self::LeaseFlush,
+        Self::DropFlush,
+        Self::Shutdown,
+    ];
+
+    pub fn id(self) -> i64 {
+        self as i64
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::LeastAccessed => "least_accessed",
+            Self::CacheFlush => "cache_flush",
+            Self::LeaseFlush => "lease_flush",
+            Self::DropFlush => "drop_flush",
+            Self::Shutdown => "shutdown",
+        }
+    }
+}
+
+/// Slot occupancy state. Clean/dirty is NOT encoded here — it is carried by the
+/// raw `DIRTY`/`FLUSHING` bits, so the three columns are independent.
+#[derive(Clone, Copy, Debug)]
+pub enum CacheSlotState {
+    Cached = 1,
+    Lent = 2,
+    Reading = 3,
+}
+
+impl CacheSlotState {
+    const ALL: [CacheSlotState; 3] = [Self::Cached, Self::Lent, Self::Reading];
+
+    pub fn id(self) -> i64 {
+        self as i64
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Cached => "cached",
+            Self::Lent => "lent",
+            Self::Reading => "reading",
+        }
+    }
+}
+
 /// One block lifecycle event. Copy; hot paths build it and hand it to the
 /// writer via a single channel send. Optional columns are filled per `kind`
 /// (`exp_us` at pick/repick, `rtt_us`/`bytes` at receive, etc.).
@@ -210,6 +298,89 @@ pub struct BwSampleEvent {
     pub mode: Option<BwMode>,
 }
 
+/// One cache slot lifecycle row. `piece`/`sub` are the cache-native identity
+/// (`JointIndex`); byte ranges are derived by joining `torrent`.
+#[derive(Clone, Copy)]
+pub struct CacheSlotEvent {
+    pub torrent_id: i64,
+    pub ts_us: i64,
+    pub piece: i64,
+    pub sub: i64,
+    /// Buffer instance id; `None` on failed loads, whose buffer is consumed by the read.
+    pub buf_id: Option<i64>,
+    pub kind: CacheEventKind,
+    pub reason: Option<CacheReason>,
+    pub state: Option<CacheSlotState>,
+    /// Raw `DIRTY` bit; only meaningful when `state = cached`.
+    pub dirty: Option<i64>,
+    /// Raw `FLUSHING` bit; only meaningful when `state = cached`.
+    pub flushing: Option<i64>,
+    /// `load_end` / `flush_end`: 1 ok, 0 failed.
+    pub ok: Option<i64>,
+    /// `flush_end`: write-back duration.
+    pub dst_us: Option<i64>,
+    /// `load_end`: waiters queued for the key when the read finished.
+    pub n_waiters: Option<i64>,
+    /// `evict`: `now - access_time` (last write).
+    pub age_us: Option<i64>,
+}
+
+impl CacheSlotEvent {
+    /// Build an event with `ts_us = now` and all optional columns unset.
+    pub fn at(torrent_id: i64, piece: i64, sub: i64, kind: CacheEventKind) -> Self {
+        Self {
+            torrent_id,
+            ts_us: now_us(),
+            piece,
+            sub,
+            buf_id: None,
+            kind,
+            reason: None,
+            state: None,
+            dirty: None,
+            flushing: None,
+            ok: None,
+            dst_us: None,
+            n_waiters: None,
+            age_us: None,
+        }
+    }
+}
+
+/// One line of the periodic full slot snapshot.
+#[derive(Clone, Copy)]
+pub struct CacheSlotSample {
+    pub ts_us: i64,
+    pub torrent_id: i64,
+    pub piece: i64,
+    pub sub: i64,
+    pub state: CacheSlotState,
+    pub dirty: Option<i64>,
+    pub flushing: Option<i64>,
+    pub age_us: Option<i64>,
+}
+
+/// Per-tick aggregate row, derived from the same slot scan plus the completed
+/// stats window.
+#[derive(Clone, Copy, Default)]
+pub struct CacheSampleEvent {
+    pub capacity: i64,
+    pub lent: i64,
+    pub reading: i64,
+    pub cached_clean: i64,
+    pub cached_dirty: i64,
+    pub waiting_keys: i64,
+    pub pending_waiters: i64,
+    /// Rates are `stats.last / TIMER_INTERVAL` (pure single window), unlike
+    /// `CacheStats` which blends last/current 50/50.
+    pub request_rate: f64,
+    pub lend_rate: f64,
+    pub return_rate: f64,
+    pub flush_rate: f64,
+    pub cache_flush_rate: f64,
+    pub evict_rate: f64,
+}
+
 /// Wall-clock microseconds since the Unix epoch (used as the `ts_us` on every
 /// row, so events across tables share one timeline for as-of joins).
 pub fn now_us() -> i64 {
@@ -236,6 +407,13 @@ enum TraceMsg {
     Block(BlockEvent),
     PeerState(PeerStateEvent),
     BwSample(BwSampleEvent),
+    CacheEvent(CacheSlotEvent),
+    /// Aggregate row plus all slot rows of one tick, sent as a unit.
+    CacheTick {
+        ts_us: i64,
+        sample: CacheSampleEvent,
+        slots: Vec<CacheSlotSample>,
+    },
     /// Flush the open transaction, close the DB, and stop the writer thread.
     Shutdown,
 }
@@ -291,6 +469,24 @@ pub fn install(db_path: &str) -> rusqlite::Result<TraceHandle> {
             params![r.id(), r.name()],
         )?;
     }
+    for k in CacheEventKind::ALL {
+        conn.execute(
+            "INSERT OR IGNORE INTO cache_event_kind(id, name) VALUES (?1, ?2)",
+            params![k.id(), k.name()],
+        )?;
+    }
+    for r in CacheReason::ALL {
+        conn.execute(
+            "INSERT OR IGNORE INTO cache_reason(id, name) VALUES (?1, ?2)",
+            params![r.id(), r.name()],
+        )?;
+    }
+    for s in CacheSlotState::ALL {
+        conn.execute(
+            "INSERT OR IGNORE INTO cache_slot_state(id, name) VALUES (?1, ?2)",
+            params![s.id(), s.name()],
+        )?;
+    }
 
     let (tx, rx) = sync_channel::<TraceMsg>(CHANNEL_CAP);
     let join = std::thread::Builder::new()
@@ -306,7 +502,8 @@ pub fn install(db_path: &str) -> rusqlite::Result<TraceHandle> {
 }
 
 /// Owns the `Connection`. Data events accumulate in a batch, committed as one
-/// transaction per `BATCH_MAX` events or every `BATCH_MS`. Register messages are
+/// transaction per `BATCH_MAX` events or once `BATCH_MS` has passed since the
+/// last flush. Register messages are
 /// handled inline (they reply with an FK id). On `Shutdown` (or all senders
 /// dropping) the partial batch is flushed before exit, so no committed-in-memory
 /// event is lost on graceful shutdown.
@@ -314,8 +511,10 @@ fn writer_loop(conn: Connection, rx: Receiver<TraceMsg>) {
     let mut torrents: HashMap<[u8; 20], i64> = HashMap::new();
     let mut peers: HashMap<(i64, [u8; 20]), i64> = HashMap::new();
     let mut batch: Vec<TraceMsg> = Vec::with_capacity(BATCH_MAX);
+    let max_wait = Duration::from_millis(BATCH_MS);
+    let mut last_flush = Instant::now();
     loop {
-        match rx.recv_timeout(Duration::from_millis(BATCH_MS)) {
+        match rx.recv_timeout(max_wait) {
             Ok(msg) => match msg {
                 TraceMsg::Shutdown => {
                     flush_batch(&conn, &mut batch);
@@ -326,12 +525,16 @@ fn writer_loop(conn: Connection, rx: Receiver<TraceMsg>) {
                 }
                 data => {
                     batch.push(data);
-                    if batch.len() >= BATCH_MAX {
+                    if batch.len() >= BATCH_MAX || last_flush.elapsed() >= max_wait {
                         flush_batch(&conn, &mut batch);
+                        last_flush = Instant::now();
                     }
                 }
             },
-            Err(RecvTimeoutError::Timeout) => flush_batch(&conn, &mut batch),
+            Err(RecvTimeoutError::Timeout) => {
+                flush_batch(&conn, &mut batch);
+                last_flush = Instant::now();
+            }
             Err(RecvTimeoutError::Disconnected) => {
                 flush_batch(&conn, &mut batch);
                 break;
@@ -359,6 +562,12 @@ fn flush_batch(conn: &Connection, batch: &mut Vec<TraceMsg>) {
             TraceMsg::Block(e) => insert_block(&tx, &e),
             TraceMsg::PeerState(e) => insert_peer_state(&tx, &e),
             TraceMsg::BwSample(e) => insert_bw(&tx, &e),
+            TraceMsg::CacheEvent(e) => insert_cache_event(&tx, &e),
+            TraceMsg::CacheTick {
+                ts_us,
+                sample,
+                slots,
+            } => insert_cache_tick(&tx, ts_us, &sample, &slots),
             _ => unreachable!("only data events are batched"),
         };
         if let Err(err) = res {
@@ -520,6 +729,82 @@ fn insert_bw(conn: &Connection, e: &BwSampleEvent) -> rusqlite::Result<usize> {
     ])
 }
 
+fn insert_cache_event(conn: &Connection, e: &CacheSlotEvent) -> rusqlite::Result<usize> {
+    conn.prepare_cached(
+        "INSERT INTO cache_slot_event
+         (ts_us, torrent_id, piece, sub, kind, reason, state, dirty, flushing, ok, dst_us, n_waiters, age_us, buf_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+    )?
+    .execute(params![
+        e.ts_us,
+        e.torrent_id,
+        e.piece,
+        e.sub,
+        e.kind.id(),
+        e.reason.map(|r| r.id()),
+        e.state.map(|s| s.id()),
+        e.dirty,
+        e.flushing,
+        e.ok,
+        e.dst_us,
+        e.n_waiters,
+        e.age_us,
+        e.buf_id,
+    ])
+}
+
+/// Insert one tick: the aggregate row plus every slot row, inside the caller's
+/// transaction so both are committed together.
+fn insert_cache_tick(
+    conn: &Connection,
+    ts_us: i64,
+    s: &CacheSampleEvent,
+    slots: &[CacheSlotSample],
+) -> rusqlite::Result<usize> {
+    conn.prepare_cached(
+        "INSERT INTO cache_sample
+         (ts_us, capacity, lent, reading, cached_clean, cached_dirty,
+          waiting_keys, pending_waiters,
+          request_rate, lend_rate, return_rate, flush_rate, cache_flush_rate, evict_rate)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+    )?
+    .execute(params![
+        ts_us,
+        s.capacity,
+        s.lent,
+        s.reading,
+        s.cached_clean,
+        s.cached_dirty,
+        s.waiting_keys,
+        s.pending_waiters,
+        s.request_rate,
+        s.lend_rate,
+        s.return_rate,
+        s.flush_rate,
+        s.cache_flush_rate,
+        s.evict_rate,
+    ])?;
+
+    let mut stmt = conn.prepare_cached(
+        "INSERT INTO cache_slot_sample
+         (ts_us, torrent_id, piece, sub, state, dirty, flushing, age_us)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+    )?;
+    for slot in slots {
+        stmt.execute(params![
+            slot.ts_us,
+            slot.torrent_id,
+            slot.piece,
+            slot.sub,
+            slot.state.id(),
+            slot.dirty,
+            slot.flushing,
+            slot.age_us,
+        ])?;
+    }
+    Ok(slots.len())
+}
+
 /// Resolve (and cache in-DB) the FK id for a torrent. Off hot path: called
 /// once per torrent at startup/registration. Returns `None` if tracing is off
 /// or the write failed.
@@ -574,6 +859,22 @@ pub fn record_peer_state(ev: PeerStateEvent) {
 pub fn record_bw_sample(ev: BwSampleEvent) {
     if let Some(s) = SINK.get() {
         let _ = s.tx.send(TraceMsg::BwSample(ev));
+    }
+}
+
+pub fn record_cache_event(ev: CacheSlotEvent) {
+    if let Some(s) = SINK.get() {
+        let _ = s.tx.send(TraceMsg::CacheEvent(ev));
+    }
+}
+
+pub fn record_cache_tick(ts_us: i64, sample: CacheSampleEvent, slots: Vec<CacheSlotSample>) {
+    if let Some(s) = SINK.get() {
+        let _ = s.tx.send(TraceMsg::CacheTick {
+            ts_us,
+            sample,
+            slots,
+        });
     }
 }
 
@@ -642,4 +943,61 @@ CREATE TABLE IF NOT EXISTS bw_sample(
   app_limited INTEGER,
   mode INTEGER);
 CREATE INDEX IF NOT EXISTS ix_bw_peer ON bw_sample(peer_id, ts_us);
+
+CREATE TABLE IF NOT EXISTS cache_event_kind(id INTEGER PRIMARY KEY, name TEXT UNIQUE);
+CREATE TABLE IF NOT EXISTS cache_reason(id INTEGER PRIMARY KEY, name TEXT UNIQUE);
+CREATE TABLE IF NOT EXISTS cache_slot_state(id INTEGER PRIMARY KEY, name TEXT UNIQUE);
+
+-- Cache slot events. Identity is (torrent_id, piece, sub); the info hash lives
+-- once in torrent.info_hash, byte ranges are derived by joining torrent.
+CREATE TABLE IF NOT EXISTS cache_slot_event(
+  id INTEGER PRIMARY KEY,
+  ts_us INTEGER NOT NULL,
+  torrent_id INTEGER NOT NULL REFERENCES torrent(id),
+  piece INTEGER NOT NULL,
+  sub INTEGER NOT NULL,
+  buf_id INTEGER,
+  kind INTEGER NOT NULL REFERENCES cache_event_kind(id),
+  reason INTEGER REFERENCES cache_reason(id),
+  state INTEGER REFERENCES cache_slot_state(id),
+  dirty INTEGER,
+  flushing INTEGER,
+  ok INTEGER,
+  dst_us INTEGER,
+  n_waiters INTEGER,
+  age_us INTEGER);
+CREATE INDEX IF NOT EXISTS ix_cse_kind ON cache_slot_event(kind, ts_us);
+CREATE INDEX IF NOT EXISTS ix_cse_key ON cache_slot_event(torrent_id, piece, sub, ts_us);
+CREATE INDEX IF NOT EXISTS ix_cse_buf ON cache_slot_event(buf_id, ts_us);
+
+-- Per-tick aggregate. Derived values are deliberately not stored:
+-- occupied = lent + reading + cached_clean + cached_dirty,
+-- untracked = capacity - occupied, available = cached_clean + untracked.
+CREATE TABLE IF NOT EXISTS cache_sample(
+  ts_us INTEGER PRIMARY KEY,
+  capacity INTEGER NOT NULL,
+  lent INTEGER NOT NULL,
+  reading INTEGER NOT NULL,
+  cached_clean INTEGER NOT NULL,
+  cached_dirty INTEGER NOT NULL,
+  waiting_keys INTEGER NOT NULL,
+  pending_waiters INTEGER NOT NULL,
+  request_rate REAL,
+  lend_rate REAL,
+  return_rate REAL,
+  flush_rate REAL,
+  cache_flush_rate REAL,
+  evict_rate REAL);
+
+-- Per-tick full slot snapshot (~capacity rows per tick).
+CREATE TABLE IF NOT EXISTS cache_slot_sample(
+  ts_us INTEGER NOT NULL,
+  torrent_id INTEGER NOT NULL REFERENCES torrent(id),
+  piece INTEGER NOT NULL,
+  sub INTEGER NOT NULL,
+  state INTEGER NOT NULL REFERENCES cache_slot_state(id),
+  dirty INTEGER,
+  flushing INTEGER,
+  age_us INTEGER,
+  PRIMARY KEY (ts_us, torrent_id, piece, sub)) WITHOUT ROWID;
 ";

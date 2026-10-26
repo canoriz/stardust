@@ -8,12 +8,17 @@ use std::{
     },
 };
 
+#[cfg(feature = "blocktrace")]
+use std::sync::{atomic::AtomicU64, LazyLock};
+
 use super::MutexBackFile;
 use crate::transmit_manager::Msg as TmMsg;
 use crate::{
     cache::cache_manager::{CacheMsg, GlobalPieceKey},
     protocol::Request,
 };
+#[cfg(feature = "blocktrace")]
+use crate::cache::cache_manager::FlushOrigin;
 use bytes::BytesMut;
 use tokio::sync::mpsc;
 use tokio::time;
@@ -270,6 +275,19 @@ pub struct FlushErr {
 
 type BufState = AtomicU32;
 
+/// Next buffer instance id: monotonic, seeded with process start time in µs so
+/// ids never repeat across runs appending to one trace DB.
+#[cfg(feature = "blocktrace")]
+fn next_buf_id() -> u64 {
+    static NEXT: LazyLock<AtomicU64> = LazyLock::new(|| {
+        let start_us = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_micros() as u64);
+        AtomicU64::new(start_us)
+    });
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 pub struct PieceBuf {
     /// always Some, except in drop
     buf: CowBuf<PooledBuf>,
@@ -280,6 +298,9 @@ pub struct PieceBuf {
     touch: time::Instant,
     write_time: time::Instant,
     state: Arc<BufState>,
+    /// Monotonic instance id used to join cache trace rows by generation.
+    #[cfg(feature = "blocktrace")]
+    buf_id: u64,
     file: MutexBackFile,
 
     // TODO: maybe remove Option, make flush tracking mandatory
@@ -350,6 +371,8 @@ impl Drop for PieceBuf {
         let s = self.state.clone();
         let offset = self.offset;
         let buf = self.buf.clone();
+        #[cfg(feature = "blocktrace")]
+        let (start, buf_id) = (time::Instant::now(), self.buf_id());
 
         // if drop is running, all background flush should stop
         // set in_drop, if other worker see in_drop is true, they stop
@@ -379,6 +402,12 @@ impl Drop for PieceBuf {
                                 format!("PieceBuf::Drop flush error index {index:?} {e:?}")
                             })
                             .map(|_| ()),
+                        #[cfg(feature = "blocktrace")]
+                        origin: FlushOrigin::Drop,
+                        #[cfg(feature = "blocktrace")]
+                        dst_us: start.elapsed().as_micros() as i64,
+                        #[cfg(feature = "blocktrace")]
+                        buf_id,
                     });
                 }
                 if let Some(sender) = msg_sender {
@@ -402,6 +431,20 @@ impl PieceBuf {
     pub fn is_flushing(&self) -> bool {
         let s = self.state.load(Ordering::Relaxed);
         (s & FLUSHING) > 0
+    }
+
+    /// Raw `(DIRTY, FLUSHING)` bits. `is_dirty()` collapses both, which cannot
+    /// tell "flushing but not rewritten" from "flushing and rewritten again".
+    #[cfg(feature = "blocktrace")]
+    pub fn state_bits(&self) -> (bool, bool) {
+        let s = self.state.load(Ordering::Relaxed);
+        (s & DIRTY > 0, s & FLUSHING > 0)
+    }
+
+    /// Monotonic buffer instance id, assigned at allocation.
+    #[cfg(feature = "blocktrace")]
+    pub fn buf_id(&self) -> u64 {
+        self.buf_id
     }
 
     pub fn write_time(&self) -> time::Instant {
@@ -489,6 +532,8 @@ impl PieceBuf {
             index,
             offset,
             state: Arc::new(AtomicU32::new(0)),
+            #[cfg(feature = "blocktrace")]
+            buf_id: next_buf_id(),
             file,
             flush_count,
             flush_count2,
