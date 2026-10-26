@@ -1720,7 +1720,8 @@ impl TransmitWorker {
                     // pick_blocks from panicking when called before we received a bitfield.
                     match &mut self.torrent_state {
                         TorrentState::Metadata(d) => {
-                            d.block_picker.peer_add((peer_addr, conn_id), PieceState::HaveNone);
+                            d.block_picker
+                                .peer_add((peer_addr, conn_id), PieceState::HaveNone);
                         }
                         TorrentState::Fetching(_) => {}
                     }
@@ -3259,7 +3260,8 @@ impl TransmitWorker {
         {
             if long_peers.len() > LIMIT {
                 long_peers.remove(&a);
-                warn!("kick out {a:?}");
+                let s = self.connected_peers.get(&a);
+                warn!("kick out {a:?}, {:?}", s.map(|s| s.stat));
                 self.candidates
                     .insert(a.0, PeerState::Kicked(time::Instant::now() + ONE_MIN));
                 let _ = self.handle_peer_leave(a);
@@ -3267,10 +3269,11 @@ impl TransmitWorker {
         }
 
         while long_peers.len() > LIMIT
-            && let Some((_, addr)) = slowest_first.pop_first()
+            && let Some((bw, addr)) = slowest_first.pop_first()
         {
             long_peers.remove(&addr);
-            warn!("kick out {addr:?}");
+            let s = self.connected_peers.get(&addr);
+            warn!("kick out {addr:?}, bw {bw} {:?}", s.map(|s| s.stat));
             self.candidates
                 .insert(addr.0, PeerState::Kicked(time::Instant::now() + ONE_MIN));
             let _ = self.handle_peer_leave(addr);
