@@ -394,8 +394,8 @@ enum TraceMsg {
     RegisterTorrent {
         info_hash: [u8; 20],
         name: Option<String>,
-        total_len: i64,
-        piece_len: i64,
+        total_len: Option<i64>,
+        piece_len: Option<i64>,
         reply: oneshot::Sender<i64>,
     },
     RegisterPeer {
@@ -508,7 +508,6 @@ pub fn install(db_path: &str) -> rusqlite::Result<TraceHandle> {
 /// dropping) the partial batch is flushed before exit, so no committed-in-memory
 /// event is lost on graceful shutdown.
 fn writer_loop(conn: Connection, rx: Receiver<TraceMsg>) {
-    let mut torrents: HashMap<[u8; 20], i64> = HashMap::new();
     let mut peers: HashMap<(i64, [u8; 20]), i64> = HashMap::new();
     let mut batch: Vec<TraceMsg> = Vec::with_capacity(BATCH_MAX);
     let max_wait = Duration::from_millis(BATCH_MS);
@@ -521,7 +520,7 @@ fn writer_loop(conn: Connection, rx: Receiver<TraceMsg>) {
                     break;
                 }
                 TraceMsg::RegisterTorrent { .. } | TraceMsg::RegisterPeer { .. } => {
-                    handle_register(&conn, &mut torrents, &mut peers, msg);
+                    handle_register(&conn, &mut peers, msg);
                 }
                 data => {
                     batch.push(data);
@@ -581,7 +580,6 @@ fn flush_batch(conn: &Connection, batch: &mut Vec<TraceMsg>) {
 
 fn handle_register(
     conn: &Connection,
-    torrents: &mut HashMap<[u8; 20], i64>,
     peers: &mut HashMap<(i64, [u8; 20]), i64>,
     msg: TraceMsg,
 ) {
@@ -593,25 +591,15 @@ fn handle_register(
             piece_len,
             reply,
         } => {
-            let id = match torrents.get(&info_hash) {
-                Some(id) => Some(*id),
-                None => {
-                    match upsert_torrent(conn, &info_hash, name.as_deref(), total_len, piece_len) {
-                        Ok(id) => {
-                            torrents.insert(info_hash, id);
-                            Some(id)
-                        }
-                        Err(e) => {
-                            error!("blocktrace register torrent: {e}");
-                            None
-                        }
-                    }
+            // Always upsert: the row is created at add time from the info hash
+            // alone and completed with len/piece_len once metadata arrives.
+            match upsert_torrent(conn, &info_hash, name.as_deref(), total_len, piece_len) {
+                // On failure, drop `reply` unsent: the caller's `rx.await`
+                // errors and `register_torrent` returns `None`.
+                Ok(id) => {
+                    let _ = reply.send(id);
                 }
-            };
-            // On failure, drop `reply` unsent: the caller's `rx.await` errors
-            // and `register_torrent` returns None (no sentinel value).
-            if let Some(id) = id {
-                let _ = reply.send(id);
+                Err(e) => error!("blocktrace register torrent: {e}"),
             }
         }
         TraceMsg::RegisterPeer {
@@ -646,13 +634,16 @@ fn upsert_torrent(
     conn: &Connection,
     info_hash: &[u8; 20],
     name: Option<&str>,
-    total_len: i64,
-    piece_len: i64,
+    total_len: Option<i64>,
+    piece_len: Option<i64>,
 ) -> rusqlite::Result<i64> {
     conn.query_row(
         "INSERT INTO torrent(info_hash, name, total_len, piece_len, started_at_us)
          VALUES (?1, ?2, ?3, ?4, ?5)
-         ON CONFLICT(info_hash) DO UPDATE SET name = coalesce(excluded.name, name)
+         ON CONFLICT(info_hash) DO UPDATE SET
+             name      = coalesce(excluded.name, name),
+             total_len = coalesce(excluded.total_len, total_len),
+             piece_len = coalesce(excluded.piece_len, piece_len)
          RETURNING id",
         params![hex::encode(info_hash), name, total_len, piece_len, now_us()],
         |r| r.get(0),
@@ -806,13 +797,14 @@ fn insert_cache_tick(
 }
 
 /// Resolve (and cache in-DB) the FK id for a torrent. Off hot path: called
-/// once per torrent at startup/registration. Returns `None` if tracing is off
-/// or the write failed.
+/// when the torrent is added (info hash only, for a magnet) and again once
+/// metadata arrives to fill in name/len/piece_len — same row, same id.
+/// Returns `None` if tracing is off or the write failed.
 pub async fn register_torrent(
     info_hash: [u8; 20],
     name: Option<String>,
-    total_len: i64,
-    piece_len: i64,
+    total_len: Option<i64>,
+    piece_len: Option<i64>,
 ) -> Option<i64> {
     let s = SINK.get()?;
     let (reply, rx) = oneshot::channel();

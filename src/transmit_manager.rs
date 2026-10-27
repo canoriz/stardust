@@ -1103,7 +1103,7 @@ impl TransmitWorker {
         #[cfg(feature = "blocktrace")]
         let blocktrace_torrent_id = match &dump.state {
             TorrentStateDump::Metadata { metadata, .. } => resolve_blocktrace_tid(metadata),
-            TorrentStateDump::Fetching(_) => None,
+            TorrentStateDump::Fetching(f) => resolve_blocktrace_tid_pending(&f.magnet),
         };
         let (info_hash, torrent_state) = match dump.state {
             TorrentStateDump::Metadata { metadata, picker } => {
@@ -1186,7 +1186,7 @@ impl TransmitWorker {
         #[cfg(feature = "blocktrace")]
         let blocktrace_torrent_id = match &t {
             TorrentTask::Torrent(m) => resolve_blocktrace_tid(m),
-            TorrentTask::Magnet(_) => None,
+            TorrentTask::Magnet(m) => resolve_blocktrace_tid_pending(m),
         };
         let (info_hash, state) = match t {
             TorrentTask::Torrent(m) => {
@@ -3321,8 +3321,21 @@ fn resolve_blocktrace_tid(m: &Metadata) -> Option<i64> {
     futures::executor::block_on(blocktrace::register_torrent(
         m.info_hash,
         Some(m.info.name.clone()),
-        m.len() as i64,
-        m.regular_piece_size() as i64,
+        Some(m.len() as i64),
+        Some(m.regular_piece_size() as i64),
+    ))
+}
+
+/// Register a torrent whose metadata is not known yet: only the info hash (and
+/// the magnet display name) is available, and the row is completed by
+/// `resolve_blocktrace_tid` once metadata arrives.
+#[cfg(feature = "blocktrace")]
+fn resolve_blocktrace_tid_pending(m: &Magnet) -> Option<i64> {
+    futures::executor::block_on(blocktrace::register_torrent(
+        m.info_hash,
+        m.dn.clone(),
+        None,
+        None,
     ))
 }
 
