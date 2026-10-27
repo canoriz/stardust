@@ -834,6 +834,9 @@ pub struct Downloading {
     pub back_file: MutexBackFile,
 }
 
+/// How long a kicked peer is refused, on both accept and dial.
+const KICK_BAN: time::Duration = time::Duration::from_mins(1);
+
 pub struct TransmitWorker {
     // our peer ID
     id: InfoHash,
@@ -863,7 +866,11 @@ pub struct TransmitWorker {
     // `conn_id`, so this map and the picker could key on `Version` alone.
     connected_peers: HashMap<PeerAddr, PeerConn>,
     /// Dial state per address, covering peers not yet connected.
+    /// TODO: `Candidate`/`Connecting` entries carry no timestamp, so they never age
+    /// out; needs a periodic sweep.
     candidates: HashMap<SocketAddr, PeerState>,
+    /// Kicked peers, banned until the instant; keyed by their self-reported BT id.
+    kicked_peers: HashMap<InfoHash, time::Instant>,
 
     /// Next id handed to a connection. Distinguishes a new connection to an
     /// address from the one a stale `PeerLeave` belongs to.
@@ -1145,6 +1152,7 @@ impl TransmitWorker {
             connected_peers: HashMap::new(),
             next_conn_id: 0,
             candidates: HashMap::new(),
+            kicked_peers: HashMap::new(),
             announce_urls: dump.announce_urls,
             waiting_for_piecebuf: HashMap::new(),
             pending_renames: HashMap::new(),
@@ -1230,6 +1238,7 @@ impl TransmitWorker {
             connected_peers: HashMap::new(),
             next_conn_id: 0,
             candidates: HashMap::new(),
+            kicked_peers: HashMap::new(),
             announce_urls: Vec::new(),
             waiting_for_piecebuf: HashMap::new(),
             pending_renames: HashMap::new(),
@@ -1624,8 +1633,18 @@ impl TransmitWorker {
                     bt_conn
                 );
                 let peer_addr = to_canonical_addr(bt_conn.peer_addr());
-                #[cfg(feature = "blocktrace")]
                 let peer_bt_id = bt_conn.peer_id();
+                if let Some(until) = self.kicked_peers.get(&peer_bt_id).copied()
+                    && time::Instant::now() < until
+                {
+                    warn!("refuse kicked peer {peer_addr} until {until:?}");
+                    // Do not leave a banned outward dial stuck in Connecting, or
+                    // discovery never dials it again.
+                    if matches!(self.candidates.get(&peer_addr), Some(PeerState::Connecting)) {
+                        self.candidates.insert(peer_addr, PeerState::Kicked(until));
+                    }
+                    return Ok(());
+                }
                 // An outward dial is only valid while its address is still Connecting.
                 // An inward connection loses to one already live, or to a kick cooldown.
                 let accept = if is_income {
@@ -1696,6 +1715,7 @@ impl TransmitWorker {
                         PeerConn::new(
                             cm,
                             conn_id,
+                            peer_bt_id,
                             #[cfg(feature = "metrics")]
                             self.info_hash,
                             #[cfg(feature = "metrics")]
@@ -3208,17 +3228,28 @@ impl TransmitWorker {
         const ONE_MIN: time::Duration = time::Duration::from_mins(1);
         let mut slowest_first = BTreeSet::new();
 
-        let long_peers: HashMap<_, _> = self
+        let now = time::Instant::now();
+        self.kicked_peers.retain(|_, until| now < *until);
+        // An expired kick is an ordinary candidate again.
+        for s in self.candidates.values_mut() {
+            match s {
+                PeerState::Kicked(until) if now >= *until => *s = PeerState::Candidate,
+                _ => {}
+            }
+        }
+
+        let long_peers: Vec<_> = self
             .connected_peers
             .iter()
             .filter(|(_, c)| c.stat.create_time.elapsed() > ONE_MIN)
+            .map(|(a, c)| (*a, c, c.peer_bt_id))
             .collect();
 
         let no_response: Vec<_> = long_peers
             .iter()
-            .filter_map(|(a, c)| {
+            .filter_map(|(a, c, _)| {
                 if c.stat.last_recv.elapsed() > ONE_MIN {
-                    Some(**a)
+                    Some(*a)
                 } else {
                     None
                 }
@@ -3227,10 +3258,10 @@ impl TransmitWorker {
 
         let lots_discard: Vec<_> = long_peers
             .iter()
-            .filter_map(|(a, c)| {
+            .filter_map(|(a, c, _)| {
                 let s = &c.stat;
                 if s.total_discard as f32 / s.total_recv as f32 > 0.3 {
-                    Some(**a)
+                    Some(*a)
                 } else {
                     None
                 }
@@ -3239,48 +3270,53 @@ impl TransmitWorker {
 
         let lots_cancel: Vec<_> = long_peers
             .iter()
-            .filter_map(|(a, c)| {
+            .filter_map(|(a, c, _)| {
                 let s = &c.stat;
                 if s.total_cancel as f32 / s.total_recv as f32 > 0.3 {
-                    Some(**a)
+                    Some(*a)
                 } else {
                     None
                 }
             })
             .collect();
 
-        for (addr, c) in long_peers.iter() {
-            slowest_first.insert((c.bw.count_bytes_within_period(ONE_MIN).0, **addr));
+        for (addr, c, _) in long_peers.iter() {
+            slowest_first.insert((c.bw.count_bytes_within_period(ONE_MIN).0, *addr));
         }
 
-        let mut long_peers: HashSet<_> = long_peers.into_iter().map(|(a, _)| *a).collect();
+        // Owned, so the kicks below may borrow self mutably.
+        let mut long_peers: HashMap<PeerAddr, InfoHash> =
+            long_peers.into_iter().map(|(a, _, id)| (a, id)).collect();
         const LIMIT: usize = 20;
 
         for a in no_response
             .into_iter()
-            .chain(lots_discard.into_iter())
-            .chain(lots_cancel.into_iter())
+            .chain(lots_discard)
+            .chain(lots_cancel)
         {
-            if long_peers.len() > LIMIT {
-                long_peers.remove(&a);
-                let s = self.connected_peers.get(&a);
-                warn!("kick out {a:?}, {:?}", s.map(|s| s.stat));
-                self.candidates
-                    .insert(a.0, PeerState::Kicked(time::Instant::now() + ONE_MIN));
-                let _ = self.handle_peer_leave(a);
+            if long_peers.len() > LIMIT
+                && let Some(bt_id) = long_peers.remove(&a)
+            {
+                self.kick(a, bt_id);
             }
         }
 
         while long_peers.len() > LIMIT
-            && let Some((bw, addr)) = slowest_first.pop_first()
+            && let Some((_, a)) = slowest_first.pop_first()
         {
-            long_peers.remove(&addr);
-            let s = self.connected_peers.get(&addr);
-            warn!("kick out {addr:?}, bw {bw} {:?}", s.map(|s| s.stat));
-            self.candidates
-                .insert(addr.0, PeerState::Kicked(time::Instant::now() + ONE_MIN));
-            let _ = self.handle_peer_leave(addr);
+            if let Some(bt_id) = long_peers.remove(&a) {
+                self.kick(a, bt_id);
+            }
         }
+    }
+
+    /// Drop the connection and refuse the peer for `KICK_BAN`, on both accept and dial.
+    fn kick(&mut self, a: PeerAddr, bt_id: InfoHash) {
+        warn!("kick out {a:?}");
+        let until = time::Instant::now() + KICK_BAN;
+        self.kicked_peers.insert(bt_id, until);
+        self.candidates.insert(a.0, PeerState::Kicked(until));
+        let _ = self.handle_peer_leave(a);
     }
 }
 

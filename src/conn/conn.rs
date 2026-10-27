@@ -4,9 +4,10 @@ use tokio::time;
 use tracing::{debug, trace};
 
 #[cfg(feature = "metrics")]
-use crate::{api::InfoHash, metrics};
+use crate::metrics;
 
 use crate::{
+    api::InfoHash,
     conn::{BandwidthMode, Inflight, PeerAddr, inflight::Rejected},
     connection_manager::{ConnectionManagerHandle, CtrlOfSend},
     picker::{BlockRequests, PieceState},
@@ -89,6 +90,9 @@ pub struct PeerConn {
     #[cfg(feature = "blocktrace")]
     pub blocktrace_peer_id: Option<i64>,
 
+    /// The peer's self-reported BT id, used to ban it across reconnects.
+    pub peer_bt_id: InfoHash,
+
     /// Id of this connection, not of the peer address. A later connection to the
     /// same address gets a new one, so a stale `PeerLeave` can be told apart.
     pub conn_id: Version,
@@ -98,6 +102,7 @@ impl PeerConn {
     pub fn new(
         cm: ConnectionManagerHandle,
         conn_id: Version,
+        peer_bt_id: InfoHash,
         #[cfg(feature = "metrics")] info_hash: InfoHash,
         #[cfg(feature = "metrics")] peer_addr: SocketAddr,
         #[cfg(feature = "blocktrace")] blocktrace_peer_id: Option<i64>,
@@ -117,6 +122,7 @@ impl PeerConn {
             inflight: Inflight::new(time::Duration::from_secs(90)),
             stat: Default::default(),
             app_limited: false,
+            peer_bt_id,
 
             #[cfg(feature = "metrics")]
             metrics: metrics::PeerMetrics::new(&hex::encode(info_hash), &peer_addr),
