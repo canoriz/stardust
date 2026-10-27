@@ -39,8 +39,8 @@
 use crate::metadata::{FileMetadata, Magnet};
 use crate::session::Session;
 use crate::transmit_manager::{RunningCmd, TorrentTask};
-use axum::{extract::State, routing::post, Json, Router};
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use axum::{Json, Router, extract::State, routing::post};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;

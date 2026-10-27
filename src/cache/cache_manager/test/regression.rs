@@ -12,7 +12,7 @@ async fn dirty_cached_piece(
     tx: &mpsc::UnboundedSender<TmMsg>,
     rx: &mut mpsc::UnboundedReceiver<TmMsg>,
 ) {
-    handle.send_get_piece(key, tx.clone());
+    handle.send_get_piece(key, tx.clone(), false);
     pump(mgr).await;
     let (_, mut lease) = drain_ready(rx).pop().expect("initial lease");
     lease.as_mut()[0] = 0x5a;
@@ -39,7 +39,7 @@ async fn background_flush_serves_waiting_request() {
     };
     dirty_cached_piece(&mut mgr, &handle, key(0), &tx, &mut rx).await;
     assert_eq!(handle.vacant_count(), 0);
-    handle.send_get_piece(key(1), tx.clone());
+    handle.send_get_piece(key(1), tx.clone(), false);
     pump(&mut mgr).await;
     assert!(drain_ready(&mut rx).is_empty());
     // Age the dirty page and trigger the background flush path.
@@ -63,13 +63,13 @@ async fn duplicate_waiters_share_one_slot_entry() {
         info_hash,
         index: JointIndex::new(i, 0),
     };
-    handle.send_get_piece(key(0), tx.clone());
+    handle.send_get_piece(key(0), tx.clone(), false);
     pump(&mut mgr).await;
     let held = drain_ready(&mut rx);
     assert_eq!(held.len(), 1);
 
-    handle.send_get_piece(key(1), tx.clone());
-    handle.send_get_piece(key(1), tx.clone());
+    handle.send_get_piece(key(1), tx.clone(), false);
+    handle.send_get_piece(key(1), tx.clone(), false);
     pump(&mut mgr).await;
     assert_eq!(mgr.waiting_slot.len(), 1);
     assert_eq!(mgr.pending[&key(1)].len(), 2);
@@ -96,7 +96,7 @@ async fn clean_return_updates_eviction_index() {
         info_hash,
         index: JointIndex::new(i, 0),
     };
-    handle.send_get_piece(key(0), tx.clone());
+    handle.send_get_piece(key(0), tx.clone(), false);
     pump(&mut mgr).await;
     let held = drain_ready(&mut rx);
     assert_eq!(held.len(), 1);
@@ -107,7 +107,7 @@ async fn clean_return_updates_eviction_index() {
     assert!(mgr.assume_clear.contains(&key(0)));
     assert_eq!(handle.vacant_count(), 1);
     // A new key should evict the indexed clean buffer and reuse its slot.
-    handle.send_get_piece(key(1), tx.clone());
+    handle.send_get_piece(key(1), tx.clone(), false);
     pump(&mut mgr).await;
     assert_eq!(drain_ready(&mut rx).len(), 1);
     assert!(!mgr.cache.contains_key(&key(0)));
@@ -125,7 +125,7 @@ async fn write_during_flush_preserves_newer_data() {
         info_hash,
         index: JointIndex::new(i, 0),
     };
-    handle.send_get_piece(key(0), tx.clone());
+    handle.send_get_piece(key(0), tx.clone(), false);
     pump(&mut mgr).await;
     let (_, mut lease) = drain_ready(&mut rx).pop().unwrap();
     let file = match &mgr.torrents[&info_hash].0 {
@@ -141,7 +141,7 @@ async fn write_during_flush_preserves_newer_data() {
     });
     lease.as_mut()[0] = 0x22;
     drop(lease);
-    handle.send_get_piece(key(1), tx.clone());
+    handle.send_get_piece(key(1), tx.clone(), false);
     // Both messages are already queued; avoid holding a mutex across await.
     for _ in 0..2 {
         let msg = mgr.receiver.try_recv().unwrap();
@@ -178,10 +178,10 @@ async fn flush_completion_waits_for_lease_return() {
         info_hash,
         index: JointIndex::new(i, 0),
     };
-    handle.send_get_piece(key(0), tx.clone());
+    handle.send_get_piece(key(0), tx.clone(), false);
     pump(&mut mgr).await;
     let (_, mut lease) = drain_ready(&mut rx).pop().unwrap();
-    handle.send_get_piece(key(1), tx.clone());
+    handle.send_get_piece(key(1), tx.clone(), false);
     pump(&mut mgr).await;
     lease.as_mut()[0] = 1;
     let (done, completed) = oneshot::channel();
@@ -257,7 +257,7 @@ async fn failed_flush_retries_without_losing_waiter() {
         index: JointIndex::new(i, 0),
     };
     dirty_cached_piece(&mut mgr, &handle, key(0), &tx, &mut rx).await;
-    handle.send_get_piece(key(1), tx.clone());
+    handle.send_get_piece(key(1), tx.clone(), false);
     pump(&mut mgr).await;
     age_dirty_pages().await;
     // The first timer tick must report the failure without hot-looping.
@@ -383,7 +383,7 @@ async fn file_op_defers_until_lease_returned() {
         index: JointIndex::new(i, 0),
     };
     // Hold the lease so the torrent's I/O barrier stays raised (in_io > 0).
-    handle.send_get_piece(key(0), tx.clone());
+    handle.send_get_piece(key(0), tx.clone(), false);
     pump(&mut mgr).await;
     let held = drain_ready(&mut rx);
     assert_eq!(held.len(), 1);
@@ -621,14 +621,14 @@ async fn piece_request_deferred_by_pending_file_op_replays() {
         index: JointIndex::new(i, 0),
     };
     // Hold a lease so the rename cannot run yet.
-    handle.send_get_piece(key(0), tx.clone());
+    handle.send_get_piece(key(0), tx.clone(), false);
     pump(&mut mgr).await;
     let held = drain_ready(&mut rx);
     assert_eq!(held.len(), 1);
 
     let accept = queue_file_op(&handle, info_hash, rename_op(0, "x", 0, 0, false, &tx));
     // A new request arrives while the op is queued: it must be deferred, not served.
-    handle.send_get_piece(key(1), tx.clone());
+    handle.send_get_piece(key(1), tx.clone(), false);
     pump(&mut mgr).await;
     let id = accept.await.unwrap().expect("file op accepted");
     assert!(

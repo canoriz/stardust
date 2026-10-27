@@ -8,8 +8,8 @@ use std::{
 use bt_bencode::ByteString;
 use reqwest::Client;
 use serde::{
-    de::{self, Visitor},
     Deserialize, Serialize,
+    de::{self, Visitor},
 };
 use thiserror::Error;
 use tracing::warn;

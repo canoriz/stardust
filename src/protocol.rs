@@ -2834,7 +2834,7 @@ pub mod tests {
     use std::task::{Context, Poll, Wake};
 
     use super::*;
-    use tokio::io::{duplex, split, DuplexStream, ReadHalf, WriteHalf};
+    use tokio::io::{DuplexStream, ReadHalf, WriteHalf, duplex, split};
 
     impl Split for DuplexStream {
         type R = ReadHalf<DuplexStream>;

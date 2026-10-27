@@ -1,7 +1,6 @@
 use crate::bandwidth::Bandwidth;
 pub use crate::protocol::{self, BitField};
 use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
 
 mod block_picker;
 mod rarest_first;
@@ -358,7 +357,7 @@ fn block_size(blk_index: u32, piece_size: u32) -> u32 {
 
 #[cfg(test)]
 mod test {
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     use super::*;
 

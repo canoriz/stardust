@@ -1,5 +1,5 @@
 use clap::Parser;
-use stardust::{protocol::InfoHash, Session, SessionDump, SessionOpt};
+use stardust::{Session, SessionDump, SessionOpt, protocol::InfoHash};
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;

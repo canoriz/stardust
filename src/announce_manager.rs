@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::{CancellationToken, DropGuard};
-use tokio_util::time::{delay_queue, DelayQueue};
+use tokio_util::time::{DelayQueue, delay_queue};
 use tracing::info;
 
 pub use crate::protocol::InfoHash;

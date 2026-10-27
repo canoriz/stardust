@@ -3,22 +3,22 @@ use std::{
     fmt, io,
     ops::{Deref, DerefMut},
     sync::{
-        atomic::{AtomicU32, Ordering},
         Arc, Mutex,
+        atomic::{AtomicU32, Ordering},
     },
 };
 
 #[cfg(feature = "blocktrace")]
-use std::sync::{atomic::AtomicU64, LazyLock};
+use std::sync::{LazyLock, atomic::AtomicU64};
 
 use super::MutexBackFile;
+#[cfg(feature = "blocktrace")]
+use crate::cache::cache_manager::FlushOrigin;
 use crate::transmit_manager::Msg as TmMsg;
 use crate::{
     cache::cache_manager::{CacheMsg, GlobalPieceKey},
     protocol::Request,
 };
-#[cfg(feature = "blocktrace")]
-use crate::cache::cache_manager::FlushOrigin;
 use bytes::BytesMut;
 use tokio::sync::mpsc;
 use tokio::time;
@@ -428,6 +428,11 @@ impl PieceBuf {
         (s & (DIRTY | FLUSHING)) > 0
     }
 
+    /// Zero the buffer without marking it dirty; used when the disk read is skipped.
+    pub(crate) fn fill_zero(&mut self) {
+        self.buf.fill(0);
+    }
+
     pub fn is_flushing(&self) -> bool {
         let s = self.state.load(Ordering::Relaxed);
         (s & FLUSHING) > 0
@@ -615,8 +620,8 @@ mod test {
     use tokio::time;
 
     use super::{
-        read_from_file, CowBuf, FlushErr, JointIndex, MutexBackFile, PieceBuf, Pool, PooledBuf,
-        DIRTY, FLUSHING,
+        CowBuf, DIRTY, FLUSHING, FlushErr, JointIndex, MutexBackFile, PieceBuf, Pool, PooledBuf,
+        read_from_file,
     };
     use crate::backfile::BackFile;
 
@@ -1067,7 +1072,7 @@ mod test {
             cache_mgr_sender: None,
         };
         let _shared = pb.buf.clone(); // make Shared
-                                      // read_from_file must panic when buf is Shared.
+        // read_from_file must panic when buf is Shared.
         read_from_file(pb, file).unwrap();
     }
 }

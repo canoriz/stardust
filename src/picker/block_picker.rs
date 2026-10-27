@@ -327,8 +327,7 @@ impl PieceBlocks {
 
         let sub_sz = SUB_PIECE_SIZE as usize;
         let blocks_per_sub = sub_sz / BLOCK_SIZE;
-        let mut sub_receive_count =
-            vec![0; (self.block_map.len() * BLOCK_SIZE + sub_sz - 1) / sub_sz];
+        let mut sub_receive_count = vec![0; self.block_map.len().div_ceil(sub_sz)];
         let mut repick = IndexTree::new();
         for (i, b) in self.block_map.iter().enumerate() {
             match b {
@@ -1339,6 +1338,10 @@ impl BlockPicker {
     /// Call when some block request is rejected, and request for that block
     /// should be send to other peers again.
     pub fn peer_reject_block(&mut self, peer: &PeerAddr, req: Request) {
+        if !self.check_block_validity(&req) {
+            info!("ignore reject of invalid block {req:?}");
+            return;
+        }
         if let Some(b) = self.receiving.get_mut(&req.index) {
             assert!(b.is_all_requested_or_received(), "{}", req.index);
             assert!(!self.requesting.contains_key(&req.index), "{}", req.index);
@@ -1372,6 +1375,12 @@ impl BlockPicker {
         }
         if req.begin % (BLOCK_SIZE as u32) != 0 {
             info!("invalid req begin");
+            return false;
+        }
+        // `begin` is peer-controlled: an out-of-piece offset would index past
+        // `block_map` in `want_block` / `receive` / `revoke`.
+        if req.begin as usize >= self.piece_size(index) {
+            info!("invalid req begin {} out of piece {index}", req.begin);
             return false;
         }
         let (n_blocks, last_block_size) = self.n_blocks_and_last_block_size(index);
@@ -1794,6 +1803,23 @@ impl BlockPicker {
                 .unwrap_or(false)
     }
 
+    /// Blocks of this sub-piece already received
+    pub fn sub_received_count(&self, ji: JointIndex) -> usize {
+        let index = ji.index();
+        let sub = ji.sub_index() as usize;
+        if self.have(index) {
+            let (n_blocks, _) = self.n_blocks_and_last_block_size(index);
+            let blocks_per_sub = SUB_PIECE_SIZE as usize / BLOCK_SIZE;
+            let from = sub * blocks_per_sub;
+            let to = ((sub + 1) * blocks_per_sub).min(n_blocks);
+            return to - from;
+        }
+        self.requesting
+            .get(&index)
+            .or_else(|| self.receiving.get(&index))
+            .map_or(0, |b| b.sub_receive_count[sub])
+    }
+
     /// set we have this piece
     pub fn set_have(&mut self, index: u32, have: bool) {
         self.piece_picker.set_have(index, have);
@@ -1811,9 +1837,18 @@ mod test {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-    const PEER1: PeerAddr = (SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 1), 1);
-    const PEER2: PeerAddr = (SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 2), 2);
-    const PEER3: PeerAddr = (SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 3), 3);
+    const PEER1: PeerAddr = (
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 1),
+        1,
+    );
+    const PEER2: PeerAddr = (
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 2),
+        2,
+    );
+    const PEER3: PeerAddr = (
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 3),
+        3,
+    );
 
     fn picked_detail_at(pick_time: time::Instant, n_in_flight_when_picked: usize) -> PickedDetail {
         PickedDetail::new(
@@ -2026,6 +2061,39 @@ mod test {
             assert_eq!(b.all_request_or_received_before, 3);
             assert_eq!(b.requested_or_received_count, 3);
         }
+    }
+
+    /// Peer-controlled `begin` outside the piece must be rejected instead of
+    /// indexing past `block_map`.
+    #[test]
+    fn test_out_of_range_begin_is_ignored() {
+        use crate::picker::RarestPicker;
+        const PIECE_SIZE: usize = 16384 * 10;
+        let p = Box::new(RarestPicker::new(PIECE_SIZE as u64, PIECE_SIZE));
+        let mut b = BlockPicker::new_single_file(
+            PIECE_SIZE as u64,
+            PIECE_SIZE,
+            p,
+            time::Duration::from_secs(10),
+        );
+        b.peer_add(PEER1, PieceState::HaveAll);
+        b.select(0, true);
+        b.piece_picker.set_have(0, true);
+        let pb = b.piece_block_of(0);
+        b.requesting.insert(0, pb);
+
+        let req = Request {
+            index: 0,
+            begin: PIECE_SIZE as u32,
+            len: BLOCK_SIZE as u32,
+        };
+        assert!(b.get_block_status(&req).is_none());
+        assert!(!b.want_block(req));
+        let (complete, peers) = b.receive_block(req);
+        assert!(!complete.piece && !complete.sub_piece);
+        assert!(peers.is_empty());
+        // A REJECT for the same bogus block must not panic either.
+        b.peer_reject_block(&PEER1, req);
     }
 
     #[test]

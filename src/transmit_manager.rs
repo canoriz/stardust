@@ -991,7 +991,7 @@ impl TransmitWorker {
 
     /// Request a piece buffer, ensuring at most one GetPiece is outstanding
     /// per key. The entry also collects blocks that arrive before PieceBufReady.
-    fn request_piecebuf(&mut self, ji: JointIndex) {
+    fn request_piecebuf(&mut self, ji: JointIndex, skip_read: bool) {
         let state = self
             .waiting_for_piecebuf
             .entry(ji)
@@ -1010,6 +1010,7 @@ impl TransmitWorker {
                 index: ji,
             },
             self.self_handle.sender.clone(),
+            skip_read,
         );
     }
 
@@ -1074,7 +1075,7 @@ impl TransmitWorker {
             })
             .collect();
         for ji in ready {
-            self.request_piecebuf(ji);
+            self.request_piecebuf(ji, false);
         }
     }
 
@@ -1168,7 +1169,7 @@ impl TransmitWorker {
             RunningState::Checking { to_check, .. } => {
                 info!("dump is in checking state, start in stopped state and trigger re-check");
                 if let Some(piece) = to_check.first() {
-                    worker.request_piecebuf(JointIndex::new(*piece, 0));
+                    worker.request_piecebuf(JointIndex::new(*piece, 0), false);
                 }
             }
             RunningState::Downloading { .. } | RunningState::Seeding => {
@@ -2135,7 +2136,7 @@ impl TransmitWorker {
                 } else {
                     let first = JointIndex::new(index, 0);
                     if block_picker.have_sub(first) || force_check {
-                        self.request_piecebuf(first);
+                        self.request_piecebuf(first, false);
                     }
                     return Ok(false);
                 }
@@ -2168,7 +2169,7 @@ impl TransmitWorker {
                 JointIndex::from(req)
             };
             if block_picker.have_sub(next_ji) || force_check {
-                self.request_piecebuf(next_ji);
+                self.request_piecebuf(next_ji, false);
             }
         }
         info!("advance hash of piece {index} from sub piece {next_sub_piece} / {total_sub_pieces}");
@@ -2279,7 +2280,7 @@ impl TransmitWorker {
                 } else {
                     // load next piece to check
                     let next_piece = *to_check.first().unwrap();
-                    self.request_piecebuf(JointIndex::new(next_piece, 0));
+                    self.request_piecebuf(JointIndex::new(next_piece, 0), false);
                     None
                 }
             }
@@ -2585,11 +2586,12 @@ impl TransmitWorker {
             }
         }
 
-        // TODO: BlockPicker marks this block as Received before the bytes are
-        // copied into PieceBuf. Shutdown must not create a dump with this state
-        // unless waiting_for_piecebuf is drained successfully, or the picker
-        // state is rolled back / stop_wait returns an error. Otherwise restore
-        // can think a block is owned while its bytes never reached the cache.
+        // Received is set before the bytes reach PieceBuf, so state is dumped
+        // only after waiting_for_piecebuf drains (or the piece is rolled back).
+        // Sampled before receive_block: the counter includes the block being
+        // received once receive_block runs.
+        let ji = JointIndex::from(piece.to_request());
+        let skip_read = block_picker.sub_received_count(ji) == 0;
         let (complete, peers_revoked) = block_picker.receive_block(req);
         for addr in peers_revoked {
             if addr != *peer {
@@ -2619,8 +2621,7 @@ impl TransmitWorker {
             }
         }
 
-        let ji = JointIndex::from(piece.to_request());
-        self.request_piecebuf(ji);
+        self.request_piecebuf(ji, skip_read);
         let state = self
             .waiting_for_piecebuf
             .get_mut(&ji)
@@ -2678,7 +2679,7 @@ impl TransmitWorker {
             _ => None,
         };
         if let Some(first) = first {
-            self.request_piecebuf(JointIndex::new(first, 0));
+            self.request_piecebuf(JointIndex::new(first, 0), false);
         }
     }
 
@@ -3182,7 +3183,7 @@ impl TransmitWorker {
             .filter_map(|(ji, state)| (!state.requested).then_some(*ji))
             .collect();
         for ji in to_request {
-            self.request_piecebuf(ji);
+            self.request_piecebuf(ji, false);
         }
         while !self.waiting_for_piecebuf.is_empty()
             || !self.pending_renames.is_empty()

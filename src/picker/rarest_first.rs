@@ -287,9 +287,18 @@ mod test {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-    const PEER1: PeerAddr = (SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 1), 1);
-    const PEER2: PeerAddr = (SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 2), 2);
-    const PEER3: PeerAddr = (SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 3), 3);
+    const PEER1: PeerAddr = (
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 1),
+        1,
+    );
+    const PEER2: PeerAddr = (
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 2),
+        2,
+    );
+    const PEER3: PeerAddr = (
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 3),
+        3,
+    );
 
     fn init() -> Picker {
         // 6 pieces, last piece length 1
@@ -321,10 +330,11 @@ mod test {
         assert_eq!(p.pick_next(&PEER1), Some(2));
 
         // after pick, 2 should not in want_rarity
-        assert!(p
-            .want_rarity
-            .iter()
-            .fold(true, |acc, (_, idx)| acc && *idx != 2));
+        assert!(
+            p.want_rarity
+                .iter()
+                .fold(true, |acc, (_, idx)| acc && *idx != 2)
+        );
 
         p.set_have(2, false);
         assert_eq!(p.have.bitfield_bytes(), &[0]);

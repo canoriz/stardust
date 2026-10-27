@@ -3,7 +3,7 @@ use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
 use super::{ByteSocketAddr, VecNode4, VecNode6};
-use serde::{self, de, de::Visitor, Deserializer, Serializer};
+use serde::{self, Deserializer, Serializer, de, de::Visitor};
 
 impl serde::Serialize for VecNode4 {
     fn serialize<S>(&self, s: S) -> Result<S::Ok, S::Error>

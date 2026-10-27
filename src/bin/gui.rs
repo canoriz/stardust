@@ -24,10 +24,10 @@
 //!   - `Arc<Mutex<Target>>`          (GUI → frontend loop: connection target)
 //!   - `CancellationToken`           (GUI window close → shutdown)
 
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use clap::Parser;
 use eframe::egui;
-use std::sync::{mpsc as std_mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc as std_mpsc};
 use std::thread;
 use std::time::Duration;
 use tokio::sync::mpsc as async_mpsc;
@@ -36,10 +36,10 @@ use tokio_util::sync::CancellationToken;
 use tracing_subscriber::fmt::format::FmtSpan;
 
 use stardust::api::{
-    handle_rpc, ApiCommand, BufferPoolStats, CacheStats, RpcRequest, RpcResponse, RunningStateDump,
-    TorrentSource,
+    ApiCommand, BufferPoolStats, CacheStats, RpcRequest, RpcResponse, RunningStateDump,
+    TorrentSource, handle_rpc,
 };
-use stardust::{protocol::InfoHash, Session, SessionDump, SessionOpt};
+use stardust::{Session, SessionDump, SessionOpt, protocol::InfoHash};
 
 // ── CLI ────────────────────────────────────────────────────────────────────────
 

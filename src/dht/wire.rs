@@ -413,10 +413,12 @@ mod test {
                                 .as_ref()
                                 .into(),
                         ),
-                        values: Some(vec!["[240e:3b0:6a3:d004:90a8:171f:c106:be27]:63764"
-                            .parse::<SocketAddr>()
-                            .unwrap()
-                            .into()]),
+                        values: Some(vec![
+                            "[240e:3b0:6a3:d004:90a8:171f:c106:be27]:63764"
+                                .parse::<SocketAddr>()
+                                .unwrap()
+                                .into(),
+                        ]),
                     }),
                 },
             },

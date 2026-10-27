@@ -578,11 +578,7 @@ fn flush_batch(conn: &Connection, batch: &mut Vec<TraceMsg>) {
     }
 }
 
-fn handle_register(
-    conn: &Connection,
-    peers: &mut HashMap<(i64, [u8; 20]), i64>,
-    msg: TraceMsg,
-) {
+fn handle_register(conn: &Connection, peers: &mut HashMap<(i64, [u8; 20]), i64>, msg: TraceMsg) {
     match msg {
         TraceMsg::RegisterTorrent {
             info_hash,

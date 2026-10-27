@@ -133,7 +133,7 @@ fn downloading_state(worker: &mut TransmitWorker) -> &mut Downloading {
 fn queue_received_subpiece(worker: &mut TransmitWorker, sub: u32, byte: u8) {
     mark_subpiece_received(&mut downloading_state(worker).block_picker, sub);
     let ji = JointIndex::new(0, sub * SUB_PIECE_SIZE);
-    worker.request_piecebuf(ji);
+    worker.request_piecebuf(ji, false);
     let pending = worker.waiting_for_piecebuf.get_mut(&ji).unwrap();
     for i in 0..(SUB_PIECE_SIZE / 16384) {
         pending.blocks.push(BlockWaitingBuf {
@@ -196,10 +196,7 @@ async fn restore_received_subpiece0_rebuilds_hasher_to_subpiece1_offset() {
     pump(&mut worker).await;
     assert!(downloading_state(&mut worker).block_picker.have(0));
     assert_eq!(worker.runtime_status().process, 1.0);
-    assert!(matches!(
-        worker.running_state,
-        RunningState::Seeding
-    ));
+    assert!(matches!(worker.running_state, RunningState::Seeding));
     cleanup(worker, cache).await;
 }
 
@@ -247,7 +244,7 @@ async fn receive_subpiece1_rebuilds_hasher_from_subpiece0() {
     mark_subpiece_received(&mut downloading_state(&mut worker).block_picker, 0);
     mark_subpiece_received(&mut downloading_state(&mut worker).block_picker, 1);
     // Deliver a later sub-piece; this must recreate the hasher request at sub-piece 0.
-    worker.request_piecebuf(JointIndex::new(0, SUB_PIECE_SIZE));
+    worker.request_piecebuf(JointIndex::new(0, SUB_PIECE_SIZE), false);
     pump(&mut worker).await;
     assert!(downloading_state(&mut worker).block_picker.have(0));
     cleanup(worker, cache).await;
@@ -267,15 +264,12 @@ async fn out_of_order_subpieces_verify_without_rehashing_duplicates() {
     assert!(downloading_state(&mut worker).block_picker.have(0));
     change_state(&mut worker, RunningCmd::Pause).await;
     // Re-deliver both buffers after verification; they must not start a second hasher.
-    worker.request_piecebuf(JointIndex::new(0, 0));
-    worker.request_piecebuf(JointIndex::new(0, SUB_PIECE_SIZE));
+    worker.request_piecebuf(JointIndex::new(0, 0), false);
+    worker.request_piecebuf(JointIndex::new(0, SUB_PIECE_SIZE), false);
     pump(&mut worker).await;
     assert!(downloading_state(&mut worker).hasher.is_empty());
     assert!(worker.waiting_for_piecebuf.is_empty());
-    assert!(matches!(
-        worker.running_state,
-        RunningState::Paused
-    ));
+    assert!(matches!(worker.running_state, RunningState::Paused));
     cleanup(worker, cache).await;
 }
 
@@ -315,7 +309,7 @@ async fn write_error_clears_hasher_and_waiting_buffers() {
     // beginning of sub-piece 1.
     let (mut worker, cache) = new_downloading_worker();
     mark_subpiece_received(&mut downloading_state(&mut worker).block_picker, 0);
-    worker.request_piecebuf(JointIndex::new(0, 0));
+    worker.request_piecebuf(JointIndex::new(0, 0), false);
     pump(&mut worker).await;
     assert_eq!(
         downloading_state(&mut worker).hasher[&0].next_offset(),
@@ -325,7 +319,7 @@ async fn write_error_clears_hasher_and_waiting_buffers() {
 
     // Simulate a block from sub-piece 1 arriving while its PieceBuf is still
     // being requested. This block must be released if the earlier write fails.
-    worker.request_piecebuf(ji);
+    worker.request_piecebuf(ji, false);
     let pool = BufferPool::new(1, || BytesMut::zeroed(16384));
     worker
         .waiting_for_piecebuf
@@ -356,16 +350,15 @@ async fn write_error_clears_hasher_and_waiting_buffers() {
         })))
         .await;
     assert!(downloading_state(&mut worker).hasher.is_empty());
-    assert!(!downloading_state(&mut worker)
-        .block_picker
-        .have_sub(JointIndex::new(0, 0)));
+    assert!(
+        !downloading_state(&mut worker)
+            .block_picker
+            .have_sub(JointIndex::new(0, 0))
+    );
     assert_eq!(pool.available(), 1);
     let pending = &worker.waiting_for_piecebuf[&ji];
     assert!(pending.requested && pending.blocks.is_empty());
-    assert!(matches!(
-        worker.running_state,
-        RunningState::Fatal(_)
-    ));
+    assert!(matches!(worker.running_state, RunningState::Fatal(_)));
 
     // Resume and redownload the piece with deliberately corrupt data in
     // sub-piece 0. Reusing the old hasher would incorrectly reuse the old valid
@@ -387,13 +380,13 @@ async fn read_error_clears_hasher_and_waiting_data() {
     // Leave data waiting for one sub-piece, then inject a read failure for another.
     let (mut worker, cache) = new_downloading_worker();
     mark_subpiece_received(&mut downloading_state(&mut worker).block_picker, 0);
-    worker.request_piecebuf(JointIndex::new(0, 0));
+    worker.request_piecebuf(JointIndex::new(0, 0), false);
     pump(&mut worker).await;
 
     // worker holds hasher of piece 0
     assert!(!downloading_state(&mut worker).hasher.is_empty());
 
-    worker.request_piecebuf(JointIndex::new(0, 0));
+    worker.request_piecebuf(JointIndex::new(0, 0), false);
     worker
         .waiting_for_piecebuf
         .get_mut(&JointIndex::new(0, 0))
@@ -411,7 +404,7 @@ async fn read_error_clears_hasher_and_waiting_data() {
     let failed_ji = JointIndex::new(0, SUB_PIECE_SIZE);
     // Also keep a block waiting for the sub-piece whose cache read will fail.
     // The error path must remove this waiting entry entirely.
-    worker.request_piecebuf(failed_ji);
+    worker.request_piecebuf(failed_ji, false);
     worker
         .waiting_for_piecebuf
         .get_mut(&failed_ji)
@@ -436,14 +429,13 @@ async fn read_error_clears_hasher_and_waiting_data() {
     // The failed sub-piece entry is removed, while other sub-piece entries for
     // the same piece remain only as deduplicated requests with no stale blocks.
     assert!(!worker.waiting_for_piecebuf.contains_key(&failed_ji));
-    assert!(worker.waiting_for_piecebuf[&JointIndex::new(0, 0)]
-        .blocks
-        .is_empty());
+    assert!(
+        worker.waiting_for_piecebuf[&JointIndex::new(0, 0)]
+            .blocks
+            .is_empty()
+    );
     assert!(worker.waiting_for_piecebuf[&JointIndex::new(0, 0)].requested);
-    assert!(matches!(
-        worker.running_state,
-        RunningState::Fatal(_)
-    ));
+    assert!(matches!(worker.running_state, RunningState::Fatal(_)));
     cleanup(worker, cache).await;
 }
 
@@ -510,10 +502,7 @@ async fn completed_file_renamed_from_part_to_final() {
     assert!(worker.pending_renames.is_empty());
     assert!(std::path::Path::new(&path).exists());
     assert!(!std::path::Path::new(&format!("{path}.part")).exists());
-    assert!(matches!(
-        worker.running_state,
-        RunningState::Seeding
-    ));
+    assert!(matches!(worker.running_state, RunningState::Seeding));
     cleanup(worker, cache).await;
 }
 
@@ -549,10 +538,7 @@ async fn rename_failure_enters_fatal() {
         })
         .await;
     assert!(worker.pending_renames.is_empty());
-    assert!(matches!(
-        worker.running_state,
-        RunningState::Fatal(_)
-    ));
+    assert!(matches!(worker.running_state, RunningState::Fatal(_)));
     cleanup(worker, cache).await;
 }
 

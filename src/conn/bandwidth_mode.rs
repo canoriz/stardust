@@ -536,18 +536,9 @@ impl BandwidthMode {
         match self {
             BandwidthMode::Choked => time::Duration::from_millis(100),
             BandwidthMode::Startup { min_rtt, .. } => *min_rtt,
-            BandwidthMode::ProbeBW {
-                min_rtt,
-                ..
-            } => *min_rtt,
-            BandwidthMode::SlowDown {
-                min_rtt,
-                ..
-            } => *min_rtt,
-            BandwidthMode::ProbeRTT {
-                min_rtt,
-                ..
-            } => *min_rtt,
+            BandwidthMode::ProbeBW { min_rtt, .. } => *min_rtt,
+            BandwidthMode::SlowDown { min_rtt, .. } => *min_rtt,
+            BandwidthMode::ProbeRTT { min_rtt, .. } => *min_rtt,
         }
     }
 

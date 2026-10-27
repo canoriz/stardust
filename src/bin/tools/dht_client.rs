@@ -1,7 +1,7 @@
 use std::{sync::Arc, time::Duration};
 
-use stardust::dht::{DHTOption, NodeID, RpcAddr, DHT};
-use tokio::io::{stdin, stdout, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use stardust::dht::{DHT, DHTOption, NodeID, RpcAddr};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, stdin, stdout};
 use tracing::info;
 
 #[tokio::main]
@@ -30,7 +30,9 @@ async fn main() -> std::io::Result<()> {
         .id(id)
         .port(49999)
         .version("ST01".into())
-        .bootstrap_nodes(vec!["[2408:820c:5b38:1c0:ba6d:9133:2cac:b62b]:60416".into()])
+        .bootstrap_nodes(vec![
+            "[2408:820c:5b38:1c0:ba6d:9133:2cac:b62b]:60416".into(),
+        ])
         .build();
     let client = Arc::new(DHT::new(dht_opt));
 

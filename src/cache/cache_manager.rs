@@ -18,7 +18,7 @@ use super::MutexBackFile;
 #[cfg(feature = "blocktrace")]
 use crate::blocktrace;
 use crate::cache::simple_buffer::{
-    read_from_file, FlushErr, JointIndex, PieceBuf, Pool, POOL_SIZE, SUB_PIECE_SIZE,
+    FlushErr, JointIndex, POOL_SIZE, PieceBuf, Pool, SUB_PIECE_SIZE, read_from_file,
 };
 use crate::math_helper::piece_total_and_last_size;
 use crate::transmit_manager::Msg as TmMsg;
@@ -49,39 +49,41 @@ enum CacheEntry {
 /// the same key from being queued more than once.
 #[derive(Default)]
 struct WaitingSlots {
-    queue: VecDeque<GlobalPieceKey>,
+    queue: VecDeque<(GlobalPieceKey, bool)>,
     keys: HashSet<GlobalPieceKey>,
 }
 
 impl WaitingSlots {
-    fn push(&mut self, key: GlobalPieceKey) {
+    fn push(&mut self, key: GlobalPieceKey, skip_read: bool) {
         if self.keys.insert(key) {
-            self.queue.push_back(key);
+            self.queue.push_back((key, skip_read));
+            return;
+        }
+        if let Some((_, flag)) = self.queue.iter_mut().find(|(k, _)| *k == key) {
+            *flag &= skip_read;
         }
     }
 
-    fn pop(&mut self) -> Option<GlobalPieceKey> {
-        let key = self.queue.pop_front()?;
+    fn pop(&mut self) -> Option<(GlobalPieceKey, bool)> {
+        let (key, skip_read) = self.queue.pop_front()?;
         self.keys.remove(&key);
-        Some(key)
+        Some((key, skip_read))
     }
 
     fn remove_torrent(&mut self, info_hash: InfoHash) {
-        for k in self.queue.iter().filter(|key| key.info_hash == info_hash) {
-            self.keys.remove(&k);
-        }
-        self.queue.retain(|key| key.info_hash != info_hash);
+        self.keys.retain(|key| key.info_hash != info_hash);
+        self.queue.retain(|(key, _)| key.info_hash != info_hash);
     }
 
     /// Remove and return this torrent's queued keys (in queue order). Their
     /// waiters stay parked in `CacheManager::pending`; the caller re-`push`es
     /// these keys once its file-op barrier clears.
-    fn drain_torrent(&mut self, info_hash: InfoHash) -> Vec<GlobalPieceKey> {
+    fn drain_torrent(&mut self, info_hash: InfoHash) -> Vec<(GlobalPieceKey, bool)> {
         let mut drained = Vec::new();
-        self.queue.retain(|key| {
-            if key.info_hash == info_hash {
-                self.keys.remove(key);
-                drained.push(*key);
+        self.queue.retain(|&(k, skip_read)| {
+            if k.info_hash == info_hash {
+                self.keys.remove(&k);
+                drained.push((k, skip_read));
                 false
             } else {
                 true
@@ -151,6 +153,9 @@ pub enum CacheMsg {
     GetPiece {
         key: GlobalPieceKey,
         sender: mpsc::UnboundedSender<TmMsg>,
+        /// The caller guarantees no block of this sub-piece exists on disk, so
+        /// the buffer only needs zero-filling instead of a file read.
+        skip_read: bool,
     },
     /// Internal: file-read task completed.
     PieceLoaded {
@@ -207,8 +212,17 @@ pub struct CacheManagerHandle {
 }
 
 impl CacheManagerHandle {
-    pub fn send_get_piece(&self, key: GlobalPieceKey, sender: UnboundedSender<TmMsg>) {
-        let _ = self.sender.send(CacheMsg::GetPiece { key, sender });
+    pub fn send_get_piece(
+        &self,
+        key: GlobalPieceKey,
+        sender: UnboundedSender<TmMsg>,
+        skip_read: bool,
+    ) {
+        let _ = self.sender.send(CacheMsg::GetPiece {
+            key,
+            sender,
+            skip_read,
+        });
     }
 
     pub fn register_torrent(
@@ -509,7 +523,7 @@ struct IoState {
     /// Keys drained out of `waiting_slot` when the first file op was accepted.
     /// Their waiters remain in `CacheManager::pending`; re-queued once the whole
     /// `pending_ops` deque drains.
-    deferred_load_keys: Vec<GlobalPieceKey>,
+    deferred_load_keys: Vec<(GlobalPieceKey, bool)>,
     /// Piece requests deferred until queued file ops finish.
     pending_req: Vec<CacheMsg>,
 }
@@ -655,8 +669,12 @@ impl CacheManager {
                 self.handle_unregister_torrent(info_hash, done);
             }
 
-            CacheMsg::GetPiece { key, sender } => {
-                self.handle_get_piece(key, sender);
+            CacheMsg::GetPiece {
+                key,
+                sender,
+                skip_read,
+            } => {
+                self.handle_get_piece(key, sender, skip_read);
             }
 
             CacheMsg::PieceLoaded { key, buf } => {
@@ -725,7 +743,12 @@ impl CacheManager {
     }
 
     // TODO: if too many get_piece requests, make a queue and only read when there are available cache slots
-    fn handle_get_piece(&mut self, key: GlobalPieceKey, sender: UnboundedSender<TmMsg>) {
+    fn handle_get_piece(
+        &mut self,
+        key: GlobalPieceKey,
+        sender: UnboundedSender<TmMsg>,
+        skip_read: bool,
+    ) {
         self.stats.current.requests += 1;
         let ios = match self.torrents.get_mut(&key.info_hash) {
             Some((TorrentState::Unregisting(_), _)) => {
@@ -746,7 +769,11 @@ impl CacheManager {
                     ..
                 },
             )) if pending_ops.len() > 0 => {
-                pending_req.push(CacheMsg::GetPiece { key, sender });
+                pending_req.push(CacheMsg::GetPiece {
+                    key,
+                    sender,
+                    skip_read,
+                });
                 return;
             }
             Some((TorrentState::Registed(_), ios)) => ios,
@@ -788,7 +815,7 @@ impl CacheManager {
                 // Several callers may request the same key before its read starts.
                 // Keep one cache-load entry for that key and fan out the result to
                 // all waiters through `pending`.
-                self.waiting_slot.push(key);
+                self.waiting_slot.push(key, skip_read);
                 self.load_pending_pieces();
             }
         }
@@ -950,14 +977,14 @@ impl CacheManager {
         // Only pop a key once there is room for it: a popped key that is not
         // scheduled is lost, and nothing will ever put it back.
         while self.cache.len() < self.capacity && !self.waiting_slot.is_empty() {
-            let key = self.waiting_slot.pop().expect("checked non-empty");
+            let (key, skip_read) = self.waiting_slot.pop().expect("checked non-empty");
             // A duplicate stale queue entry may remain from an older request
             // sequence. The cache entry is authoritative; do not start a second
             // read for a key that is already being read or lent out.
             if self.cache.contains_key(&key) {
                 continue;
             }
-            self.spawn_piece_read(key);
+            self.spawn_piece_read(key, skip_read);
             self.cache.insert(key, CacheEntry::Reading);
             self.stats.reading += 1;
         }
@@ -1309,8 +1336,8 @@ impl CacheManager {
             ),
             None => return,
         };
-        for k in keys {
-            self.waiting_slot.push(k);
+        for (k, skip_read) in keys {
+            self.waiting_slot.push(k, skip_read);
         }
         for req in reqs {
             self.handle_msg(req);
@@ -1333,7 +1360,7 @@ impl CacheManager {
         self.trace_tick();
     }
 
-    fn spawn_piece_read(&mut self, key: GlobalPieceKey) {
+    fn spawn_piece_read(&mut self, key: GlobalPieceKey, skip_read: bool) {
         let info = match self.torrents.get_mut(&key.info_hash) {
             Some((TorrentState::Registed(ti), i)) => {
                 i.in_io += 1;
@@ -1395,7 +1422,7 @@ impl CacheManager {
         let pool = self.pool.clone();
         let handle = self.self_handle.clone();
 
-        let piece = PieceBuf::alloc(
+        let mut piece = PieceBuf::alloc(
             pool,
             key.info_hash,
             key.index,
@@ -1409,6 +1436,15 @@ impl CacheManager {
         );
         #[cfg(feature = "blocktrace")]
         self.trace_load_begin(key, piece.buf_id());
+
+        if skip_read {
+            // No block of this sub-piece exists on disk, so skip the read and
+            // hand out a zeroed buffer. `in_io` was already bumped above and is
+            // balanced by handle_piece_loaded / handle_return_piece as usual.
+            piece.fill_zero();
+            handle.piece_loaded(key, Ok(piece));
+            return;
+        }
 
         tokio::task::spawn_blocking(move || match read_from_file(piece, file) {
             Ok(p) => handle.piece_loaded(key, Ok(p)),
@@ -1812,15 +1848,15 @@ mod test {
 
         // Fill the cache and keep both leases, so nothing is evictable:
         // cache is at capacity and no piece is known clear.
-        handle.send_get_piece(key(0), tx.clone());
-        handle.send_get_piece(key(1), tx.clone());
+        handle.send_get_piece(key(0), tx.clone(), false);
+        handle.send_get_piece(key(1), tx.clone(), false);
         pump(&mut mgr).await;
         let mut held = drain_ready(&mut rx);
         assert_eq!(held.len(), 2);
         assert_eq!(mgr.cache.len(), mgr.capacity());
         assert_eq!(handle.vacant_count(), 0);
 
-        handle.send_get_piece(key(2), tx.clone());
+        handle.send_get_piece(key(2), tx.clone(), false);
         pump(&mut mgr).await;
         assert!(
             drain_ready(&mut rx).is_empty(),
@@ -1853,14 +1889,14 @@ mod test {
         };
 
         // Occupy the single slot with a lease we hold.
-        handle.send_get_piece(key(0), tx.clone());
+        handle.send_get_piece(key(0), tx.clone(), false);
         pump(&mut mgr).await;
         let mut held = drain_ready(&mut rx);
         assert_eq!(held.len(), 1);
 
         // Two requests park behind it; only one can fit at a time.
-        handle.send_get_piece(key(1), tx.clone());
-        handle.send_get_piece(key(2), tx.clone());
+        handle.send_get_piece(key(1), tx.clone(), false);
+        handle.send_get_piece(key(2), tx.clone(), false);
         pump(&mut mgr).await;
         assert!(drain_ready(&mut rx).is_empty());
         assert_eq!(mgr.waiting_slot.len(), 2);
