@@ -90,6 +90,10 @@ pub struct PeerConn {
     #[cfg(feature = "blocktrace")]
     pub blocktrace_peer_id: Option<i64>,
 
+    /// Microseconds this connection was the earliest requester of a sub-piece's
+    /// last-arriving block, accumulated since connect. Numerator of `lift`.
+    pub last_wait_us: u64,
+
     /// The peer's self-reported BT id, used to ban it across reconnects.
     pub peer_bt_id: InfoHash,
 
@@ -129,8 +133,15 @@ impl PeerConn {
 
             #[cfg(feature = "blocktrace")]
             blocktrace_peer_id,
+            last_wait_us: 0,
             conn_id,
         }
+    }
+
+    /// Bytes this peer delivered for us: received minus duplicate (discarded) bytes.
+    #[inline]
+    pub fn useful_bytes(&self) -> u64 {
+        self.stat.total_recv.saturating_sub(self.stat.total_discard)
     }
 
     pub fn choke(&mut self) {

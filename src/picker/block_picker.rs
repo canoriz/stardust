@@ -34,7 +34,7 @@ const REPICK_RESPONSE_DELAY: time::Duration = time::Duration::from_millis(2000);
 
 #[derive(Eq, PartialEq, Debug, Clone)]
 pub struct PickedDetail {
-    pub pick_time: time::Instant,
+    pub pick_time: tokio::time::Instant,
     pub n_in_flight_when_picked: usize,
     pub expected_response_time: time::Duration,
 
@@ -44,7 +44,7 @@ pub struct PickedDetail {
 
 impl PickedDetail {
     fn new(
-        pick_time: time::Instant,
+        pick_time: tokio::time::Instant,
         n_in_flight_when_picked: usize,
         avg_speed: f32,
         rtt: Option<time::Duration>,
@@ -57,19 +57,19 @@ impl PickedDetail {
         }
     }
 
-    fn expected_recv_at(&self) -> time::Instant {
+    fn expected_recv_at(&self) -> tokio::time::Instant {
         self.pick_time + self.expected_response_time
     }
 
     /// The instant the block this detail was picked for becomes repick-eligible:
-    fn repick_eligible_at(&self) -> time::Instant {
+    fn repick_eligible_at(&self) -> tokio::time::Instant {
         (self.expected_recv_at() + REPICK_RESPONSE_DELAY).min(self.pick_time + REPICK_AFTER_PICK)
     }
 }
 
 /// A block is repick-eligible only once every current requester is overdue, so
 /// its deadline is the latest per-requester `repick_eligible_at`.
-fn repick_deadline_of(requested: &HashMap<PeerAddr, PickedDetail>) -> Option<time::Instant> {
+fn repick_deadline_of(requested: &HashMap<PeerAddr, PickedDetail>) -> Option<tokio::time::Instant> {
     requested
         .values()
         .map(PickedDetail::repick_eligible_at)
@@ -175,6 +175,42 @@ where
     }
 }
 
+/// Per-sub-piece progress: `received` gates completion; the arrival pair and
+/// `blocker` carry the `lift` bookkeeping.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SubPieceState {
+    received: usize,
+    // the picker's clock is the tokio one everywhere, so tests advance it
+    /// When the previous block arrived, or when the `blocker` picked the last one
+    /// up if that came later.
+    second_last: Option<tokio::time::Instant>,
+    last: Option<tokio::time::Instant>,
+    /// Earliest still-outstanding requester of the last-arriving block; `lift`
+    /// bills this sub-piece's last wait to it.
+    blocker: Option<PeerAddr>,
+}
+
+impl SubPieceState {
+    fn new() -> Self {
+        Self {
+            received: 0,
+            second_last: None,
+            last: None,
+            blocker: None,
+        }
+    }
+}
+
+/// The sub-piece's last wait: how long its last block was the only outstanding
+/// block, and the earliest still-outstanding requester of that block. The wait
+/// is charged to that requester from when it picked the block up, so a rescuer
+/// pays only for its own hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LastWait {
+    pub wait: time::Duration,
+    pub blocker: Option<PeerAddr>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[cfg_attr(test, derive(PartialEq, Eq))]
 #[serde(into = "PieceBlockDump", from = "PieceBlockDump")]
@@ -197,10 +233,10 @@ struct PieceBlocks {
     block_map: Vec<BlockStatus>,
 
     /// book keeping of per-block repick deadline, used for repick and endgame
-    repick_deadline: IndexTree<usize, time::Instant>,
+    repick_deadline: IndexTree<usize, tokio::time::Instant>,
 
-    /// sub pieces receive count
-    sub_receive_count: Vec<usize>,
+    /// per-sub-piece receive count and last-wait bookkeeping
+    subs: Vec<SubPieceState>,
 }
 
 /// Serialized form of `PieceBlocks`: all `Requested` blocks are normalized to
@@ -229,7 +265,7 @@ impl From<PieceBlocks> for PieceBlockDump {
             piece_index: pb.piece_index,
             last_block_size: pb.last_block_size,
             block_map,
-            sub_receive_count: pb.sub_receive_count,
+            sub_receive_count: pb.subs.iter().map(|s| s.received).collect(),
         }
     }
 }
@@ -254,7 +290,15 @@ impl From<PieceBlockDump> for PieceBlocks {
             received_count,
             block_map: d.block_map,
             repick_deadline: IndexTree::new(),
-            sub_receive_count: d.sub_receive_count,
+            // arrival instants of already-received blocks are not persisted
+            subs: d
+                .sub_receive_count
+                .into_iter()
+                .map(|received| SubPieceState {
+                    received,
+                    ..SubPieceState::new()
+                })
+                .collect(),
         }
     }
 }
@@ -271,7 +315,21 @@ impl PieceBlocks {
         let blocks_per_sub = (SUB_PIECE_SIZE as usize) / BLOCK_SIZE;
         let from = index * blocks_per_sub;
         let to = ((index + 1) * blocks_per_sub).min(self.block_map.len());
-        self.sub_receive_count[index] == to - from
+        self.subs[index].received == to - from
+    }
+
+    /// Take the sub-piece's arrival pair as its last wait; `None` if fewer than
+    /// two blocks have landed or the pair was already taken.
+    fn take_last_wait(&mut self, in_piece_offset: u32) -> Option<LastWait> {
+        let sub = (in_piece_offset / SUB_PIECE_SIZE) as usize;
+        let st = self.subs.get_mut(sub)?;
+        let last = st.last.take()?;
+        let second_last = st.second_last.take()?;
+        // `second_last` was already clamped to the blocker's own pick.
+        Some(LastWait {
+            wait: last - second_last,
+            blocker: st.blocker,
+        })
     }
 
     fn is_all_not_requested(&self) -> bool {
@@ -298,14 +356,14 @@ impl PieceBlocks {
             received_count: 0,
             block_map,
             repick_deadline: IndexTree::new(),
-            sub_receive_count: Vec::new(),
+            subs: Vec::new(),
         };
         pb.rebuild_cursors();
         pb
     }
 
     /// Test helper: recompute every derived cursor field from `block_map`
-    /// (`*_count`, the contiguous requested/received prefix, `sub_receive_count`,
+    /// (`*_count`, the contiguous requested/received prefix, `subs`,
     /// and `repick_deadline` from each block's requesters).
     #[cfg(test)]
     fn rebuild_cursors(&mut self) {
@@ -325,13 +383,12 @@ impl PieceBlocks {
             .filter(|b| matches!(b, BlockStatus::Requested { .. } | BlockStatus::Received))
             .count();
 
-        let sub_sz = SUB_PIECE_SIZE as usize;
-        let blocks_per_sub = sub_sz / BLOCK_SIZE;
-        let mut sub_receive_count = vec![0; self.block_map.len().div_ceil(sub_sz)];
+        let blocks_per_sub = (SUB_PIECE_SIZE as usize) / BLOCK_SIZE;
+        let mut subs = vec![SubPieceState::new(); self.block_map.len().div_ceil(blocks_per_sub)];
         let mut repick = IndexTree::new();
         for (i, b) in self.block_map.iter().enumerate() {
             match b {
-                BlockStatus::Received => sub_receive_count[i / blocks_per_sub] += 1,
+                BlockStatus::Received => subs[i / blocks_per_sub].received += 1,
                 BlockStatus::Requested { requested, .. } => {
                     if let Some(deadline) = repick_deadline_of(requested) {
                         repick.insert(i, deadline);
@@ -340,7 +397,7 @@ impl PieceBlocks {
                 BlockStatus::NotRequested { .. } => {}
             }
         }
-        self.sub_receive_count = sub_receive_count;
+        self.subs = subs;
         self.repick_deadline = repick;
     }
 
@@ -372,7 +429,7 @@ impl PieceBlocks {
 
         let mut count = 0;
         let n_blocks = self.block_map.len();
-        let now = time::Instant::now();
+        let now = tokio::time::Instant::now();
 
         while self.all_request_or_received_before < self.block_map.len() && count < n {
             let mut from = None;
@@ -582,24 +639,53 @@ impl PieceBlocks {
     fn receive(&mut self, req: Request) -> Vec<PeerAddr> {
         // input req must be valid
         let b_index = (req.begin as usize) / BLOCK_SIZE;
+        let sub = (b_index * BLOCK_SIZE) / (SUB_PIECE_SIZE as usize);
+        // A duplicate must not move the last wait: only the first arrival of a
+        // block bounds the sub-piece's wait.
+        if matches!(self.block_map[b_index], BlockStatus::Received) {
+            return vec![];
+        }
+
+        // `blocker` travels with `last`, so it always names the last-arriving
+        // block's requester; revoked peers are already pruned from `requested`.
+        let (blocker, pick_at) = match &self.block_map[b_index] {
+            BlockStatus::Requested { requested, .. } => {
+                match requested.iter().min_by_key(|(_, d)| d.pick_time) {
+                    Some((a, d)) => (Some(*a), Some(d.pick_time)),
+                    None => (None, None),
+                }
+            }
+            BlockStatus::NotRequested { .. } => (None, None),
+            BlockStatus::Received => unreachable!("duplicates returned above"),
+        };
+        let now = tokio::time::Instant::now();
+        let st = &mut self.subs[sub];
+        st.blocker = blocker;
+        // The wait may only start when its requester took the block on: a
+        // rescuer must not pay for the gap that preceded its pick.
+        st.second_last = match (st.last, pick_at) {
+            (Some(prev), Some(pick_at)) => Some(prev.max(pick_at)),
+            (prev, _) => prev,
+        };
+        st.last = Some(now);
+        st.received += 1;
+
         let b = &mut self.block_map[b_index];
         match b {
             BlockStatus::NotRequested { .. } => {
                 self.received_count += 1;
                 self.requested_or_received_count += 1;
-                self.sub_receive_count[(b_index * BLOCK_SIZE) / (SUB_PIECE_SIZE as usize)] += 1;
                 *b = BlockStatus::Received;
                 vec![]
             }
             BlockStatus::Requested { requested, .. } => {
                 self.received_count += 1;
-                self.sub_receive_count[(b_index * BLOCK_SIZE) / (SUB_PIECE_SIZE as usize)] += 1;
                 let ret = requested.keys().map(|x| *x).collect();
                 *b = BlockStatus::Received;
                 self.repick_deadline.remove(&b_index);
                 ret
             }
-            BlockStatus::Received => vec![],
+            BlockStatus::Received => unreachable!("duplicates returned above"),
         }
     }
 
@@ -650,7 +736,7 @@ impl PieceBlocks {
         remove: F,
         revoked_reqs: &mut HashMap<PeerAddr, Vec<Request>>,
     ) where
-        F: Fn(&PeerAddr, &time::Instant) -> bool,
+        F: Fn(&PeerAddr, &tokio::time::Instant) -> bool,
     {
         let n_blocks = self.block_map.len();
         for (i, b) in self.block_map.iter_mut().enumerate().rev() {
@@ -756,7 +842,7 @@ pub struct BlockPicker {
     receiving: BTreeMap<PieceIndex, PieceBlocks>,
 
     // previous time the timeout request check runs
-    prev_time_check: time::Instant,
+    prev_time_check: tokio::time::Instant,
 
     no_response_timeout: time::Duration,
 
@@ -794,7 +880,7 @@ impl BlockPicker {
             piece_picker,
             requesting: BTreeMap::new(),
             receiving: BTreeMap::new(),
-            prev_time_check: time::Instant::now(),
+            prev_time_check: tokio::time::Instant::now(),
             no_response_timeout,
             endgame: false,
             file_tracker: FileTracker::new(meta),
@@ -820,7 +906,7 @@ impl BlockPicker {
             piece_picker,
             requesting: BTreeMap::new(),
             receiving: BTreeMap::new(),
-            prev_time_check: time::Instant::now(),
+            prev_time_check: tokio::time::Instant::now(),
             no_response_timeout,
             endgame: false,
             file_tracker: FileTracker::from_lengths(piece_size as u64, [total_size]),
@@ -850,6 +936,7 @@ impl BlockPicker {
     fn piece_block_of(&self, index: u32) -> PieceBlocks {
         let (n_blocks, last_block_size) = self.n_blocks_and_last_block_size(index);
         let sub_sz = SUB_PIECE_SIZE as usize;
+        let n_subs = (n_blocks * BLOCK_SIZE).div_ceil(sub_sz);
         PieceBlocks {
             piece_index: index,
             last_block_size,
@@ -863,8 +950,19 @@ impl BlockPicker {
             requested_or_received_count: 0,
             received_count: 0,
             repick_deadline: IndexTree::new(),
-            sub_receive_count: vec![0; (n_blocks * BLOCK_SIZE + sub_sz - 1) / sub_sz],
+            subs: vec![SubPieceState::new(); n_subs],
         }
+    }
+
+    /// Last wait of the sub-piece at `in_piece_offset`; `None` once taken or when the
+    /// piece is not tracked (verified, or restored from a dump).
+    pub fn take_last_wait(&mut self, index: u32, in_piece_offset: u32) -> Option<LastWait> {
+        if let Some(b) = self.receiving.get_mut(&index) {
+            return b.take_last_wait(in_piece_offset);
+        }
+        self.requesting
+            .get_mut(&index)
+            .and_then(|b| b.take_last_wait(in_piece_offset))
     }
 
     pub fn get_block_status(&self, req: &Request) -> Option<&BlockStatus> {
@@ -951,7 +1049,7 @@ impl BlockPicker {
 
         if self.prev_time_check.elapsed() >= time::Duration::from_secs(1) {
             self.revoke_unrespond(revoked);
-            self.prev_time_check = time::Instant::now();
+            self.prev_time_check = tokio::time::Instant::now();
         }
 
         let rush_mode = n_cache_vacant < POOL_SIZE * 1 / 4;
@@ -1497,7 +1595,7 @@ impl BlockPicker {
     /// Mark blocks as `NotRequested` if they are `Requested` and did not respond
     /// longer than timeout
     fn revoke_unrespond(&mut self, revoked: &mut HashMap<PeerAddr, Vec<Request>>) {
-        let no_response = |_: &PeerAddr, at: &time::Instant| at.elapsed() > NO_RESPONSE_TIMEOUT;
+        let no_response = |_: &PeerAddr, at: &tokio::time::Instant| at.elapsed() > NO_RESPONSE_TIMEOUT;
         for (index, blocks) in self.receiving.extract_if(.., |_, blocks| {
             blocks.revoke_all_requested_if(no_response, revoked);
             !blocks.is_all_requested_or_received()
@@ -1692,7 +1790,7 @@ impl BlockPicker {
 
     pub fn peer_leave(&mut self, addr: &PeerAddr) {
         // Revoke all blocks requested by this peer so they become available immediately.
-        let requested_peer = |p: &PeerAddr, _: &time::Instant| p == addr;
+        let requested_peer = |p: &PeerAddr, _: &tokio::time::Instant| p == addr;
         let mut revoked = HashMap::new();
         for (i, b) in self.receiving.extract_if(.., |_, b| {
             b.revoke_all_requested_if(requested_peer, &mut revoked);
@@ -1731,7 +1829,7 @@ impl BlockPicker {
     }
 
     pub fn peer_choke(&mut self, peer: &PeerAddr) {
-        let requested_peer = |p: &PeerAddr, _: &time::Instant| p == peer;
+        let requested_peer = |p: &PeerAddr, _: &tokio::time::Instant| p == peer;
 
         let mut revoked = HashMap::new();
         for (i, b) in self.receiving.extract_if(.., |_, b| {
@@ -1817,7 +1915,7 @@ impl BlockPicker {
         self.requesting
             .get(&index)
             .or_else(|| self.receiving.get(&index))
-            .map_or(0, |b| b.sub_receive_count[sub])
+            .map_or(0, |b| b.subs[sub].received)
     }
 
     /// set we have this piece
@@ -1850,7 +1948,7 @@ mod test {
         3,
     );
 
-    fn picked_detail_at(pick_time: time::Instant, n_in_flight_when_picked: usize) -> PickedDetail {
+    fn picked_detail_at(pick_time: tokio::time::Instant, n_in_flight_when_picked: usize) -> PickedDetail {
         PickedDetail::new(
             pick_time,
             n_in_flight_when_picked,
@@ -2005,7 +2103,7 @@ mod test {
                     revoked: HashMap::new(),
                 },
                 BlockStatus::Requested {
-                    requested: HashMap::from([(PEER1, picked_detail_at(time::Instant::now(), 0))]),
+                    requested: HashMap::from([(PEER1, picked_detail_at(tokio::time::Instant::now(), 0))]),
                     revoked: HashMap::new(),
                 },
                 BlockStatus::NotRequested {
@@ -2238,7 +2336,7 @@ mod test {
             vec![BlockStatus::Requested {
                 requested: HashMap::from([(
                     PEER1,
-                    PickedDetail::new(time::Instant::now(), 4, 1024.0, Some(time::Duration::ZERO)),
+                    PickedDetail::new(tokio::time::Instant::now(), 4, 1024.0, Some(time::Duration::ZERO)),
                 )]),
                 revoked: HashMap::new(),
             }],
@@ -2277,7 +2375,7 @@ mod test {
                 requested: HashMap::from([(
                     PEER1,
                     PickedDetail::new(
-                        time::Instant::now(),
+                        tokio::time::Instant::now(),
                         0,
                         4096.0,
                         Some(time::Duration::from_secs(10)),
@@ -2320,7 +2418,7 @@ mod test {
                 BlockStatus::Requested {
                     requested: HashMap::from([(
                         PEER1,
-                        picked_detail_at(time::Instant::now() - time::Duration::from_secs(6), 0),
+                        picked_detail_at(tokio::time::Instant::now() - time::Duration::from_secs(6), 0),
                     )]),
                     revoked: HashMap::new(),
                 };
@@ -2376,9 +2474,9 @@ mod test {
             let (mut picker, peers) = make_block_picker_with_state(3, 4 * BLOCK_SIZE, 2, 0, 0);
             // Endgame must allow repicking even fresh requests; rush needs expired ones.
             let picked_at = if endgame {
-                time::Instant::now()
+                tokio::time::Instant::now()
             } else {
-                time::Instant::now() - time::Duration::from_secs(6)
+                tokio::time::Instant::now() - time::Duration::from_secs(6)
             };
             let mut map = vec![
                 BlockStatus::Requested {
@@ -2446,7 +2544,7 @@ mod test {
             vec![BlockStatus::Requested {
                 requested: HashMap::from([(
                     PEER1,
-                    picked_detail_at(time::Instant::now() - time::Duration::from_secs(6), 0),
+                    picked_detail_at(tokio::time::Instant::now() - time::Duration::from_secs(6), 0),
                 )]),
                 revoked: HashMap::new(),
             }],
@@ -2485,7 +2583,7 @@ mod test {
                 requested: HashMap::from([(
                     PEER1,
                     PickedDetail::new(
-                        time::Instant::now(),
+                        tokio::time::Instant::now(),
                         0,
                         BLOCK_SIZE as f32,
                         Some(time::Duration::ZERO),
@@ -2530,6 +2628,251 @@ mod test {
         // b.check_block_validity(req)
         // b.have(index);
         // b.is_finished();
+    }
+
+    // ---- lift: sub-piece last wait ----
+
+    /// Piece declared from an explicit per-block map; the derived cursors
+    /// (counts, subs, repick deadlines) are rebuilt from it.
+    fn blocks(block_map: Vec<BlockStatus>) -> PieceBlocks {
+        PieceBlocks::from_block_map(0, BLOCK_SIZE, block_map)
+    }
+
+    fn not_requested_block() -> BlockStatus {
+        BlockStatus::NotRequested {
+            revoked: HashMap::new(),
+        }
+    }
+
+    /// Block requested by `reqs` `(peer, pick_time)`, already given up by
+    /// `revoked` `(peer, pick_time)`.
+    fn requested_block(
+        reqs: &[(PeerAddr, tokio::time::Instant)],
+        revoked: &[(PeerAddr, tokio::time::Instant)],
+    ) -> BlockStatus {
+        BlockStatus::Requested {
+            requested: reqs
+                .iter()
+                .map(|(p, t)| (*p, picked_detail_at(*t, 0)))
+                .collect(),
+            revoked: revoked
+                .iter()
+                .map(|(p, t)| (*p, picked_detail_at(*t, 0)))
+                .collect(),
+        }
+    }
+
+    /// All-`NotRequested` piece of `n` blocks.
+    fn plain_blocks(n: usize) -> PieceBlocks {
+        blocks(vec![not_requested_block(); n])
+    }
+
+    /// A pick far enough in the past that it never bounds a test's wait.
+    fn picked_long_ago() -> tokio::time::Instant {
+        tokio::time::Instant::now() - time::Duration::from_secs(1)
+    }
+
+    fn block_req(i: usize) -> Request {
+        Request {
+            index: 0,
+            begin: (i * BLOCK_SIZE) as u32,
+            len: BLOCK_SIZE as u32,
+        }
+    }
+
+    /// Mirrors the caller: only a completed sub-piece settles a last wait.
+    fn take_completed_last_wait(pb: &mut PieceBlocks, i: usize) -> Option<LastWait> {
+        if !pb.is_sub_all_received(block_req(i).begin) {
+            return None;
+        }
+        pb.take_last_wait(block_req(i).begin)
+    }
+
+    /// The last wait is the gap between the last two arrivals, and the `blocker` is the
+    /// earliest still-outstanding requester of the last-arriving block — not of
+    /// the highest-indexed one.
+    #[tokio::test(start_paused = true)]
+    async fn test_last_wait_measures_last_two_arrivals() {
+        let t0 = picked_long_ago();
+        let mut pb = blocks(vec![
+            requested_block(&[(PEER3, t0)], &[]),
+            requested_block(&[(PEER2, t0)], &[]),
+            requested_block(&[(PEER1, t0)], &[]),
+        ]);
+        // block 1 arrives last, so it is the gating block
+        pb.receive(block_req(0));
+        pb.receive(block_req(2));
+        tokio::time::advance(time::Duration::from_millis(120)).await;
+        pb.receive(block_req(1));
+
+        let g = take_completed_last_wait(&mut pb, 1).expect("sub is complete");
+        assert!(g.wait >= time::Duration::from_millis(120), "{:?}", g.wait);
+        assert!(g.wait < time::Duration::from_secs(1), "{:?}", g.wait);
+        assert_eq!(
+            g.blocker,
+            Some(PEER2),
+            "blocker must be the last-arriving block's requester"
+        );
+    }
+
+    /// A duplicate must not refresh the arrival pair nor inflate the sub count:
+    /// only a block's first arrival bounds the sub-piece's wait.
+    #[tokio::test(start_paused = true)]
+    async fn test_duplicate_does_not_move_last_wait() {
+        let t0 = picked_long_ago();
+        let mut pb = blocks(vec![
+            requested_block(&[(PEER1, t0)], &[]),
+            requested_block(&[(PEER1, t0)], &[]),
+        ]);
+
+        pb.receive(block_req(0));
+        let first_arrival = pb.subs[0].last.expect("first arrival recorded");
+        tokio::time::advance(time::Duration::from_millis(60)).await;
+        assert!(pb.receive(block_req(0)).is_empty(), "duplicate is a no-op");
+        assert_eq!(
+            pb.subs[0].last,
+            Some(first_arrival),
+            "duplicate moved `last`"
+        );
+        assert_eq!(pb.subs[0].received, 1, "duplicate inflated the sub count");
+
+        tokio::time::advance(time::Duration::from_millis(60)).await;
+        pb.receive(block_req(1));
+        let g = take_completed_last_wait(&mut pb, 1).expect("sub is complete");
+        assert!(g.wait >= time::Duration::from_millis(120), "{:?}", g.wait);
+    }
+
+    /// A peer that only picks up a block after its previous holder gave up is
+    /// charged from its own pick, not from the previous arrival: the gap it did
+    /// not cause is nobody's.
+    #[tokio::test(start_paused = true)]
+    async fn test_rescuer_is_not_charged_the_gap_before_its_pick() {
+        // PEER1 holds the last block for the whole 500 ms gap and is revoked;
+        // PEER2 picks it up 50 ms before delivering it.
+        let mut pb = blocks(vec![
+            requested_block(&[(PEER1, picked_long_ago())], &[]),
+            not_requested_block(),
+        ]);
+
+        pb.receive(block_req(0));
+        tokio::time::advance(time::Duration::from_millis(500)).await;
+        // the take-over: PEER2 picks the block up, PEER1 is out
+        pb.block_map[1] = requested_block(
+            &[(
+                PEER2,
+                tokio::time::Instant::now() - time::Duration::from_millis(50),
+            )],
+            &[(PEER1, picked_long_ago())],
+        );
+        pb.receive(block_req(1));
+
+        let g = take_completed_last_wait(&mut pb, 1).expect("sub is complete");
+        assert_eq!(g.blocker, Some(PEER2));
+        assert!(g.wait >= time::Duration::from_millis(50), "{:?}", g.wait);
+        assert!(
+            g.wait < time::Duration::from_millis(400),
+            "the gap before the pick must not be charged: {:?}",
+            g.wait
+        );
+    }
+
+    /// `take_last_wait` settles a sub-piece once: the second call is `None`, and an
+    /// incomplete sub-piece has no last wait.
+    #[test]
+    fn test_take_last_wait_is_one_shot() {
+        let t0 = tokio::time::Instant::now();
+        let mut pb = blocks(vec![
+            requested_block(&[(PEER1, t0)], &[]),
+            requested_block(&[(PEER1, t0)], &[]),
+        ]);
+
+        pb.receive(block_req(0));
+        assert!(
+            take_completed_last_wait(&mut pb, 0).is_none(),
+            "incomplete sub has no last wait"
+        );
+
+        pb.receive(block_req(1));
+        assert!(take_completed_last_wait(&mut pb, 1).is_some());
+        assert!(
+            take_completed_last_wait(&mut pb, 1).is_none(),
+            "second take must be None"
+        );
+    }
+
+    /// One last wait per sub-piece: a 128-block piece has four, settled by blocks
+    /// 31/63/95/127; a 16-block piece has a single sub-piece.
+    #[test]
+    fn test_last_wait_per_sub_piece() {
+        let t0 = tokio::time::Instant::now();
+        let mut pb = blocks(vec![requested_block(&[(PEER1, t0)], &[]); 128]);
+        assert_eq!(pb.subs.len(), 4);
+
+        let mut settled = Vec::new();
+        for i in 0..128 {
+            pb.receive(block_req(i));
+            if let Some(g) = take_completed_last_wait(&mut pb, i) {
+                settled.push((i, g));
+            }
+        }
+        assert_eq!(
+            settled.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            vec![31, 63, 95, 127],
+            "each last wait settles on its sub-piece's last block"
+        );
+        assert!(settled.iter().all(|(_, g)| g.blocker == Some(PEER1)));
+
+        assert_eq!(plain_blocks(16).subs.len(), 1);
+    }
+
+    /// A 128-block piece rebuilds four sub-pieces (the old `div_ceil(sub_sz)`
+    /// produced one and panicked on `subs[i / blocks_per_sub]`), and a restored
+    /// dump carries counts but no arrival instants, so it yields no last wait.
+    #[test]
+    fn test_subs_survive_dump_restore() {
+        let t0 = tokio::time::Instant::now();
+        let mut pb = blocks(vec![requested_block(&[(PEER1, t0)], &[]); 128]);
+        pb.receive(block_req(3));
+        assert_eq!(pb.subs.len(), 4);
+        assert_eq!(pb.subs[0].received, 1);
+
+        let dump: PieceBlockDump = pb.clone().into();
+        assert_eq!(dump.sub_receive_count, vec![1, 0, 0, 0]);
+
+        let mut restored = PieceBlocks::from(dump);
+        assert_eq!(restored.subs.len(), 4);
+        assert_eq!(restored.subs[0].received, 1);
+        assert!(
+            restored.take_last_wait(block_req(3).begin).is_none(),
+            "restored pieces have no arrival instants"
+        );
+    }
+
+    /// `BlockPicker::take_last_wait` finds the piece in `requesting` or `receiving`,
+    /// and is a no-op for a piece it does not track.
+    #[test]
+    fn test_block_picker_take_last_wait_lookup() {
+        let (mut bp, peers) = make_block_picker_with_state(1, SUB_PIECE_SIZE as usize, 1, 1, 0);
+        let peer = peers[0];
+        let n_blocks = (SUB_PIECE_SIZE as usize) / BLOCK_SIZE;
+        for i in 0..n_blocks {
+            let req = block_req(i);
+            let (complete, _) = bp.receive_block(req);
+            if i + 1 < n_blocks {
+                assert!(!complete.sub_piece);
+            } else {
+                assert!(complete.sub_piece);
+                let g = bp
+                    .take_last_wait(0, req.begin)
+                    .expect("last wait after the last block");
+                assert_eq!(g.blocker, Some(peer));
+                assert!(bp.take_last_wait(0, req.begin).is_none(), "one-shot");
+            }
+        }
+        assert!(
+            bp.take_last_wait(1, 0).is_none(),
+            "untracked piece has no last wait"
+        );
     }
 
     // ---- Performance benchmarks ----
@@ -2609,7 +2952,7 @@ mod test {
         let (mut bp, peers) =
             make_block_picker_with_state(N_PIECES, PIECE_SIZE, N_PEERS, N_REQUESTING, N_RECEIVING);
 
-        let start = std::time::Instant::now();
+        let start = tokio::time::Instant::now();
         for i in 0..ITERATIONS {
             let peer = &peers[i % N_PEERS];
             let mut revoked = HashMap::new();
@@ -2668,7 +3011,7 @@ mod test {
         );
 
         // Measure n=0 path (ticker only, no actual picks)
-        let start = std::time::Instant::now();
+        let start = tokio::time::Instant::now();
         for i in 0..ITERATIONS {
             let peer = &peers[i % N_PEERS];
             let mut revoked = HashMap::new();
@@ -2686,7 +3029,7 @@ mod test {
         let per_call_n0 = elapsed_n0 / ITERATIONS as u32;
 
         // Measure n=1 path (pick 1 block per call, also receive blocks to keep state realistic)
-        let start = std::time::Instant::now();
+        let start = tokio::time::Instant::now();
         let mut max_req = 0usize;
         let mut max_recv = 0usize;
         let mut block_cursor = 0u32; // track which blocks we've "received"
@@ -2754,7 +3097,7 @@ mod test {
         // Now benchmark receiving blocks
         let n_blocks_per_piece = PIECE_SIZE / BLOCK_SIZE;
         let total_blocks = N_PIECES * n_blocks_per_piece;
-        let start = std::time::Instant::now();
+        let start = tokio::time::Instant::now();
         let mut received_count = 0;
         for piece_idx in 0..N_PIECES as u32 {
             for block_idx in 0..n_blocks_per_piece as u32 {
@@ -2810,7 +3153,7 @@ mod test {
             bp.receiving.len()
         );
 
-        let start = std::time::Instant::now();
+        let start = tokio::time::Instant::now();
         for _ in 0..ITERATIONS {
             let mut revoked = HashMap::new();
             bp.revoke_unrespond(&mut revoked);
@@ -2856,13 +3199,13 @@ mod test {
                         };
                         32
                     ],
-                    sub_receive_count: vec![0],
+                    subs: vec![SubPieceState::new()],
                     repick_deadline: IndexTree::new(),
                 },
             );
         }
 
-        let start = std::time::Instant::now();
+        let start = tokio::time::Instant::now();
         for _ in 0..ITERATIONS {
             let mut piece_order: Vec<_> = map.iter().map(|(i, b)| (*i, b.received_count)).collect();
             piece_order.sort_by(|(_, recv_a), (_, recv_b)| recv_a.cmp(recv_b).reverse());

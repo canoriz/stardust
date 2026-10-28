@@ -1031,6 +1031,14 @@ impl TransmitWorker {
 
     #[cfg(feature = "blocktrace")]
     fn sample_blocktrace(&self, n_blocks_received: usize) {
+        // lift compares only peers connected right now: numerator and denominator
+        // must cover the same set, and a leaving peer drops out of both.
+        let total_last_wait: u64 = self.connected_peers.values().map(|c| c.last_wait_us).sum();
+        let total_bytes: u64 = self
+            .connected_peers
+            .values()
+            .map(PeerConn::useful_bytes)
+            .sum();
         for conn in self.connected_peers.values() {
             let Some(pid) = conn.blocktrace_peer_id else {
                 continue;
@@ -1055,6 +1063,12 @@ impl TransmitWorker {
                 max_bw: Some(max_bw as f64),
                 app_limited: conn.app_limited,
                 mode: Some(crate::conn::bt_bw_mode(&conn.bw_mode)),
+                lift: peer_lift(
+                    conn.last_wait_us,
+                    total_last_wait,
+                    conn.useful_bytes(),
+                    total_bytes,
+                ),
             });
         }
     }
@@ -2593,6 +2607,17 @@ impl TransmitWorker {
         let ji = JointIndex::from(piece.to_request());
         let skip_read = block_picker.sub_received_count(ji) == 0;
         let (complete, peers_revoked) = block_picker.receive_block(req);
+
+        // lift: bill the sub-piece's last wait to the earliest requester of the
+        // block that closed it. If that blocker already left, drop the sample.
+        if complete.sub_piece
+            && let Some(g) = block_picker.take_last_wait(req.index, req.begin)
+            && let Some(addr) = g.blocker
+            && let Some(conn) = self.connected_peers.get_mut(&addr)
+        {
+            conn.last_wait_us += g.wait.as_micros() as u64;
+        }
+
         for addr in peers_revoked {
             if addr != *peer {
                 // if we requested this block from many peers, cancel other requests
@@ -3227,7 +3252,6 @@ impl TransmitWorker {
     // kicked again next tick and loops through reconnect and slow start.
     fn kick_out_burden_peers(&mut self) {
         const ONE_MIN: time::Duration = time::Duration::from_mins(1);
-        let mut slowest_first = BTreeSet::new();
 
         let now = time::Instant::now();
         self.kicked_peers.retain(|_, until| now < *until);
@@ -3281,9 +3305,30 @@ impl TransmitWorker {
             })
             .collect();
 
-        for (addr, c, _) in long_peers.iter() {
-            slowest_first.insert((c.bw.count_bytes_within_period(ONE_MIN).0, *addr));
-        }
+        // Rank the survivors by `lift` — waiting time per byte delivered. The
+        // highest lift is the peer that holds sub-pieces up the longest for what
+        // it delivers, so it is kicked first. The fewest bytes in the last minute
+        // breaks ties, and decides alone while no wait has been billed yet.
+        let total_wait: u64 = self.connected_peers.values().map(|c| c.last_wait_us).sum();
+        let total_bytes: u64 = self
+            .connected_peers
+            .values()
+            .map(PeerConn::useful_bytes)
+            .sum();
+        let mut burden: Vec<_> = long_peers
+            .iter()
+            .map(|(addr, c, id)| {
+                (
+                    peer_lift(c.last_wait_us, total_wait, c.useful_bytes(), total_bytes)
+                        .unwrap_or(0.0),
+                    c.bw.count_bytes_within_period(ONE_MIN).0,
+                    *addr,
+                    *id,
+                )
+            })
+            .collect();
+        // best first, so the worst are popped off the back
+        burden.sort_by(|a, b| a.0.total_cmp(&b.0).then(b.1.cmp(&a.1)));
 
         // Owned, so the kicks below may borrow self mutably.
         let mut long_peers: HashMap<PeerAddr, InfoHash> =
@@ -3303,9 +3348,9 @@ impl TransmitWorker {
         }
 
         while long_peers.len() > LIMIT
-            && let Some((_, a)) = slowest_first.pop_first()
+            && let Some((_, _, a, bt_id)) = burden.pop()
         {
-            if let Some(bt_id) = long_peers.remove(&a) {
+            if long_peers.remove(&a).is_some() {
                 self.kick(a, bt_id);
             }
         }
@@ -3562,6 +3607,24 @@ fn to_canonical_addr(s: SocketAddr) -> SocketAddr {
     SocketAddr::new(s.ip().to_canonical(), s.port())
 }
 
+/// A peer's share of the connected peers' last-wait time over its share of their
+/// useful bytes. `None` when there is nothing to attribute; `inf` for a peer that
+/// held a last wait but delivered nothing.
+fn peer_lift(last_wait: u64, total_last_wait: u64, bytes: u64, total_bytes: u64) -> Option<f64> {
+    if total_last_wait == 0 || total_bytes == 0 {
+        return None;
+    }
+    let w = last_wait as f64 / total_last_wait as f64;
+    let b = bytes as f64 / total_bytes as f64;
+    if b > 0.0 {
+        Some(w / b)
+    } else if last_wait > 0 {
+        Some(f64::INFINITY)
+    } else {
+        Some(0.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3569,6 +3632,19 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     mod hashing;
+
+    #[test]
+    fn test_peer_lift() {
+        // half the last-wait time, a quarter of the bytes → 2x
+        assert_eq!(peer_lift(50, 100, 25, 100), Some(2.0));
+        // never held a last wait
+        assert_eq!(peer_lift(0, 100, 25, 100), Some(0.0));
+        // held a last wait but delivered nothing
+        assert_eq!(peer_lift(50, 100, 0, 100), Some(f64::INFINITY));
+        // nothing to attribute
+        assert_eq!(peer_lift(0, 0, 25, 100), None);
+        assert_eq!(peer_lift(0, 100, 0, 0), None);
+    }
 
     #[test]
     fn test_dump_and_load_fetching() {
