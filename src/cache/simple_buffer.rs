@@ -642,6 +642,8 @@ mod test {
             write_time: time::Instant::now(),
             touch: time::Instant::now(),
             state: Arc::new(AtomicU32::new(initial_state)),
+            #[cfg(feature = "blocktrace")]
+            buf_id: super::next_buf_id(),
             file: void_file(),
             flush_count: None,
             flush_count2: None,
@@ -958,6 +960,8 @@ mod test {
             write_time: time::Instant::now(),
             touch: time::Instant::now(),
             state: Arc::new(AtomicU32::new(DIRTY)),
+            #[cfg(feature = "blocktrace")]
+            buf_id: super::next_buf_id(),
             file: void_file(),
             flush_count: Some(flush_count.clone()),
             flush_count2: None,
@@ -1000,6 +1004,8 @@ mod test {
             write_time: time::Instant::now(),
             touch: time::Instant::now(),
             state: Arc::new(AtomicU32::new(DIRTY)),
+            #[cfg(feature = "blocktrace")]
+            buf_id: super::next_buf_id(),
             file: void_file(),
             flush_count: Some(flush_count.clone()),
             flush_count2: None,
@@ -1036,6 +1042,8 @@ mod test {
             write_time: time::Instant::now(),
             touch: time::Instant::now(),
             state: Arc::new(AtomicU32::new(0)), // clean
+            #[cfg(feature = "blocktrace")]
+            buf_id: super::next_buf_id(),
             file: void_file(),
             flush_count: Some(flush_count.clone()),
             flush_count2: None,
@@ -1065,6 +1073,8 @@ mod test {
             write_time: time::Instant::now(),
             touch: time::Instant::now(),
             state: Arc::new(AtomicU32::new(0)),
+            #[cfg(feature = "blocktrace")]
+            buf_id: super::next_buf_id(),
             file: file.clone(),
             flush_count: None,
             flush_count2: None,

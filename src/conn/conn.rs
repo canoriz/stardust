@@ -44,20 +44,24 @@ pub struct Stat {
 
     /// Creation time of this connection
     pub create_time: time::Instant,
+
+    pub useful_blocks: u64,
 }
 
 impl Default for Stat {
     fn default() -> Self {
         Self {
-            total_recv: Default::default(),
-            total_req: Default::default(),
-            total_sent: Default::default(),
-            total_reject: Default::default(),
-            total_cancel: Default::default(),
-            total_discard: Default::default(),
-            total_timeout: Default::default(),
+            total_recv: 0,
+            total_req: 0,
+            total_sent: 0,
+            total_reject: 0,
+            total_cancel: 0,
+            total_discard: 0,
+            total_timeout: 0,
             last_recv: time::Instant::now(),
             last_req: time::Instant::now(),
+
+            useful_blocks: 0,
 
             create_time: time::Instant::now(),
         }
@@ -133,6 +137,8 @@ impl PeerConn {
 
             #[cfg(feature = "blocktrace")]
             blocktrace_peer_id,
+            #[cfg(feature = "blocktrace")]
+            useful_blocks: 0,
             last_wait_us: 0,
             conn_id,
         }

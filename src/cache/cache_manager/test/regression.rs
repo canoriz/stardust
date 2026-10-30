@@ -250,6 +250,8 @@ async fn failed_flush_retries_without_losing_waiter() {
         Arc::new(Mutex::new(BackFile::new::<FailFirstWrite>().build())),
         None,
         None,
+        #[cfg(feature = "blocktrace")]
+        None,
     );
     let (tx, mut rx) = mpsc::unbounded_channel();
     let key = |i| GlobalPieceKey {
@@ -466,6 +468,8 @@ async fn file_op_failure_is_reported() {
         Arc::new(Mutex::new(BackFile::new::<FailRename>().build())),
         None,
         None,
+        #[cfg(feature = "blocktrace")]
+        None,
     );
     let (tx, mut rx) = mpsc::unbounded_channel();
     let accept = queue_file_op(&handle, info_hash, rename_op(0, "fail", 0, 0, false, &tx));
@@ -541,6 +545,8 @@ async fn fixpath_uses_final_name_when_present() {
         bf.clone(),
         None,
         None,
+        #[cfg(feature = "blocktrace")]
+        None,
     );
     let (tx, mut rx) = mpsc::unbounded_channel();
     let fop = Fop::FixPath {
@@ -570,6 +576,8 @@ async fn fixpath_falls_back_to_part_when_absent() {
         2 * SUB_PIECE_SIZE as u64,
         bf.clone(),
         None,
+        None,
+        #[cfg(feature = "blocktrace")]
         None,
     );
     let (tx, mut rx) = mpsc::unbounded_channel();

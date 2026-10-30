@@ -21,7 +21,7 @@ use crate::{
         self, Capability, Conn, ExtendedMetadata, ExtendedMsg, ExtendedPex, HandshakeOption,
         PexFlag, Piece, Request,
     },
-    tracker::{self, AnnounceResp},
+    tracker::{self, AnnounceResp, Peer},
 };
 
 use bytes::BytesMut;
@@ -54,11 +54,11 @@ use crate::metrics;
 const PROBE_TO_AUTO_NORMAL_RTT_LIMIT: u32 = 2;
 const PROBE_TO_SLOWDOWN_SLOW_RTT_LIMIT: u32 = 2;
 
-/// 95% 置信度 (双侧检验) 的 t 分布临界值表
-/// 用于判定 RTT 是否显著偏离均值（两侧）
-/// 索引 0 对应 df=1 (n=2), 索引 9 对应 df=10 (n=11)
+/// Critical t values for a two-sided test at 95% confidence.
+/// Used to test whether RTT significantly differs from the mean in either direction.
+/// Index 0 corresponds to df=1 (n=2); index 9 to df=10 (n=11).
 const T_TABLE_95_TWO_TAIL_DF_1_10: [f32; 10] = [
-    12.706, // df = 1: 极度保守，防止只有两个包时的随机抖动
+    12.706, // df = 1: Conservative with only two packets, to avoid reacting to random jitter.
     4.303,  // df = 2
     3.182,  // df = 3
     2.776,  // df = 4
@@ -70,7 +70,7 @@ const T_TABLE_95_TWO_TAIL_DF_1_10: [f32; 10] = [
     2.228,  // df = 10
 ];
 
-/// 获取双侧 t 临界值
+/// Return the critical t value for a two-sided test.
 fn get_t_critical_two_tail(df: usize) -> f32 {
     if df == 0 {
         return T_TABLE_95_TWO_TAIL_DF_1_10[0];
@@ -78,7 +78,7 @@ fn get_t_critical_two_tail(df: usize) -> f32 {
     if df <= 10 {
         T_TABLE_95_TWO_TAIL_DF_1_10[df - 1]
     } else {
-        // 当 df > 10 时，t 值继续向 1.960 收敛（95% 双侧）
+        // For df > 10, t continues converging to 1.960 (two-sided 95% confidence).
         1.960
     }
 }
@@ -1030,7 +1030,19 @@ impl TransmitWorker {
     }
 
     #[cfg(feature = "blocktrace")]
-    fn sample_blocktrace(&self, n_blocks_received: usize) {
+    fn sample_blocktrace(&mut self, only: Option<PeerAddr>, n_blocks_received: usize) {
+        if self.blocktrace_torrent_id.is_none() {
+            return;
+        }
+        let ts_us = blocktrace::now_us();
+        // Settle unfinished intervals once, at the same boundary for every row.
+        let picker = match &mut self.torrent_state {
+            TorrentState::Metadata(d) => {
+                d.block_picker.settle_all_piece(tokio::time::Instant::now());
+                Some(&d.block_picker)
+            }
+            TorrentState::Fetching(_) => None,
+        };
         // lift compares only peers connected right now: numerator and denominator
         // must cover the same set, and a leaving peer drops out of both.
         let total_last_wait: u64 = self.connected_peers.values().map(|c| c.last_wait_us).sum();
@@ -1039,7 +1051,10 @@ impl TransmitWorker {
             .values()
             .map(PeerConn::useful_bytes)
             .sum();
-        for conn in self.connected_peers.values() {
+        for (addr, conn) in &self.connected_peers {
+            if only.is_some_and(|peer| peer != *addr) {
+                continue;
+            }
             let Some(pid) = conn.blocktrace_peer_id else {
                 continue;
             };
@@ -1048,7 +1063,7 @@ impl TransmitWorker {
             let avg_bw = conn.bw.count_avg_bw_in(look_back);
             blocktrace::record_bw_sample(blocktrace::BwSampleEvent {
                 peer_id: pid,
-                ts_us: blocktrace::now_us(),
+                ts_us,
                 rtt_us: Some(conn.bw.get_rtt().as_micros() as i64),
                 rtt_var_us: Some(conn.bw.get_var().as_micros() as i64),
                 min_rtt_us: conn
@@ -1069,6 +1084,10 @@ impl TransmitWorker {
                     conn.useful_bytes(),
                     total_bytes,
                 ),
+                st_blk: picker.and_then(|p| {
+                    let seconds = p.peer_slot_cost(addr).direct;
+                    peer_slot_time(seconds, conn.useful_blocks)
+                }),
             });
         }
     }
@@ -1774,7 +1793,11 @@ impl TransmitWorker {
                 }
                 Ok(())
             }
-            Msg::PeerLeave(peer) => self.handle_peer_leave(peer),
+            Msg::PeerLeave(peer) => self.handle_peer_leave(
+                peer,
+                #[cfg(feature = "blocktrace")]
+                false,
+            ),
             Msg::PeerMsg(pm) => {
                 // Peer protocol handling only buffers data / updates bandwidth
                 // state; disk I/O is async (PieceBufReady/FlushComplete). Never fatal.
@@ -2068,7 +2091,11 @@ impl TransmitWorker {
 
     /// Drop the connection `conn_id` at `addr`. A leave whose id does not match the
     /// live connection is stale and ignored, so it cannot remove a newer one.
-    fn handle_peer_leave(&mut self, peer: PeerAddr) -> io::Result<()> {
+    fn handle_peer_leave(
+        &mut self,
+        peer: PeerAddr,
+        #[cfg(feature = "blocktrace")] kicked: bool,
+    ) -> io::Result<()> {
         let (mut addr, conn_id) = peer;
         info!("peer leave {addr}");
         addr = to_canonical_addr(addr);
@@ -2076,6 +2103,9 @@ impl TransmitWorker {
         if self.connected_peers.get(&peer).map(|c| c.conn_id) != Some(conn_id) {
             return Ok(());
         }
+        // Capture the final cost before peer_leave removes its accounting entry.
+        #[cfg(feature = "blocktrace")]
+        self.sample_blocktrace(Some(peer), 0);
         // notify piece picker this peer left so it can update rarity and internal state
         match &mut self.torrent_state {
             TorrentState::Metadata(d) => d.block_picker.peer_leave(&peer),
@@ -2091,7 +2121,11 @@ impl TransmitWorker {
             blocktrace::record_peer_state(blocktrace::PeerStateEvent {
                 peer_id: pid,
                 ts_us: blocktrace::now_us(),
-                kind: blocktrace::PeerStateKind::Disconnect,
+                kind: if kicked {
+                    blocktrace::PeerStateKind::Kicked
+                } else {
+                    blocktrace::PeerStateKind::Disconnect
+                },
                 mode: None,
             });
         }
@@ -2480,7 +2514,7 @@ impl TransmitWorker {
 
         #[cfg(feature = "blocktrace")]
         if need_sample {
-            self.sample_blocktrace(n_blocks_received);
+            self.sample_blocktrace(Some(peer), n_blocks_received);
         }
         Ok(())
     }
@@ -2573,6 +2607,10 @@ impl TransmitWorker {
                 piece.begin >> 14,
             );
             return Ok(());
+        }
+
+        if let Some(conn) = self.connected_peers.get_mut(peer) {
+            conn.stat.useful_blocks += 1;
         }
 
         // TODO: if peer already left the map; blocktrace peer id is gone, so this receive is not recorded.
@@ -3253,6 +3291,11 @@ impl TransmitWorker {
     fn kick_out_burden_peers(&mut self) {
         const ONE_MIN: time::Duration = time::Duration::from_mins(1);
 
+        let Downloading { block_picker, .. } = match &mut self.torrent_state {
+            TorrentState::Metadata(downloading) => downloading,
+            TorrentState::Fetching(fetching_metadata) => return,
+        };
+
         let now = time::Instant::now();
         self.kicked_peers.retain(|_, until| now < *until);
         // An expired kick is an ordinary candidate again.
@@ -3319,8 +3362,11 @@ impl TransmitWorker {
             .iter()
             .map(|(addr, c, id)| {
                 (
-                    peer_lift(c.last_wait_us, total_wait, c.useful_bytes(), total_bytes)
-                        .unwrap_or(0.0),
+                    peer_slot_time(
+                        block_picker.peer_slot_cost(addr).direct,
+                        c.stat.useful_blocks,
+                    )
+                    .unwrap_or(0.0),
                     c.bw.count_bytes_within_period(ONE_MIN).0,
                     *addr,
                     *id,
@@ -3333,7 +3379,7 @@ impl TransmitWorker {
         // Owned, so the kicks below may borrow self mutably.
         let mut long_peers: HashMap<PeerAddr, InfoHash> =
             long_peers.into_iter().map(|(a, _, id)| (a, id)).collect();
-        const LIMIT: usize = 20;
+        const LIMIT: usize = 8;
 
         for a in no_response
             .into_iter()
@@ -3362,7 +3408,11 @@ impl TransmitWorker {
         let until = time::Instant::now() + KICK_BAN;
         self.kicked_peers.insert(bt_id, until);
         self.candidates.insert(a.0, PeerState::Kicked(until));
-        let _ = self.handle_peer_leave(a);
+        let _ = self.handle_peer_leave(
+            a,
+            #[cfg(feature = "blocktrace")]
+            true,
+        );
     }
 }
 
@@ -3452,7 +3502,7 @@ pub(crate) async fn run_transmit_worker(
                 #[cfg(feature = "metrics")]
                 transmit.sample_metrics();
                 #[cfg(feature = "blocktrace")]
-                transmit.sample_blocktrace(0);
+                transmit.sample_blocktrace(None, 0);
             }
             _ = cancel.cancelled() => {
                 info!("transmit manager cancelled");
@@ -3622,6 +3672,16 @@ fn peer_lift(last_wait: u64, total_last_wait: u64, bytes: u64, total_bytes: u64)
         Some(f64::INFINITY)
     } else {
         Some(0.0)
+    }
+}
+
+fn peer_slot_time(seconds: f64, useful_blocks: u64) -> Option<f64> {
+    if useful_blocks > 0 {
+        Some(seconds / useful_blocks as f64)
+    } else if seconds > 0.0 {
+        Some(f64::INFINITY)
+    } else {
+        None
     }
 }
 

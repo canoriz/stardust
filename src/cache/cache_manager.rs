@@ -1830,6 +1830,8 @@ mod test {
             void_file(),
             None,
             None,
+            #[cfg(feature = "blocktrace")]
+            None,
         );
         (mgr, handle, info_hash)
     }

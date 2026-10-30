@@ -108,6 +108,7 @@ pub enum PeerStateKind {
     Connect = 1,
     Disconnect = 2,
     BwMode = 3,
+    Kicked = 4,
 }
 
 impl PeerStateKind {
@@ -299,6 +300,8 @@ pub struct BwSampleEvent {
     /// Last-wait share over useful-byte share among currently connected peers;
     /// `inf` for a peer that held a sub-piece's last wait but delivered nothing.
     pub lift: Option<f64>,
+    /// Slot time per block: cumulative attributed fill time / accepted block count.
+    pub st_blk: Option<f64>,
 }
 
 /// One cache slot lifecycle row. `piece`/`sub` are the cache-native identity
@@ -701,8 +704,9 @@ fn insert_peer_state(conn: &Connection, e: &PeerStateEvent) -> rusqlite::Result<
 fn insert_bw(conn: &Connection, e: &BwSampleEvent) -> rusqlite::Result<usize> {
     conn.prepare_cached(
         "INSERT INTO bw_sample
-         (peer_id, ts_us, rtt_us, rtt_var_us, min_rtt_us, n_received, inflight, avg_bw, max_bw, app_limited, mode, lift)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+         (peer_id, ts_us, rtt_us, rtt_var_us, min_rtt_us, n_received, inflight, avg_bw, max_bw, app_limited, mode, lift,
+          st_blk)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
     )?
     .execute(params![
         e.peer_id,
@@ -717,6 +721,7 @@ fn insert_bw(conn: &Connection, e: &BwSampleEvent) -> rusqlite::Result<usize> {
         e.app_limited,
         e.mode.map(|m| m.id()),
         e.lift,
+        e.st_blk,
     ])
 }
 
@@ -934,7 +939,12 @@ CREATE TABLE IF NOT EXISTS bw_sample(
   max_bw REAL,
   app_limited INTEGER,
   mode INTEGER,
-  lift REAL);
+  lift REAL,
+  st_blk REAL);
+-- st_blk (slot time per block): this connection's cumulative attributed sub-piece
+-- fill time / accepted block count, in slot-seconds/block. Short tails count as one
+-- block; duplicates are excluded. NULL if metadata is unavailable or both values
+-- are zero; positive slot time with zero accepted blocks yields infinity.
 CREATE INDEX IF NOT EXISTS ix_bw_peer ON bw_sample(peer_id, ts_us);
 
 CREATE TABLE IF NOT EXISTS cache_event_kind(id INTEGER PRIMARY KEY, name TEXT UNIQUE);
@@ -994,3 +1004,44 @@ CREATE TABLE IF NOT EXISTS cache_slot_sample(
   age_us INTEGER,
   PRIMARY KEY (ts_us, torrent_id, piece, sub)) WITHOUT ROWID;
 ";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bw_sample_contains_slot_time_per_block() {
+        let c = Connection::open_in_memory().unwrap();
+        init_schema(&c).unwrap();
+        c.execute_batch(
+            "INSERT INTO torrent VALUES (1, 'hash', 'test', 16385, 16385, 0);
+             INSERT INTO peer VALUES (7, 1, 'peer', '127.0.0.1:1', 0);",
+        )
+        .unwrap();
+        insert_bw(
+            &c,
+            &BwSampleEvent {
+                peer_id: 7,
+                ts_us: 100,
+                rtt_us: Some(20),
+                rtt_var_us: None,
+                min_rtt_us: None,
+                n_received: 2,
+                inflight: None,
+                avg_bw: None,
+                max_bw: None,
+                app_limited: false,
+                mode: None,
+                lift: None,
+                st_blk: Some(1.5),
+            },
+        )
+        .unwrap();
+        let row: (i64, f64) = c
+            .query_row("SELECT peer_id, st_blk FROM bw_sample", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(row, (7, 1.5));
+    }
+}
