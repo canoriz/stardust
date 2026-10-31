@@ -300,8 +300,10 @@ pub struct BwSampleEvent {
     /// Last-wait share over useful-byte share among currently connected peers;
     /// `inf` for a peer that held a sub-piece's last wait but delivered nothing.
     pub lift: Option<f64>,
-    /// Slot time per block: cumulative attributed fill time / accepted block count.
+    /// Missing-block shares of request-to-completion time / accepted block count.
     pub st_blk: Option<f64>,
+    /// Fixed-block fair slot-time from first request / accepted block count.
+    pub fair_st: Option<f64>,
 }
 
 /// One cache slot lifecycle row. `piece`/`sub` are the cache-native identity
@@ -452,10 +454,8 @@ impl Drop for TraceHandle {
     }
 }
 
-/// Open the DB (WAL), create schema, seed lookup tables, and spawn the writer
-/// thread. Installs the global sink so `record_*`/`register_*` become live.
-pub fn install(db_path: &str) -> rusqlite::Result<TraceHandle> {
-    let conn = Connection::open(db_path)?;
+/// Create the current schema and seed lookup tables for production and tests.
+fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(SCHEMA)?;
     for k in EventKind::ALL {
         conn.execute(
@@ -494,6 +494,14 @@ pub fn install(db_path: &str) -> rusqlite::Result<TraceHandle> {
         )?;
     }
 
+    Ok(())
+}
+
+/// Open the DB (WAL), create schema, seed lookup tables, and spawn the writer
+/// thread. Installs the global sink so `record_*`/`register_*` become live.
+pub fn install(db_path: &str) -> rusqlite::Result<TraceHandle> {
+    let conn = Connection::open(db_path)?;
+    init_schema(&conn)?;
     let (tx, rx) = sync_channel::<TraceMsg>(CHANNEL_CAP);
     let join = std::thread::Builder::new()
         .name("blocktrace-writer".into())
@@ -705,8 +713,8 @@ fn insert_bw(conn: &Connection, e: &BwSampleEvent) -> rusqlite::Result<usize> {
     conn.prepare_cached(
         "INSERT INTO bw_sample
          (peer_id, ts_us, rtt_us, rtt_var_us, min_rtt_us, n_received, inflight, avg_bw, max_bw, app_limited, mode, lift,
-          st_blk)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+          st_blk, fair_st)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
     )?
     .execute(params![
         e.peer_id,
@@ -722,6 +730,7 @@ fn insert_bw(conn: &Connection, e: &BwSampleEvent) -> rusqlite::Result<usize> {
         e.mode.map(|m| m.id()),
         e.lift,
         e.st_blk,
+        e.fair_st,
     ])
 }
 
@@ -940,9 +949,12 @@ CREATE TABLE IF NOT EXISTS bw_sample(
   app_limited INTEGER,
   mode INTEGER,
   lift REAL,
-  st_blk REAL);
--- st_blk (slot time per block): this connection's cumulative attributed sub-piece
--- fill time / accepted block count, in slot-seconds/block. Short tails count as one
+  st_blk REAL,
+  fair_st REAL);
+-- fair_st: fixed 1/N block shares, first request to completion / accepted blocks.
+-- Empty and received block shares go to scheduler; NULL/inf follow st_blk.
+-- st_blk (slot time per block): this connection's cumulative missing-block shares
+-- of first-request-to-completion time / accepted block count. Short tails count as one
 -- block; duplicates are excluded. NULL if metadata is unavailable or both values
 -- are zero; positive slot time with zero accepted blocks yields infinity.
 CREATE INDEX IF NOT EXISTS ix_bw_peer ON bw_sample(peer_id, ts_us);
@@ -1018,30 +1030,32 @@ mod tests {
              INSERT INTO peer VALUES (7, 1, 'peer', '127.0.0.1:1', 0);",
         )
         .unwrap();
-        insert_bw(
-            &c,
-            &BwSampleEvent {
-                peer_id: 7,
-                ts_us: 100,
-                rtt_us: Some(20),
-                rtt_var_us: None,
-                min_rtt_us: None,
-                n_received: 2,
-                inflight: None,
-                avg_bw: None,
-                max_bw: None,
-                app_limited: false,
-                mode: None,
-                lift: None,
-                st_blk: Some(1.5),
-            },
-        )
-        .unwrap();
+        let sample = BwSampleEvent {
+            peer_id: 7,
+            ts_us: 100,
+            rtt_us: Some(20),
+            rtt_var_us: None,
+            min_rtt_us: None,
+            n_received: 2,
+            inflight: None,
+            avg_bw: None,
+            max_bw: None,
+            app_limited: false,
+            mode: None,
+            lift: None,
+            st_blk: Some(1.5),
+            fair_st: Some(2.5),
+        };
+        insert_bw(&c, &sample).unwrap();
         let row: (i64, f64) = c
             .query_row("SELECT peer_id, st_blk FROM bw_sample", [], |r| {
                 Ok((r.get(0)?, r.get(1)?))
             })
             .unwrap();
         assert_eq!(row, (7, 1.5));
+        let fair: f64 = c
+            .query_row("SELECT fair_st FROM bw_sample", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fair, 2.5);
     }
 }

@@ -137,8 +137,6 @@ impl PeerConn {
 
             #[cfg(feature = "blocktrace")]
             blocktrace_peer_id,
-            #[cfg(feature = "blocktrace")]
-            useful_blocks: 0,
             last_wait_us: 0,
             conn_id,
         }

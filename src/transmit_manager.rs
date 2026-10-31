@@ -1086,7 +1086,10 @@ impl TransmitWorker {
                 ),
                 st_blk: picker.and_then(|p| {
                     let seconds = p.peer_slot_cost(addr).direct;
-                    peer_slot_time(seconds, conn.useful_blocks)
+                    peer_slot_time(seconds, conn.stat.useful_blocks)
+                }),
+                fair_st: picker.and_then(|p| {
+                    peer_slot_time(p.peer_slot_cost(addr).fair, conn.stat.useful_blocks)
                 }),
             });
         }
@@ -3348,16 +3351,10 @@ impl TransmitWorker {
             })
             .collect();
 
-        // Rank the survivors by `lift` — waiting time per byte delivered. The
-        // highest lift is the peer that holds sub-pieces up the longest for what
-        // it delivers, so it is kicked first. The fewest bytes in the last minute
-        // breaks ties, and decides alone while no wait has been billed yet.
-        let total_wait: u64 = self.connected_peers.values().map(|c| c.last_wait_us).sum();
-        let total_bytes: u64 = self
-            .connected_peers
-            .values()
-            .map(PeerConn::useful_bytes)
-            .sum();
+        // Include outstanding waiting time even without blocktrace sampling or
+        // a recent ownership mutation. Rank by ST per accepted block, then by
+        // the fewest bytes received in the last minute.
+        block_picker.settle_all_piece(time::Instant::now());
         let mut burden: Vec<_> = long_peers
             .iter()
             .map(|(addr, c, id)| {

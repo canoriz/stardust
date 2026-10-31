@@ -1,4 +1,5 @@
-//! Picker-owned sub-piece fill-time totals. Timing boundaries live in SubPieceState;
+//! Picker-owned sub-piece request-to-completion costs. Both ledgers share one total
+//! and one timing boundary per SubPieceState;
 //! there are no cache callbacks, duplicated block maps, slot registries, or locks.
 
 use crate::conn::PeerAddr;
@@ -6,8 +7,10 @@ use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct PeerCost {
-    /// Cumulative share of first-block-to-completion waiting time, in sub-piece-seconds.
+    /// Missing-block shares from first request to completion, in sub-piece-seconds.
     pub direct: f64,
+    /// Fixed-block shares from first request to sub-piece completion.
+    pub fair: f64,
 }
 
 /// Owned exclusively by BlockPicker. Mutators receive a mutable reference to
@@ -19,8 +22,11 @@ pub(crate) struct Accounting {
     retired_direct: f64,
     /// Shares of missing blocks without a current requester.
     pub scheduler: f64,
-    /// Sum of all active sub-piece intervals, including scheduler shares.
+    /// Common request-to-completion budget for both ledgers, including scheduler.
     pub total: f64,
+    retired_fair: f64,
+    /// Fixed shares without an active requester, including accepted blocks.
+    pub fair_scheduler: f64,
 }
 
 /// Scalar test snapshot. Production tracing only exports seconds per block.
@@ -44,6 +50,7 @@ impl Accounting {
     pub fn remove_peer(&mut self, peer: &PeerAddr) {
         if let Some(cost) = self.peers.remove(peer) {
             self.retired_direct += cost.direct;
+            self.retired_fair += cost.fair;
         }
     }
 
