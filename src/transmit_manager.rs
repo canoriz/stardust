@@ -1084,13 +1084,8 @@ impl TransmitWorker {
                     conn.useful_bytes(),
                     total_bytes,
                 ),
-                st_blk: picker.and_then(|p| {
-                    let seconds = p.peer_slot_cost(addr).direct;
-                    peer_slot_time(seconds, conn.stat.useful_blocks)
-                }),
-                fair_st: picker.and_then(|p| {
-                    peer_slot_time(p.peer_slot_cost(addr).fair, conn.stat.useful_blocks)
-                }),
+                st_blk: picker.and_then(|p| p.peer_slot_cost(addr).0),
+                fair_st: picker.and_then(|p| p.peer_slot_cost(addr).1),
             });
         }
     }
@@ -2614,6 +2609,7 @@ impl TransmitWorker {
 
         if let Some(conn) = self.connected_peers.get_mut(peer) {
             conn.stat.useful_blocks += 1;
+            block_picker.record_slot_block(peer);
         }
 
         // TODO: if peer already left the map; blocktrace peer id is gone, so this receive is not recorded.
@@ -3359,11 +3355,7 @@ impl TransmitWorker {
             .iter()
             .map(|(addr, c, id)| {
                 (
-                    peer_slot_time(
-                        block_picker.peer_slot_cost(addr).direct,
-                        c.stat.useful_blocks,
-                    )
-                    .unwrap_or(0.0),
+                    block_picker.peer_slot_cost(addr).0.unwrap_or(0.0),
                     c.bw.count_bytes_within_period(ONE_MIN).0,
                     *addr,
                     *id,
@@ -3669,16 +3661,6 @@ fn peer_lift(last_wait: u64, total_last_wait: u64, bytes: u64, total_bytes: u64)
         Some(f64::INFINITY)
     } else {
         Some(0.0)
-    }
-}
-
-fn peer_slot_time(seconds: f64, useful_blocks: u64) -> Option<f64> {
-    if useful_blocks > 0 {
-        Some(seconds / useful_blocks as f64)
-    } else if seconds > 0.0 {
-        Some(f64::INFINITY)
-    } else {
-        None
     }
 }
 

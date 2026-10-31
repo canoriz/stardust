@@ -300,9 +300,9 @@ pub struct BwSampleEvent {
     /// Last-wait share over useful-byte share among currently connected peers;
     /// `inf` for a peer that held a sub-piece's last wait but delivered nothing.
     pub lift: Option<f64>,
-    /// Missing-block shares of request-to-completion time / accepted block count.
+    /// Aged missing-block cost / aged accepted blocks (0.49 weight per rotation).
     pub st_blk: Option<f64>,
-    /// Fixed-block fair slot-time from first request / accepted block count.
+    /// Aged fixed-block fair cost / the same aged accepted block count.
     pub fair_st: Option<f64>,
 }
 
@@ -952,9 +952,11 @@ CREATE TABLE IF NOT EXISTS bw_sample(
   st_blk REAL,
   fair_st REAL);
 -- fair_st: fixed 1/N block shares, first request to completion / accepted blocks.
--- Empty and received block shares go to scheduler; NULL/inf follow st_blk.
--- st_blk (slot time per block): this connection's cumulative missing-block shares
--- of first-request-to-completion time / accepted block count. Short tails count as one
+-- Shares without active requesters go to scheduler counters; NULL/inf follow st_blk.
+-- Both costs and accepted blocks decay on pick, at most once per 15 seconds:
+-- Each rotation multiplies old weight by 0.49; the open bucket is included unaged.
+-- st_blk: aged missing-block request-to-completion cost / aged accepted blocks.
+-- Short tails count as one
 -- block; duplicates are excluded. NULL if metadata is unavailable or both values
 -- are zero; positive slot time with zero accepted blocks yields infinity.
 CREATE INDEX IF NOT EXISTS ix_bw_peer ON bw_sample(peer_id, ts_us);

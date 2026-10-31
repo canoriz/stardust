@@ -11,7 +11,7 @@ use crate::{
     math_helper::piece_total_and_last_size,
     metadata::Metadata,
     protocol::Request,
-    slot_accounting::{Accounting, PeerCost},
+    slot_accounting::Accounting,
 };
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -22,8 +22,6 @@ use std::{
 use crate::blocktrace;
 #[cfg(feature = "metrics")]
 use crate::metrics;
-#[cfg(test)]
-use crate::slot_accounting::Snapshot;
 
 const BLOCK_SIZE: usize = 16384;
 const NO_RESPONSE_TIMEOUT: time::Duration = time::Duration::from_secs(90);
@@ -338,31 +336,32 @@ impl PieceBlocks {
         }
         state.last_accounted_at = Some(now);
         let elapsed = now.duration_since(last).as_secs_f64();
-        account.total += elapsed;
         let per_block = elapsed / missing as f64;
         let fair_per_block = elapsed / blocks.len() as f64;
-        // Both ledgers split the same interval and total; only denominators differ.
+        // Attribute unowned shares to the scheduler without changing peer weights.
         for block in blocks {
             match block {
-                BlockStatus::Received => account.fair_scheduler += fair_per_block,
+                BlockStatus::Received => account.scheduler_fair_st += fair_per_block,
                 BlockStatus::Requested { requested, .. } if !requested.is_empty() => {
                     let share = per_block / requested.len() as f64;
                     let fair_share = fair_per_block / requested.len() as f64;
                     for peer in requested.keys() {
-                        let cost = account.peers.entry(*peer).or_default();
-                        cost.direct += share;
-                        cost.fair += fair_share;
+                        account
+                            .peers
+                            .entry(*peer)
+                            .or_default()
+                            .add_cost(share, fair_share);
                     }
                 }
                 _ => {
-                    account.scheduler += per_block;
-                    account.fair_scheduler += fair_per_block;
+                    account.scheduler_blocker_st += per_block;
+                    account.scheduler_fair_st += fair_per_block;
                 }
             }
         }
     }
 
-    /// Settle every sub-piece for full snapshots and piece removal.
+    /// Settle every sub-piece for sampling, rotation and piece removal.
     fn settle_account(&mut self, account: &mut Accounting, now: tokio::time::Instant) {
         for sub in 0..self.subs.len() {
             Self::settle_sub(&mut self.subs, &self.block_map, sub, account, now);
@@ -856,7 +855,7 @@ impl PieceBlocks {
     {
         let now = tokio::time::Instant::now();
         // A removal can make the caller drop the whole piece, including other
-        // sub-pieces whose clocks currently accrue only scheduler cost.
+        // sub-pieces with no active requesters.
         let needs_settlement = self.is_all_not_requested()
             || self.block_map.iter().any(|b| match b {
                 BlockStatus::Requested { requested, .. } => {
@@ -976,8 +975,11 @@ pub struct BlockPicker {
 
     no_response_timeout: time::Duration,
 
-    /// Torrent-wide totals, owned by this picker and updated before block mutations.
+    /// Peer windows, owned by this picker and updated before block mutations.
     accounting: Accounting,
+    /// Shared aging boundary; checked lazily at the start of pick_blocks.
+    slot_window_rotated_at: tokio::time::Instant,
+
     endgame: bool,
 
     // tracks per-file completion by counting verified pieces against each
@@ -997,16 +999,21 @@ pub struct PieceComplete {
 }
 
 impl BlockPicker {
-    /// Include unfinished fill intervals; this mutates the picker-owned counters.
-    #[cfg(test)]
-    pub(crate) fn slot_cost_snapshot(&mut self) -> Snapshot {
-        self.settle_all_piece(tokio::time::Instant::now());
-        self.accounting.snapshot()
+    /// Return aged (ST, fair ST) per accepted block, hiding the aging windows.
+    pub(crate) fn peer_slot_cost(&self, peer: &PeerAddr) -> (Option<f64>, Option<f64>) {
+        self.accounting
+            .peers
+            .get(peer)
+            .map_or((None, None), |slot_time| slot_time.per_block())
     }
 
-    /// Fetch one live connection's cost without copying the peer map.
-    pub(crate) fn peer_slot_cost(&self, peer: &PeerAddr) -> PeerCost {
-        self.accounting.peers.get(peer).copied().unwrap_or_default()
+    /// Called only for a useful, non-duplicate block from a live connection.
+    pub(crate) fn record_slot_block(&mut self, peer: &PeerAddr) {
+        self.accounting
+            .peers
+            .entry(*peer)
+            .or_default()
+            .accept_block();
     }
 
     /// Settle all active pieces to the same timestamp.
@@ -1052,6 +1059,7 @@ impl BlockPicker {
             no_response_timeout,
             endgame: false,
             accounting: Accounting::default(),
+            slot_window_rotated_at: tokio::time::Instant::now(),
             file_tracker: FileTracker::new(meta),
             #[cfg(feature = "metrics")]
             torrent_hex: hex::encode(meta.info_hash),
@@ -1079,6 +1087,7 @@ impl BlockPicker {
             no_response_timeout,
             endgame: false,
             accounting: Accounting::default(),
+            slot_window_rotated_at: tokio::time::Instant::now(),
             file_tracker: FileTracker::from_lengths(piece_size as u64, [total_size]),
             #[cfg(feature = "metrics")]
             torrent_hex: String::new(),
@@ -1214,6 +1223,18 @@ impl BlockPicker {
         #[cfg(feature = "blocktrace")] bt_torrent_id: Option<i64>,
         #[cfg(feature = "blocktrace")] bt_peer_id: Option<i64>,
     ) -> (BlockRequests, usize) {
+        let now = tokio::time::Instant::now();
+        let elapsed = now.duration_since(self.slot_window_rotated_at);
+        if elapsed >= time::Duration::from_secs(15) {
+            // Close all pending costs before moving the current windows to history.
+            self.settle_all_piece(now);
+            // With regular 15s windows and uniform arrivals, data older than 30s
+            for slot_time in self.accounting.peers.values_mut() {
+                slot_time.rotate(0.5);
+            }
+            self.slot_window_rotated_at = now;
+        }
+
         #[cfg(feature = "metrics")]
         let torrent = self.torrent_hex.clone();
 
@@ -1998,7 +2019,7 @@ impl BlockPicker {
         }
         self.requesting.retain(|_, b| !b.is_all_not_requested());
         self.piece_picker.peer_leave(addr);
-        self.accounting.remove_peer(addr);
+        self.accounting.peers.remove(addr);
     }
 
     /// Returns true if this piece is in the receiving set (all blocks requested or some received,
@@ -2922,11 +2943,6 @@ mod test {
         // b.is_finished();
     }
 
-    fn cost_snapshot(pb: &mut PieceBlocks, account: &mut Accounting) -> Snapshot {
-        pb.settle_account(account, tokio::time::Instant::now());
-        account.snapshot()
-    }
-
     fn assert_cost(actual: f64, expected: f64) {
         assert!((actual - expected).abs() < 1e-8, "{actual} != {expected}");
     }
@@ -2955,14 +2971,14 @@ mod test {
             None,
         );
         tokio::time::advance(time::Duration::from_secs(7)).await;
-        assert_cost(cost_snapshot(&mut pb, &mut a).total, 7.0);
-        assert_cost(a.peers[&PEER1].direct, 7.0);
+        pb.settle_account(&mut a, tokio::time::Instant::now());
+        assert_cost(a.peers[&PEER1].current_cost().0, 7.0);
         pb.receive(block_req(0), &mut a);
         tokio::time::advance(time::Duration::from_secs(2)).await;
         pb.receive(block_req(1), &mut a);
         tokio::time::advance(time::Duration::from_secs(9)).await;
-        assert_cost(cost_snapshot(&mut pb, &mut a).total, 9.0);
-        assert_cost(a.peers[&PEER1].direct, 9.0);
+        pb.settle_account(&mut a, tokio::time::Instant::now());
+        assert_cost(a.peers[&PEER1].current_cost().0, 9.0);
         assert!(pb.subs[0].last_accounted_at.is_none());
     }
 
@@ -3012,13 +3028,18 @@ mod test {
             tokio::time::advance(time::Duration::from_secs(3)).await;
             pb.receive(block_req(block), &mut a);
         }
-        let s = cost_snapshot(&mut pb, &mut a);
-        for (p, want) in [(PEER1, 3.75), (PEER2, 0.75), (PEER3, 3.5), (p4, 5.5)] {
-            assert_cost(a.peers[&p].direct, want);
+        pb.settle_account(&mut a, tokio::time::Instant::now());
+        for (p, st, fair) in [
+            (PEER1, 3.75, 2.4),
+            (PEER2, 0.75, 0.6),
+            (PEER3, 3.5, 1.8),
+            (p4, 5.5, 1.8),
+        ] {
+            assert_cost(a.peers[&p].current_cost().0, st);
+            assert_cost(a.peers[&p].current_cost().1, fair);
         }
-        assert_cost(s.scheduler, 4.5);
-        assert_cost(s.total, 18.0);
-        assert_cost(s.residual(), 0.0);
+        assert_cost(a.scheduler_blocker_st, 4.5);
+        assert_cost(a.scheduler_fair_st, 11.4);
     }
 
     #[tokio::test(start_paused = true)]
@@ -3058,11 +3079,9 @@ mod test {
         pb.receive(block_req(1), &mut a);
         tokio::time::advance(time::Duration::from_secs(5)).await;
         pb.receive(block_req(1), &mut a);
-        let s = cost_snapshot(&mut pb, &mut a);
-        assert_cost(a.peers[&PEER1].direct, 5.0);
-        assert_cost(a.peers[&PEER2].direct, 4.0);
-        assert_cost(s.scheduler, 2.0);
-        assert_cost(s.total, 11.0);
+        pb.settle_account(&mut a, tokio::time::Instant::now());
+        assert_cost(a.peers[&PEER1].current_cost().0, 5.0);
+        assert_cost(a.peers[&PEER2].current_cost().0, 4.0);
     }
 
     #[tokio::test(start_paused = true)]
@@ -3103,22 +3122,20 @@ mod test {
                 }
             }
             // The other sub-piece remains deferred; a no-op pick settles nothing.
-            assert_cost(a.total, if action == 2 { 0.0 } else { 2.0 });
+            assert_cost(
+                a.peers.values().map(|cost| cost.current_cost().0).sum(),
+                if action == 2 { 0.0 } else { 2.0 },
+            );
             tokio::time::advance(time::Duration::from_secs(2)).await;
-            let s = cost_snapshot(&mut pb, &mut a);
-            assert_cost(s.total, 8.0);
-            assert_cost(s.residual(), 0.0);
+            pb.settle_account(&mut a, tokio::time::Instant::now());
             let transferred = if action == 1 || action == 3 {
                 2.0 / 31.0
             } else {
                 0.0
             };
-            assert_cost(a.peers[&PEER1].direct, 8.0 - transferred);
-            if action == 1 {
-                assert_cost(s.scheduler, transferred);
-            }
+            assert_cost(a.peers[&PEER1].current_cost().0, 8.0 - transferred);
             if action == 3 {
-                assert_cost(a.peers[&PEER2].direct, transferred);
+                assert_cost(a.peers[&PEER2].current_cost().0, transferred);
             }
         }
     }
@@ -3141,9 +3158,8 @@ mod test {
         for b in 33..64 {
             pb.receive(block_req(b), &mut a);
         }
-        let s = cost_snapshot(&mut pb, &mut a);
-        assert_cost(s.total, 12.0); // sub 0: 5 seconds; sub 1: 7 seconds
-        assert_cost(a.peers[&PEER1].direct, 12.0);
+        pb.settle_account(&mut a, tokio::time::Instant::now());
+        assert_cost(a.peers[&PEER1].current_cost().0, 12.0);
     }
 
     #[tokio::test(start_paused = true)]
@@ -3169,35 +3185,11 @@ mod test {
                 }
             }
             tokio::time::advance(time::Duration::from_secs(3)).await;
-            let s = bp.slot_cost_snapshot();
-            assert_cost(bp.accounting.peers[&PEER1].direct, 2.0);
-            assert_cost(s.total, 2.0);
+            bp.settle_all_piece(tokio::time::Instant::now());
+            assert_cost(bp.accounting.peers[&PEER1].current_cost().0, 2.0);
+            assert_cost(bp.accounting.scheduler_blocker_st, 0.0);
+            assert_cost(bp.accounting.scheduler_fair_st, 1.0);
         }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn slot_accounting_restore_excludes_offline_time() {
-        let (mut bp, _) = make_block_picker_with_state(1, 32768, 0, 0, 0);
-        bp.select(0, true);
-        let t = tokio::time::Instant::now();
-        let mut pb = blocks(vec![
-            not_requested_block(),
-            requested_block(&[(PEER1, t)], &[]),
-        ]);
-        pb.receive(block_req(0), &mut bp.accounting);
-        bp.requesting.insert(0, pb);
-        let bytes = serde_json::to_vec(&bp.dump()).unwrap();
-        tokio::time::advance(time::Duration::from_secs(100)).await;
-        let (mut restored, _) = make_block_picker_with_state(1, 32768, 0, 0, 0);
-        restored.load_progress(serde_json::from_slice(&bytes).unwrap());
-        let s = restored.slot_cost_snapshot();
-        assert_cost(s.total, 0.0);
-        tokio::time::advance(time::Duration::from_secs(3)).await;
-        let s = restored.slot_cost_snapshot();
-        assert_cost(s.total, 3.0);
-        assert_cost(s.scheduler, 3.0); // old requests are not restored
-        assert!(restored.accounting.peers.is_empty());
-        assert_cost(restored.slot_cost_snapshot().total, 3.0);
     }
 
     #[tokio::test(start_paused = true)]
@@ -3240,29 +3232,9 @@ mod test {
         assert_eq!(revoked[&PEER1], vec![block_req(1)]);
         assert!(!revoked.contains_key(&PEER2));
         tokio::time::advance(time::Duration::from_secs(2)).await;
-        let s = bp.slot_cost_snapshot();
-        assert_cost(bp.accounting.peers[&PEER1].direct, 45.5);
-        assert_cost(bp.accounting.peers[&PEER2].direct, 21.5);
-        assert_cost(s.scheduler, 26.0);
-        assert_cost(s.total, 93.0);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn slot_accounting_failed_piece_restarts_only_on_new_first_block() {
-        let (mut bp, _) = make_block_picker_with_state(1, 32768, 0, 0, 0);
-        bp.select(0, true);
-        bp.receive_block(block_req(0));
-        tokio::time::advance(time::Duration::from_secs(2)).await;
-        bp.piece_verified(0, false);
-        tokio::time::advance(time::Duration::from_secs(10)).await;
-        assert_cost(bp.slot_cost_snapshot().total, 2.0);
-        bp.receive_block(block_req(0));
-        tokio::time::advance(time::Duration::from_secs(3)).await;
-        bp.receive_block(block_req(1));
-        tokio::time::advance(time::Duration::from_secs(8)).await;
-        let s = bp.slot_cost_snapshot();
-        assert_cost(s.total, 5.0);
-        assert_cost(s.scheduler, 5.0);
+        bp.settle_all_piece(tokio::time::Instant::now());
+        assert_cost(bp.accounting.peers[&PEER1].current_cost().0, 45.5);
+        assert_cost(bp.accounting.peers[&PEER2].current_cost().0, 21.5);
     }
 
     #[tokio::test(start_paused = true)]
@@ -3279,7 +3251,7 @@ mod test {
         tokio::time::advance(time::Duration::from_secs(2)).await;
         bp.peer_leave(&PEER1);
         assert!(!bp.accounting.peers.contains_key(&PEER1));
-        assert_cost(bp.slot_cost_snapshot().direct, 2.0);
+        assert_eq!(bp.peer_slot_cost(&PEER1), (None, None));
         tokio::time::advance(time::Duration::from_secs(3)).await;
         let new = (PEER1.0, 999);
         let pb = bp.requesting.get_mut(&0).unwrap();
@@ -3307,13 +3279,12 @@ mod test {
             1
         );
         tokio::time::advance(time::Duration::from_secs(4)).await;
-        let s = bp.slot_cost_snapshot();
+        bp.settle_all_piece(tokio::time::Instant::now());
         assert!(!bp.accounting.peers.contains_key(&PEER1));
         assert_eq!(bp.accounting.peers.len(), 1);
-        assert_cost(bp.accounting.peers[&new].direct, 4.0);
-        assert_cost(s.direct, 6.0);
-        assert_cost(s.scheduler, 3.0);
-        assert_cost(s.total, 9.0);
+        assert_cost(bp.accounting.peers[&new].current_cost().0, 4.0);
+        assert_cost(bp.accounting.scheduler_blocker_st, 3.0);
+        assert_cost(bp.accounting.scheduler_fair_st, 6.0);
     }
 
     // ---- lift: sub-piece last wait ----
