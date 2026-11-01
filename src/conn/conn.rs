@@ -30,7 +30,7 @@ pub struct PeerStatus {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-/// Stats, all in bytes
+/// Connection statistics. `total_*` counters are bytes; `*_blocks` counters are blocks.
 pub struct Stat {
     pub total_recv: u64,
     pub total_req: u64,

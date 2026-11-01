@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, trace};
 
 use super::{
-    BitField, BlockRange, BlockRequests, PeerAddr, PeerPieceDetail, PieceMap, PiecePicker,
-    PieceState,
+    BitField, BlockRange, BlockRequests, PeerAddr, PeerPieceDetail, PickMode, PieceMap,
+    PiecePicker, PieceState,
 };
 use crate::{
     cache::simple_buffer::{JointIndex, POOL_SIZE, SUB_PIECE_SIZE},
@@ -15,7 +15,7 @@ use crate::{
     slot_accounting::{Accounting, PeerCost},
 };
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     time,
 };
 
@@ -562,6 +562,8 @@ impl PieceBlocks {
             return count;
         }
 
+        // TODO: Enforce repick_limit against requested.len() to bound duplicate
+        // requests and make endgame's request-count rounds distribute them evenly.
         let repick_begin = picked_out.len();
         // The tree is ordered by deadline. In rush mode `take_while` stops at the
         // first block whose deadline is still in the future; in endgame mode the
@@ -900,23 +902,26 @@ pub struct BlockPicker {
 
     // pieces whose blocks are not all requested
     requesting: BTreeMap<PieceIndex, PieceBlocks>,
-
     // pieces whose blocks that all requested and waiting receiving
     receiving: BTreeMap<PieceIndex, PieceBlocks>,
-
     // Lightweight scheduling indexes; PieceBlocks remains owned by the maps above.
     requesting_order: IndexTree<PieceIndex, Unrequested>,
     receiving_order: IndexTree<PieceIndex, Unreceived>,
 
+    // Shared by slow peers; fully requested pieces remain here until verified.
+    slow_pieces: HashMap<PieceIndex, PieceBlocks>,
+    slow_order: IndexTree<PieceIndex, Unreceived>,
+    slow_peers: HashSet<PeerAddr>,
+
     // previous time the timeout request check runs
     prev_time_check: tokio::time::Instant,
+    // Previous picker-maintenance tick, checked when selecting blocks.
+    prev_tick: tokio::time::Instant,
 
     no_response_timeout: time::Duration,
 
     /// Peer windows, owned by this picker and updated before block mutations.
     accounting: Accounting,
-    /// Shared aging boundary; checked lazily at the start of pick_blocks.
-    slot_window_rotated_at: tokio::time::Instant,
 
     endgame: bool,
 
@@ -937,8 +942,64 @@ pub struct PieceComplete {
 }
 
 impl BlockPicker {
-    /// Update one piece after a mutation, migration, or removal.
-    fn update_piece_order(&mut self, index: PieceIndex) {
+    fn piece(&self, index: PieceIndex) -> Option<&PieceBlocks> {
+        self.requesting
+            .get(&index)
+            .or_else(|| self.receiving.get(&index))
+            .or_else(|| self.slow_pieces.get(&index))
+    }
+
+    fn piece_mut(&mut self, index: PieceIndex) -> Option<&mut PieceBlocks> {
+        self.piece_and_accounting_mut(index).map(|(piece, _)| piece)
+    }
+
+    fn piece_and_accounting_mut(
+        &mut self,
+        index: PieceIndex,
+    ) -> Option<(&mut PieceBlocks, &mut Accounting)> {
+        let piece = self
+            .requesting
+            .get_mut(&index)
+            .or_else(|| self.receiving.get_mut(&index))
+            .or_else(|| self.slow_pieces.get_mut(&index))?;
+        Some((piece, &mut self.accounting))
+    }
+
+    fn pieces(&self) -> impl Iterator<Item = (&PieceIndex, &PieceBlocks)> {
+        self.requesting
+            .iter()
+            .chain(self.receiving.iter())
+            .chain(self.slow_pieces.iter())
+    }
+
+    fn remove_piece(&mut self, index: PieceIndex) {
+        self.requesting.remove(&index);
+        self.receiving.remove(&index);
+        self.slow_pieces.remove(&index);
+        self.requesting_order.remove(&index);
+        self.receiving_order.remove(&index);
+        self.slow_order.remove(&index);
+    }
+
+    /// Normalize fast-pool requesting/receiving membership and refresh scheduling indexes.
+    fn update_piece_state_and_order(&mut self, index: PieceIndex) {
+        // Pool ownership is independent of whether every block has a requester.
+        if self
+            .requesting
+            .get(&index)
+            .is_some_and(|p| p.requested_or_received_count == p.block_map.len())
+        {
+            let p = self.requesting.remove(&index).unwrap();
+            self.receiving.insert(index, p);
+        } else if self
+            .receiving
+            .get(&index)
+            .is_some_and(|p| p.requested_or_received_count < p.block_map.len())
+        {
+            let p = self.receiving.remove(&index).unwrap();
+            self.requesting.insert(index, p);
+        }
+
         if let Some(blocks) = self.requesting.get(&index) {
             self.requesting_order.insert(
                 index,
@@ -953,12 +1014,24 @@ impl BlockPicker {
         } else {
             self.receiving_order.remove(&index);
         }
+
+        if let Some(p) = self
+            .slow_pieces
+            .get(&index)
+            .filter(|p| !p.is_all_received())
+        {
+            self.slow_order
+                .insert(index, p.block_map.len() - p.received_count);
+        } else {
+            self.slow_order.remove(&index);
+        }
     }
 
     /// Bulk changes and progress restoration rebuild the derived indexes.
     fn rebuild_piece_order(&mut self) {
         self.requesting_order = IndexTree::new();
         self.receiving_order = IndexTree::new();
+        self.slow_order = IndexTree::new();
         for (&index, blocks) in &self.requesting {
             self.requesting_order.insert(
                 index,
@@ -968,6 +1041,12 @@ impl BlockPicker {
         for (&index, blocks) in &self.receiving {
             self.receiving_order
                 .insert(index, blocks.block_map.len() - blocks.received_count);
+        }
+        for (&index, blocks) in &self.slow_pieces {
+            if !blocks.is_all_received() {
+                self.slow_order
+                    .insert(index, blocks.block_map.len() - blocks.received_count);
+            }
         }
     }
 
@@ -990,6 +1069,7 @@ impl BlockPicker {
             .requesting
             .values_mut()
             .chain(self.receiving.values_mut())
+            .chain(self.slow_pieces.values_mut())
         {
             p.settle_account(&mut self.accounting, now);
         }
@@ -997,12 +1077,8 @@ impl BlockPicker {
 
     /// Settle one piece to the current time without stopping its clock.
     fn settle_piece(&mut self, index: u32) {
-        if let Some(p) = self
-            .requesting
-            .get_mut(&index)
-            .or_else(|| self.receiving.get_mut(&index))
-        {
-            p.settle_account(&mut self.accounting, tokio::time::Instant::now());
+        if let Some((piece, accounting)) = self.piece_and_accounting_mut(index) {
+            piece.settle_account(accounting, tokio::time::Instant::now());
         }
     }
 }
@@ -1023,13 +1099,16 @@ impl BlockPicker {
             piece_picker,
             requesting: BTreeMap::new(),
             receiving: BTreeMap::new(),
+            slow_pieces: HashMap::new(),
+            slow_order: IndexTree::new(),
+            slow_peers: HashSet::new(),
             requesting_order: IndexTree::new(),
             receiving_order: IndexTree::new(),
             prev_time_check: tokio::time::Instant::now(),
+            prev_tick: tokio::time::Instant::now(),
             no_response_timeout,
             endgame: false,
             accounting: Accounting::default(),
-            slot_window_rotated_at: tokio::time::Instant::now(),
             file_tracker: FileTracker::new(meta),
             #[cfg(feature = "metrics")]
             torrent_hex: hex::encode(meta.info_hash),
@@ -1053,13 +1132,16 @@ impl BlockPicker {
             piece_picker,
             requesting: BTreeMap::new(),
             receiving: BTreeMap::new(),
+            slow_pieces: HashMap::new(),
+            slow_order: IndexTree::new(),
+            slow_peers: HashSet::new(),
             requesting_order: IndexTree::new(),
             receiving_order: IndexTree::new(),
             prev_time_check: tokio::time::Instant::now(),
+            prev_tick: tokio::time::Instant::now(),
             no_response_timeout,
             endgame: false,
             accounting: Accounting::default(),
-            slot_window_rotated_at: tokio::time::Instant::now(),
             file_tracker: FileTracker::from_lengths(piece_size as u64, [total_size]),
             #[cfg(feature = "metrics")]
             torrent_hex: String::new(),
@@ -1108,26 +1190,16 @@ impl BlockPicker {
     /// Last wait of the sub-piece at `in_piece_offset`; `None` once taken or when the
     /// piece is not tracked (verified, or restored from a dump).
     pub fn take_last_wait(&mut self, index: u32, in_piece_offset: u32) -> Option<LastWait> {
-        if let Some(b) = self.receiving.get_mut(&index) {
-            return b.take_last_wait(in_piece_offset);
-        }
-        self.requesting
-            .get_mut(&index)
+        self.piece_mut(index)
             .and_then(|b| b.take_last_wait(in_piece_offset))
     }
 
     pub fn get_block_status(&self, req: &Request) -> Option<&BlockStatus> {
-        if !self.check_block_validity(&req) {
+        if !self.check_block_validity(req) {
             return None;
         }
-
-        if let Some(b) = self.requesting.get(&req.index) {
-            Some(&b.block_map[req.begin as usize / BLOCK_SIZE])
-        } else if let Some(b) = self.receiving.get(&req.index) {
-            Some(&b.block_map[req.begin as usize / BLOCK_SIZE])
-        } else {
-            None
-        }
+        self.piece(req.index)
+            .map(|b| &b.block_map[req.begin as usize / BLOCK_SIZE])
     }
 
     pub fn get_inflight_when_sent(&self, peer: &PeerAddr, req: &Request) -> Option<usize> {
@@ -1177,12 +1249,13 @@ impl BlockPicker {
         }
     }
 
-    /// Pick n blocks from peer, returns
-    /// (
-    ///  picked blocks,
-    ///  number of picked blocks,
-    ///  no response blocks
-    /// )
+    /// Pick up to `n` blocks from `peer`.
+    ///
+    /// Returns:
+    /// - The picked block requests.
+    /// - The actual number of blocks picked.
+    ///
+    /// Timed-out requests are added to `revoked`, grouped by peer.
     pub fn pick_blocks(
         &mut self,
         peer: &PeerAddr,
@@ -1195,410 +1268,96 @@ impl BlockPicker {
         #[cfg(feature = "blocktrace")] bt_torrent_id: Option<i64>,
         #[cfg(feature = "blocktrace")] bt_peer_id: Option<i64>,
     ) -> (BlockRequests, usize) {
-        let now = tokio::time::Instant::now();
-        let elapsed = now.duration_since(self.slot_window_rotated_at);
-        if elapsed >= time::Duration::from_secs(15) {
-            // Close all pending costs before moving the current windows to history.
-            self.settle_all_piece(now);
-            // With regular 15s windows and uniform arrivals, data older than 30s
-            let peers: Vec<_> = self
-                .accounting
-                .peers
-                .iter(false)
-                .map(|(peer, _)| *peer)
-                .collect();
-            for peer in peers {
-                self.accounting.peers.get_mut(&peer).unwrap().rotate(0.5);
-            }
-            self.slot_window_rotated_at = now;
-        }
-
-        #[cfg(feature = "metrics")]
-        let torrent = self.torrent_hex.clone();
-
         if self.prev_time_check.elapsed() >= time::Duration::from_secs(1) {
             self.revoke_unrespond(revoked);
             self.prev_time_check = tokio::time::Instant::now();
         }
-
-        let rush_mode = n_cache_vacant < POOL_SIZE * 1 / 4;
-        let endgame = self.update_endgame();
-        let repick_option = if endgame {
-            RepickOption {
-                repick_limit: 1,
-                endgame: true,
-            }
-        } else if rush_mode {
-            RepickOption {
-                repick_limit: 7, // TODO: set a proper repick limit
-                endgame: false,
-            }
-        } else {
-            RepickOption {
-                repick_limit: 1,
-                endgame: false,
-            }
-        };
-        info!("{peer:?} endgame {endgame}, rush {}", rush_mode);
-
-        let mut remain = n;
-        let peer_status = if let Some(h) = self.piece_picker.peer_detail(peer) {
-            h
-        } else {
-            info!("pick_blocks: peer {peer:?} not registered in piece_picker, skipping");
-            return (
-                BlockRequests {
-                    piece_size: self.piece_size as u32,
-                    range: Vec::new(),
-                },
-                0,
-            );
-        };
-
-        // Snapshot the order so picking can update the indexes during this pass.
-        fn piece_index_order(order: &IndexTree<PieceIndex, usize>) -> Vec<PieceIndex> {
-            order.iter(false).map(|(index, _)| *index).collect()
-        }
-
-        // TODO: reuse vector
+        // TODO: Reuse vectors to reduce allocations on the pick path.
         let mut ret = Vec::new();
-        let pick_blocks_from_requesting =
-            |ret: &mut Vec<BlockRange>,
-             pieces: &mut BTreeMap<u32, PieceBlocks>,
-             order: &mut IndexTree<PieceIndex, Unrequested>,
-             peer_status: &PeerPieceDetail,
-             remain: &mut usize,
-             n_in_flight: &mut usize,
-             avg_speed: f32,
-             rtt: Option<time::Duration>,
-             piece_size: usize,
-             account: &mut Accounting| {
-                for index in piece_index_order(order) {
-                    let blocks = &mut pieces.get_mut(&index).expect("must exist");
-                    assert!(!endgame);
-                    if *remain == 0 {
-                        break;
-                    }
-                    if peer_status.have(index) {
-                        let before = ret.len();
-                        let n_picked = blocks.pick(
-                            *peer,
-                            *remain,
-                            n_in_flight,
-                            avg_speed,
-                            rtt,
-                            repick_option,
-                            ret,
-                            account,
-                            #[cfg(feature = "metrics")]
-                            &torrent,
-                            #[cfg(feature = "blocktrace")]
-                            bt_torrent_id,
-                            #[cfg(feature = "blocktrace")]
-                            bt_peer_id,
-                        );
-                        order.insert(
-                            index,
-                            blocks.block_map.len() - blocks.requested_or_received_count,
-                        );
-                        *remain -= n_picked;
-                        if tracing::enabled!(tracing::Level::TRACE) {
-                            for blks in &ret[before..] {
-                                let pb: Vec<_> = blks.iter(piece_size as u32).collect();
-                                trace!(
-                                    "pick piece {index} from peer {peer:?} (requesting), picked blks: {pb:?}"
-                                );
-                            }
-                        }
-                    }
-                }
-            };
-
-        // if in normal more, pick requesting pieces
-        // if in rush mode, pick receiving pieces first, then requesting pieces, try to finish pieces asap
-        if !rush_mode {
-            pick_blocks_from_requesting(
-                &mut ret,
-                &mut self.requesting,
-                &mut self.requesting_order,
-                &peer_status,
-                &mut remain,
-                &mut n_in_flight,
-                avg_speed,
-                rtt,
-                self.piece_size,
-                &mut self.accounting,
-            );
-            for (index, blocks) in self
-                .requesting
-                .extract_if(.., |_, b| b.is_all_requested_or_received())
-            {
-                self.requesting_order.remove(&index);
-                self.receiving_order
-                    .insert(index, blocks.block_map.len() - blocks.received_count);
-                self.receiving.insert(index, blocks);
-            }
-        }
-
-        let endgame = self.update_endgame();
-        let peer_status = if let Some(h) = self.piece_picker.peer_detail(peer) {
-            h
-        } else {
-            info!(
-                "pick_blocks: peer {peer:?} not registered in piece_picker after initial picks; returning {} picked",
-                n - remain
-            );
+        let mut remain = n;
+        if n == 0 || self.piece_picker.peer_detail(peer).is_none_or(|p| p.choke) {
             return (
                 BlockRequests {
                     piece_size: self.piece_size as u32,
                     range: ret,
                 },
-                n - remain,
+                0,
             );
-        };
-
-        if remain > 0 && endgame {
-            // the fewest number of peers we have requested for a given block among all receiving blocks
-            let from = self
-                .receiving
-                .iter()
-                .filter_map(|(_, p)| {
-                    p.block_map
-                        .iter()
-                        .filter_map(|b| match b {
-                            BlockStatus::NotRequested { .. } => Some(0),
-                            BlockStatus::Requested { requested, .. } => Some(requested.len()),
-                            BlockStatus::Received => None,
-                        })
-                        .min()
-                })
-                .min();
-
-            // If in endgame mode, we re-requesting requested blocks
-            // In endgame mode, duplicate requested count of every block should be put evenly,
-            // since in endgame mode, remaining candidates should be few(TODO: fact check)
-            // use a simple approach
-            // TODO: set dynamic upper limit, optimize impossible pick(if all blocks requested before
-            // simply add limit does not work
-            // maybe add a BTreeSet to maintain this
-            if let Some(from) = from {
-                for limit in from..=from.saturating_add(1) {
-                    let repick_option = RepickOption {
-                        repick_limit: limit,
-                        endgame: true,
-                    };
-                    for index in piece_index_order(&self.receiving_order) {
-                        let blocks = &mut self.receiving.get_mut(&index).expect("must exist");
-                        if remain == 0 {
-                            break;
-                        }
-                        if peer_status.have(index) {
-                            let before = ret.len();
-                            let n_picked = blocks.pick(
-                                *peer,
-                                remain,
-                                &mut n_in_flight,
-                                avg_speed,
-                                rtt,
-                                repick_option,
-                                &mut ret,
-                                &mut self.accounting,
-                                #[cfg(feature = "metrics")]
-                                &torrent,
-                                #[cfg(feature = "blocktrace")]
-                                bt_torrent_id,
-                                #[cfg(feature = "blocktrace")]
-                                bt_peer_id,
-                            );
-                            remain -= n_picked;
-                            if tracing::enabled!(tracing::Level::TRACE) {
-                                for blks in &ret[before..] {
-                                    let pb: Vec<_> = blks.iter(self.piece_size as u32).collect();
-                                    trace!(
-                                        "pick piece {index} from peer {peer:?} (requested endgame), picked blks: {pb:?}"
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            info!("remain 1 {remain}");
-        } else if remain > 0 && rush_mode {
-            for index in piece_index_order(&self.receiving_order) {
-                let blocks = &mut self.receiving.get_mut(&index).expect("must exist");
-                if remain == 0 {
-                    break;
-                }
-                if peer_status.have(index) {
-                    let before = ret.len();
-                    let n_picked = blocks.pick(
-                        *peer,
-                        remain,
-                        &mut n_in_flight,
-                        avg_speed,
-                        rtt,
-                        repick_option,
-                        &mut ret,
-                        &mut self.accounting,
-                        #[cfg(feature = "metrics")]
-                        &torrent,
-                        #[cfg(feature = "blocktrace")]
-                        bt_torrent_id,
-                        #[cfg(feature = "blocktrace")]
-                        bt_peer_id,
-                    );
-                    remain -= n_picked;
-                    if tracing::enabled!(tracing::Level::TRACE) {
-                        trace!("{peer:?} pick piece {index} (pick_next), inflight {n_in_flight}");
-                        for blks in &ret[before..] {
-                            let pb: Vec<_> = blks.iter(self.piece_size as u32).collect();
-                            trace!(
-                                "{peer:?} (pick_next), picked blks: {pb:?}, repick_option: {repick_option:?}"
-                            );
-                        }
-                    }
-                }
-            }
-            info!("remain 2 {remain}");
         }
-
-        if rush_mode {
-            pick_blocks_from_requesting(
-                &mut ret,
-                &mut self.requesting,
-                &mut self.requesting_order,
-                &peer_status,
+        let rush = n_cache_vacant < POOL_SIZE / 4;
+        let slow = self.slow_peers.contains(peer);
+        if !self.update_endgame() {
+            let option = RepickOption {
+                // TODO: Choose a proper rush repick limit instead of the fixed 7.
+                repick_limit: if rush { 7 } else { 1 },
+                endgame: false,
+            };
+            let order = self.normal_piece_order(rush, !slow);
+            self.pick_blocks_within(
+                peer,
+                &order,
                 &mut remain,
                 &mut n_in_flight,
                 avg_speed,
                 rtt,
-                self.piece_size,
-                &mut self.accounting,
+                option,
+                &mut ret,
+                #[cfg(feature = "blocktrace")]
+                bt_torrent_id,
+                #[cfg(feature = "blocktrace")]
+                bt_peer_id,
             );
-            for (index, blocks) in self
-                .requesting
-                .extract_if(.., |_, b| b.is_all_requested_or_received())
-            {
-                self.requesting_order.remove(&index);
-                self.receiving_order
-                    .insert(index, blocks.block_map.len() - blocks.received_count);
-                self.receiving.insert(index, blocks);
-            }
-        }
 
-        let endgame = self.update_endgame();
-        // if self.rush_mode() {
-        //     for (index, blocks) in self.receiving.iter().chain(self.requesting.iter()) {
-        //         let n_received = blocks.received_count;
-        //         let n_requesting = blocks
-        //             .block_map
-        //             .iter()
-        //             .filter(|b| matches!(b, BlockStatus::Requested { .. }))
-        //             .count();
-        //         let n_to_request = blocks
-        //             .block_map
-        //             .iter()
-        //             .filter(|b| matches!(b, BlockStatus::NotRequested { .. }))
-        //             .count();
-        //         let least_waiting_time = blocks
-        //             .block_map
-        //             .iter()
-        //             .filter_map(|b| {
-        //                 if let BlockStatus::Requested { requested, .. } = b {
-        //                     requested
-        //                         .iter()
-        //                         .map(|(p, t)| t.pick_time)
-        //                         .reduce(|ta, tb| ta.max(tb))
-        //                 } else {
-        //                     None
-        //                 }
-        //             })
-        //             .reduce(|va, vb| va.max(vb));
-        //         let most_waiting_time = blocks
-        //             .block_map
-        //             .iter()
-        //             .filter_map(|b| {
-        //                 if let BlockStatus::Requested { requested, .. } = b {
-        //                     requested
-        //                         .iter()
-        //                         .map(|(_, t)| t.pick_time)
-        //                         .reduce(|ta, tb| ta.min(tb))
-        //                 } else {
-        //                     None
-        //                 }
-        //             })
-        //             .reduce(|va, vb| va.min(vb));
-        //         debug!(
-        //             "{peer} in rush mode detail: piece {}, to request {}, requesting {}, received {}, requested least time {:?}, most time {:?}",
-        //             index, n_to_request, n_requesting, n_received, least_waiting_time.map(|x| x.elapsed()), most_waiting_time.map(|x| x.elapsed()),
-        //         );
-        //     }
-        // }
-        let strict_rush_mode = n_cache_vacant == 0;
-        while remain > 0 && !strict_rush_mode {
-            if let Some(index) = self.piece_picker.pick_next(peer) {
-                assert!(!endgame);
-                let mut blocks = self.piece_block_of(index);
+            // Existing pieces always precede fresh pieces, including in the slow pool.
+            while remain > 0 && n_cache_vacant > 0 && !self.update_endgame() {
+                let mode = if slow {
+                    PickMode::ForSlowPeer
+                } else {
+                    PickMode::Normal
+                };
+                let Some(index) = self.piece_picker.pick_next(peer, mode) else {
+                    break;
+                };
+                let blocks = self.piece_block_of(index);
 
-                let before = ret.len();
-                let n_picked = blocks.pick(
-                    *peer,
-                    remain,
+                if slow {
+                    self.slow_pieces.insert(index, blocks);
+                } else {
+                    self.requesting.insert(index, blocks);
+                }
+                self.pick_blocks_within(
+                    peer,
+                    &[index],
+                    &mut remain,
                     &mut n_in_flight,
                     avg_speed,
                     rtt,
-                    repick_option,
+                    option,
                     &mut ret,
-                    &mut self.accounting,
-                    #[cfg(feature = "metrics")]
-                    &torrent,
                     #[cfg(feature = "blocktrace")]
                     bt_torrent_id,
                     #[cfg(feature = "blocktrace")]
                     bt_peer_id,
                 );
-                remain -= n_picked;
-                if tracing::enabled!(tracing::Level::TRACE) {
-                    trace!(
-                        "{peer:?} rush mode extra {} pick piece {} (pick_next), inflight {}",
-                        rush_mode, index, n_in_flight
-                    );
-                    for blks in &ret[before..] {
-                        let pb: Vec<_> = blks.iter(self.piece_size as u32).collect();
-                        trace!(
-                            "{peer:?} rush mode extra {} picked blks: {pb:?}, {:?}",
-                            rush_mode, blocks.block_map
-                        );
-                    }
-                }
-                assert!(!self.requesting.contains_key(&index));
-                self.requesting.insert(index, blocks);
-                self.update_piece_order(index);
-            } else {
-                break;
-            }
-            info!("remain 3 {remain}");
-        }
-        if (rush_mode || endgame) && remain > 0 {
-            info!(
-                "{peer:?} rush mode {} endgame {} causing less picking, remain {remain}",
-                rush_mode, endgame
-            );
-            for (index, blocks) in &self.receiving {
-                trace!(
-                    "{peer:?} rush mode, receiving piece {index}, blocks: {:?}",
-                    blocks.block_map
-                );
-            }
-            for (index, blocks) in &self.requesting {
-                trace!(
-                    "{peer:?} rush mode {}, endgame {} requesting piece {index}, blocks: {:?}",
-                    rush_mode, endgame, blocks.block_map,
-                );
+                self.update_piece_state_and_order(index);
             }
         }
 
+        // we may not in endgame before, but entering endgame now
+        if remain > 0 && self.update_endgame() {
+            self.pick_endgame(
+                peer,
+                &mut remain,
+                &mut n_in_flight,
+                avg_speed,
+                rtt,
+                &mut ret,
+                #[cfg(feature = "blocktrace")]
+                bt_torrent_id,
+                #[cfg(feature = "blocktrace")]
+                bt_peer_id,
+            );
+        }
         (
             BlockRequests {
                 piece_size: self.piece_size as u32,
@@ -1608,38 +1367,334 @@ impl BlockPicker {
         )
     }
 
+    /// Pick blocks only from the pieces listed in `indices`, in the supplied order.
+    fn pick_blocks_within(
+        &mut self,
+        peer: &PeerAddr,
+        indices: &[PieceIndex],
+        remain: &mut usize,
+        n_in_flight: &mut usize,
+        avg_speed: f32,
+        rtt: Option<time::Duration>,
+        option: RepickOption,
+        ret: &mut Vec<BlockRange>,
+        #[cfg(feature = "blocktrace")] bt_torrent_id: Option<i64>,
+        #[cfg(feature = "blocktrace")] bt_peer_id: Option<i64>,
+    ) {
+        #[cfg(feature = "metrics")]
+        let torrent_hex = self.torrent_hex.clone();
+
+        for &index in indices {
+            if *remain == 0 {
+                break;
+            }
+            if !self
+                .piece_picker
+                .peer_detail(peer)
+                .is_some_and(|p| p.have(index))
+            {
+                continue;
+            }
+            let Some((blocks, accounting)) = self.piece_and_accounting_mut(index) else {
+                continue;
+            };
+            let picked = blocks.pick(
+                *peer,
+                *remain,
+                n_in_flight,
+                avg_speed,
+                rtt,
+                option,
+                ret,
+                accounting,
+                #[cfg(feature = "metrics")]
+                &torrent_hex,
+                #[cfg(feature = "blocktrace")]
+                bt_torrent_id,
+                #[cfg(feature = "blocktrace")]
+                bt_peer_id,
+            );
+            *remain -= picked;
+            self.update_piece_state_and_order(index);
+        }
+    }
+
+    fn pick_endgame(
+        &mut self,
+        peer: &PeerAddr,
+        remain: &mut usize,
+        n_in_flight: &mut usize,
+        avg_speed: f32,
+        rtt: Option<time::Duration>,
+        ret: &mut Vec<BlockRange>,
+        #[cfg(feature = "blocktrace")] bt_torrent_id: Option<i64>,
+        #[cfg(feature = "blocktrace")] bt_peer_id: Option<i64>,
+    ) {
+        // Endgame uses exactly one candidate set for every peer, regardless of class.
+        // TODO: Verify that endgame candidate sets stay small; computing `from`
+        // currently scans every tracked block on each pick.
+        let from = self
+            .pieces()
+            .flat_map(|(_, p)| &p.block_map)
+            .filter_map(|b| match b {
+                BlockStatus::NotRequested { .. } => Some(0),
+                BlockStatus::Requested { requested, .. } => Some(requested.len()),
+                BlockStatus::Received => None,
+            })
+            .min();
+        if let Some(from) = from {
+            // TODO: Set a dynamic duplicate-request upper limit and avoid repeated
+            // scans when this peer has already been requested for every candidate.
+            let order = self.endgame_piece_order();
+            for limit in from..=from.saturating_add(1) {
+                self.pick_blocks_within(
+                    peer,
+                    &order,
+                    remain,
+                    n_in_flight,
+                    avg_speed,
+                    rtt,
+                    RepickOption {
+                        repick_limit: limit,
+                        endgame: true,
+                    },
+                    ret,
+                    #[cfg(feature = "blocktrace")]
+                    bt_torrent_id,
+                    #[cfg(feature = "blocktrace")]
+                    bt_peer_id,
+                );
+            }
+        }
+    }
+
+    /// Run due 15-second maintenance before picking. Peer statistics are collected
+    /// only when due; each entry contains a connection's identity and received bytes.
+    pub(crate) fn tick(
+        &mut self,
+        peers: impl Iterator<Item = (PeerAddr, u64)>,
+        #[cfg(feature = "blocktrace")] peer_trace_id: impl Fn(&PeerAddr) -> Option<i64>,
+    ) {
+        let now = tokio::time::Instant::now();
+        if now.duration_since(self.prev_tick) < time::Duration::from_secs(15) {
+            return;
+        }
+        self.rotate_slot_windows(now);
+        let peers: Vec<_> = peers.collect();
+        self.update_peer_classes(
+            &peers,
+            #[cfg(feature = "blocktrace")]
+            peer_trace_id,
+        );
+        self.prev_tick = now;
+    }
+
+    /// Advance windows only from the periodic picker tick.
+    fn rotate_slot_windows(&mut self, now: tokio::time::Instant) {
+        self.settle_all_piece(now);
+        let peers: Vec<_> = self
+            .accounting
+            .peers
+            .iter(false)
+            .map(|(peer, _)| *peer)
+            .collect();
+        for peer in peers {
+            self.accounting.peers.get_mut(&peer).unwrap().rotate(0.5);
+        }
+    }
+
+    /// Classify live connections as fast or slow using their current aged ST.
+    ///
+    /// Each entry in `peers` is `(peer, received_bytes)`:
+    /// - `peer` is a `PeerAddr` containing the socket address and connection ID.
+    /// - `received_bytes` is the cumulative number of bytes received on that
+    ///   connection, including duplicate and late responses (`PeerConn::stat.total_recv`).
+    ///   Zero keeps the peer fast until data arrives, even if it was repicked and
+    ///   is no longer useful; this value is not a connection ID.
+    fn update_peer_classes(
+        &mut self,
+        peers: &[(PeerAddr, u64)],
+        #[cfg(feature = "blocktrace")] peer_trace_id: impl Fn(&PeerAddr) -> Option<i64>,
+    ) {
+        let now = tokio::time::Instant::now();
+        self.settle_all_piece(now);
+        let samples: Vec<_> = peers
+            .iter()
+            .map(|(peer, received_bytes)| {
+                (*peer, self.peer_slot_cost(peer).blocker, *received_bytes)
+            })
+            .collect();
+        let slow = super::peer_classification::classify_peers(&samples);
+        #[cfg(feature = "blocktrace")]
+        let ts_us = blocktrace::now_us();
+        for (addr, _) in peers {
+            if slow.contains(addr) != self.slow_peers.contains(addr) {
+                info!(peer = ?addr, slow = slow.contains(addr), "peer picker class changed");
+                #[cfg(feature = "blocktrace")]
+                if let Some(peer_id) = peer_trace_id(addr) {
+                    blocktrace::record_peer_state(blocktrace::PeerStateEvent {
+                        peer_id,
+                        ts_us,
+                        kind: if slow.contains(addr) {
+                            blocktrace::PeerStateKind::FastToSlow
+                        } else {
+                            blocktrace::PeerStateKind::SlowToFast
+                        },
+                        mode: None,
+                    });
+                }
+            }
+        }
+        self.slow_peers = slow;
+        let live: Vec<_> = peers.iter().map(|(addr, _)| *addr).collect();
+        self.reconcile_piece_pools(&live);
+        self.update_endgame();
+        info!(
+            fast = peers.len() - self.slow_peers.len(),
+            slow = self.slow_peers.len(),
+            slow_pieces = self.slow_pieces.len(),
+            "peer picker classes refreshed"
+        );
+    }
+
+    /// Decide all migrations from the same peer/bitfield snapshot before moving anything.
+    fn reconcile_piece_pools(&mut self, peers: &[PeerAddr]) {
+        let mut to_fast = Vec::new();
+        let mut to_slow = Vec::new();
+        let pieces: Vec<_> = self
+            .pieces()
+            .filter(|(index, p)| {
+                !p.is_all_received()
+                    || (self.slow_peers.is_empty() && self.slow_pieces.contains_key(*index))
+            })
+            .map(|(&index, _)| index)
+            .collect();
+        'piece: for index in pieces {
+            let in_slow = self.slow_pieces.contains_key(&index);
+            if in_slow && self.slow_peers.is_empty() {
+                to_fast.push(index);
+                continue;
+            }
+            let mut fast_source = false;
+            let mut slow_source = false;
+            for peer in peers {
+                if self
+                    .piece_picker
+                    .peer_detail(peer)
+                    .is_some_and(|p| p.have(index))
+                {
+                    if self.slow_peers.contains(peer) {
+                        slow_source = true;
+                    } else {
+                        fast_source = true;
+                    }
+                }
+                if fast_source && slow_source {
+                    continue 'piece;
+                }
+            }
+            if in_slow && !slow_source {
+                to_fast.push(index);
+            } else if !in_slow && !fast_source && slow_source {
+                to_slow.push(index);
+            }
+        }
+        for index in to_fast {
+            let blocks = self.slow_pieces.remove(&index).unwrap();
+            if blocks.requested_or_received_count == blocks.block_map.len() {
+                self.receiving.insert(index, blocks);
+            } else {
+                self.requesting.insert(index, blocks);
+            }
+            self.update_piece_state_and_order(index);
+            info!(piece = index, "piece returned to fast pool: no slow source");
+        }
+        for index in to_slow {
+            let blocks = self
+                .requesting
+                .remove(&index)
+                .or_else(|| self.receiving.remove(&index))
+                .unwrap();
+            self.slow_pieces.insert(index, blocks);
+            self.update_piece_state_and_order(index);
+            info!(piece = index, "piece moved to slow pool: only slow sources");
+        }
+    }
+
+    /// The order of pieces to picking blocks from.
+    /// In normal mode, slow peers only use slow piece pool, fast peers
+    /// only use fast piece pool.
+    /// In rush mode, fast peers can takeover slow blocks in slow pool
+    fn normal_piece_order(&self, rush: bool, fast: bool) -> Vec<PieceIndex> {
+        if !fast {
+            return self
+                .slow_order
+                .iter(false)
+                .map(|(index, _)| *index)
+                .collect();
+        }
+        let mut order = if rush {
+            self.merge_receiving_and_slow_by_order()
+        } else {
+            Vec::new()
+        };
+        order.extend(self.requesting_order.iter(false).map(|(index, _)| *index));
+        order
+    }
+
+    /// Endgame has no fast requesting pieces and uses both pools for every peer.
+    fn endgame_piece_order(&self) -> Vec<PieceIndex> {
+        self.merge_receiving_and_slow_by_order()
+    }
+
+    /// Merge the existing (unreceived count, piece index) orders in linear time.
+    fn merge_receiving_and_slow_by_order(&self) -> Vec<PieceIndex> {
+        let mut receiving = self
+            .receiving_order
+            .iter(false)
+            .filter(|(_, count)| **count > 0)
+            .map(|(index, count)| (*count, *index))
+            .peekable();
+        let mut slow = self
+            .slow_order
+            .iter(false)
+            .map(|(index, count)| (*count, *index))
+            .peekable();
+        let mut order = Vec::with_capacity(self.receiving.len() + self.slow_pieces.len());
+        while let (Some(receiving_key), Some(slow_key)) = (receiving.peek(), slow.peek()) {
+            let next = if receiving_key <= slow_key {
+                receiving.next()
+            } else {
+                slow.next()
+            };
+            order.push(next.unwrap().1);
+        }
+
+        // one iterator ends, append remaining
+        order.extend(receiving.map(|(_, index)| index));
+        order.extend(slow.map(|(_, index)| index));
+        order
+    }
+
     /// Call when some block request is rejected, and request for that block
     /// should be send to other peers again.
     pub fn peer_reject_block(&mut self, peer: &PeerAddr, req: Request) {
         if !self.check_block_validity(&req) {
-            info!("ignore reject of invalid block {req:?}");
             return;
         }
-        if let Some(b) = self.receiving.get_mut(&req.index) {
-            assert!(b.is_all_requested_or_received(), "{}", req.index);
-            assert!(!self.requesting.contains_key(&req.index), "{}", req.index);
-            assert!(self.piece_picker.have(req.index), "{}", req.index);
-            b.revoke(peer, req, &mut self.accounting);
-            if !b.is_all_requested_or_received() {
-                let b = self.receiving.remove(&req.index).unwrap();
-                self.requesting.insert(req.index, b);
-            } else if b.is_all_not_requested() {
-                self.piece_picker.set_have(req.index, false);
-                self.receiving.remove(&req.index);
+        let mut empty = false;
+        if let Some((b, accounting)) = self.piece_and_accounting_mut(req.index) {
+            b.revoke(peer, req, accounting);
+            empty = b.is_all_not_requested();
+            if empty {
+                b.settle_account(accounting, tokio::time::Instant::now());
             }
-        } else if let Some(b) = self.requesting.get_mut(&req.index) {
-            assert!(!self.receiving.contains_key(&req.index), "{}", req.index);
-            assert!(self.piece_picker.have(req.index), "{}", req.index);
-            b.revoke(peer, req, &mut self.accounting);
-            if b.is_all_not_requested() {
-                b.settle_account(&mut self.accounting, tokio::time::Instant::now());
-                self.piece_picker.set_have(req.index, false);
-                self.requesting.remove(&req.index);
-            }
-        } else {
-            info!("revoke not requested/already checked piece");
         }
-        self.update_piece_order(req.index);
+        if empty {
+            self.remove_piece(req.index);
+            self.piece_picker.set_have(req.index, false);
+        }
+        self.update_piece_state_and_order(req.index);
     }
 
     fn check_block_validity(&self, req: &Request) -> bool {
@@ -1688,52 +1743,27 @@ impl BlockPicker {
             );
         }
 
-        let result = if let Some(b) = self.requesting.get_mut(&ji.index()) {
-            let r = b.receive(req, &mut self.accounting);
-            if b.is_all_requested_or_received() {
-                let b = self.requesting.remove(&ji.index()).unwrap();
-                // return peers to cancel
-                let complete = PieceComplete {
-                    piece: b.is_all_received(),
-                    sub_piece: b.is_sub_all_received(req.begin),
-                };
-                self.receiving.insert(ji.index(), b);
-                (complete, r)
-            } else {
-                (
-                    PieceComplete {
-                        piece: false,
-                        sub_piece: b.is_sub_all_received(req.begin),
-                    },
-                    r,
-                )
-            }
-        } else if let Some(b) = self.receiving.get_mut(&ji.index()) {
-            let r = b.receive(req, &mut self.accounting);
+        let index = ji.index();
+        let result = if let Some((b, accounting)) = self.piece_and_accounting_mut(index) {
+            let cancel = b.receive(req, accounting);
             (
                 PieceComplete {
                     piece: b.is_all_received(),
                     sub_piece: b.is_sub_all_received(req.begin),
                 },
-                r,
+                cancel,
             )
-        } else if self.piece_picker.selected(ji.index()) && !self.piece_picker.have(ji.index()) {
-            let mut b = self.piece_block_of(ji.index());
-            let r = b.receive(req, &mut self.accounting);
-            let sub_complete = b.is_sub_all_received(req.begin);
-            // only receive one block must be partial requested
-            // TODO: FIXME: there should be no way that piece only have one block, huh?
-            // otherwise we may move that to received
-            self.requesting.insert(ji.index(), b);
-            // notify piece_picker this piece is downloading
-            self.piece_picker.set_have(ji.index(), true);
-            (
-                PieceComplete {
-                    piece: false,
-                    sub_piece: sub_complete,
-                },
-                r,
-            )
+        } else if self.piece_picker.selected(index) && !self.piece_picker.have(index) {
+            // Late arrivals can reopen a piece after all its requests were revoked.
+            let mut b = self.piece_block_of(index);
+            let cancel = b.receive(req, &mut self.accounting);
+            let complete = PieceComplete {
+                piece: b.is_all_received(),
+                sub_piece: b.is_sub_all_received(req.begin),
+            };
+            self.requesting.insert(index, b);
+            self.piece_picker.set_have(index, true);
+            (complete, cancel)
         } else {
             // blocks we didn't select or already have
             (
@@ -1744,7 +1774,7 @@ impl BlockPicker {
                 vec![],
             )
         };
-        self.update_piece_order(ji.index());
+        self.update_piece_state_and_order(index);
         result
     }
 
@@ -1755,10 +1785,9 @@ impl BlockPicker {
     pub fn piece_verified(&mut self, index: u32, success: bool) -> Vec<usize> {
         self.settle_piece(index);
         let had = self.have(index);
-        self.receiving.remove(&index);
-        self.requesting.remove(&index);
+        self.remove_piece(index);
         self.piece_picker.set_have(index, success);
-        self.update_piece_order(index);
+        self.update_piece_state_and_order(index);
         match (had, success) {
             // genuine transitions drive the tracker exactly once
             (false, true) => self.file_tracker.piece_verified(index, true),
@@ -1776,50 +1805,47 @@ impl BlockPicker {
     /// Mark blocks as `NotRequested` if they are `Requested` and did not respond
     /// longer than timeout
     fn revoke_unrespond(&mut self, revoked: &mut HashMap<PeerAddr, Vec<Request>>) {
-        // Keep the decision stable across the settlement check and actual revoke.
         let now = tokio::time::Instant::now();
         let no_response =
             |_: &PeerAddr, at: &tokio::time::Instant| now.duration_since(*at) > NO_RESPONSE_TIMEOUT;
-        for (index, blocks) in self.receiving.extract_if(.., |_, blocks| {
-            blocks.revoke_all_requested_if(no_response, revoked, &mut self.accounting);
-            !blocks.is_all_requested_or_received()
-        }) {
-            self.requesting.insert(index, blocks);
-        }
-
-        for (index, blocks) in self.requesting.iter_mut() {
-            blocks.revoke_all_requested_if(no_response, revoked, &mut self.accounting);
-            if blocks.is_all_not_requested() {
-                let has_revoked_history = blocks.block_map.iter().any(|s| {
-                    if let BlockStatus::NotRequested { revoked } = s {
-                        // TODO: optimize, do not loop over block_map, store a revoked_count
-                        !revoked.is_empty()
-                    } else {
-                        false
-                    }
-                });
-                if !has_revoked_history {
-                    self.piece_picker.set_have(*index, false);
-                }
+        let mut remove = Vec::new();
+        let mut indices = Vec::new();
+        for (&index, b) in self
+            .requesting
+            .iter_mut()
+            .chain(self.receiving.iter_mut())
+            .chain(self.slow_pieces.iter_mut())
+        {
+            b.revoke_all_requested_if(no_response, revoked, &mut self.accounting);
+            indices.push(index);
+            if b.is_all_not_requested()
+                && !b.block_map.iter().any(
+                    // TODO: optimize, do not loop over block_map, store a revoked_count
+                    |s| matches!(s, BlockStatus::NotRequested { revoked } if !revoked.is_empty()),
+                )
+            {
+                remove.push(index);
             }
         }
-        self.requesting.retain(|_, b| {
-            !b.is_all_not_requested()
-                || b.block_map.iter().any(|s| {
-                    if let BlockStatus::NotRequested { revoked } = s {
-                        // TODO: optimize, do not loop over block_map, store a revoked_count
-                        !revoked.is_empty()
-                    } else {
-                        false
-                    }
-                })
-        });
-        self.rebuild_piece_order();
+        for index in remove {
+            self.remove_piece(index);
+            self.piece_picker.set_have(index, false);
+        }
+        for index in indices {
+            self.update_piece_state_and_order(index);
+        }
     }
 
     fn update_endgame(&mut self) -> bool {
         let old = self.endgame;
-        self.endgame = self.requesting.is_empty() && self.piece_picker.is_finished();
+        // Fast pieces with unrequested blocks live in requesting; receiving
+        // already guarantees all blocks are requested or received.
+        self.endgame = self.requesting.is_empty()
+            && self.piece_picker.is_finished()
+            && self
+                .slow_pieces
+                .values()
+                .all(|p| p.requested_or_received_count == p.block_map.len());
         if old != self.endgame {
             info!("switch endgame from {old} to {}", self.endgame);
             info!("requesting pieces?: {:?}", self.requesting.keys());
@@ -1846,36 +1872,12 @@ impl BlockPicker {
             return false;
         }
 
-        if let Some(b) = self.requesting.get(&index) {
-            let s = &b.block_map[req.begin as usize / BLOCK_SIZE];
-            match s {
-                BlockStatus::NotRequested { .. } | BlockStatus::Requested { .. } => {
-                    return true;
-                }
-                BlockStatus::Received => {
-                    info!("unwant because received");
-                    return false;
-                }
-            }
-        }
-
-        if let Some(b) = self.receiving.get(&index) {
-            let s = &b.block_map[req.begin as usize / BLOCK_SIZE];
-            match s {
-                BlockStatus::Requested { .. } => {
-                    return true;
-                }
-                BlockStatus::Received => {
-                    info!("unwant because received2");
-                    return false;
-                }
-                _ => unreachable!(),
-            }
-        }
-
-        // we selected, but we did not request it, or we mark this block as
-        // not requested because of timeout
-        return true;
+        self.piece(index).is_none_or(|b| {
+            !matches!(
+                b.block_map[req.begin as usize / BLOCK_SIZE],
+                BlockStatus::Received
+            )
+        })
     }
 
     /// returns the number of peers that have this piece.
@@ -1885,14 +1887,26 @@ impl BlockPicker {
 
     /// Are all selected pieces downloaded and verified?
     pub fn is_finished(&mut self) -> bool {
-        self.receiving.is_empty() && self.requesting.is_empty() && self.piece_picker.is_finished()
+        self.receiving.is_empty()
+            && self.requesting.is_empty()
+            && self.slow_pieces.is_empty()
+            && self.piece_picker.is_finished()
     }
 
     /// dump current status
     pub fn dump(&mut self) -> BlockPickerDump {
+        let mut requesting = self.requesting.clone();
+        let mut receiving = self.receiving.clone();
+        for (&index, p) in &self.slow_pieces {
+            if p.requested_or_received_count < p.block_map.len() {
+                requesting.insert(index, p.clone());
+            } else {
+                receiving.insert(index, p.clone());
+            }
+        }
         BlockPickerDump {
-            receiving: self.receiving.clone(),
-            requesting: self.requesting.clone(),
+            receiving,
+            requesting,
             piece_map: self.piece_picker.dump(),
             no_response_timeout: self.no_response_timeout,
         }
@@ -1903,6 +1917,8 @@ impl BlockPicker {
         self.settle_all_piece(tokio::time::Instant::now());
         self.receiving = dump.receiving;
         self.requesting = dump.requesting;
+        self.slow_pieces.clear();
+        self.slow_peers.clear();
         self.piece_picker.load(dump.piece_map);
         self.no_response_timeout = dump.no_response_timeout;
 
@@ -1984,68 +2000,53 @@ impl BlockPicker {
         self.piece_picker.peer_add(addr, state);
     }
 
-    pub fn peer_leave(&mut self, addr: &PeerAddr) {
-        // Revoke all blocks requested by this peer so they become available immediately.
-        let requested_peer = |p: &PeerAddr, _: &tokio::time::Instant| p == addr;
+    fn revoke_peer_requests(&mut self, peer: &PeerAddr) {
         let mut revoked = HashMap::new();
-        for (i, b) in self.receiving.extract_if(.., |_, b| {
-            b.revoke_all_requested_if(requested_peer, &mut revoked, &mut self.accounting);
-            !b.is_all_requested_or_received()
-        }) {
-            self.requesting.insert(i, b);
-        }
-        for (i, b) in self.requesting.iter_mut() {
-            b.revoke_all_requested_if(requested_peer, &mut revoked, &mut self.accounting);
+        let mut empty = Vec::new();
+        let mut indices = Vec::new();
+        for (&index, b) in self
+            .requesting
+            .iter_mut()
+            .chain(self.receiving.iter_mut())
+            .chain(self.slow_pieces.iter_mut())
+        {
+            b.revoke_all_requested_if(|p, _| p == peer, &mut revoked, &mut self.accounting);
+            indices.push(index);
             if b.is_all_not_requested() {
-                self.piece_picker.set_have(*i, false);
+                empty.push(index);
             }
         }
-        self.requesting.retain(|_, b| !b.is_all_not_requested());
+        for index in empty {
+            self.remove_piece(index);
+            self.piece_picker.set_have(index, false);
+        }
+        for index in indices {
+            self.update_piece_state_and_order(index);
+        }
+    }
+
+    pub fn peer_leave(&mut self, addr: &PeerAddr) {
+        self.revoke_peer_requests(addr);
         self.piece_picker.peer_leave(addr);
+        self.slow_peers.remove(addr);
         self.accounting.peers.remove(addr);
-        self.rebuild_piece_order();
     }
 
-    /// Returns true if this piece is in the receiving set (all blocks requested or some received,
-    /// waiting for completion or hash verification).
+    /// True only once every block has arrived, independent of pool ownership.
     pub fn is_piece_wait_check(&self, index: u32) -> bool {
-        self.receiving
-            .get(&index)
-            .map(|b| b.is_all_received())
-            .unwrap_or(false)
+        self.piece(index).is_some_and(|b| b.is_all_received())
     }
 
-    /// Unverified pieces whose first sub-piece (sub-piece 0) is already received
-    /// Used for restoring hashers
+    /// Unverified pieces whose first sub-piece is received, for restoring hashers.
     pub fn unverified_pieces_whose_head_received(&self) -> impl Iterator<Item = u32> + '_ {
-        self.requesting
-            .iter()
-            .chain(self.receiving.iter())
-            .filter_map(|(&index, blocks)| {
-                (self.selected(index) && blocks.is_sub_all_received(0)).then_some(index)
-            })
+        self.pieces().filter_map(|(&index, blocks)| {
+            (self.selected(index) && blocks.is_sub_all_received(0)).then_some(index)
+        })
     }
 
     pub fn peer_choke(&mut self, peer: &PeerAddr) {
-        let requested_peer = |p: &PeerAddr, _: &tokio::time::Instant| p == peer;
-
-        let mut revoked = HashMap::new();
-        for (i, b) in self.receiving.extract_if(.., |_, b| {
-            b.revoke_all_requested_if(requested_peer, &mut revoked, &mut self.accounting);
-            !b.is_all_requested_or_received()
-        }) {
-            self.requesting.insert(i, b);
-            info!("345");
-        }
-
-        for (i, b) in self.requesting.iter_mut() {
-            b.revoke_all_requested_if(requested_peer, &mut revoked, &mut self.accounting);
-            if b.is_all_not_requested() {
-                self.piece_picker.set_have(*i, false);
-            }
-        }
-        self.requesting.retain(|_, b| !b.is_all_not_requested());
-        self.rebuild_piece_order();
+        self.revoke_peer_requests(peer);
+        self.piece_picker.peer_choke(peer);
     }
 
     pub fn peer_unchoke(&mut self, addr: &PeerAddr) {
@@ -2062,10 +2063,13 @@ impl BlockPicker {
         self.piece_picker.select(index, selected);
         if !selected {
             self.settle_piece(index);
-            self.receiving.remove(&index);
-            self.requesting.remove(&index);
+            // Tracked pieces use have as an occupancy bit, not verified progress.
+            if self.piece(index).is_some() {
+                self.piece_picker.set_have(index, false);
+            }
+            self.remove_piece(index);
         }
-        self.update_piece_order(index);
+        self.update_piece_state_and_order(index);
     }
 
     /// returns if we want this piece(piece in selected set)
@@ -2083,6 +2087,7 @@ impl BlockPicker {
         self.piece_picker.have(index)
             && !self.receiving.contains_key(&index)
             && !self.requesting.contains_key(&index)
+            && !self.slow_pieces.contains_key(&index)
     }
 
     /// returns if we have this sub-piece
@@ -2091,15 +2096,8 @@ impl BlockPicker {
         if self.have(index) {
             return true;
         }
-        self.requesting
-            .get(&index)
-            .map(|b| b.is_sub_all_received(ji.in_piece_offset() as u32))
-            .unwrap_or(false)
-            || self
-                .receiving
-                .get(&index)
-                .map(|b| b.is_sub_all_received(ji.in_piece_offset() as u32))
-                .unwrap_or(false)
+        self.piece(index)
+            .is_some_and(|b| b.is_sub_all_received(ji.in_piece_offset() as u32))
     }
 
     /// Blocks of this sub-piece already received
@@ -2113,10 +2111,7 @@ impl BlockPicker {
             let to = ((sub + 1) * blocks_per_sub).min(n_blocks);
             return to - from;
         }
-        self.requesting
-            .get(&index)
-            .or_else(|| self.receiving.get(&index))
-            .map_or(0, |b| b.subs[sub].received)
+        self.piece(index).map_or(0, |b| b.subs[sub].received)
     }
 
     /// set we have this piece
@@ -2124,10 +2119,9 @@ impl BlockPicker {
         self.piece_picker.set_have(index, have);
         if have {
             self.settle_piece(index);
-            self.receiving.remove(&index);
-            self.requesting.remove(&index);
+            self.remove_piece(index);
         }
-        self.update_piece_order(index);
+        self.update_piece_state_and_order(index);
     }
 }
 
@@ -2776,7 +2770,7 @@ mod test {
             } else {
                 picker.receiving.insert(0, blocks);
             }
-            picker.update_piece_order(0);
+            picker.update_piece_state_and_order(0);
             if endgame {
                 picker.piece_picker.set_have(1, true);
                 picker.piece_picker.set_have(2, true);

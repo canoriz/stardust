@@ -99,8 +99,8 @@ impl RepickReason {
 /// A peer connection state transition. The discriminant is stored directly in
 /// `peer_state_event.kind` (no lookup table; the set is tiny and fixed).
 ///
-/// Deliberately coarse: only the connection lifecycle plus bandwidth-mode
-/// transitions. Choke/unchoke and interested/uninterested are orthogonal
+/// Records connection lifecycle, bandwidth-mode and picker-class transitions.
+/// Choke/unchoke and interested/uninterested are orthogonal
 /// dimensions (not one mutually-exclusive state), and the stalled/choked case
 /// is already expressed by a `BwMode` event carrying `BwMode::Choked`.
 #[derive(Clone, Copy, Debug)]
@@ -109,6 +109,8 @@ pub enum PeerStateKind {
     Disconnect = 2,
     BwMode = 3,
     Kicked = 4,
+    SlowToFast = 5,
+    FastToSlow = 6,
 }
 
 impl PeerStateKind {
@@ -1022,6 +1024,42 @@ CREATE TABLE IF NOT EXISTS cache_slot_sample(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn peer_class_transitions_are_stored_as_peer_state_events() {
+        let c = Connection::open_in_memory().unwrap();
+        init_schema(&c).unwrap();
+        c.execute_batch(
+            "INSERT INTO torrent VALUES (1, 'hash', 'test', 16384, 16384, 0);
+             INSERT INTO peer VALUES (7, 1, 'peer', '127.0.0.1:1', 0);",
+        )
+        .unwrap();
+        for (ts_us, kind) in [
+            (100, PeerStateKind::FastToSlow),
+            (200, PeerStateKind::SlowToFast),
+        ] {
+            insert_peer_state(
+                &c,
+                &PeerStateEvent {
+                    peer_id: 7,
+                    ts_us,
+                    kind,
+                    mode: None,
+                },
+            )
+            .unwrap();
+        }
+        let rows: Vec<(i64, i64, i64, Option<i64>)> = c
+            .prepare("SELECT peer_id, ts_us, kind, mode FROM peer_state_event ORDER BY ts_us")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(rows, vec![(7, 100, 6, None), (7, 200, 5, None)]);
+    }
 
     #[test]
     fn bw_sample_contains_slot_time_per_block() {

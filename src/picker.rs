@@ -3,12 +3,19 @@ use serde::{Deserialize, Serialize};
 use {crate::bandwidth::Bandwidth, crate::conn::PeerAddr};
 
 mod block_picker;
+mod peer_classification;
 mod rarest_first;
 pub use block_picker::{BlockPicker, BlockPickerDump};
 pub use rarest_first::Picker as RarestPicker;
 
 const BLOCK_SIZE: u32 = 16384;
 pub(crate) const BW_SLOT_SIZE: usize = 50;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickMode {
+    Normal,
+    ForSlowPeer,
+}
 
 impl PieceState {
     pub fn have(&self, index: u32) -> bool {
@@ -144,7 +151,7 @@ pub trait PiecePicker {
     /// and marks we have this piece
     /// If later we don't receive this
     /// call set_have(index, false) to reset it
-    fn pick_next(&mut self, addr: &PeerAddr) -> Option<u32>;
+    fn pick_next(&mut self, addr: &PeerAddr, mode: PickMode) -> Option<u32>;
 
     /// if we have all the piece we want
     fn is_finished(&mut self) -> bool;

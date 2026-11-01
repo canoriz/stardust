@@ -1362,6 +1362,21 @@ impl TransmitWorker {
             }
         };
 
+        // TODO: Picker tick scheduling belongs in the picker. Both Transmit pick
+        // entry points currently drive it because received-byte statistics live
+        // in PeerConn; this temporary delegation mixes the layer responsibilities.
+        block_picker.tick(
+            self.connected_peers
+                .iter()
+                .map(|(peer, conn)| (*peer, conn.stat.total_recv)),
+            #[cfg(feature = "blocktrace")]
+            |peer| {
+                self.connected_peers
+                    .get(peer)
+                    .and_then(|conn| conn.blocktrace_peer_id)
+            },
+        );
+
         let mut revoked = HashMap::new();
         for (addr, h) in &mut self.connected_peers {
             info!("peer status {addr:?}: {:?}", h.state);
@@ -1419,6 +1434,21 @@ impl TransmitWorker {
                 return 0;
             }
         };
+
+        // TODO: Picker tick scheduling belongs in the picker. Both Transmit pick
+        // entry points currently drive it because received-byte statistics live
+        // in PeerConn; this temporary delegation mixes the layer responsibilities.
+        block_picker.tick(
+            self.connected_peers
+                .iter()
+                .map(|(peer, conn)| (*peer, conn.stat.total_recv)),
+            #[cfg(feature = "blocktrace")]
+            |peer| {
+                self.connected_peers
+                    .get(peer)
+                    .and_then(|conn| conn.blocktrace_peer_id)
+            },
+        );
 
         let mut revoked = HashMap::new();
         let picked_n = if let Some(h) = self.connected_peers.get_mut(addr) {
@@ -2008,6 +2038,9 @@ impl TransmitWorker {
                 warn!("{} unchoked us", peer.0);
                 if let Some(st) = self.connected_peers.get_mut(&peer) {
                     st.unchoke();
+                    if let TorrentState::Metadata(downloading) = &mut self.torrent_state {
+                        downloading.block_picker.peer_unchoke(&peer);
+                    }
                 }
                 // TODO: are we interested in this peer?
                 // self.pick_blocks_for_peer(&peer, 0);

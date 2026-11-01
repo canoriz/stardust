@@ -1,6 +1,6 @@
 use tracing::trace;
 
-use super::{PeerAddr, PeerPieceDetail, PiecePicker, PieceState};
+use super::{PeerAddr, PeerPieceDetail, PickMode, PiecePicker, PieceState};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::{math_helper::piece_total_and_last_size, picker::BitField};
@@ -211,7 +211,7 @@ impl PiecePicker for Picker {
         }
     }
 
-    fn pick_next(&mut self, peer: &PeerAddr) -> Option<u32> {
+    fn pick_next(&mut self, peer: &PeerAddr, mode: PickMode) -> Option<u32> {
         let peer_status = if let Some(h) = self.peers.get(peer) {
             h
         } else {
@@ -224,8 +224,12 @@ impl PiecePicker for Picker {
 
         let mut found = None;
 
-        // find the first piece this peer have
-        for (r, index) in self.want_rarity.iter() {
+        // Both modes share availability and occupancy; only traversal changes.
+        let mut candidates = self.want_rarity.iter();
+        while let Some((r, index)) = match mode {
+            PickMode::Normal => candidates.next(),
+            PickMode::ForSlowPeer => candidates.next_back(),
+        } {
             assert_eq!(self.have.get(*index), false);
             if peer_status.have(*index) {
                 let selected = self.selected.get(*index);
@@ -327,7 +331,7 @@ mod test {
 
         assert_eq!(p.selected, selected);
 
-        assert_eq!(p.pick_next(&PEER1), Some(2));
+        assert_eq!(p.pick_next(&PEER1, PickMode::Normal), Some(2));
 
         // after pick, 2 should not in want_rarity
         assert!(
@@ -355,12 +359,12 @@ mod test {
             p.select(i as u32, w);
         }
 
-        assert_eq!(p.pick_next(&PEER1), Some(2));
-        assert_eq!(p.pick_next(&PEER1), Some(1));
+        assert_eq!(p.pick_next(&PEER1, PickMode::Normal), Some(2));
+        assert_eq!(p.pick_next(&PEER1, PickMode::Normal), Some(1));
         p.set_have(2, false);
         p.set_have(1, false);
         p.peer_leave(&PEER2);
-        assert_eq!(p.pick_next(&PEER1), Some(1));
+        assert_eq!(p.pick_next(&PEER1, PickMode::Normal), Some(1));
     }
 
     #[test]
@@ -371,10 +375,10 @@ mod test {
             p.select(i as u32, w);
         }
 
-        assert_eq!(p.pick_next(&PEER1), Some(2));
+        assert_eq!(p.pick_next(&PEER1, PickMode::Normal), Some(2));
         p.select(5, true);
         p.select(4, true);
-        assert_eq!(p.pick_next(&PEER1), Some(5));
+        assert_eq!(p.pick_next(&PEER1, PickMode::Normal), Some(5));
     }
 
     #[test]
@@ -385,14 +389,14 @@ mod test {
             p.select(i as u32, w);
         }
 
-        assert_eq!(p.pick_next(&PEER1), Some(2));
+        assert_eq!(p.pick_next(&PEER1, PickMode::Normal), Some(2));
         p.peer_add(
             PEER3,
             PieceState::Bitfield(BitField::from(vec![true, true, true, true, false, true])),
         );
         p.select(4, true);
         p.select(5, true);
-        assert_eq!(p.pick_next(&PEER1), Some(4));
+        assert_eq!(p.pick_next(&PEER1, PickMode::Normal), Some(4));
     }
 
     #[test]
@@ -403,7 +407,7 @@ mod test {
             p.select(i as u32, w);
         }
 
-        assert_eq!(p.pick_next(&PEER1), Some(2));
+        assert_eq!(p.pick_next(&PEER1, PickMode::Normal), Some(2));
         p.peer_add(
             PEER3,
             PieceState::Bitfield(BitField::from(vec![true, true, true, true, false, false])),
