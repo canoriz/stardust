@@ -287,15 +287,15 @@ mod test {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-    const PEER1: PeerAddr = (
+    const PEER1: PeerAddr = PeerAddr(
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 1),
         1,
     );
-    const PEER2: PeerAddr = (
+    const PEER2: PeerAddr = PeerAddr(
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 2),
         2,
     );
-    const PEER3: PeerAddr = (
+    const PEER3: PeerAddr = PeerAddr(
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 3),
         3,
     );

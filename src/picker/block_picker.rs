@@ -7,14 +7,15 @@ use super::{
 };
 use crate::{
     cache::simple_buffer::{JointIndex, POOL_SIZE, SUB_PIECE_SIZE},
+    data_structure::IndexTree,
     file_tracker::FileTracker,
     math_helper::piece_total_and_last_size,
     metadata::Metadata,
     protocol::Request,
-    slot_accounting::Accounting,
+    slot_accounting::{Accounting, PeerCost},
 };
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, HashMap},
     time,
 };
 
@@ -108,71 +109,6 @@ pub enum BlockStatus {
         revoked: HashMap<PeerAddr, PickedDetail>,
     },
     Received, // TODO: maybe record which peer sends us this block?
-}
-
-/// An IndexedTree to find element with given value at O(log n)
-/// and modify/delete element at O(log n)
-#[cfg(not(test))]
-#[derive(Debug, Clone)]
-struct IndexTree<K, V> {
-    tree: BTreeSet<(V, K)>,
-    index: HashMap<K, V>,
-}
-
-#[cfg(test)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct IndexTree<K: std::cmp::Eq + std::hash::Hash, V> {
-    tree: BTreeSet<(V, K)>,
-    index: HashMap<K, V>,
-}
-
-impl<K, V> IndexTree<K, V>
-where
-    K: std::cmp::Ord + std::hash::Hash + Clone,
-    V: std::cmp::Ord + Clone,
-{
-    pub fn new() -> Self {
-        Self {
-            tree: BTreeSet::new(),
-            index: HashMap::new(),
-        }
-    }
-
-    pub fn first(&self) -> Option<(&K, &V)> {
-        self.tree.first().map(|(v, k)| (k, v))
-    }
-
-    pub fn pop_first(&mut self) -> Option<(K, V)> {
-        if let Some((v, k)) = self.tree.pop_first() {
-            self.index.remove(&k);
-            Some((k, v))
-        } else {
-            None
-        }
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
-        self.tree.iter().map(|(v, k)| (k, v))
-    }
-
-    pub fn insert(&mut self, k: K, v: V) -> Option<V> {
-        let old = self.index.insert(k.clone(), v.clone());
-        if let Some(old_v) = &old {
-            self.tree.remove(&(old_v.clone(), k.clone()));
-        }
-        self.tree.insert((v, k));
-        old
-    }
-
-    pub fn remove(&mut self, k: &K) -> Option<V> {
-        let v = self.index.remove(k);
-        if let Some(v) = v {
-            self.tree.remove(&(v.clone(), k.clone()));
-            Some(v)
-        } else {
-            None
-        }
-    }
 }
 
 /// Per-sub-piece progress: `received` gates completion; the arrival pair and
@@ -346,11 +282,7 @@ impl PieceBlocks {
                     let share = per_block / requested.len() as f64;
                     let fair_share = fair_per_block / requested.len() as f64;
                     for peer in requested.keys() {
-                        account
-                            .peers
-                            .entry(*peer)
-                            .or_default()
-                            .add_cost(share, fair_share);
+                        account.add_cost(*peer, share, fair_share);
                     }
                 }
                 _ => {
@@ -636,7 +568,7 @@ impl PieceBlocks {
         // predicate is always true so every requested block is considered.
         for (i, _) in self
             .repick_deadline
-            .iter()
+            .iter(false)
             .take_while(|(_, t)| repick_option.endgame || **t <= now)
         {
             if count >= n {
@@ -1000,20 +932,16 @@ pub struct PieceComplete {
 
 impl BlockPicker {
     /// Return aged (ST, fair ST) per accepted block, hiding the aging windows.
-    pub(crate) fn peer_slot_cost(&self, peer: &PeerAddr) -> (Option<f64>, Option<f64>) {
+    pub(crate) fn peer_slot_cost(&self, peer: &PeerAddr) -> PeerCost {
         self.accounting
             .peers
             .get(peer)
-            .map_or((None, None), |slot_time| slot_time.per_block())
+            .map_or_default(|slot_time| slot_time.per_block())
     }
 
     /// Called only for a useful, non-duplicate block from a live connection.
     pub(crate) fn record_slot_block(&mut self, peer: &PeerAddr) {
-        self.accounting
-            .peers
-            .entry(*peer)
-            .or_default()
-            .accept_block();
+        self.accounting.accept_block(*peer);
     }
 
     /// Settle all active pieces to the same timestamp.
@@ -1229,8 +1157,14 @@ impl BlockPicker {
             // Close all pending costs before moving the current windows to history.
             self.settle_all_piece(now);
             // With regular 15s windows and uniform arrivals, data older than 30s
-            for slot_time in self.accounting.peers.values_mut() {
-                slot_time.rotate(0.5);
+            let peers: Vec<_> = self
+                .accounting
+                .peers
+                .iter(false)
+                .map(|(peer, _)| *peer)
+                .collect();
+            for peer in peers {
+                self.accounting.peers.get_mut(&peer).unwrap().rotate(0.5);
             }
             self.slot_window_rotated_at = now;
         }
@@ -2151,15 +2085,15 @@ mod test {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-    const PEER1: PeerAddr = (
+    const PEER1: PeerAddr = PeerAddr(
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 1),
         1,
     );
-    const PEER2: PeerAddr = (
+    const PEER2: PeerAddr = PeerAddr(
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 2),
         2,
     );
-    const PEER3: PeerAddr = (
+    const PEER3: PeerAddr = PeerAddr(
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 3),
         3,
     );
@@ -2984,7 +2918,7 @@ mod test {
 
     #[tokio::test(start_paused = true)]
     async fn slot_accounting_four_remaining_blocks_match_manual_shares() {
-        let p4 = (PEER3.0, 4);
+        let p4 = PeerAddr(PEER3.0, 4);
         let now = tokio::time::Instant::now();
         // Block 0 starts the interval; the remaining four follow the worked example.
         let mut pb = blocks(vec![
@@ -3123,7 +3057,10 @@ mod test {
             }
             // The other sub-piece remains deferred; a no-op pick settles nothing.
             assert_cost(
-                a.peers.values().map(|cost| cost.current_cost().0).sum(),
+                a.peers
+                    .iter(false)
+                    .map(|(_, cost)| cost.current_cost().0)
+                    .sum(),
                 if action == 2 { 0.0 } else { 2.0 },
             );
             tokio::time::advance(time::Duration::from_secs(2)).await;
@@ -3250,10 +3187,10 @@ mod test {
         bp.requesting.insert(0, pb);
         tokio::time::advance(time::Duration::from_secs(2)).await;
         bp.peer_leave(&PEER1);
-        assert!(!bp.accounting.peers.contains_key(&PEER1));
-        assert_eq!(bp.peer_slot_cost(&PEER1), (None, None));
+        assert!(!bp.accounting.peers.contains(&PEER1));
+        assert_eq!(bp.peer_slot_cost(&PEER1), PeerCost::default());
         tokio::time::advance(time::Duration::from_secs(3)).await;
-        let new = (PEER1.0, 999);
+        let new = PeerAddr(PEER1.0, 999);
         let pb = bp.requesting.get_mut(&0).unwrap();
         let mut picked = Vec::new();
         assert_eq!(
@@ -3280,8 +3217,8 @@ mod test {
         );
         tokio::time::advance(time::Duration::from_secs(4)).await;
         bp.settle_all_piece(tokio::time::Instant::now());
-        assert!(!bp.accounting.peers.contains_key(&PEER1));
-        assert_eq!(bp.accounting.peers.len(), 1);
+        assert!(!bp.accounting.peers.contains(&PEER1));
+        assert_eq!(bp.accounting.peers.iter(false).count(), 1);
         assert_cost(bp.accounting.peers[&new].current_cost().0, 4.0);
         assert_cost(bp.accounting.scheduler_blocker_st, 3.0);
         assert_cost(bp.accounting.scheduler_fair_st, 6.0);
@@ -3559,7 +3496,7 @@ mod test {
 
         let mut peers = Vec::new();
         for i in 0..n_peers {
-            let addr = (
+            let addr = PeerAddr(
                 SocketAddr::new(
                     IpAddr::V4(Ipv4Addr::new(10, 0, (i / 256) as u8, (i % 256) as u8)),
                     (6881 + i) as u16,

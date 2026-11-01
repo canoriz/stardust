@@ -963,7 +963,11 @@ impl TransmitDump {
 
 impl TransmitWorker {
     fn handle_dump_status(self) -> TransmitDump {
-        let peers: Vec<_> = self.connected_peers.keys().map(|(addr, _)| *addr).collect();
+        let peers: Vec<_> = self
+            .connected_peers
+            .keys()
+            .map(|PeerAddr(addr, _)| *addr)
+            .collect();
         let state = match self.torrent_state {
             TorrentState::Metadata(mut d) => TorrentStateDump::Metadata {
                 metadata: d.metadata.as_ref().clone(),
@@ -1084,8 +1088,8 @@ impl TransmitWorker {
                     conn.useful_bytes(),
                     total_bytes,
                 ),
-                st_blk: picker.and_then(|p| p.peer_slot_cost(addr).0),
-                fair_st: picker.and_then(|p| p.peer_slot_cost(addr).1),
+                st_blk: picker.and_then(|p| p.peer_slot_cost(addr).blocker),
+                fair_st: picker.and_then(|p| p.peer_slot_cost(addr).fair),
             });
         }
     }
@@ -1743,7 +1747,7 @@ impl TransmitWorker {
                     };
 
                     self.connected_peers.insert(
-                        (peer_addr, conn_id),
+                        PeerAddr(peer_addr, conn_id),
                         PeerConn::new(
                             cm,
                             conn_id,
@@ -1773,7 +1777,7 @@ impl TransmitWorker {
                     match &mut self.torrent_state {
                         TorrentState::Metadata(d) => {
                             d.block_picker
-                                .peer_add((peer_addr, conn_id), PieceState::HaveNone);
+                                .peer_add(PeerAddr(peer_addr, conn_id), PieceState::HaveNone);
                         }
                         TorrentState::Fetching(_) => {}
                     }
@@ -2094,10 +2098,10 @@ impl TransmitWorker {
         peer: PeerAddr,
         #[cfg(feature = "blocktrace")] kicked: bool,
     ) -> io::Result<()> {
-        let (mut addr, conn_id) = peer;
+        let PeerAddr(mut addr, conn_id) = peer;
         info!("peer leave {addr}");
         addr = to_canonical_addr(addr);
-        let peer = (addr, conn_id);
+        let peer = PeerAddr(addr, conn_id);
         if self.connected_peers.get(&peer).map(|c| c.conn_id) != Some(conn_id) {
             return Ok(());
         }
@@ -3355,7 +3359,7 @@ impl TransmitWorker {
             .iter()
             .map(|(addr, c, id)| {
                 (
-                    block_picker.peer_slot_cost(addr).0.unwrap_or(0.0),
+                    block_picker.peer_slot_cost(addr).blocker.unwrap_or(0.0),
                     c.bw.count_bytes_within_period(ONE_MIN).0,
                     *addr,
                     *id,
@@ -3543,7 +3547,7 @@ fn run_pex(transmit: &mut TransmitWorker) {
     let now_peers: HashMap<SocketAddr, Option<PexFlag>> = transmit
         .connected_peers
         .iter()
-        .filter_map(|((addr, _), conn)| {
+        .filter_map(|(PeerAddr(addr, _), conn)| {
             let advertised = if conn.conn.info().is_income {
                 conn.conn
                     .info()
@@ -3557,7 +3561,7 @@ fn run_pex(transmit: &mut TransmitWorker) {
         })
         .collect();
 
-    for ((peer_addr, _), conn) in transmit
+    for (PeerAddr(peer_addr, _), conn) in transmit
         .connected_peers
         .iter_mut()
         .filter(|(_, conn)| conn.conn.capability().have(Capability::PEX))

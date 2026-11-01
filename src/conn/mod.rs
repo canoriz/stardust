@@ -11,7 +11,9 @@ use std::net::SocketAddr;
 /// A connection's address together with the id of that connection. A later
 /// connection to the same address gets a new id, so a stale message can be told
 /// apart from the live one.
-pub type PeerAddr = (SocketAddr, Version);
+#[derive(Debug, Eq, Hash, PartialEq, Copy, Clone, Ord, PartialOrd)]
+pub struct PeerAddr(pub SocketAddr, pub Version);
+
 pub use inflight::Inflight;
 
 #[cfg(feature = "blocktrace")]

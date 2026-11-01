@@ -25,6 +25,7 @@ pub(crate) mod tracker;
 pub(crate) mod transmit_manager;
 pub(crate) mod util;
 
+mod data_structure;
 mod hasher;
 mod helper;
 

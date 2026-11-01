@@ -1,6 +1,6 @@
-use crate::bandwidth::Bandwidth;
 pub use crate::protocol::{self, BitField};
 use serde::{Deserialize, Serialize};
+use {crate::bandwidth::Bandwidth, crate::conn::PeerAddr};
 
 mod block_picker;
 mod rarest_first;
@@ -100,8 +100,6 @@ impl PeerPieceDetail {
         self.choke
     }
 }
-
-pub type PeerAddr = crate::conn::PeerAddr;
 
 pub trait PiecePicker {
     type T;

@@ -306,7 +306,7 @@ impl Drop for NotifyTransmitGuard {
         info!("both send and recv end of {} stopped", self.addr);
         self.transmit_handle
             .sender
-            .send(TransmitMsg::PeerLeave((self.addr, self.conn_id)));
+            .send(TransmitMsg::PeerLeave(PeerAddr(self.addr, self.conn_id)));
     }
 }
 
@@ -373,7 +373,7 @@ async fn run_recv_stream<T>(
     let report_interval = time::Duration::from_secs(1);
     let mut ticker = tokio::time::interval(report_interval);
     let addr = to_canonical_addr(conn.read_stream.peer_addr());
-    let peer = (addr, conn.conn_id);
+    let peer = PeerAddr(addr, conn.conn_id);
 
     let pending_recvs = conn.read_stream.maybe_recv_pending_msg().await;
     for mut m in pending_recvs {
@@ -437,7 +437,7 @@ where
     T: AsyncRead + Unpin,
 {
     fn handle_report_tick(&mut self) {
-        let peer = (
+        let peer = PeerAddr(
             to_canonical_addr(self.read_stream.peer_addr()),
             self.conn_id,
         );
@@ -509,7 +509,7 @@ where
                 self.transmit_handle
                     .sender
                     .send(TransmitMsg::PeerMsg(PeerMsg::Pieces(
-                        (
+                        PeerAddr(
                             to_canonical_addr(self.read_stream.peer_addr()),
                             self.conn_id,
                         ),
@@ -837,11 +837,11 @@ mod test {
         let first1 = rx1.recv().await.unwrap();
         let first2 = rx2.recv().await.unwrap();
         let inner1 = match first1 {
-            Msg::PeerMsg(PeerMsg::DhtPort((sa, _), p)) => (sa, p),
+            Msg::PeerMsg(PeerMsg::DhtPort(PeerAddr(sa, _), p)) => (sa, p),
             e => unreachable!("{e:?}"),
         };
         let inner2 = match first2 {
-            Msg::PeerMsg(PeerMsg::DhtPort((sa, _), p)) => (sa, p),
+            Msg::PeerMsg(PeerMsg::DhtPort(PeerAddr(sa, _), p)) => (sa, p),
             _ => unreachable!(),
         };
         assert_eq!(inner1, inner2);
