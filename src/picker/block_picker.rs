@@ -885,6 +885,8 @@ impl RepickOption {
 
 type Picker = dyn PiecePicker<T = PeerPieceDetail> + Send;
 type PieceIndex = u32;
+type Unrequested = usize;
+type Unreceived = usize;
 pub struct BlockPicker {
     // total piece number
     n: usize,
@@ -901,6 +903,10 @@ pub struct BlockPicker {
 
     // pieces whose blocks that all requested and waiting receiving
     receiving: BTreeMap<PieceIndex, PieceBlocks>,
+
+    // Lightweight scheduling indexes; PieceBlocks remains owned by the maps above.
+    requesting_order: IndexTree<PieceIndex, Unrequested>,
+    receiving_order: IndexTree<PieceIndex, Unreceived>,
 
     // previous time the timeout request check runs
     prev_time_check: tokio::time::Instant,
@@ -931,6 +937,40 @@ pub struct PieceComplete {
 }
 
 impl BlockPicker {
+    /// Update one piece after a mutation, migration, or removal.
+    fn update_piece_order(&mut self, index: PieceIndex) {
+        if let Some(blocks) = self.requesting.get(&index) {
+            self.requesting_order.insert(
+                index,
+                blocks.block_map.len() - blocks.requested_or_received_count,
+            );
+        } else {
+            self.requesting_order.remove(&index);
+        }
+        if let Some(blocks) = self.receiving.get(&index) {
+            self.receiving_order
+                .insert(index, blocks.block_map.len() - blocks.received_count);
+        } else {
+            self.receiving_order.remove(&index);
+        }
+    }
+
+    /// Bulk changes and progress restoration rebuild the derived indexes.
+    fn rebuild_piece_order(&mut self) {
+        self.requesting_order = IndexTree::new();
+        self.receiving_order = IndexTree::new();
+        for (&index, blocks) in &self.requesting {
+            self.requesting_order.insert(
+                index,
+                blocks.block_map.len() - blocks.requested_or_received_count,
+            );
+        }
+        for (&index, blocks) in &self.receiving {
+            self.receiving_order
+                .insert(index, blocks.block_map.len() - blocks.received_count);
+        }
+    }
+
     /// Return aged (ST, fair ST) per accepted block, hiding the aging windows.
     pub(crate) fn peer_slot_cost(&self, peer: &PeerAddr) -> PeerCost {
         self.accounting
@@ -983,6 +1023,8 @@ impl BlockPicker {
             piece_picker,
             requesting: BTreeMap::new(),
             receiving: BTreeMap::new(),
+            requesting_order: IndexTree::new(),
+            receiving_order: IndexTree::new(),
             prev_time_check: tokio::time::Instant::now(),
             no_response_timeout,
             endgame: false,
@@ -1011,6 +1053,8 @@ impl BlockPicker {
             piece_picker,
             requesting: BTreeMap::new(),
             receiving: BTreeMap::new(),
+            requesting_order: IndexTree::new(),
+            receiving_order: IndexTree::new(),
             prev_time_check: tokio::time::Instant::now(),
             no_response_timeout,
             endgame: false,
@@ -1211,18 +1255,9 @@ impl BlockPicker {
             );
         };
 
-        // produce piece index in the ascending order of mapper(p)
-        fn piece_index_order<'a, F, G>(
-            m: &'a BTreeMap<u32, PieceBlocks>,
-            mapper: F,
-        ) -> impl Iterator<Item = u32> + use<F, G>
-        where
-            F: Fn(&PieceBlocks) -> G,
-            G: std::cmp::Ord,
-        {
-            let mut piece_order = m.iter().map(|(i, b)| (*i, mapper(b))).collect::<Vec<_>>();
-            piece_order.sort_by(|(_, val_a), (_, val_b)| val_a.cmp(val_b));
-            piece_order.into_iter().map(|(i, _)| i)
+        // Snapshot the order so picking can update the indexes during this pass.
+        fn piece_index_order(order: &IndexTree<PieceIndex, usize>) -> Vec<PieceIndex> {
+            order.iter(false).map(|(index, _)| *index).collect()
         }
 
         // TODO: reuse vector
@@ -1230,6 +1265,7 @@ impl BlockPicker {
         let pick_blocks_from_requesting =
             |ret: &mut Vec<BlockRange>,
              pieces: &mut BTreeMap<u32, PieceBlocks>,
+             order: &mut IndexTree<PieceIndex, Unrequested>,
              peer_status: &PeerPieceDetail,
              remain: &mut usize,
              n_in_flight: &mut usize,
@@ -1237,9 +1273,7 @@ impl BlockPicker {
              rtt: Option<time::Duration>,
              piece_size: usize,
              account: &mut Accounting| {
-                for index in piece_index_order(pieces, |b| {
-                    b.block_map.len() - b.requested_or_received_count
-                }) {
+                for index in piece_index_order(order) {
                     let blocks = &mut pieces.get_mut(&index).expect("must exist");
                     assert!(!endgame);
                     if *remain == 0 {
@@ -1263,6 +1297,10 @@ impl BlockPicker {
                             #[cfg(feature = "blocktrace")]
                             bt_peer_id,
                         );
+                        order.insert(
+                            index,
+                            blocks.block_map.len() - blocks.requested_or_received_count,
+                        );
                         *remain -= n_picked;
                         if tracing::enabled!(tracing::Level::TRACE) {
                             for blks in &ret[before..] {
@@ -1282,6 +1320,7 @@ impl BlockPicker {
             pick_blocks_from_requesting(
                 &mut ret,
                 &mut self.requesting,
+                &mut self.requesting_order,
                 &peer_status,
                 &mut remain,
                 &mut n_in_flight,
@@ -1294,6 +1333,9 @@ impl BlockPicker {
                 .requesting
                 .extract_if(.., |_, b| b.is_all_requested_or_received())
             {
+                self.requesting_order.remove(&index);
+                self.receiving_order
+                    .insert(index, blocks.block_map.len() - blocks.received_count);
                 self.receiving.insert(index, blocks);
             }
         }
@@ -1345,9 +1387,7 @@ impl BlockPicker {
                         repick_limit: limit,
                         endgame: true,
                     };
-                    for index in
-                        piece_index_order(&self.receiving, |b| b.block_map.len() - b.received_count)
-                    {
+                    for index in piece_index_order(&self.receiving_order) {
                         let blocks = &mut self.receiving.get_mut(&index).expect("must exist");
                         if remain == 0 {
                             break;
@@ -1385,9 +1425,7 @@ impl BlockPicker {
             }
             info!("remain 1 {remain}");
         } else if remain > 0 && rush_mode {
-            for index in
-                piece_index_order(&self.receiving, |b| b.block_map.len() - b.received_count)
-            {
+            for index in piece_index_order(&self.receiving_order) {
                 let blocks = &mut self.receiving.get_mut(&index).expect("must exist");
                 if remain == 0 {
                     break;
@@ -1429,6 +1467,7 @@ impl BlockPicker {
             pick_blocks_from_requesting(
                 &mut ret,
                 &mut self.requesting,
+                &mut self.requesting_order,
                 &peer_status,
                 &mut remain,
                 &mut n_in_flight,
@@ -1441,6 +1480,9 @@ impl BlockPicker {
                 .requesting
                 .extract_if(.., |_, b| b.is_all_requested_or_received())
             {
+                self.requesting_order.remove(&index);
+                self.receiving_order
+                    .insert(index, blocks.block_map.len() - blocks.received_count);
                 self.receiving.insert(index, blocks);
             }
         }
@@ -1532,6 +1574,7 @@ impl BlockPicker {
                 }
                 assert!(!self.requesting.contains_key(&index));
                 self.requesting.insert(index, blocks);
+                self.update_piece_order(index);
             } else {
                 break;
             }
@@ -1596,6 +1639,7 @@ impl BlockPicker {
         } else {
             info!("revoke not requested/already checked piece");
         }
+        self.update_piece_order(req.index);
     }
 
     fn check_block_validity(&self, req: &Request) -> bool {
@@ -1644,7 +1688,7 @@ impl BlockPicker {
             );
         }
 
-        if let Some(b) = self.requesting.get_mut(&ji.index()) {
+        let result = if let Some(b) = self.requesting.get_mut(&ji.index()) {
             let r = b.receive(req, &mut self.accounting);
             if b.is_all_requested_or_received() {
                 let b = self.requesting.remove(&ji.index()).unwrap();
@@ -1699,7 +1743,9 @@ impl BlockPicker {
                 },
                 vec![],
             )
-        }
+        };
+        self.update_piece_order(ji.index());
+        result
     }
 
     /// Call when some piece is verified (`success = true`) or invalidated
@@ -1712,6 +1758,7 @@ impl BlockPicker {
         self.receiving.remove(&index);
         self.requesting.remove(&index);
         self.piece_picker.set_have(index, success);
+        self.update_piece_order(index);
         match (had, success) {
             // genuine transitions drive the tracker exactly once
             (false, true) => self.file_tracker.piece_verified(index, true),
@@ -1767,6 +1814,7 @@ impl BlockPicker {
                     }
                 })
         });
+        self.rebuild_piece_order();
     }
 
     fn update_endgame(&mut self) -> bool {
@@ -1892,6 +1940,7 @@ impl BlockPicker {
                 self.file_tracker.piece_verified(i, true);
             }
         }
+        self.rebuild_piece_order();
     }
 }
 
@@ -1954,6 +2003,7 @@ impl BlockPicker {
         self.requesting.retain(|_, b| !b.is_all_not_requested());
         self.piece_picker.peer_leave(addr);
         self.accounting.peers.remove(addr);
+        self.rebuild_piece_order();
     }
 
     /// Returns true if this piece is in the receiving set (all blocks requested or some received,
@@ -1995,6 +2045,7 @@ impl BlockPicker {
             }
         }
         self.requesting.retain(|_, b| !b.is_all_not_requested());
+        self.rebuild_piece_order();
     }
 
     pub fn peer_unchoke(&mut self, addr: &PeerAddr) {
@@ -2014,6 +2065,7 @@ impl BlockPicker {
             self.receiving.remove(&index);
             self.requesting.remove(&index);
         }
+        self.update_piece_order(index);
     }
 
     /// returns if we want this piece(piece in selected set)
@@ -2075,6 +2127,7 @@ impl BlockPicker {
             self.receiving.remove(&index);
             self.requesting.remove(&index);
         }
+        self.update_piece_order(index);
     }
 }
 
@@ -2723,6 +2776,7 @@ mod test {
             } else {
                 picker.receiving.insert(0, blocks);
             }
+            picker.update_piece_order(0);
             if endgame {
                 picker.piece_picker.set_have(1, true);
                 picker.piece_picker.set_have(2, true);
@@ -3537,6 +3591,7 @@ mod test {
             }
         }
 
+        bp.rebuild_piece_order();
         (bp, peers)
     }
 
