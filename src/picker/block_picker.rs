@@ -1509,8 +1509,6 @@ impl BlockPicker {
     /// - `peer` is a `PeerAddr` containing the socket address and connection ID.
     /// - `received_bytes` is the cumulative number of bytes received on that
     ///   connection, including duplicate and late responses (`PeerConn::stat.total_recv`).
-    ///   Zero keeps the peer fast until data arrives, even if it was repicked and
-    ///   is no longer useful; this value is not a connection ID.
     fn update_peer_classes(
         &mut self,
         peers: &[(PeerAddr, u64)],

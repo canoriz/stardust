@@ -6,15 +6,10 @@ use crate::conn::PeerAddr;
 ///
 /// `samples` contains `(peer, aged_st_per_useful_block, received_bytes)` for each
 /// live connection in one torrent. `received_bytes` includes duplicate and late
-/// responses. Each call classifies independently of earlier results.
 ///
 /// Rank eligible peers by descending `1 / ST`, breaking ties by peer address.
 /// The smallest prefix contributing at least 85% of the total score is fast;
 /// the remaining ranked peers are slow.
-///
-/// Peers with no received bytes or zero ST are fast and excluded from ranking.
-/// Missing, negative or NaN ST defaults to fast. Positive infinite ST has zero
-/// score. If no positive finite ST is eligible, all peers default to fast.
 ///
 /// Returns the new slow-peer set, containing only peers present in `samples`.
 /// All other sampled peers are fast.
@@ -25,8 +20,7 @@ pub(super) fn classify_peers(samples: &[(PeerAddr, Option<f64>, u64)]) -> HashSe
 
     for (peer, st) in samples
         .iter()
-        .filter(|(_, _, received_bytes)| *received_bytes > 0)
-        .filter_map(|&(peer, st, _)| st.map(|st| (peer, st)))
+        .filter_map(|&(peer, st, _received_bytes)| st.map(|st| (peer, st)))
         .filter(|(peer, st)| {
             let valid = !st.is_nan() && *st >= 0.0;
             if !valid {
@@ -73,7 +67,7 @@ mod tests {
     }
 
     #[test]
-    fn classification_uses_eighty_five_percent_of_score_and_received_bytes() {
+    fn classification_uses_eighty_five_percent_of_score() {
         let cases: &[(&str, Vec<(PeerAddr, Option<f64>, u64)>, Vec<PeerAddr>)] = &[
             (
                 "70/20/10 score",
@@ -90,13 +84,13 @@ mod tests {
                 vec![peer(2)],
             ),
             (
-                "duplicate received versus no response",
+                "infinite ST is slow regardless of received bytes",
                 vec![
                     (peer(1), Some(1.0), 1),
                     (peer(2), Some(f64::INFINITY), 16384),
                     (peer(3), Some(f64::INFINITY), 0),
                 ],
-                vec![peer(2)],
+                vec![peer(2), peer(3)],
             ),
             (
                 "independent empty-score fallback",
