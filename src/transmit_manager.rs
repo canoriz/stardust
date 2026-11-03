@@ -1378,6 +1378,7 @@ impl TransmitWorker {
         );
 
         let mut revoked = HashMap::new();
+        let mut requests = Vec::new();
         for (addr, h) in &mut self.connected_peers {
             info!("peer status {addr:?}: {:?}", h.state);
             if h.is_choked() == Some(false) {
@@ -1397,11 +1398,17 @@ impl TransmitWorker {
                     #[cfg(feature = "blocktrace")]
                     h.blocktrace_peer_id,
                 );
-                h.request_batch(*addr, reqs);
+                requests.push((*addr, reqs));
             }
         }
 
         self.handle_revoked_requests(revoked);
+        for (addr, reqs) in requests {
+            self.connected_peers
+                .get_mut(&addr)
+                .unwrap()
+                .request_batch(addr, reqs);
+        }
     }
 
     /// Apply the connection action specified by each picker revocation.
@@ -1476,7 +1483,7 @@ impl TransmitWorker {
         );
 
         let mut revoked = HashMap::new();
-        let picked_n = if let Some(h) = self.connected_peers.get_mut(addr) {
+        if let Some(h) = self.connected_peers.get_mut(addr) {
             if h.is_choked() == Some(false) {
                 let n_in_flight = h.inflight.inflight(h.bw.get_rtt_4var());
                 let look_back_duration = h.bw_mode.look_back_window();
@@ -1495,21 +1502,17 @@ impl TransmitWorker {
                     h.blocktrace_peer_id,
                 );
 
+                self.handle_revoked_requests(revoked);
+                let h = self.connected_peers.get_mut(addr).unwrap();
                 h.request_batch(*addr, reqs);
                 if pick_n > 0 {
                     trace!("really picked {picked_n} blocks");
                     h.adjust_app_limited(picked_n < pick_n);
                 }
-                picked_n
-            } else {
-                0
+                return picked_n;
             }
-        } else {
-            0
-        };
-
-        self.handle_revoked_requests(revoked);
-        picked_n
+        }
+        0
     }
 
     #[instrument(skip_all, fields(hash = crate::helper::to_hex(&self.info_hash)))]

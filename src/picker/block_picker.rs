@@ -76,6 +76,52 @@ impl PickedDetail {
     }
 }
 
+/// Picker-owned reverse index; block_map remains the source of request details.
+/// tracks which peer occupies which block
+#[derive(Default)]
+struct BlockOccupy {
+    /// Active and revoked requests ordered by their original pick time.
+    /// Revocation keeps the entry; a new pick replaces it.
+    by_peer: HashMap<PeerAddr, IndexTree<(PieceIndex, BlockIndex), tokio::time::Instant>>,
+}
+
+impl BlockOccupy {
+    fn insert(
+        &mut self,
+        peer: PeerAddr,
+        key: (PieceIndex, BlockIndex),
+        picked_at: tokio::time::Instant,
+    ) {
+        self.by_peer.entry(peer).or_default().insert(key, picked_at);
+    }
+
+    fn remove_one(&mut self, peer: PeerAddr, key: (PieceIndex, BlockIndex)) {
+        if let Some(requests) = self.by_peer.get_mut(&peer) {
+            requests.remove(&key);
+            if requests.is_empty() {
+                self.by_peer.remove(&peer);
+            }
+        }
+    }
+
+    /// remove this requests entry of all peer, called when a block is received
+    fn remove_all(&mut self, (piece, block): (PieceIndex, BlockIndex), status: &BlockStatus) {
+        let revoked = match status {
+            BlockStatus::Requested { requested, revoked } => {
+                for peer in requested.keys() {
+                    self.remove_one(*peer, (piece, block));
+                }
+                revoked
+            }
+            BlockStatus::NotRequested { revoked } => revoked,
+            BlockStatus::Received => return,
+        };
+        for peer in revoked.keys() {
+            self.remove_one(*peer, (piece, block));
+        }
+    }
+}
+
 /// A block is repick-eligible only once every current requester is overdue, so
 /// its deadline is the latest per-requester `repick_eligible_at`.
 fn repick_deadline_of(requested: &HashMap<PeerAddr, PickedDetail>) -> Option<tokio::time::Instant> {
@@ -201,7 +247,7 @@ struct PieceBlocks {
     block_map: Vec<BlockStatus>,
 
     /// book keeping of per-block repick deadline, used for repick and endgame
-    repick_deadline: IndexTree<usize, tokio::time::Instant>,
+    repick_deadline: IndexTree<BlockIndex, tokio::time::Instant>,
 
     /// per-sub-piece receive count and last-wait bookkeeping
     subs: Vec<SubPieceState>,
@@ -223,9 +269,11 @@ impl From<PieceBlocks> for PieceBlockDump {
             .block_map
             .into_iter()
             .map(|b| match b {
-                BlockStatus::Requested { .. } => BlockStatus::NotRequested {
-                    revoked: HashMap::new(),
-                },
+                BlockStatus::Requested { .. } | BlockStatus::NotRequested { .. } => {
+                    BlockStatus::NotRequested {
+                        revoked: HashMap::new(),
+                    }
+                }
                 other => other,
             })
             .collect();
@@ -337,6 +385,18 @@ impl PieceBlocks {
         for (sub, state) in self.subs.iter_mut().enumerate() {
             let len = (self.block_map.len() - sub * blocks_per_sub).min(blocks_per_sub);
             state.last_accounted_at = (state.received > 0 && state.received < len).then_some(now);
+        }
+    }
+
+    fn request_at(&self, block: BlockIndex) -> Request {
+        Request {
+            index: self.piece_index,
+            begin: (block * BLOCK_SIZE) as u32,
+            len: if block + 1 == self.block_map.len() {
+                self.last_block_size as u32
+            } else {
+                BLOCK_SIZE as u32
+            },
         }
     }
 
@@ -455,7 +515,8 @@ impl PieceBlocks {
         repick_option: RepickOption,
         picked_out: &mut Vec<BlockRange>,
         account: &mut Accounting,
-        mut on_repick: impl FnMut(usize, tokio::time::Instant),
+        block_occupy: &mut BlockOccupy,
+        mut on_repick: impl FnMut(BlockIndex, tokio::time::Instant),
         #[cfg(feature = "metrics")] torrent: &str,
         #[cfg(feature = "blocktrace")] bt_torrent_id: Option<i64>,
         #[cfg(feature = "blocktrace")] bt_peer_id: Option<i64>,
@@ -488,21 +549,14 @@ impl PieceBlocks {
                     Self::settle_sub(&mut self.subs, &self.block_map, sub, account, now);
                     self.subs[sub].last_accounted_at.get_or_insert(now);
                 }
+                let req = Some(self.request_at(i));
                 let b = &mut self.block_map[i];
-                let req = Some(Request {
-                    index: self.piece_index,
-                    begin: (i * BLOCK_SIZE) as u32,
-                    len: if i + 1 == n_blocks {
-                        self.last_block_size as u32
-                    } else {
-                        BLOCK_SIZE as u32
-                    },
-                });
                 match b {
                     BlockStatus::NotRequested { revoked } => {
                         let detail =
                             PickedDetail::new(now, *n_in_flight, avg_speed, rtt, slow_at_pick);
                         let deadline = detail.repick_eligible_at();
+
                         #[cfg(feature = "blocktrace")]
                         if let (Some(tid), Some(pid)) = (bt_torrent_id, bt_peer_id) {
                             let mut ev = blocktrace::BlockEvent::at(
@@ -516,6 +570,9 @@ impl PieceBlocks {
                             ev.n_inflight = Some(detail.n_in_flight_when_picked as i64);
                             blocktrace::record_block_event(ev);
                         }
+
+                        revoked.remove(&peer);
+                        block_occupy.insert(peer, (self.piece_index, i), now);
                         *b = BlockStatus::Requested {
                             requested: HashMap::from([(peer, detail)]),
                             revoked: std::mem::take(revoked),
@@ -531,12 +588,13 @@ impl PieceBlocks {
                         self.all_request_or_received_before = i + 1;
                         self.repick_deadline.insert(i, deadline);
                     }
-                    BlockStatus::Requested { requested, .. } => {
+                    BlockStatus::Requested { requested, revoked } => {
                         self.all_request_or_received_before = i + 1;
                         if requested.is_empty() {
                             let detail =
                                 PickedDetail::new(now, *n_in_flight, avg_speed, rtt, slow_at_pick);
                             let deadline = detail.repick_eligible_at();
+
                             #[cfg(feature = "blocktrace")]
                             if let (Some(tid), Some(pid)) = (bt_torrent_id, bt_peer_id) {
                                 let mut ev = blocktrace::BlockEvent::at(
@@ -550,6 +608,9 @@ impl PieceBlocks {
                                 ev.n_inflight = Some(detail.n_in_flight_when_picked as i64);
                                 blocktrace::record_block_event(ev);
                             }
+
+                            revoked.remove(&peer);
+                            block_occupy.insert(peer, (self.piece_index, i), now);
                             requested.insert(peer, detail);
                             *n_in_flight += 1;
                             if from.is_none() {
@@ -615,19 +676,11 @@ impl PieceBlocks {
                 let sub = i / blocks_per_sub;
                 Self::settle_sub(&mut self.subs, &self.block_map, sub, account, now);
             }
+            let req = self.request_at(i);
             let b = &mut self.block_map[i];
             match b {
-                BlockStatus::Requested { requested, .. } => {
+                BlockStatus::Requested { requested, revoked } => {
                     if !requested.contains_key(&peer) {
-                        let req = Request {
-                            index: self.piece_index,
-                            begin: (i * BLOCK_SIZE) as u32,
-                            len: if i + 1 == n_blocks {
-                                self.last_block_size as u32
-                            } else {
-                                BLOCK_SIZE as u32
-                            },
-                        };
                         if repick_option.endgame {
                             trace!("{peer:?} in endgame mode, repick {req:?}",);
                         } else {
@@ -642,6 +695,7 @@ impl PieceBlocks {
                         count += 1;
                         let detail =
                             PickedDetail::new(now, *n_in_flight, avg_speed, rtt, slow_at_pick);
+
                         #[cfg(feature = "blocktrace")]
                         if let (Some(tid), Some(pid)) = (bt_torrent_id, bt_peer_id) {
                             let mut ev = blocktrace::BlockEvent::at(
@@ -660,6 +714,9 @@ impl PieceBlocks {
                             ev.n_inflight = Some(detail.n_in_flight_when_picked as i64);
                             blocktrace::record_block_event(ev);
                         }
+
+                        revoked.remove(&peer);
+                        block_occupy.insert(peer, (self.piece_index, i), now);
                         requested.insert(peer, detail);
                         on_repick(i, now);
                         *n_in_flight += 1;
@@ -694,7 +751,12 @@ impl PieceBlocks {
 
     /// inform some block is received, returns all being requested peers
     /// requested for that block
-    fn receive(&mut self, req: Request, account: &mut Accounting) -> Vec<PeerAddr> {
+    fn receive(
+        &mut self,
+        req: Request,
+        account: &mut Accounting,
+        block_occupy: &mut BlockOccupy,
+    ) -> Vec<PeerAddr> {
         let now = tokio::time::Instant::now();
         // input req must be valid
         let b_index = (req.begin as usize) / BLOCK_SIZE;
@@ -739,6 +801,7 @@ impl PieceBlocks {
             st.last_accounted_at.get_or_insert(now);
         }
 
+        block_occupy.remove_all((self.piece_index, b_index), &self.block_map[b_index]);
         let b = &mut self.block_map[b_index];
         match b {
             BlockStatus::NotRequested { .. } => {
@@ -775,9 +838,8 @@ impl PieceBlocks {
                 tokio::time::Instant::now(),
             );
         }
+
         let b = &mut self.block_map[b_index];
-        #[cfg(test)]
-        println!("{b:?}");
         match b {
             BlockStatus::Requested { requested, revoked } => {
                 // A peer can only be revoked if it's requested before
@@ -786,7 +848,6 @@ impl PieceBlocks {
                     revoked.insert(*peer, v);
                     did_remove = true;
                 }
-                revoked.retain(|_, t| t.pick_time.elapsed() < NO_RESPONSE_TIMEOUT);
                 if requested.is_empty() {
                     *b = BlockStatus::NotRequested {
                         revoked: std::mem::take(revoked),
@@ -805,14 +866,32 @@ impl PieceBlocks {
                     }
                 }
             }
-            BlockStatus::NotRequested { revoked } => {
-                revoked.retain(|_, t| t.pick_time.elapsed() < NO_RESPONSE_TIMEOUT);
-            }
-            BlockStatus::Received => {}
+            BlockStatus::NotRequested { .. } | BlockStatus::Received => {}
         }
     }
 
+    /// Finish a rejected request and discard its history and index entry.
+    fn reject(
+        &mut self,
+        peer: &PeerAddr,
+        req: Request,
+        account: &mut Accounting,
+        block_occupy: &mut BlockOccupy,
+    ) {
+        self.revoke(peer, req, account);
+
+        let block = req.begin as usize / BLOCK_SIZE;
+        match &mut self.block_map[block] {
+            BlockStatus::Requested { revoked, .. } | BlockStatus::NotRequested { revoked } => {
+                revoked.remove(peer);
+            }
+            BlockStatus::Received => {}
+        }
+        block_occupy.remove_one(*peer, (self.piece_index, block));
+    }
+
     /// revoke request of one peer for all `Requested` which fulfills condition
+    #[cfg(test)]
     fn revoke_all_requested_if<F>(
         &mut self,
         remove: F,
@@ -835,17 +914,9 @@ impl PieceBlocks {
             self.settle_account(account, now);
         }
 
-        let n_blocks = self.block_map.len();
-        for (i, b) in self.block_map.iter_mut().enumerate().rev() {
-            let req = Request {
-                index: self.piece_index,
-                begin: (i * BLOCK_SIZE) as u32,
-                len: if i + 1 == n_blocks {
-                    self.last_block_size
-                } else {
-                    BLOCK_SIZE
-                } as u32,
-            };
+        for i in (0..self.block_map.len()).rev() {
+            let req = self.request_at(i);
+            let b = &mut self.block_map[i];
             match b {
                 BlockStatus::Requested {
                     requested, revoked, ..
@@ -868,7 +939,6 @@ impl PieceBlocks {
                         }
                     });
                     let removed_any = requested.len() != before;
-                    revoked.retain(|_, t| t.pick_time.elapsed() < NO_RESPONSE_TIMEOUT);
                     if requested.is_empty() {
                         *b = BlockStatus::NotRequested {
                             revoked: std::mem::take(revoked),
@@ -885,9 +955,6 @@ impl PieceBlocks {
                             self.repick_deadline.insert(i, deadline);
                         }
                     }
-                }
-                BlockStatus::NotRequested { revoked } => {
-                    revoked.retain(|_, t| t.pick_time.elapsed() < NO_RESPONSE_TIMEOUT);
                 }
                 _ => {}
             }
@@ -921,6 +988,7 @@ impl RepickOption {
 
 type Picker = dyn PiecePicker<T = PeerPieceDetail> + Send;
 type PieceIndex = u32;
+type BlockIndex = usize;
 type Unrequested = usize;
 type Unreceived = usize;
 pub struct BlockPicker {
@@ -947,7 +1015,7 @@ pub struct BlockPicker {
     slow_order: IndexTree<PieceIndex, Unreceived>,
     slow_peers: HashSet<PeerAddr>,
     /// Slow block requests left in fast pieces, indexed by takeover deadline.
-    slow_blocks: IndexTree<(PieceIndex, usize), tokio::time::Instant>,
+    slow_blocks: IndexTree<(PieceIndex, BlockIndex), tokio::time::Instant>,
 
     // previous time the timeout request check runs
     prev_time_check: tokio::time::Instant,
@@ -958,6 +1026,7 @@ pub struct BlockPicker {
 
     /// Peer windows, owned by this picker and updated before block mutations.
     accounting: Accounting,
+    block_occupy: BlockOccupy,
 
     endgame: bool,
 
@@ -1001,19 +1070,19 @@ impl BlockPicker {
     }
 
     fn piece_mut(&mut self, index: PieceIndex) -> Option<&mut PieceBlocks> {
-        self.piece_and_accounting_mut(index).map(|(piece, _)| piece)
+        self.piece_state_mut(index).map(|(piece, _, _)| piece)
     }
 
-    fn piece_and_accounting_mut(
+    fn piece_state_mut(
         &mut self,
         index: PieceIndex,
-    ) -> Option<(&mut PieceBlocks, &mut Accounting)> {
+    ) -> Option<(&mut PieceBlocks, &mut Accounting, &mut BlockOccupy)> {
         let piece = self
             .requesting
             .get_mut(&index)
             .or_else(|| self.receiving.get_mut(&index))
             .or_else(|| self.slow_pieces.get_mut(&index))?;
-        Some((piece, &mut self.accounting))
+        Some((piece, &mut self.accounting, &mut self.block_occupy))
     }
 
     fn pieces(&self) -> impl Iterator<Item = (&PieceIndex, &PieceBlocks)> {
@@ -1023,7 +1092,7 @@ impl BlockPicker {
             .chain(self.slow_pieces.iter())
     }
 
-    fn remove_from_slow_blocks(&mut self, index: PieceIndex, block: Option<usize>) {
+    fn remove_from_slow_blocks(&mut self, index: PieceIndex, block: Option<BlockIndex>) {
         if let Some(block) = block {
             self.slow_blocks.remove(&(index, block));
         } else {
@@ -1038,7 +1107,7 @@ impl BlockPicker {
     /// move to or remove from slow_blocks
     /// If blocks in a fast piece are now all requested to slow peers
     /// add to slow blocks
-    fn update_slow_blocks(&mut self, index: PieceIndex, block: Option<usize>) {
+    fn update_slow_blocks(&mut self, index: PieceIndex, block: Option<BlockIndex>) {
         let fast_piece = self
             .requesting
             .get(&index)
@@ -1069,7 +1138,19 @@ impl BlockPicker {
     }
 
     fn remove_piece(&mut self, index: PieceIndex) {
+        self.settle_piece(index);
         self.remove_from_slow_blocks(index, None);
+        if let Some(piece) = self
+            .requesting
+            .get(&index)
+            .or_else(|| self.receiving.get(&index))
+            .or_else(|| self.slow_pieces.get(&index))
+        {
+            for (block, status) in piece.block_map.iter().enumerate() {
+                self.block_occupy.remove_all((index, block), status);
+            }
+        }
+
         self.requesting.remove(&index);
         self.receiving.remove(&index);
         self.slow_pieces.remove(&index);
@@ -1176,7 +1257,7 @@ impl BlockPicker {
 
     /// Settle one piece to the current time without stopping its clock.
     fn settle_piece(&mut self, index: u32) {
-        if let Some((piece, accounting)) = self.piece_and_accounting_mut(index) {
+        if let Some((piece, accounting, _)) = self.piece_state_mut(index) {
             piece.settle_account(accounting, tokio::time::Instant::now());
         }
     }
@@ -1209,6 +1290,7 @@ impl BlockPicker {
             no_response_timeout,
             endgame: false,
             accounting: Accounting::default(),
+            block_occupy: BlockOccupy::default(),
             file_tracker: FileTracker::new(meta),
             #[cfg(feature = "metrics")]
             torrent_hex: hex::encode(meta.info_hash),
@@ -1243,6 +1325,7 @@ impl BlockPicker {
             no_response_timeout,
             endgame: false,
             accounting: Accounting::default(),
+            block_occupy: BlockOccupy::default(),
             file_tracker: FileTracker::from_lengths(piece_size as u64, [total_size]),
             #[cfg(feature = "metrics")]
             torrent_hex: String::new(),
@@ -1515,24 +1598,15 @@ impl BlockPicker {
                 break;
             }
 
-            let status = self.piece(index).map(|piece| &piece.block_map[block]);
-            if let Some(BlockStatus::Requested { requested, .. }) = status
+            let (piece, accounting, block_occupy) = self.piece_state_mut(index).unwrap();
+            if let BlockStatus::Requested { requested, .. } = &piece.block_map[block]
                 && !requested.contains_key(peer)
             {
-                self.slow_blocks.remove(&(index, block));
                 let detail = PickedDetail::new(now, *n_in_flight, avg_speed, rtt, false);
-                let (piece, accounting) = self.piece_and_accounting_mut(index).unwrap();
                 let sub = block / (SUB_PIECE_SIZE as usize / BLOCK_SIZE);
                 PieceBlocks::settle_sub(&mut piece.subs, &piece.block_map, sub, accounting, now);
-                let req = Request {
-                    index,
-                    begin: (block * BLOCK_SIZE) as u32,
-                    len: if block + 1 == piece.block_map.len() {
-                        piece.last_block_size as u32
-                    } else {
-                        BLOCK_SIZE as u32
-                    },
-                };
+
+                let req = piece.request_at(block);
                 let BlockStatus::Requested {
                     requested,
                     revoked: revoked_reqs,
@@ -1540,6 +1614,7 @@ impl BlockPicker {
                 else {
                     unreachable!("slow takeover requires outstanding requests");
                 };
+
                 for (p, detail) in requested.drain() {
                     revoked_reqs.insert(p, detail);
                     revoked
@@ -1566,7 +1641,10 @@ impl BlockPicker {
                 piece
                     .repick_deadline
                     .insert(block, detail.repick_eligible_at());
+                revoked_reqs.remove(peer);
+                block_occupy.insert(*peer, (index, block), now);
                 requested.insert(*peer, detail);
+                self.slow_blocks.remove(&(index, block));
                 ret.push(BlockRange { from: req, to: req });
                 *remain -= 1;
                 *n_in_flight += 1;
@@ -1624,6 +1702,7 @@ impl BlockPicker {
                     option,
                     ret,
                     &mut self.accounting,
+                    &mut self.block_occupy,
                     |block, picked_at| {
                         let key = (index, block);
                         if slow && slowblocks.contains(&key) {
@@ -1773,19 +1852,26 @@ impl BlockPicker {
             }
         }
 
-        self.slow_peers = slow;
+        let old_slow = std::mem::replace(&mut self.slow_peers, slow);
         let live: Vec<_> = peers.iter().map(|(addr, _)| *addr).collect();
         self.reconcile_piece_pools(&live);
 
-        // handling left blocks requested by newly classified SLOW peers
-        // insert these blocks to slowblocks tree
-        for (&index, piece) in self.requesting.iter().chain(self.receiving.iter()) {
-            for (block, status) in piece.block_map.iter().enumerate() {
-                // TODO: OPTIMIZE: iterate over blocks of a peer, not cycling over all blocks
-                if let Some(deadline) = takeover_deadline_of(&self.slow_peers, status) {
-                    self.slow_blocks.insert((index, block), deadline);
+        // Enroll outstanding fast-pool blocks held by newly demoted peers.
+        let mut demoted = Vec::new();
+        for peer in self.slow_peers.difference(&old_slow) {
+            if let Some(requests) = self.block_occupy.by_peer.get(peer) {
+                for (&(index, block), _) in requests.iter(false) {
+                    if let BlockStatus::Requested { requested, .. } =
+                        &self.piece(index).unwrap().block_map[block]
+                        && requested.contains_key(peer)
+                    {
+                        demoted.push((index, block));
+                    }
                 }
             }
+        }
+        for (index, block) in demoted {
+            self.update_slow_blocks(index, Some(block));
         }
 
         self.update_endgame();
@@ -1926,13 +2012,11 @@ impl BlockPicker {
         if !self.check_block_validity(&req) {
             return;
         }
+        let block = req.begin as usize / BLOCK_SIZE;
         let mut empty = false;
-        if let Some((b, accounting)) = self.piece_and_accounting_mut(req.index) {
-            b.revoke(peer, req, accounting);
+        if let Some((b, accounting, block_occupy)) = self.piece_state_mut(req.index) {
+            b.reject(peer, req, accounting, block_occupy);
             empty = b.is_all_not_requested();
-            if empty {
-                b.settle_account(accounting, tokio::time::Instant::now());
-            }
         }
 
         if empty {
@@ -1940,7 +2024,7 @@ impl BlockPicker {
             self.piece_picker.set_have(req.index, false);
         }
 
-        self.update_slow_blocks(req.index, Some(req.begin as usize / BLOCK_SIZE));
+        self.update_slow_blocks(req.index, Some(block));
         self.update_piece_state_and_order(req.index);
     }
 
@@ -1992,8 +2076,8 @@ impl BlockPicker {
 
         let index = ji.index();
         self.remove_from_slow_blocks(index, Some(req.begin as usize / BLOCK_SIZE));
-        let result = if let Some((b, accounting)) = self.piece_and_accounting_mut(index) {
-            let cancel = b.receive(req, accounting);
+        let result = if let Some((b, accounting, block_occupy)) = self.piece_state_mut(index) {
+            let cancel = b.receive(req, accounting, block_occupy);
             (
                 PieceComplete {
                     piece: b.is_all_received(),
@@ -2004,7 +2088,7 @@ impl BlockPicker {
         } else if self.piece_picker.selected(index) && !self.piece_picker.have(index) {
             // Late arrivals can reopen a piece after all its requests were revoked.
             let mut b = self.piece_block_of(index);
-            let cancel = b.receive(req, &mut self.accounting);
+            let cancel = b.receive(req, &mut self.accounting, &mut self.block_occupy);
             let complete = PieceComplete {
                 piece: b.is_all_received(),
                 sub_piece: b.is_sub_all_received(req.begin),
@@ -2031,7 +2115,6 @@ impl BlockPicker {
     /// actual verified state so the file tracker is never double-counted, and
     /// returns the indices of files that just became complete.
     pub fn piece_verified(&mut self, index: u32, success: bool) -> Vec<usize> {
-        self.settle_piece(index);
         let had = self.have(index);
         self.remove_piece(index);
         self.piece_picker.set_have(index, success);
@@ -2054,34 +2137,55 @@ impl BlockPicker {
     /// longer than timeout
     fn revoke_unrespond(&mut self, revoked: &mut HashMap<PeerAddr, Vec<Revoke>>) {
         let now = tokio::time::Instant::now();
-        let no_response =
-            |_: &PeerAddr, at: &tokio::time::Instant| now.duration_since(*at) > NO_RESPONSE_TIMEOUT;
-        let mut remove = Vec::new();
-        let mut indices = Vec::new();
-        for (&index, b) in self
-            .requesting
-            .iter_mut()
-            .chain(self.receiving.iter_mut())
-            .chain(self.slow_pieces.iter_mut())
-        {
-            b.revoke_all_requested_if(no_response, revoked, &mut self.accounting);
-            indices.push(index);
-            if b.is_all_not_requested()
-                && !b.block_map.iter().any(
-                    // TODO: optimize, do not loop over block_map, store a revoked_count
-                    |s| matches!(s, BlockStatus::NotRequested { revoked } if !revoked.is_empty()),
-                )
+
+        // Both active requests and revoked history expire in pick-time order.
+        let mut expired = Vec::new();
+        self.block_occupy.by_peer.retain(|peer, requests| {
+            while requests
+                .first()
+                .is_some_and(|(_, picked_at)| now.duration_since(*picked_at) > NO_RESPONSE_TIMEOUT)
             {
-                remove.push(index);
+                let (key, _) = requests.pop_first().unwrap();
+                expired.push((*peer, key));
             }
+            !requests.is_empty()
+        });
+
+        let mut pieces = HashSet::new();
+        for (peer, (index, block)) in expired {
+            let (piece, accounting, _) = self.piece_state_mut(index).unwrap();
+            if let BlockStatus::Requested { requested, .. } = &piece.block_map[block]
+                && requested.contains_key(&peer)
+            {
+                let req = piece.request_at(block);
+                piece.revoke(&peer, req, accounting);
+                revoked.entry(peer).or_default().push(Revoke::Timeout(req));
+            }
+
+            // Discard expired history, including the request just timed out.
+            match &mut piece.block_map[block] {
+                BlockStatus::Requested { revoked, .. } | BlockStatus::NotRequested { revoked } => {
+                    revoked.remove(&peer);
+                }
+                BlockStatus::Received => {}
+            }
+
+            self.update_slow_blocks(index, Some(block));
+            pieces.insert(index);
         }
-        for index in remove {
-            self.remove_piece(index);
-            self.piece_picker.set_have(index, false);
-        }
-        for index in indices {
-            self.update_slow_blocks(index, None);
-            self.update_piece_state_and_order(index);
+
+        for index in pieces {
+            let empty = self.piece(index).is_some_and(|piece| {
+                piece.is_all_not_requested() && piece.block_map.iter().all(|status| {
+                    matches!(status, BlockStatus::NotRequested { revoked } if revoked.is_empty())
+                })
+            });
+            if empty {
+                self.remove_piece(index);
+                self.piece_picker.set_have(index, false);
+            } else {
+                self.update_piece_state_and_order(index);
+            }
         }
     }
 
@@ -2153,9 +2257,12 @@ impl BlockPicker {
                 receiving.insert(index, p.clone());
             }
         }
+
+        let clear_requests =
+            |(index, piece)| (index, PieceBlocks::from(PieceBlockDump::from(piece)));
         BlockPickerDump {
-            receiving,
-            requesting,
+            receiving: receiving.into_iter().map(clear_requests).collect(),
+            requesting: requesting.into_iter().map(clear_requests).collect(),
             piece_map: self.piece_picker.dump(),
             no_response_timeout: self.no_response_timeout,
         }
@@ -2169,6 +2276,7 @@ impl BlockPicker {
         self.slow_pieces.clear();
         self.slow_peers.clear();
         self.slow_blocks = IndexTree::new();
+        self.block_occupy = BlockOccupy::default();
         self.piece_picker.load(dump.piece_map);
         self.no_response_timeout = dump.no_response_timeout;
 
@@ -2251,28 +2359,35 @@ impl BlockPicker {
     }
 
     fn revoke_peer_requests(&mut self, peer: &PeerAddr) {
-        let mut revoked = HashMap::new();
-        let mut empty = Vec::new();
-        let mut indices = Vec::new();
-        for (&index, b) in self
-            .requesting
-            .iter_mut()
-            .chain(self.receiving.iter_mut())
-            .chain(self.slow_pieces.iter_mut())
-        {
-            b.revoke_all_requested_if(|p, _| p == peer, &mut revoked, &mut self.accounting);
-            indices.push(index);
-            if b.is_all_not_requested() {
-                empty.push(index);
+        let Some(requests) = self.block_occupy.by_peer.get(peer) else {
+            return;
+        };
+        let blocks: Vec<_> = requests.iter(false).map(|(key, _)| *key).collect();
+
+        let mut affected_pieces = HashSet::new();
+        for (index, block) in blocks {
+            let (piece, accounting, _) = self.piece_state_mut(index).unwrap();
+            if let BlockStatus::Requested { requested, .. } = &piece.block_map[block]
+                && requested.contains_key(peer)
+            {
+                let req = piece.request_at(block);
+                piece.revoke(peer, req, accounting);
+                self.update_slow_blocks(index, Some(block));
+
+                affected_pieces.insert(index);
             }
         }
-        for index in empty {
-            self.remove_piece(index);
-            self.piece_picker.set_have(index, false);
-        }
-        for index in indices {
-            self.update_slow_blocks(index, None);
-            self.update_piece_state_and_order(index);
+
+        for index in affected_pieces {
+            let empty = self
+                .piece(index)
+                .is_some_and(PieceBlocks::is_all_not_requested);
+            if empty {
+                self.remove_piece(index);
+                self.piece_picker.set_have(index, false);
+            } else {
+                self.update_piece_state_and_order(index);
+            }
         }
     }
 
@@ -2313,7 +2428,6 @@ impl BlockPicker {
     pub fn select(&mut self, index: u32, selected: bool) {
         self.piece_picker.select(index, selected);
         if !selected {
-            self.settle_piece(index);
             // Tracked pieces use have as an occupancy bit, not verified progress.
             if self.piece(index).is_some() {
                 self.piece_picker.set_have(index, false);
@@ -2369,7 +2483,6 @@ impl BlockPicker {
     pub fn set_have(&mut self, index: u32, have: bool) {
         self.piece_picker.set_have(index, have);
         if have {
-            self.settle_piece(index);
             self.remove_piece(index);
         }
         self.update_piece_state_and_order(index);
@@ -2395,6 +2508,16 @@ mod test {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 3),
         3,
     );
+
+    fn index_fixture_requests(block_occupy: &mut BlockOccupy, piece: &PieceBlocks) {
+        for (block, status) in piece.block_map.iter().enumerate() {
+            if let BlockStatus::Requested { requested, .. } = status {
+                for (peer, detail) in requested {
+                    block_occupy.insert(*peer, (piece.piece_index, block), detail.pick_time);
+                }
+            }
+        }
+    }
 
     fn picked_detail_at(
         pick_time: tokio::time::Instant,
@@ -2437,6 +2560,7 @@ mod test {
                 },
                 &mut picked,
                 &mut Accounting::default(),
+                &mut BlockOccupy::default(),
                 |_, _| {},
                 #[cfg(feature = "metrics")]
                 "test",
@@ -2477,6 +2601,7 @@ mod test {
                 },
                 &mut picked,
                 &mut Accounting::default(),
+                &mut BlockOccupy::default(),
                 |_, _| {},
                 #[cfg(feature = "metrics")]
                 "test",
@@ -2514,6 +2639,7 @@ mod test {
                         len: 16384,
                     },
                     &mut Accounting::default(),
+                    &mut BlockOccupy::default(),
                 );
             }
             b.receive(
@@ -2523,6 +2649,7 @@ mod test {
                     len: 16384,
                 },
                 &mut Accounting::default(),
+                &mut BlockOccupy::default(),
             );
             assert_eq!(b.received_count, 11);
             assert_eq!(b.requested_or_received_count, 50);
@@ -2610,6 +2737,7 @@ mod test {
                 },
                 &mut picked,
                 &mut Accounting::default(),
+                &mut BlockOccupy::default(),
                 |_, _| {},
                 #[cfg(feature = "metrics")]
                 "test",
@@ -2864,6 +2992,7 @@ mod test {
             },
             &mut picked,
             &mut Accounting::default(),
+            &mut BlockOccupy::default(),
             |_, _| {},
             #[cfg(feature = "metrics")]
             "test",
@@ -2917,6 +3046,7 @@ mod test {
             },
             &mut picked,
             &mut Accounting::default(),
+            &mut BlockOccupy::default(),
             |_, _| {},
             #[cfg(feature = "metrics")]
             "test",
@@ -2982,6 +3112,7 @@ mod test {
                 option,
                 &mut picked,
                 &mut Accounting::default(),
+                &mut BlockOccupy::default(),
                 |_, _| {},
                 #[cfg(feature = "metrics")]
                 "test",
@@ -3111,6 +3242,7 @@ mod test {
             },
             &mut picked,
             &mut Accounting::default(),
+            &mut BlockOccupy::default(),
             |_, _| {},
             #[cfg(feature = "metrics")]
             "test",
@@ -3164,6 +3296,7 @@ mod test {
             },
             &mut picked,
             &mut Accounting::default(),
+            &mut BlockOccupy::default(),
             |_, _| {},
             #[cfg(feature = "metrics")]
             "test",
@@ -3217,6 +3350,7 @@ mod test {
             },
             &mut Vec::new(),
             &mut a,
+            &mut BlockOccupy::default(),
             |_, _| {},
             #[cfg(feature = "metrics")]
             "test",
@@ -3228,9 +3362,9 @@ mod test {
         tokio::time::advance(time::Duration::from_secs(7)).await;
         pb.settle_account(&mut a, tokio::time::Instant::now());
         assert_cost(a.peers[&PEER1].current_cost().0, 7.0);
-        pb.receive(block_req(0), &mut a);
+        pb.receive(block_req(0), &mut a, &mut BlockOccupy::default());
         tokio::time::advance(time::Duration::from_secs(2)).await;
-        pb.receive(block_req(1), &mut a);
+        pb.receive(block_req(1), &mut a, &mut BlockOccupy::default());
         tokio::time::advance(time::Duration::from_secs(9)).await;
         pb.settle_account(&mut a, tokio::time::Instant::now());
         assert_cost(a.peers[&PEER1].current_cost().0, 9.0);
@@ -3250,9 +3384,9 @@ mod test {
             not_requested_block(),
         ]);
         let mut a = Accounting::default();
-        pb.receive(block_req(0), &mut a);
+        pb.receive(block_req(0), &mut a, &mut BlockOccupy::default());
         tokio::time::advance(time::Duration::from_secs(3)).await;
-        pb.receive(block_req(2), &mut a);
+        pb.receive(block_req(2), &mut a, &mut BlockOccupy::default());
         let mut picked = Vec::new();
         for peer in [PEER3, p4] {
             tokio::time::advance(time::Duration::from_secs(3)).await;
@@ -3270,6 +3404,7 @@ mod test {
                     },
                     &mut picked,
                     &mut a,
+                    &mut BlockOccupy::default(),
                     |_, _| {},
                     #[cfg(feature = "metrics")]
                     "test",
@@ -3283,7 +3418,7 @@ mod test {
         }
         for block in [1, 3, 4] {
             tokio::time::advance(time::Duration::from_secs(3)).await;
-            pb.receive(block_req(block), &mut a);
+            pb.receive(block_req(block), &mut a, &mut BlockOccupy::default());
         }
         pb.settle_account(&mut a, tokio::time::Instant::now());
         for (p, st, fair) in [
@@ -3303,7 +3438,7 @@ mod test {
     async fn slot_accounting_repick_revoke_and_duplicate_do_not_reassign_history() {
         let mut pb = plain_blocks(2);
         let mut a = Accounting::default();
-        pb.receive(block_req(0), &mut a);
+        pb.receive(block_req(0), &mut a, &mut BlockOccupy::default());
         let mut picked = Vec::new();
         for (seconds, peer) in [(2, PEER1), (4, PEER2)] {
             tokio::time::advance(time::Duration::from_secs(seconds)).await;
@@ -3321,6 +3456,7 @@ mod test {
                     },
                     &mut picked,
                     &mut a,
+                    &mut BlockOccupy::default(),
                     |_, _| {},
                     #[cfg(feature = "metrics")]
                     "test",
@@ -3335,9 +3471,9 @@ mod test {
         tokio::time::advance(time::Duration::from_secs(2)).await;
         pb.revoke(&PEER1, block_req(1), &mut a);
         tokio::time::advance(time::Duration::from_secs(3)).await;
-        pb.receive(block_req(1), &mut a);
+        pb.receive(block_req(1), &mut a, &mut BlockOccupy::default());
         tokio::time::advance(time::Duration::from_secs(5)).await;
-        pb.receive(block_req(1), &mut a);
+        pb.receive(block_req(1), &mut a, &mut BlockOccupy::default());
         pb.settle_account(&mut a, tokio::time::Instant::now());
         assert_cost(a.peers[&PEER1].current_cost().0, 5.0);
         assert_cost(a.peers[&PEER2].current_cost().0, 4.0);
@@ -3349,12 +3485,12 @@ mod test {
             let now = tokio::time::Instant::now();
             let mut pb = blocks(vec![requested_block(&[(PEER1, now)], &[]); 64]);
             let mut a = Accounting::default();
-            pb.receive(block_req(0), &mut a);
-            pb.receive(block_req(32), &mut a);
+            pb.receive(block_req(0), &mut a, &mut BlockOccupy::default());
+            pb.receive(block_req(32), &mut a, &mut BlockOccupy::default());
             tokio::time::advance(time::Duration::from_secs(2)).await;
             match action {
                 0 => {
-                    pb.receive(block_req(1), &mut a);
+                    pb.receive(block_req(1), &mut a, &mut BlockOccupy::default());
                 }
                 1 => pb.revoke(&PEER1, block_req(1), &mut a),
                 _ => {
@@ -3371,6 +3507,7 @@ mod test {
                         },
                         &mut Vec::new(),
                         &mut a,
+                        &mut BlockOccupy::default(),
                         |_, _| {},
                         #[cfg(feature = "metrics")]
                         "test",
@@ -3409,18 +3546,18 @@ mod test {
         let t = tokio::time::Instant::now();
         let mut pb = blocks(vec![requested_block(&[(PEER1, t)], &[]); 65]);
         let mut a = Accounting::default();
-        pb.receive(block_req(0), &mut a);
+        pb.receive(block_req(0), &mut a, &mut BlockOccupy::default());
         tokio::time::advance(time::Duration::from_secs(2)).await;
-        pb.receive(block_req(32), &mut a);
+        pb.receive(block_req(32), &mut a, &mut BlockOccupy::default());
         // The last sub has one block: first arrival also completes it, costing zero.
-        pb.receive(block_req(64), &mut a);
+        pb.receive(block_req(64), &mut a, &mut BlockOccupy::default());
         tokio::time::advance(time::Duration::from_secs(3)).await;
         for b in 1..32 {
-            pb.receive(block_req(b), &mut a);
+            pb.receive(block_req(b), &mut a, &mut BlockOccupy::default());
         }
         tokio::time::advance(time::Duration::from_secs(4)).await;
         for b in 33..64 {
-            pb.receive(block_req(b), &mut a);
+            pb.receive(block_req(b), &mut a, &mut BlockOccupy::default());
         }
         pb.settle_account(&mut a, tokio::time::Instant::now());
         assert_cost(a.peers[&PEER1].current_cost().0, 12.0);
@@ -3437,7 +3574,8 @@ mod test {
                 not_requested_block(),
                 requested_block(&[(PEER1, t)], &[]),
             ]);
-            pb.receive(block_req(0), &mut bp.accounting);
+            pb.receive(block_req(0), &mut bp.accounting, &mut bp.block_occupy);
+            index_fixture_requests(&mut bp.block_occupy, &pb);
             bp.requesting.insert(0, pb);
             tokio::time::advance(time::Duration::from_secs(2)).await;
             match action {
@@ -3465,7 +3603,7 @@ mod test {
             requested_block(&[(PEER1, t)], &[]),
             not_requested_block(),
         ]);
-        pb.receive(block_req(0), &mut bp.accounting);
+        pb.receive(block_req(0), &mut bp.accounting, &mut bp.block_occupy);
         tokio::time::advance(time::Duration::from_secs(50)).await;
         assert_eq!(
             pb.pick(
@@ -3481,6 +3619,7 @@ mod test {
                 },
                 &mut Vec::new(),
                 &mut bp.accounting,
+                &mut bp.block_occupy,
                 |_, _| {},
                 #[cfg(feature = "metrics")]
                 "test",
@@ -3491,6 +3630,7 @@ mod test {
             ),
             1
         );
+        index_fixture_requests(&mut bp.block_occupy, &pb);
         bp.receiving.insert(0, pb);
         tokio::time::advance(time::Duration::from_secs(41)).await;
         let mut revoked = HashMap::new();
@@ -3512,7 +3652,8 @@ mod test {
             not_requested_block(),
             requested_block(&[(PEER1, t)], &[]),
         ]);
-        pb.receive(block_req(0), &mut bp.accounting);
+        pb.receive(block_req(0), &mut bp.accounting, &mut bp.block_occupy);
+        index_fixture_requests(&mut bp.block_occupy, &pb);
         bp.requesting.insert(0, pb);
         tokio::time::advance(time::Duration::from_secs(2)).await;
         bp.peer_leave(&PEER1);
@@ -3536,6 +3677,7 @@ mod test {
                 },
                 &mut picked,
                 &mut bp.accounting,
+                &mut bp.block_occupy,
                 |_, _| {},
                 #[cfg(feature = "metrics")]
                 "test",
@@ -3625,10 +3767,22 @@ mod test {
             requested_block(&[(PEER1, t0)], &[]),
         ]);
         // block 1 arrives last, so it is the gating block
-        pb.receive(block_req(0), &mut Accounting::default());
-        pb.receive(block_req(2), &mut Accounting::default());
+        pb.receive(
+            block_req(0),
+            &mut Accounting::default(),
+            &mut BlockOccupy::default(),
+        );
+        pb.receive(
+            block_req(2),
+            &mut Accounting::default(),
+            &mut BlockOccupy::default(),
+        );
         tokio::time::advance(time::Duration::from_millis(120)).await;
-        pb.receive(block_req(1), &mut Accounting::default());
+        pb.receive(
+            block_req(1),
+            &mut Accounting::default(),
+            &mut BlockOccupy::default(),
+        );
 
         let g = take_completed_last_wait(&mut pb, 1).expect("sub is complete");
         assert!(g.wait >= time::Duration::from_millis(120), "{:?}", g.wait);
@@ -3650,12 +3804,20 @@ mod test {
             requested_block(&[(PEER1, t0)], &[]),
         ]);
 
-        pb.receive(block_req(0), &mut Accounting::default());
+        pb.receive(
+            block_req(0),
+            &mut Accounting::default(),
+            &mut BlockOccupy::default(),
+        );
         let first_arrival = pb.subs[0].last.expect("first arrival recorded");
         tokio::time::advance(time::Duration::from_millis(60)).await;
         assert!(
-            pb.receive(block_req(0), &mut Accounting::default())
-                .is_empty(),
+            pb.receive(
+                block_req(0),
+                &mut Accounting::default(),
+                &mut BlockOccupy::default()
+            )
+            .is_empty(),
             "duplicate is a no-op"
         );
         assert_eq!(
@@ -3666,7 +3828,11 @@ mod test {
         assert_eq!(pb.subs[0].received, 1, "duplicate inflated the sub count");
 
         tokio::time::advance(time::Duration::from_millis(60)).await;
-        pb.receive(block_req(1), &mut Accounting::default());
+        pb.receive(
+            block_req(1),
+            &mut Accounting::default(),
+            &mut BlockOccupy::default(),
+        );
         let g = take_completed_last_wait(&mut pb, 1).expect("sub is complete");
         assert!(g.wait >= time::Duration::from_millis(120), "{:?}", g.wait);
     }
@@ -3683,7 +3849,11 @@ mod test {
             not_requested_block(),
         ]);
 
-        pb.receive(block_req(0), &mut Accounting::default());
+        pb.receive(
+            block_req(0),
+            &mut Accounting::default(),
+            &mut BlockOccupy::default(),
+        );
         tokio::time::advance(time::Duration::from_millis(500)).await;
         // the take-over: PEER2 picks the block up, PEER1 is out
         pb.block_map[1] = requested_block(
@@ -3693,7 +3863,11 @@ mod test {
             )],
             &[(PEER1, picked_long_ago())],
         );
-        pb.receive(block_req(1), &mut Accounting::default());
+        pb.receive(
+            block_req(1),
+            &mut Accounting::default(),
+            &mut BlockOccupy::default(),
+        );
 
         let g = take_completed_last_wait(&mut pb, 1).expect("sub is complete");
         assert_eq!(g.blocker, Some(PEER2));
@@ -3715,13 +3889,21 @@ mod test {
             requested_block(&[(PEER1, t0)], &[]),
         ]);
 
-        pb.receive(block_req(0), &mut Accounting::default());
+        pb.receive(
+            block_req(0),
+            &mut Accounting::default(),
+            &mut BlockOccupy::default(),
+        );
         assert!(
             take_completed_last_wait(&mut pb, 0).is_none(),
             "incomplete sub has no last wait"
         );
 
-        pb.receive(block_req(1), &mut Accounting::default());
+        pb.receive(
+            block_req(1),
+            &mut Accounting::default(),
+            &mut BlockOccupy::default(),
+        );
         assert!(take_completed_last_wait(&mut pb, 1).is_some());
         assert!(
             take_completed_last_wait(&mut pb, 1).is_none(),
@@ -3739,7 +3921,11 @@ mod test {
 
         let mut settled = Vec::new();
         for i in 0..128 {
-            pb.receive(block_req(i), &mut Accounting::default());
+            pb.receive(
+                block_req(i),
+                &mut Accounting::default(),
+                &mut BlockOccupy::default(),
+            );
             if let Some(g) = take_completed_last_wait(&mut pb, i) {
                 settled.push((i, g));
             }
@@ -3761,7 +3947,11 @@ mod test {
     fn test_subs_survive_dump_restore() {
         let t0 = tokio::time::Instant::now();
         let mut pb = blocks(vec![requested_block(&[(PEER1, t0)], &[]); 128]);
-        pb.receive(block_req(3), &mut Accounting::default());
+        pb.receive(
+            block_req(3),
+            &mut Accounting::default(),
+            &mut BlockOccupy::default(),
+        );
         assert_eq!(pb.subs.len(), 4);
         assert_eq!(pb.subs[0].received, 1);
 
