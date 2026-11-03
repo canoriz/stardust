@@ -62,6 +62,10 @@ where
         self.index.contains_key(k)
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.index.is_empty()
+    }
+
     pub fn first(&self) -> Option<(&K, &V)> {
         self.tree.first().map(|(v, k)| (k, v))
     }

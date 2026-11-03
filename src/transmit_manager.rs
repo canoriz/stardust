@@ -16,7 +16,7 @@ use crate::{
     dht::DHT,
     hasher::HashState,
     metadata::{self, Magnet, Metadata},
-    picker::{BlockPicker, BlockPickerDump, PieceState, RarestPicker},
+    picker::{BlockPicker, BlockPickerDump, PieceState, RarestPicker, Revoke},
     protocol::{
         self, Capability, Conn, ExtendedMetadata, ExtendedMsg, ExtendedPex, HandshakeOption,
         PexFlag, Piece, Request,
@@ -1401,23 +1401,48 @@ impl TransmitWorker {
             }
         }
 
-        for (peer, reqs) in revoked {
-            for req in reqs {
-                if let Some(h) = self.connected_peers.get_mut(&peer) {
-                    h.request_timeout(req);
-                    #[cfg(feature = "blocktrace")]
-                    if let (Some(tid), Some(pid)) =
-                        (self.blocktrace_torrent_id, h.blocktrace_peer_id)
-                    {
-                        let ev = blocktrace::BlockEvent::at(
-                            tid,
-                            pid,
-                            req.index as i64,
-                            (req.begin >> 14) as i64,
-                            blocktrace::EventKind::Timeout,
-                        );
-                        blocktrace::record_block_event(ev);
+        self.handle_revoked_requests(revoked);
+    }
+
+    /// Apply the connection action specified by each picker revocation.
+    fn handle_revoked_requests(&mut self, revoked: HashMap<PeerAddr, Vec<Revoke>>) {
+        for (peer, requests) in revoked {
+            let Some(conn) = self.connected_peers.get_mut(&peer) else {
+                continue;
+            };
+            for revoke in requests {
+                let req = revoke.request();
+                match revoke {
+                    Revoke::Timeout(_) => {
+                        conn.request_timeout(req);
                     }
+                    Revoke::SlowTakeover(_) => {
+                        conn.cancel(req);
+                    }
+                }
+                conn.conn.send_stream_cmd(ConnMsg::Cancel(req));
+                #[cfg(feature = "metrics")]
+                conn.metrics.record_cancel();
+                #[cfg(feature = "blocktrace")]
+                if let (Some(tid), Some(pid)) =
+                    (self.blocktrace_torrent_id, conn.blocktrace_peer_id)
+                {
+                    let kind = match revoke {
+                        Revoke::Timeout(_) => blocktrace::EventKind::Timeout,
+                        Revoke::SlowTakeover(_) => blocktrace::EventKind::Cancel,
+                    };
+                    let mut ev = blocktrace::BlockEvent::at(
+                        tid,
+                        pid,
+                        req.index as i64,
+                        (req.begin >> 14) as i64,
+                        kind,
+                    );
+                    if matches!(revoke, Revoke::SlowTakeover(_)) {
+                        ev.reason = Some(blocktrace::RepickReason::SlowTakeover);
+                    }
+                    ev.n_inflight = Some(conn.inflight.inflight(conn.bw.get_rtt_4var()) as i64);
+                    blocktrace::record_block_event(ev);
                 }
             }
         }
@@ -1483,28 +1508,7 @@ impl TransmitWorker {
             0
         };
 
-        for (peer, reqs) in revoked {
-            for req in reqs {
-                debug!("{peer:?} revoke block request {req:?}");
-                if let Some(h) = self.connected_peers.get_mut(&peer) {
-                    h.request_timeout(req);
-                    #[cfg(feature = "blocktrace")]
-                    if let (Some(tid), Some(pid)) =
-                        (self.blocktrace_torrent_id, h.blocktrace_peer_id)
-                    {
-                        let ev = blocktrace::BlockEvent::at(
-                            tid,
-                            pid,
-                            req.index as i64,
-                            (req.begin >> 14) as i64,
-                            blocktrace::EventKind::Timeout,
-                        );
-                        blocktrace::record_block_event(ev);
-                    }
-                }
-            }
-        }
-
+        self.handle_revoked_requests(revoked);
         picked_n
     }
 

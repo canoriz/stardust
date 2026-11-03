@@ -69,16 +69,18 @@ pub enum RepickReason {
     Timeout = 3,
     Reject = 4,
     ReceivedElsewhere = 5,
+    SlowTakeover = 6,
 }
 
 impl RepickReason {
     /// Variant list, used only to seed the `repick_reason` lookup table.
-    const ALL: [RepickReason; 5] = [
+    const ALL: [RepickReason; 6] = [
         Self::Faster,
         Self::Endgame,
         Self::Timeout,
         Self::Reject,
         Self::ReceivedElsewhere,
+        Self::SlowTakeover,
     ];
 
     pub fn id(self) -> i64 {
@@ -92,6 +94,7 @@ impl RepickReason {
             Self::Timeout => "timeout",
             Self::Reject => "reject",
             Self::ReceivedElsewhere => "received_elsewhere",
+            Self::SlowTakeover => "slow_takeover",
         }
     }
 }

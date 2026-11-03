@@ -5,7 +5,7 @@ use {crate::bandwidth::Bandwidth, crate::conn::PeerAddr};
 mod block_picker;
 mod peer_classification;
 mod rarest_first;
-pub use block_picker::{BlockPicker, BlockPickerDump};
+pub use block_picker::{BlockPicker, BlockPickerDump, Revoke};
 pub use rarest_first::Picker as RarestPicker;
 
 const BLOCK_SIZE: u32 = 16384;

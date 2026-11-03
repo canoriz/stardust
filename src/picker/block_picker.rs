@@ -30,12 +30,18 @@ const NO_RESPONSE_TIMEOUT: time::Duration = time::Duration::from_secs(90);
 /// Repick deadline for a any requester if cache is above water level
 const REPICK_AFTER_PICK: time::Duration = time::Duration::from_secs(5);
 
+/// Grace period for a block picked by slow peers
+const SLOW_TAKEOVER_DELAY: time::Duration = time::Duration::from_secs(5);
+
 /// Repick available for a peer does not respond after delay of expectation
 const REPICK_RESPONSE_DELAY: time::Duration = time::Duration::from_millis(2000);
 
 #[derive(Eq, PartialEq, Debug, Clone)]
 pub struct PickedDetail {
     pub pick_time: tokio::time::Instant,
+
+    /// The peer's category when this request was issued
+    pub slow_at_pick: bool,
     pub n_in_flight_when_picked: usize,
     pub expected_response_time: time::Duration,
 
@@ -49,9 +55,11 @@ impl PickedDetail {
         n_in_flight_when_picked: usize,
         avg_speed: f32,
         rtt: Option<time::Duration>,
+        slow_at_pick: bool,
     ) -> Self {
         Self {
             pick_time,
+            slow_at_pick,
             n_in_flight_when_picked,
             expected_response_time: expected_response_time(avg_speed, n_in_flight_when_picked, rtt),
             rtt,
@@ -75,6 +83,26 @@ fn repick_deadline_of(requested: &HashMap<PeerAddr, PickedDetail>) -> Option<tok
         .values()
         .map(PickedDetail::repick_eligible_at)
         .max()
+}
+
+/// Deadline for requests issued by slow peers
+fn takeover_deadline_of(
+    slow_peers: &HashSet<PeerAddr>,
+    status: &BlockStatus,
+) -> Option<tokio::time::Instant> {
+    if let BlockStatus::Requested { requested, .. } = status
+        && requested
+            .iter()
+            .all(|(peer, detail)| detail.slow_at_pick || slow_peers.contains(peer))
+    {
+        requested
+            .values()
+            .map(|detail| detail.pick_time)
+            .max()
+            .map(|pick_time| pick_time + SLOW_TAKEOVER_DELAY)
+    } else {
+        None
+    }
 }
 
 fn expected_response_time(
@@ -423,9 +451,11 @@ impl PieceBlocks {
         n_in_flight: &mut usize,
         avg_speed: f32,
         rtt: Option<time::Duration>,
+        slow_at_pick: bool,
         repick_option: RepickOption,
         picked_out: &mut Vec<BlockRange>,
         account: &mut Accounting,
+        mut on_repick: impl FnMut(usize, tokio::time::Instant),
         #[cfg(feature = "metrics")] torrent: &str,
         #[cfg(feature = "blocktrace")] bt_torrent_id: Option<i64>,
         #[cfg(feature = "blocktrace")] bt_peer_id: Option<i64>,
@@ -470,7 +500,8 @@ impl PieceBlocks {
                 });
                 match b {
                     BlockStatus::NotRequested { revoked } => {
-                        let detail = PickedDetail::new(now, *n_in_flight, avg_speed, rtt);
+                        let detail =
+                            PickedDetail::new(now, *n_in_flight, avg_speed, rtt, slow_at_pick);
                         let deadline = detail.repick_eligible_at();
                         #[cfg(feature = "blocktrace")]
                         if let (Some(tid), Some(pid)) = (bt_torrent_id, bt_peer_id) {
@@ -503,7 +534,8 @@ impl PieceBlocks {
                     BlockStatus::Requested { requested, .. } => {
                         self.all_request_or_received_before = i + 1;
                         if requested.is_empty() {
-                            let detail = PickedDetail::new(now, *n_in_flight, avg_speed, rtt);
+                            let detail =
+                                PickedDetail::new(now, *n_in_flight, avg_speed, rtt, slow_at_pick);
                             let deadline = detail.repick_eligible_at();
                             #[cfg(feature = "blocktrace")]
                             if let (Some(tid), Some(pid)) = (bt_torrent_id, bt_peer_id) {
@@ -608,7 +640,8 @@ impl PieceBlocks {
                             );
                         }
                         count += 1;
-                        let detail = PickedDetail::new(now, *n_in_flight, avg_speed, rtt);
+                        let detail =
+                            PickedDetail::new(now, *n_in_flight, avg_speed, rtt, slow_at_pick);
                         #[cfg(feature = "blocktrace")]
                         if let (Some(tid), Some(pid)) = (bt_torrent_id, bt_peer_id) {
                             let mut ev = blocktrace::BlockEvent::at(
@@ -628,6 +661,7 @@ impl PieceBlocks {
                             blocktrace::record_block_event(ev);
                         }
                         requested.insert(peer, detail);
+                        on_repick(i, now);
                         *n_in_flight += 1;
                         picked_out.push(BlockRange { from: req, to: req });
                     }
@@ -782,7 +816,7 @@ impl PieceBlocks {
     fn revoke_all_requested_if<F>(
         &mut self,
         remove: F,
-        revoked_reqs: &mut HashMap<PeerAddr, Vec<Request>>,
+        revoked_reqs: &mut HashMap<PeerAddr, Vec<Revoke>>,
         account: &mut Accounting,
     ) where
         F: Fn(&PeerAddr, &tokio::time::Instant) -> bool,
@@ -825,8 +859,8 @@ impl PieceBlocks {
                             );
                             revoked_reqs
                                 .entry(*p)
-                                .and_modify(|r| r.push(req))
-                                .or_insert(vec![req]);
+                                .or_default()
+                                .push(Revoke::Timeout(req));
                             revoked.entry(*p).or_insert(t.clone());
                             false
                         } else {
@@ -912,6 +946,8 @@ pub struct BlockPicker {
     slow_pieces: HashMap<PieceIndex, PieceBlocks>,
     slow_order: IndexTree<PieceIndex, Unreceived>,
     slow_peers: HashSet<PeerAddr>,
+    /// Slow block requests left in fast pieces, indexed by takeover deadline.
+    slow_blocks: IndexTree<(PieceIndex, usize), tokio::time::Instant>,
 
     // previous time the timeout request check runs
     prev_time_check: tokio::time::Instant,
@@ -931,6 +967,21 @@ pub struct BlockPicker {
 
     #[cfg(feature = "metrics")]
     torrent_hex: String,
+}
+
+/// A picker request removed from its original peer, with the required connection action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Revoke {
+    Timeout(Request),
+    SlowTakeover(Request),
+}
+
+impl Revoke {
+    pub fn request(&self) -> Request {
+        match self {
+            Self::Timeout(request) | Self::SlowTakeover(request) => *request,
+        }
+    }
 }
 
 /// if some piece or sub piece is completed
@@ -972,7 +1023,53 @@ impl BlockPicker {
             .chain(self.slow_pieces.iter())
     }
 
+    fn remove_from_slow_blocks(&mut self, index: PieceIndex, block: Option<usize>) {
+        if let Some(block) = block {
+            self.slow_blocks.remove(&(index, block));
+        } else {
+            let count = self.piece(index).map_or(0, |piece| piece.block_map.len());
+            for block in 0..count {
+                self.slow_blocks.remove(&(index, block));
+            }
+        }
+    }
+
+    /// One of the requesters of this block leaves, this block may
+    /// move to or remove from slow_blocks
+    /// If blocks in a fast piece are now all requested to slow peers
+    /// add to slow blocks
+    fn update_slow_blocks(&mut self, index: PieceIndex, block: Option<usize>) {
+        let fast_piece = self
+            .requesting
+            .get(&index)
+            .or_else(|| self.receiving.get(&index));
+        let is_fast_piece = fast_piece.is_some();
+        let Some(piece) = fast_piece.or_else(|| self.slow_pieces.get(&index)) else {
+            return;
+        };
+
+        let range = block.map_or(0..piece.block_map.len(), |b| b..b + 1);
+        for block in range {
+            let key = (index, block);
+            let status = &piece.block_map[block];
+            match status {
+                BlockStatus::Requested { requested, .. } if requested.len() > 0 => {
+                    let deadline = is_fast_piece
+                        .then(|| takeover_deadline_of(&self.slow_peers, status))
+                        .flatten();
+                    if let Some(deadline) = deadline {
+                        self.slow_blocks.insert(key, deadline);
+                    }
+                }
+                _ => {
+                    self.slow_blocks.remove(&key);
+                }
+            }
+        }
+    }
+
     fn remove_piece(&mut self, index: PieceIndex) {
+        self.remove_from_slow_blocks(index, None);
         self.requesting.remove(&index);
         self.receiving.remove(&index);
         self.slow_pieces.remove(&index);
@@ -981,9 +1078,9 @@ impl BlockPicker {
         self.slow_order.remove(&index);
     }
 
-    /// Normalize fast-pool requesting/receiving membership and refresh scheduling indexes.
+    /// Maintain requesting/receiving/slow_pieces and their orders
+    /// DOES NOT maintain slow_blocks
     fn update_piece_state_and_order(&mut self, index: PieceIndex) {
-        // Pool ownership is independent of whether every block has a requester.
         if self
             .requesting
             .get(&index)
@@ -991,7 +1088,9 @@ impl BlockPicker {
         {
             let p = self.requesting.remove(&index).unwrap();
             self.receiving.insert(index, p);
-        } else if self
+        }
+
+        if self
             .receiving
             .get(&index)
             .is_some_and(|p| p.requested_or_received_count < p.block_map.len())
@@ -1000,26 +1099,26 @@ impl BlockPicker {
             self.requesting.insert(index, p);
         }
 
-        if let Some(blocks) = self.requesting.get(&index) {
-            self.requesting_order.insert(
-                index,
-                blocks.block_map.len() - blocks.requested_or_received_count,
-            );
+        if let Some(p) = self.slow_pieces.get(&index) {
+            if p.is_all_received() {
+                let piece = self.slow_pieces.remove(&index).unwrap();
+                self.receiving.insert(index, piece);
+            }
+        }
+
+        if let Some(p) = self.requesting.get(&index) {
+            self.requesting_order
+                .insert(index, p.block_map.len() - p.requested_or_received_count);
         } else {
             self.requesting_order.remove(&index);
         }
-        if let Some(blocks) = self.receiving.get(&index) {
+        if let Some(p) = self.receiving.get(&index) {
             self.receiving_order
-                .insert(index, blocks.block_map.len() - blocks.received_count);
+                .insert(index, p.block_map.len() - p.received_count);
         } else {
             self.receiving_order.remove(&index);
         }
-
-        if let Some(p) = self
-            .slow_pieces
-            .get(&index)
-            .filter(|p| !p.is_all_received())
-        {
+        if let Some(p) = self.slow_pieces.get(&index) {
             self.slow_order
                 .insert(index, p.block_map.len() - p.received_count);
         } else {
@@ -1102,6 +1201,7 @@ impl BlockPicker {
             slow_pieces: HashMap::new(),
             slow_order: IndexTree::new(),
             slow_peers: HashSet::new(),
+            slow_blocks: IndexTree::new(),
             requesting_order: IndexTree::new(),
             receiving_order: IndexTree::new(),
             prev_time_check: tokio::time::Instant::now(),
@@ -1135,6 +1235,7 @@ impl BlockPicker {
             slow_pieces: HashMap::new(),
             slow_order: IndexTree::new(),
             slow_peers: HashSet::new(),
+            slow_blocks: IndexTree::new(),
             requesting_order: IndexTree::new(),
             receiving_order: IndexTree::new(),
             prev_time_check: tokio::time::Instant::now(),
@@ -1255,7 +1356,8 @@ impl BlockPicker {
     /// - The picked block requests.
     /// - The actual number of blocks picked.
     ///
-    /// Timed-out requests are added to `revoked`, grouped by peer.
+    /// Removed requests are added to `revoked`, grouped by peer and carrying
+    /// the reason for the connection layer.
     pub fn pick_blocks(
         &mut self,
         peer: &PeerAddr,
@@ -1263,7 +1365,7 @@ impl BlockPicker {
         mut n_in_flight: usize,
         avg_speed: f32,
         rtt: Option<time::Duration>,
-        revoked: &mut HashMap<PeerAddr, Vec<Request>>,
+        revoked: &mut HashMap<PeerAddr, Vec<Revoke>>,
         n_cache_vacant: usize,
         #[cfg(feature = "blocktrace")] bt_torrent_id: Option<i64>,
         #[cfg(feature = "blocktrace")] bt_peer_id: Option<i64>,
@@ -1292,7 +1394,7 @@ impl BlockPicker {
                 repick_limit: if rush { 7 } else { 1 },
                 endgame: false,
             };
-            let order = self.normal_piece_order(rush, !slow);
+            let order = self.normal_piece_order(rush, slow);
             self.pick_blocks_within(
                 peer,
                 &order,
@@ -1308,6 +1410,23 @@ impl BlockPicker {
                 bt_peer_id,
             );
 
+            // Try takeover slow blocks before opening fresh pieces.
+            if !slow && remain > 0 && n_cache_vacant > 0 && !self.update_endgame() {
+                self.pick_slow_blocks(
+                    peer,
+                    &mut remain,
+                    &mut n_in_flight,
+                    avg_speed,
+                    rtt,
+                    &mut ret,
+                    revoked,
+                    #[cfg(feature = "blocktrace")]
+                    bt_torrent_id,
+                    #[cfg(feature = "blocktrace")]
+                    bt_peer_id,
+                );
+            }
+
             // Existing pieces always precede fresh pieces, including in the slow pool.
             while remain > 0 && n_cache_vacant > 0 && !self.update_endgame() {
                 let mode = if slow {
@@ -1319,12 +1438,12 @@ impl BlockPicker {
                     break;
                 };
                 let blocks = self.piece_block_of(index);
-
                 if slow {
                     self.slow_pieces.insert(index, blocks);
                 } else {
                     self.requesting.insert(index, blocks);
                 }
+
                 self.pick_blocks_within(
                     peer,
                     &[index],
@@ -1339,7 +1458,6 @@ impl BlockPicker {
                     #[cfg(feature = "blocktrace")]
                     bt_peer_id,
                 );
-                self.update_piece_state_and_order(index);
             }
         }
 
@@ -1367,7 +1485,101 @@ impl BlockPicker {
         )
     }
 
+    fn pick_slow_blocks(
+        &mut self,
+        peer: &PeerAddr,
+        remain: &mut usize,
+        n_in_flight: &mut usize,
+        avg_speed: f32,
+        rtt: Option<time::Duration>,
+        ret: &mut Vec<BlockRange>,
+        revoked: &mut HashMap<PeerAddr, Vec<Revoke>>,
+        #[cfg(feature = "blocktrace")] bt_torrent_id: Option<i64>,
+        #[cfg(feature = "blocktrace")] bt_peer_id: Option<i64>,
+    ) {
+        let now = tokio::time::Instant::now();
+        let (requesting, receiving) = (&self.requesting, &self.receiving);
+        let peer_state = self.piece_picker.peer_detail(peer).unwrap();
+
+        // due is the blocks we have and can pick now
+        let pickable: Vec<_> = self
+            .slow_blocks
+            .iter(false)
+            .take_while(|(_, deadline)| **deadline <= now)
+            .filter_map(|((idx, blk), _)| peer_state.have(*idx).then_some((*idx, *blk)))
+            .filter(|(idx, _)| requesting.contains_key(&idx) || receiving.contains_key(&idx))
+            .collect();
+
+        for (index, block) in pickable {
+            if *remain == 0 {
+                break;
+            }
+
+            let status = self.piece(index).map(|piece| &piece.block_map[block]);
+            if let Some(BlockStatus::Requested { requested, .. }) = status
+                && !requested.contains_key(peer)
+            {
+                self.slow_blocks.remove(&(index, block));
+                let detail = PickedDetail::new(now, *n_in_flight, avg_speed, rtt, false);
+                let (piece, accounting) = self.piece_and_accounting_mut(index).unwrap();
+                let sub = block / (SUB_PIECE_SIZE as usize / BLOCK_SIZE);
+                PieceBlocks::settle_sub(&mut piece.subs, &piece.block_map, sub, accounting, now);
+                let req = Request {
+                    index,
+                    begin: (block * BLOCK_SIZE) as u32,
+                    len: if block + 1 == piece.block_map.len() {
+                        piece.last_block_size as u32
+                    } else {
+                        BLOCK_SIZE as u32
+                    },
+                };
+                let BlockStatus::Requested {
+                    requested,
+                    revoked: revoked_reqs,
+                } = &mut piece.block_map[block]
+                else {
+                    unreachable!("slow takeover requires outstanding requests");
+                };
+                for (p, detail) in requested.drain() {
+                    revoked_reqs.insert(p, detail);
+                    revoked
+                        .entry(p)
+                        .or_default()
+                        .push(Revoke::SlowTakeover(req));
+                }
+
+                #[cfg(feature = "blocktrace")]
+                if let (Some(tid), Some(pid)) = (bt_torrent_id, bt_peer_id) {
+                    let mut ev = blocktrace::BlockEvent::at(
+                        tid,
+                        pid,
+                        index as i64,
+                        block as i64,
+                        blocktrace::EventKind::Repick,
+                    );
+                    ev.reason = Some(blocktrace::RepickReason::SlowTakeover);
+                    ev.exp_us = Some(detail.expected_response_time.as_micros() as i64);
+                    ev.n_inflight = Some(detail.n_in_flight_when_picked as i64);
+                    blocktrace::record_block_event(ev);
+                }
+
+                piece
+                    .repick_deadline
+                    .insert(block, detail.repick_eligible_at());
+                requested.insert(*peer, detail);
+                ret.push(BlockRange { from: req, to: req });
+                *remain -= 1;
+                *n_in_flight += 1;
+
+                #[cfg(feature = "metrics")]
+                metrics::record_requests(&self.torrent_hex, "slow_takeover", 0, 1);
+            }
+        }
+    }
+
     /// Pick blocks only from the pieces listed in `indices`, in the supplied order.
+    /// The pieces in `indices` should be already in requesting/receiving/slow_pieces,
+    /// otherwise no blocks are picked
     fn pick_blocks_within(
         &mut self,
         peer: &PeerAddr,
@@ -1383,39 +1595,54 @@ impl BlockPicker {
     ) {
         #[cfg(feature = "metrics")]
         let torrent_hex = self.torrent_hex.clone();
+        let slow = self.slow_peers.contains(peer);
 
         for &index in indices {
             if *remain == 0 {
                 break;
             }
-            if !self
+
+            let have_piece = self
                 .piece_picker
                 .peer_detail(peer)
-                .is_some_and(|p| p.have(index))
-            {
-                continue;
+                .is_some_and(|p| p.have(index));
+            let piece = self
+                .requesting
+                .get_mut(&index)
+                .or_else(|| self.receiving.get_mut(&index))
+                .or_else(|| self.slow_pieces.get_mut(&index));
+
+            if have_piece && let Some(blocks) = piece {
+                let slowblocks = &mut self.slow_blocks;
+                let picked = blocks.pick(
+                    *peer,
+                    *remain,
+                    n_in_flight,
+                    avg_speed,
+                    rtt,
+                    slow,
+                    option,
+                    ret,
+                    &mut self.accounting,
+                    |block, picked_at| {
+                        let key = (index, block);
+                        if slow && slowblocks.contains(&key) {
+                            // Endgame lets a slow peer repick a fast-pool block.
+                            slowblocks.insert(key, picked_at + SLOW_TAKEOVER_DELAY);
+                        } else {
+                            slowblocks.remove(&key);
+                        }
+                    },
+                    #[cfg(feature = "metrics")]
+                    &torrent_hex,
+                    #[cfg(feature = "blocktrace")]
+                    bt_torrent_id,
+                    #[cfg(feature = "blocktrace")]
+                    bt_peer_id,
+                );
+                *remain -= picked;
+                self.update_piece_state_and_order(index);
             }
-            let Some((blocks, accounting)) = self.piece_and_accounting_mut(index) else {
-                continue;
-            };
-            let picked = blocks.pick(
-                *peer,
-                *remain,
-                n_in_flight,
-                avg_speed,
-                rtt,
-                option,
-                ret,
-                accounting,
-                #[cfg(feature = "metrics")]
-                &torrent_hex,
-                #[cfg(feature = "blocktrace")]
-                bt_torrent_id,
-                #[cfg(feature = "blocktrace")]
-                bt_peer_id,
-            );
-            *remain -= picked;
-            self.update_piece_state_and_order(index);
         }
     }
 
@@ -1516,6 +1743,7 @@ impl BlockPicker {
     ) {
         let now = tokio::time::Instant::now();
         self.settle_all_piece(now);
+
         let samples: Vec<_> = peers
             .iter()
             .map(|(peer, received_bytes)| {
@@ -1523,6 +1751,7 @@ impl BlockPicker {
             })
             .collect();
         let slow = super::peer_classification::classify_peers(&samples);
+
         #[cfg(feature = "blocktrace")]
         let ts_us = blocktrace::now_us();
         for (addr, _) in peers {
@@ -1543,9 +1772,22 @@ impl BlockPicker {
                 }
             }
         }
+
         self.slow_peers = slow;
         let live: Vec<_> = peers.iter().map(|(addr, _)| *addr).collect();
         self.reconcile_piece_pools(&live);
+
+        // handling left blocks requested by newly classified SLOW peers
+        // insert these blocks to slowblocks tree
+        for (&index, piece) in self.requesting.iter().chain(self.receiving.iter()) {
+            for (block, status) in piece.block_map.iter().enumerate() {
+                // TODO: OPTIMIZE: iterate over blocks of a peer, not cycling over all blocks
+                if let Some(deadline) = takeover_deadline_of(&self.slow_peers, status) {
+                    self.slow_blocks.insert((index, block), deadline);
+                }
+            }
+        }
+
         self.update_endgame();
         info!(
             fast = peers.len() - self.slow_peers.len(),
@@ -1555,65 +1797,68 @@ impl BlockPicker {
         );
     }
 
-    /// Decide all migrations from the same peer/bitfield snapshot before moving anything.
+    /// Move pieces between fast pool and slow pool
     fn reconcile_piece_pools(&mut self, peers: &[PeerAddr]) {
         let mut to_fast = Vec::new();
         let mut to_slow = Vec::new();
         let pieces: Vec<_> = self
             .pieces()
-            .filter(|(index, p)| {
-                !p.is_all_received()
-                    || (self.slow_peers.is_empty() && self.slow_pieces.contains_key(*index))
-            })
-            .map(|(&index, _)| index)
+            .filter_map(|(index, p)| (!p.is_all_received()).then_some(*index))
             .collect();
+
         'piece: for index in pieces {
             let in_slow = self.slow_pieces.contains_key(&index);
             if in_slow && self.slow_peers.is_empty() {
                 to_fast.push(index);
                 continue;
             }
-            let mut fast_source = false;
-            let mut slow_source = false;
+
+            let mut fast_peers_have = false;
+            let mut slow_peers_have = false;
             for peer in peers {
-                if self
+                let have_piece = self
                     .piece_picker
                     .peer_detail(peer)
-                    .is_some_and(|p| p.have(index))
-                {
-                    if self.slow_peers.contains(peer) {
-                        slow_source = true;
-                    } else {
-                        fast_source = true;
-                    }
+                    .is_some_and(|p| p.have(index));
+                if have_piece {
+                    let is_slow_peer = self.slow_peers.contains(peer);
+                    slow_peers_have |= is_slow_peer;
+                    fast_peers_have |= !is_slow_peer;
                 }
-                if fast_source && slow_source {
+                if fast_peers_have && slow_peers_have {
                     continue 'piece;
                 }
             }
-            if in_slow && !slow_source {
+            if in_slow && !slow_peers_have {
                 to_fast.push(index);
-            } else if !in_slow && !fast_source && slow_source {
+            } else if !in_slow && !fast_peers_have && slow_peers_have {
                 to_slow.push(index);
             }
         }
+
         for index in to_fast {
             let blocks = self.slow_pieces.remove(&index).unwrap();
-            if blocks.requested_or_received_count == blocks.block_map.len() {
-                self.receiving.insert(index, blocks);
-            } else {
-                self.requesting.insert(index, blocks);
+            for (block, status) in blocks.block_map.iter().enumerate() {
+                if let Some(deadline) = takeover_deadline_of(&self.slow_peers, status) {
+                    self.slow_blocks.insert((index, block), deadline);
+                }
             }
+
+            // Just insert it to receiving, update will move it to correct place
+            self.receiving.insert(index, blocks);
             self.update_piece_state_and_order(index);
             info!(piece = index, "piece returned to fast pool: no slow source");
         }
         for index in to_slow {
-            let blocks = self
+            // all this piece is moving to slow pool, fast peers should not
+            // pick it anymore, remove it in slow_blocks tree
+            self.remove_from_slow_blocks(index, None);
+            let p = self
                 .requesting
                 .remove(&index)
                 .or_else(|| self.receiving.remove(&index))
                 .unwrap();
-            self.slow_pieces.insert(index, blocks);
+            self.slow_pieces.insert(index, p);
             self.update_piece_state_and_order(index);
             info!(piece = index, "piece moved to slow pool: only slow sources");
         }
@@ -1623,14 +1868,15 @@ impl BlockPicker {
     /// In normal mode, slow peers only use slow piece pool, fast peers
     /// only use fast piece pool.
     /// In rush mode, fast peers can takeover slow blocks in slow pool
-    fn normal_piece_order(&self, rush: bool, fast: bool) -> Vec<PieceIndex> {
-        if !fast {
+    fn normal_piece_order(&self, rush: bool, slow: bool) -> Vec<PieceIndex> {
+        if slow {
             return self
                 .slow_order
                 .iter(false)
                 .map(|(index, _)| *index)
                 .collect();
         }
+
         let mut order = if rush {
             self.merge_receiving_and_slow_by_order()
         } else {
@@ -1688,10 +1934,13 @@ impl BlockPicker {
                 b.settle_account(accounting, tokio::time::Instant::now());
             }
         }
+
         if empty {
             self.remove_piece(req.index);
             self.piece_picker.set_have(req.index, false);
         }
+
+        self.update_slow_blocks(req.index, Some(req.begin as usize / BLOCK_SIZE));
         self.update_piece_state_and_order(req.index);
     }
 
@@ -1742,6 +1991,7 @@ impl BlockPicker {
         }
 
         let index = ji.index();
+        self.remove_from_slow_blocks(index, Some(req.begin as usize / BLOCK_SIZE));
         let result = if let Some((b, accounting)) = self.piece_and_accounting_mut(index) {
             let cancel = b.receive(req, accounting);
             (
@@ -1802,7 +2052,7 @@ impl BlockPicker {
 
     /// Mark blocks as `NotRequested` if they are `Requested` and did not respond
     /// longer than timeout
-    fn revoke_unrespond(&mut self, revoked: &mut HashMap<PeerAddr, Vec<Request>>) {
+    fn revoke_unrespond(&mut self, revoked: &mut HashMap<PeerAddr, Vec<Revoke>>) {
         let now = tokio::time::Instant::now();
         let no_response =
             |_: &PeerAddr, at: &tokio::time::Instant| now.duration_since(*at) > NO_RESPONSE_TIMEOUT;
@@ -1830,6 +2080,7 @@ impl BlockPicker {
             self.piece_picker.set_have(index, false);
         }
         for index in indices {
+            self.update_slow_blocks(index, None);
             self.update_piece_state_and_order(index);
         }
     }
@@ -1917,6 +2168,7 @@ impl BlockPicker {
         self.requesting = dump.requesting;
         self.slow_pieces.clear();
         self.slow_peers.clear();
+        self.slow_blocks = IndexTree::new();
         self.piece_picker.load(dump.piece_map);
         self.no_response_timeout = dump.no_response_timeout;
 
@@ -2019,6 +2271,7 @@ impl BlockPicker {
             self.piece_picker.set_have(index, false);
         }
         for index in indices {
+            self.update_slow_blocks(index, None);
             self.update_piece_state_and_order(index);
         }
     }
@@ -2152,6 +2405,7 @@ mod test {
             n_in_flight_when_picked,
             BLOCK_SIZE as f32,
             Some(time::Duration::ZERO),
+            false,
         )
     }
 
@@ -2176,12 +2430,14 @@ mod test {
                 &mut 0,
                 BLOCK_SIZE as f32,
                 Some(time::Duration::ZERO),
+                false,
                 RepickOption {
                     repick_limit: 1,
                     endgame: false,
                 },
                 &mut picked,
                 &mut Accounting::default(),
+                |_, _| {},
                 #[cfg(feature = "metrics")]
                 "test",
                 #[cfg(feature = "blocktrace")]
@@ -2214,12 +2470,14 @@ mod test {
                 &mut 0,
                 BLOCK_SIZE as f32,
                 Some(time::Duration::ZERO),
+                false,
                 RepickOption {
                     repick_limit: 1,
                     endgame: false,
                 },
                 &mut picked,
                 &mut Accounting::default(),
+                |_, _| {},
                 #[cfg(feature = "metrics")]
                 "test",
                 #[cfg(feature = "blocktrace")]
@@ -2345,12 +2603,14 @@ mod test {
                 &mut 0,
                 BLOCK_SIZE as f32,
                 Some(time::Duration::ZERO),
+                false,
                 RepickOption {
                     repick_limit: 1,
                     endgame: false,
                 },
                 &mut picked,
                 &mut Accounting::default(),
+                |_, _| {},
                 #[cfg(feature = "metrics")]
                 "test",
                 #[cfg(feature = "blocktrace")]
@@ -2583,6 +2843,7 @@ mod test {
                         4,
                         1024.0,
                         Some(time::Duration::ZERO),
+                        false,
                     ),
                 )]),
                 revoked: HashMap::new(),
@@ -2596,12 +2857,14 @@ mod test {
             &mut 0,
             BLOCK_SIZE as f32 * 64.0,
             Some(time::Duration::ZERO),
+            false,
             RepickOption {
                 repick_limit: 7,
                 endgame: false,
             },
             &mut picked,
             &mut Accounting::default(),
+            |_, _| {},
             #[cfg(feature = "metrics")]
             "test",
             #[cfg(feature = "blocktrace")]
@@ -2633,6 +2896,7 @@ mod test {
                         0,
                         4096.0,
                         Some(time::Duration::from_secs(10)),
+                        false,
                     ),
                 )]),
                 revoked: HashMap::new(),
@@ -2646,12 +2910,14 @@ mod test {
             &mut 0,
             BLOCK_SIZE as f32,
             Some(time::Duration::ZERO),
+            false,
             RepickOption {
                 repick_limit: 7,
                 endgame: false,
             },
             &mut picked,
             &mut Accounting::default(),
+            |_, _| {},
             #[cfg(feature = "metrics")]
             "test",
             #[cfg(feature = "blocktrace")]
@@ -2712,9 +2978,11 @@ mod test {
                 &mut inflight,
                 BLOCK_SIZE as f32,
                 Some(time::Duration::ZERO),
+                false,
                 option,
                 &mut picked,
                 &mut Accounting::default(),
+                |_, _| {},
                 #[cfg(feature = "metrics")]
                 "test",
                 #[cfg(feature = "blocktrace")]
@@ -2836,12 +3104,14 @@ mod test {
             &mut 0,
             BLOCK_SIZE as f32,
             Some(time::Duration::ZERO),
+            false,
             RepickOption {
                 repick_limit: 7,
                 endgame: false,
             },
             &mut picked,
             &mut Accounting::default(),
+            |_, _| {},
             #[cfg(feature = "metrics")]
             "test",
             #[cfg(feature = "blocktrace")]
@@ -2873,6 +3143,7 @@ mod test {
                         0,
                         BLOCK_SIZE as f32,
                         Some(time::Duration::ZERO),
+                        false,
                     ),
                 )]),
                 revoked: HashMap::new(),
@@ -2886,12 +3157,14 @@ mod test {
             &mut 0,
             BLOCK_SIZE as f32,
             Some(time::Duration::ZERO),
+            false,
             RepickOption {
                 repick_limit: 7,
                 endgame: false,
             },
             &mut picked,
             &mut Accounting::default(),
+            |_, _| {},
             #[cfg(feature = "metrics")]
             "test",
             #[cfg(feature = "blocktrace")]
@@ -2937,12 +3210,14 @@ mod test {
             &mut 0,
             BLOCK_SIZE as f32,
             Some(time::Duration::ZERO),
+            false,
             RepickOption {
                 repick_limit: 1,
                 endgame: false,
             },
             &mut Vec::new(),
             &mut a,
+            |_, _| {},
             #[cfg(feature = "metrics")]
             "test",
             #[cfg(feature = "blocktrace")]
@@ -2988,12 +3263,14 @@ mod test {
                     &mut 0,
                     BLOCK_SIZE as f32,
                     Some(time::Duration::ZERO),
+                    false,
                     RepickOption {
                         repick_limit: 1,
                         endgame: false
                     },
                     &mut picked,
                     &mut a,
+                    |_, _| {},
                     #[cfg(feature = "metrics")]
                     "test",
                     #[cfg(feature = "blocktrace")]
@@ -3037,12 +3314,14 @@ mod test {
                     &mut 0,
                     BLOCK_SIZE as f32,
                     Some(time::Duration::ZERO),
+                    false,
                     RepickOption {
                         repick_limit: 1,
                         endgame: true
                     },
                     &mut picked,
                     &mut a,
+                    |_, _| {},
                     #[cfg(feature = "metrics")]
                     "test",
                     #[cfg(feature = "blocktrace")]
@@ -3085,12 +3364,14 @@ mod test {
                         &mut 0,
                         BLOCK_SIZE as f32,
                         Some(time::Duration::ZERO),
+                        false,
                         RepickOption {
                             repick_limit: 2,
                             endgame: true,
                         },
                         &mut Vec::new(),
                         &mut a,
+                        |_, _| {},
                         #[cfg(feature = "metrics")]
                         "test",
                         #[cfg(feature = "blocktrace")]
@@ -3193,12 +3474,14 @@ mod test {
                 &mut 0,
                 BLOCK_SIZE as f32,
                 Some(time::Duration::ZERO),
+                false,
                 RepickOption {
                     repick_limit: 1,
                     endgame: false
                 },
                 &mut Vec::new(),
                 &mut bp.accounting,
+                |_, _| {},
                 #[cfg(feature = "metrics")]
                 "test",
                 #[cfg(feature = "blocktrace")]
@@ -3212,7 +3495,7 @@ mod test {
         tokio::time::advance(time::Duration::from_secs(41)).await;
         let mut revoked = HashMap::new();
         bp.revoke_unrespond(&mut revoked);
-        assert_eq!(revoked[&PEER1], vec![block_req(1)]);
+        assert_eq!(revoked[&PEER1], vec![Revoke::Timeout(block_req(1))]);
         assert!(!revoked.contains_key(&PEER2));
         tokio::time::advance(time::Duration::from_secs(2)).await;
         bp.settle_all_piece(tokio::time::Instant::now());
@@ -3246,12 +3529,14 @@ mod test {
                 &mut 0,
                 BLOCK_SIZE as f32,
                 Some(time::Duration::ZERO),
+                false,
                 RepickOption {
                     repick_limit: 1,
                     endgame: false
                 },
                 &mut picked,
                 &mut bp.accounting,
+                |_, _| {},
                 #[cfg(feature = "metrics")]
                 "test",
                 #[cfg(feature = "blocktrace")]
