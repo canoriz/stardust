@@ -67,6 +67,8 @@ pub struct Inflight {
     // crossed `next_round_delivered` arrives (≈ 1 RTT after that send)
     next_round_delivered: u64,
     round_count: u64,
+    // Send-time app-limited flag of the response that started the latest round.
+    app_limited_at_round_start: bool,
 
     // BtlBw: windowed max of delivery-rate samples, keyed by round
     btlbw: WindowTimeMax<f32>,
@@ -94,6 +96,7 @@ impl Inflight {
             first_sent_time: now,
             next_round_delivered: 0,
             round_count: 0,
+            app_limited_at_round_start: false,
             btlbw: WindowTimeMax::new((time::Duration::from_secs(10), BTLBW_WIN_ROUNDS), 0.0),
             min_rtt: WindowMin::new(MIN_RTT_WIN_MS, time::Duration::from_secs(50)),
             anchor: now,
@@ -175,6 +178,7 @@ impl Inflight {
         if fr.delivered_at_send >= self.next_round_delivered {
             self.next_round_delivered = self.delivered;
             self.round_count += 1;
+            self.app_limited_at_round_start = fr.app_limited_at_send;
         }
 
         let rate = self.rate_sample(&fr);
@@ -216,6 +220,12 @@ impl Inflight {
     /// BBR round counter; advances ~once per RTT as acks cross the round bookmark
     pub fn round_count(&self) -> u64 {
         self.round_count
+    }
+
+    /// Whether the request whose response started the latest round was
+    /// app-limited when sent; this is not an OR over the whole round.
+    pub fn app_limited_at_round_start(&self) -> bool {
+        self.app_limited_at_round_start
     }
 
     /// current RTprop estimate (windowed min RTT) and the instant that sample was

@@ -10,6 +10,9 @@ use crate::conn::{INIT_RTT_STARTUP, Inflight, PeerAddr, conn::Bandwidth};
 const PROBE_RTT_INTERVAL: time::Duration = time::Duration::from_secs(10);
 const MIN_IN_FLIGHT: usize = 5;
 const TEN_SECS: time::Duration = time::Duration::from_secs(10);
+const STARTUP_CWND_GAIN: f64 = 2.89;
+const STARTUP_FULL_BW_GAIN: f32 = 1.25;
+const STARTUP_FULL_BW_ROUNDS: u32 = 2;
 
 fn compute_probe_bdp_rtt(min_rtt: time::Duration) -> time::Duration {
     min_rtt + time::Duration::from_millis(50)
@@ -26,10 +29,12 @@ pub enum BandwidthMode {
     Choked,
 
     Startup {
-        // BBR round at which cwnd was last doubled; grow once per round (≈ per RTT)
+        // Last delivery round considered for the bandwidth plateau check.
         last_round: u64,
+        // In-flight request limit, grown on each matched block response.
         cwnd: usize,
-        max_bw: f32,
+        // Plateau baseline; updated only after a significant bandwidth gain.
+        full_bw: f32,
         limit_count: u32,
 
         min_rtt: time::Duration,
@@ -118,14 +123,24 @@ impl BandwidthMode {
         BandwidthMode::Startup {
             last_round: 0,
             cwnd: 4,
-            max_bw: 0.0,
+            full_bw: 0.0,
             limit_count: 0,
             min_rtt: INIT_RTT_STARTUP,
             min_rtt_at: time::Instant::now(),
         }
     }
 
-    pub fn receive(&mut self, rtt: time::Duration) {
+    fn startup_cwnd_limit(inflight: &Inflight) -> usize {
+        inflight
+            .min_rtt()
+            .map_or(4, |(rtt, _)| {
+                (STARTUP_CWND_GAIN * f64::from(inflight.max_bw()) * rtt.as_secs_f64() / 16384.0)
+                    .ceil() as usize
+            })
+            .max(4)
+    }
+
+    pub fn receive(&mut self, rtt: time::Duration, acknowledged_bytes: usize, inflight: &Inflight) {
         if matches!(self, BandwidthMode::Choked) {
             return;
         }
@@ -138,7 +153,11 @@ impl BandwidthMode {
         }
 
         match self {
-            BandwidthMode::Startup { .. } => {}
+            BandwidthMode::Startup { cwnd, .. } => {
+                *cwnd = cwnd
+                    .saturating_add(acknowledged_bytes.div_ceil(16384))
+                    .min(Self::startup_cwnd_limit(inflight));
+            }
             BandwidthMode::ProbeBW {
                 last_piece_time,
                 slow_count,
@@ -184,14 +203,12 @@ impl BandwidthMode {
         match self {
             BandwidthMode::Startup {
                 cwnd,
-                max_bw,
+                full_bw,
                 last_round,
                 limit_count,
                 min_rtt,
                 min_rtt_at,
             } => {
-                const NO_MORE_GAIN_LIMIT: u32 = 2;
-                // BBR: double cwnd once per round (≈ per RTT), ack-clocked, not wall-clock
                 let round = inflight.round_count();
                 if min_rtt_at.elapsed() > PROBE_RTT_INTERVAL {
                     *self = BandwidthMode::SlowDown {
@@ -202,40 +219,37 @@ impl BandwidthMode {
                     }
                 } else if round > *last_round {
                     let max_bw_in_rtt = inflight.max_bw();
+                    let app_limited_at_round_start = inflight.app_limited_at_round_start();
                     info!(
-                        "{peer:?} in Startup mode, cwnd {}, inflight {} prev max bw {}, avg-bw {} avg_bw_10s {} new max bw {}, limit count {} app limited {}",
+                        "{peer:?} in Startup mode, cwnd {}, inflight {} full bw {}, avg-bw {} avg_bw_10s {} new max bw {}, limit count {} app limited at round start {} current_app_limited {}",
                         *cwnd,
                         n_req_in_flight,
-                        *max_bw,
+                        *full_bw,
                         avg_bw,
                         avg_bw_10s,
                         max_bw_in_rtt,
                         *limit_count,
+                        app_limited_at_round_start,
                         *app_limited,
                     );
                     info!("startup round {} -> {}", *last_round, round);
                     *last_round = round;
 
-                    if !*app_limited {
-                        if max_bw_in_rtt <= *max_bw * 1.2 {
+                    if !app_limited_at_round_start {
+                        if max_bw_in_rtt < *full_bw * STARTUP_FULL_BW_GAIN {
                             *limit_count += 1;
                             info!(
-                                "{peer:?} Startup stagnation {}, round {}, max bw in rtt {}, current max bw {}",
-                                *limit_count, round, max_bw_in_rtt, max_bw,
+                                "{peer:?} Startup stagnation {}, round {}, max bw in rtt {}, full bw baseline {}",
+                                *limit_count, round, max_bw_in_rtt, full_bw,
                             );
                         } else {
+                            *full_bw = max_bw_in_rtt;
                             *limit_count = 0;
                         }
 
-                        *max_bw = (*max_bw).max(max_bw_in_rtt);
-                        *cwnd = (*cwnd * 2).min(max_in_flight).max(4);
-
-                        if *limit_count >= NO_MORE_GAIN_LIMIT {
-                            let optimum = (*max_bw * (*min_rtt).as_secs_f32() / 16384.0) as usize;
-                            // info!(
-                            //     "{peer:?} change from Startup to Slowdown mode, {} {:?} slow down to {optimum}",
-                            //     *max_bw, conn.min_rtt_phase,
-                            // );
+                        if *limit_count >= STARTUP_FULL_BW_ROUNDS {
+                            let optimum =
+                                (max_bw_in_rtt * (*min_rtt).as_secs_f32() / 16384.0) as usize;
                             *self = BandwidthMode::SlowDown {
                                 last_piece_time: now,
                                 inflight_target: optimum / 2,
@@ -459,7 +473,10 @@ impl BandwidthMode {
         let avg_bw = bw.count_avg_bw_in(look_back_duration);
 
         match self {
-            BandwidthMode::Startup { cwnd, .. } => cwnd.saturating_sub(n_req_in_flight),
+            BandwidthMode::Startup { cwnd, .. } => (*cwnd)
+                .min(Self::startup_cwnd_limit(inflight))
+                .min(max_in_flight)
+                .saturating_sub(n_req_in_flight),
             BandwidthMode::ProbeBW {
                 cycle_index,
                 capacity,
