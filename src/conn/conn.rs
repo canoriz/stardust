@@ -85,8 +85,6 @@ pub struct PeerConn {
 
     pub stat: Stat,
 
-    pub app_limited: bool,
-
     #[cfg(feature = "metrics")]
     pub metrics: metrics::PeerMetrics,
 
@@ -129,7 +127,6 @@ impl PeerConn {
             bw_mode: BandwidthMode::new_choked(),
             inflight: Inflight::new(time::Duration::from_secs(90)),
             stat: Default::default(),
-            app_limited: false,
             peer_bt_id,
 
             #[cfg(feature = "metrics")]
@@ -155,7 +152,6 @@ impl PeerConn {
 
     pub fn unchoke(&mut self) {
         self.state.peer_choke_status = Some(false);
-        self.app_limited = false;
         self.bw_mode = BandwidthMode::new_auto();
     }
 
@@ -167,23 +163,6 @@ impl PeerConn {
         self.state.peer_interest_status
     }
 
-    pub fn adjust_app_limited(&mut self, underfill: bool) {
-        if underfill {
-            if !self.app_limited {
-                self.app_limited = true;
-            }
-        } else if matches!(
-            self.bw_mode,
-            BandwidthMode::ProbeBW { .. } | BandwidthMode::Startup { .. }
-        ) {
-            // in slowdown mode or probeRTT mode, pipe is easily full, only reset app_limited if
-            // if we are in startup|probeBW mode
-            if self.app_limited {
-                self.app_limited = false;
-            }
-        }
-    }
-
     pub fn request_batch(&mut self, peer: PeerAddr, reqs: BlockRequests) {
         for rg in reqs.range.iter() {
             for req in rg.iter(reqs.piece_size) {
@@ -191,7 +170,6 @@ impl PeerConn {
                 debug!("{peer:?} pick block request {req:?}",);
             }
         }
-
         self.conn.send_stream_cmd(CtrlOfSend::RequestBlocks(reqs));
     }
 
@@ -228,7 +206,7 @@ impl PeerConn {
     }
 
     pub fn request(&mut self, req: Request) {
-        self.inflight.request(req, self.app_limited);
+        self.inflight.request(req);
         self.stat.last_req = time::Instant::now();
         self.stat.total_req += req.len as u64;
     }

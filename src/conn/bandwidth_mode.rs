@@ -186,9 +186,8 @@ impl BandwidthMode {
     pub fn on_blocks_received(
         &mut self,
         peer: PeerAddr,
-        inflight: &Inflight,
+        inflight: &mut Inflight,
         bw: &mut Bandwidth,
-        app_limited: &mut bool,
         max_in_flight: usize,
         #[cfg(feature = "blocktrace")] need_sample: &mut bool,
     ) {
@@ -216,7 +215,8 @@ impl BandwidthMode {
                         inflight_target: 0,
                         min_rtt: *min_rtt,
                         min_rtt_at: *min_rtt_at,
-                    }
+                    };
+                    inflight.set_app_limited();
                 } else if round > *last_round {
                     let max_bw_in_rtt = inflight.max_bw();
                     let app_limited_at_round_start = inflight.app_limited_at_round_start();
@@ -230,7 +230,7 @@ impl BandwidthMode {
                         max_bw_in_rtt,
                         *limit_count,
                         app_limited_at_round_start,
-                        *app_limited,
+                        inflight.is_app_limited(),
                     );
                     info!("startup round {} -> {}", *last_round, round);
                     *last_round = round;
@@ -256,7 +256,7 @@ impl BandwidthMode {
                                 min_rtt: *min_rtt,
                                 min_rtt_at: *min_rtt_at,
                             };
-                            *app_limited = true;
+                            inflight.set_app_limited();
 
                             #[cfg(feature = "blocktrace")]
                             {
@@ -314,7 +314,7 @@ impl BandwidthMode {
                         min_rtt: *min_rtt,
                         min_rtt_at: *min_rtt_at,
                     };
-                    *app_limited = true;
+                    inflight.set_app_limited();
 
                     #[cfg(feature = "blocktrace")]
                     {
@@ -396,6 +396,7 @@ impl BandwidthMode {
                             min_rtt: *min_rtt,
                             min_rtt_at: *min_rtt_at,
                         };
+                        inflight.set_app_limited();
 
                         #[cfg(feature = "blocktrace")]
                         {
@@ -445,7 +446,6 @@ impl BandwidthMode {
                         min_rtt: *min_rtt,
                         min_rtt_at: *min_rtt_at,
                     };
-                    *app_limited = false;
 
                     #[cfg(feature = "blocktrace")]
                     {

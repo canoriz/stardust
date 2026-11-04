@@ -53,6 +53,8 @@ pub struct Rejected {
 /// manages states of a peer's inflight requests
 pub struct Inflight {
     requested: HashMap<Request, FlightReq>,
+    // Total bytes of not responded requests
+    inflight_bytes: u64,
     canceled: HashMap<Request, FlightReq>,
 
     // an optimistic estimation of inflight
@@ -60,6 +62,8 @@ pub struct Inflight {
 
     // BBR delivery-rate accounting (cumulative, peer-scoped)
     delivered: u64,
+    // Byte-delivery bookmark for the current application-limited episode.
+    app_limited_until: Option<u64>,
     delivered_time: time::Instant,
     first_sent_time: time::Instant,
 
@@ -89,9 +93,11 @@ impl Inflight {
         let now = time::Instant::now();
         Self {
             requested: HashMap::new(),
+            inflight_bytes: 0,
             canceled: HashMap::new(),
             inflight: 0,
             delivered: 0,
+            app_limited_until: None,
             delivered_time: now,
             first_sent_time: now,
             next_round_delivered: 0,
@@ -105,8 +111,35 @@ impl Inflight {
         }
     }
 
-    pub fn request(&mut self, req: Request, app_limited: bool) {
+    /// Mark a supply gap; recovery is determined by delivery, not the next fill.
+    /// Only active requests contribute to the boundary, not canceled history.
+    pub fn set_app_limited(&mut self) {
+        self.app_limited_until = Some(self.delivered.saturating_add(self.inflight_bytes));
+    }
+
+    pub fn is_app_limited(&self) -> bool {
+        self.app_limited_until.is_some()
+    }
+
+    fn clear_app_limited_if_delivered(&mut self) {
+        if self
+            .app_limited_until
+            .is_some_and(|until| self.delivered > until)
+        {
+            self.app_limited_until = None;
+        }
+    }
+
+    fn retire_app_limited_bytes(&mut self, bytes: u32) {
+        if let Some(until) = self.app_limited_until.as_mut() {
+            *until = until.saturating_sub(u64::from(bytes));
+        }
+        self.clear_app_limited_if_delivered();
+    }
+
+    pub fn request(&mut self, req: Request) {
         let now = time::Instant::now();
+        let app_limited = self.is_app_limited();
         if self.inflight == 0 {
             // pipe empty: restart the delivery interval at this send
             self.first_sent_time = now;
@@ -124,13 +157,22 @@ impl Inflight {
             },
         ) {
             info!("re-request {req:?}, old request at {:?}", old_ts.sent_time);
+        } else {
+            self.inflight_bytes += req.len as u64;
         }
         self.inflight += 1;
     }
 
+    fn remove_requested(&mut self, req: &Request) -> Option<FlightReq> {
+        let fr = self.requested.remove(req)?;
+        self.inflight_bytes -= req.len as u64;
+        Some(fr)
+    }
+
     /// A request is cancelled by us
     pub fn cancel(&mut self, req: Request) {
-        if let Some(request_ts) = self.requested.remove(&req) {
+        if let Some(request_ts) = self.remove_requested(&req) {
+            self.retire_app_limited_bytes(req.len);
             self.canceled.insert(req, request_ts);
         }
     }
@@ -138,8 +180,11 @@ impl Inflight {
     /// A request is rejected
     pub fn reject(&mut self, req: Request) -> Option<Rejected> {
         self.inflight = self.inflight.saturating_sub(1);
-        let r = self.requested.remove(&req);
+        let r = self.remove_requested(&req);
         let c = self.canceled.remove(&req);
+        if r.is_some() {
+            self.retire_app_limited_bytes(req.len);
+        }
         r.or(c).map(|fr| Rejected {
             rtt: fr.sent_time.elapsed(),
             inflight_at_pick: fr.inflight_at_pick,
@@ -149,8 +194,11 @@ impl Inflight {
     /// A request is timeout
     pub fn timeout(&mut self, req: Request) {
         self.inflight = self.inflight.saturating_sub(1);
-        self.requested.remove(&req);
+        let r = self.remove_requested(&req);
         self.canceled.remove(&req);
+        if r.is_some() {
+            self.retire_app_limited_bytes(req.len);
+        }
     }
 
     pub fn receive(&mut self, req: Request) -> Option<Received> {
@@ -158,9 +206,10 @@ impl Inflight {
         // so always count them; only the rate sample needs a FlightReq snapshot
         self.delivered += req.len as u64;
         self.delivered_time = time::Instant::now();
+        self.clear_app_limited_if_delivered();
 
         self.inflight = self.inflight.saturating_sub(1);
-        let (fr, canceled) = if let Some(fr) = self.requested.remove(&req) {
+        let (fr, canceled) = if let Some(fr) = self.remove_requested(&req) {
             self.canceled.remove(&req);
             (fr, false)
         } else {

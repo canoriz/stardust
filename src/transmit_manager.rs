@@ -1,5 +1,3 @@
-#[cfg(feature = "blocktrace")]
-use crate::conn::BandwidthMode;
 use crate::{
     announce_manager::{self, AnnounceManagerHandle},
     backfile::{BackFile, NormalFile},
@@ -9,7 +7,7 @@ use crate::{
         cache_manager::{CacheManagerHandle, FileOpID, Fop, GlobalPieceKey, PieceLease},
         simple_buffer::{FlushErr, JointIndex, SUB_PIECE_SIZE},
     },
-    conn::{self, PeerAddr, PeerConn},
+    conn::{self, BandwidthMode, PeerAddr, PeerConn},
     connection_manager::{
         ConnectionManagerHandle, CtrlOfRecv, CtrlOfSend, CtrlOfSend as ConnMsg, ReceivedBlocks,
     },
@@ -1080,7 +1078,7 @@ impl TransmitWorker {
                 inflight: Some(conn.inflight.inflight(conn.bw.get_rtt_4var()) as i64),
                 avg_bw: Some(avg_bw as f64),
                 max_bw: Some(max_bw as f64),
-                app_limited: conn.app_limited,
+                app_limited: conn.inflight.is_app_limited(),
                 mode: Some(crate::conn::bt_bw_mode(&conn.bw_mode)),
                 lift: peer_lift(
                     conn.last_wait_us,
@@ -1385,7 +1383,7 @@ impl TransmitWorker {
                 let in_flight = h.inflight.inflight(h.bw.get_rtt_4var());
                 let look_back_duration = h.bw_mode.look_back_window();
                 let avg_bw = h.bw.count_avg_bw_in(look_back_duration);
-                let (reqs, _) = block_picker.pick_blocks(
+                let (reqs, picked_n) = block_picker.pick_blocks(
                     addr,
                     n_blocks,
                     in_flight,
@@ -1398,16 +1396,18 @@ impl TransmitWorker {
                     #[cfg(feature = "blocktrace")]
                     h.blocktrace_peer_id,
                 );
-                requests.push((*addr, reqs));
+                requests.push((*addr, reqs, picked_n < n_blocks));
             }
         }
 
         self.handle_revoked_requests(revoked);
-        for (addr, reqs) in requests {
-            self.connected_peers
-                .get_mut(&addr)
-                .unwrap()
-                .request_batch(addr, reqs);
+        for (addr, reqs, underfill) in requests {
+            let h = self.connected_peers.get_mut(&addr).unwrap();
+            // ProbeRTT deliberately limits supply even when the picker fills its budget.
+            if underfill || matches!(h.bw_mode, BandwidthMode::ProbeRTT { .. }) {
+                h.inflight.set_app_limited();
+            }
+            h.request_batch(addr, reqs);
         }
     }
 
@@ -1504,11 +1504,13 @@ impl TransmitWorker {
 
                 self.handle_revoked_requests(revoked);
                 let h = self.connected_peers.get_mut(addr).unwrap();
-                h.request_batch(*addr, reqs);
                 if pick_n > 0 {
                     trace!("really picked {picked_n} blocks");
-                    h.adjust_app_limited(picked_n < pick_n);
                 }
+                if picked_n < pick_n || matches!(h.bw_mode, BandwidthMode::ProbeRTT { .. }) {
+                    h.inflight.set_app_limited();
+                }
+                h.request_batch(*addr, reqs);
                 return picked_n;
             }
         }
@@ -2076,10 +2078,10 @@ impl TransmitWorker {
             }
             PeerMsg::BufferWaiting { peer } => {
                 if let Some(h) = self.connected_peers.get_mut(&peer) {
-                    if !h.app_limited {
+                    if !h.inflight.is_app_limited() {
                         info!("peer {peer:?} waiting for block buffer — marking app_limited");
-                        h.app_limited = true;
                     }
+                    h.inflight.set_app_limited();
                 }
                 Ok(())
             }
@@ -2537,9 +2539,8 @@ impl TransmitWorker {
         let max_inflight = conn.max_inflight();
         conn.bw_mode.on_blocks_received(
             peer,
-            &conn.inflight,
+            &mut conn.inflight,
             &mut conn.bw,
-            &mut conn.app_limited,
             max_inflight,
             #[cfg(feature = "blocktrace")]
             &mut need_sample,
