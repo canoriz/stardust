@@ -57,6 +57,11 @@ pub struct SessionOpt {
 
 impl Session {
     pub fn new(opt: SessionOpt) -> Self {
+        #[cfg(unix)]
+        {
+            _ = Self::set_fd_limit(65535);
+        }
+
         let tasks = Arc::new(Mutex::new(HashMap::new()));
         let cancel = CancellationToken::new();
 
@@ -114,6 +119,18 @@ impl Session {
         } else {
             s
         }
+    }
+
+    #[cfg(unix)]
+    pub fn set_fd_limit(limit: u64) -> io::Result<()> {
+        use nix::sys::resource::{Resource, getrlimit, setrlimit};
+        let (cur, _max) = getrlimit(Resource::RLIMIT_NOFILE)
+            .map_err(|e| io::Error::other(format!("getrlimit err {e}")))?;
+        if cur < limit {
+            setrlimit(Resource::RLIMIT_NOFILE, limit, limit)
+                .map_err(|e| io::Error::other(format!("setlimit err {e}")))?;
+        }
+        Ok(())
     }
 
     /// add new torrent
