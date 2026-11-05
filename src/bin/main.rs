@@ -87,10 +87,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         shutdown.clone(),
     ));
 
+    // Keep one signal future alive for the whole main loop.  With `biased`,
+    // Ctrl-C wins whenever both the signal and the API queue are ready.
+    let mut ctrl_c = std::pin::pin!(tokio::signal::ctrl_c());
+
     // Main loop owns session and processes forwarded API commands.
     loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
+            biased;
+
+            _ = &mut ctrl_c => {
                 info!("ctrl-c received, shutting down");
                 break;
             }

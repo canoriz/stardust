@@ -1798,14 +1798,8 @@ impl BlockPicker {
     /// Advance windows only from the periodic picker tick.
     fn rotate_slot_windows(&mut self, now: tokio::time::Instant) {
         self.settle_all_piece(now);
-        let peers: Vec<_> = self
-            .accounting
-            .peers
-            .iter(false)
-            .map(|(peer, _)| *peer)
-            .collect();
-        for peer in peers {
-            self.accounting.peers.get_mut(&peer).unwrap().rotate(0.5);
+        for slot_time in self.accounting.peers.values_mut() {
+            slot_time.rotate(0.5);
         }
     }
 
@@ -3521,10 +3515,7 @@ mod test {
             }
             // The other sub-piece remains deferred; a no-op pick settles nothing.
             assert_cost(
-                a.peers
-                    .iter(false)
-                    .map(|(_, cost)| cost.current_cost().0)
-                    .sum(),
+                a.peers.values().map(|cost| cost.current_cost().0).sum(),
                 if action == 2 { 0.0 } else { 2.0 },
             );
             tokio::time::advance(time::Duration::from_secs(2)).await;
@@ -3657,7 +3648,7 @@ mod test {
         bp.requesting.insert(0, pb);
         tokio::time::advance(time::Duration::from_secs(2)).await;
         bp.peer_leave(&PEER1);
-        assert!(!bp.accounting.peers.contains(&PEER1));
+        assert!(!bp.accounting.peers.contains_key(&PEER1));
         assert_eq!(bp.peer_slot_cost(&PEER1), PeerCost::default());
         tokio::time::advance(time::Duration::from_secs(3)).await;
         let new = PeerAddr(PEER1.0, 999);
@@ -3690,8 +3681,8 @@ mod test {
         );
         tokio::time::advance(time::Duration::from_secs(4)).await;
         bp.settle_all_piece(tokio::time::Instant::now());
-        assert!(!bp.accounting.peers.contains(&PEER1));
-        assert_eq!(bp.accounting.peers.iter(false).count(), 1);
+        assert!(!bp.accounting.peers.contains_key(&PEER1));
+        assert_eq!(bp.accounting.peers.len(), 1);
         assert_cost(bp.accounting.peers[&new].current_cost().0, 4.0);
         assert_cost(bp.accounting.scheduler_blocker_st, 3.0);
         assert_cost(bp.accounting.scheduler_fair_st, 6.0);

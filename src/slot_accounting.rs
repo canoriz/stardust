@@ -3,7 +3,7 @@
 //! the peer windows and cumulative scheduler shares.
 
 use crate::conn::PeerAddr;
-use crate::data_structure::IndexTree;
+use std::collections::HashMap;
 
 #[derive(Debug, Default)]
 pub(crate) struct Accounting {
@@ -11,30 +11,19 @@ pub(crate) struct Accounting {
     pub scheduler_blocker_st: f64,
     /// Cumulative fixed-block shares without a requester, including received blocks.
     pub scheduler_fair_st: f64,
-    pub peers: IndexTree<PeerAddr, SlotTime>,
+    pub peers: HashMap<PeerAddr, SlotTime>,
 }
 
 impl Accounting {
     pub fn accept_block(&mut self, peer: PeerAddr) {
-        if let Some(mut v) = self.peers.get_mut(&peer) {
-            v.accept_block();
-            return;
-        }
-
-        let mut v = SlotTime::default();
-        v.accept_block();
-        self.peers.insert(peer, v);
+        self.peers.entry(peer).or_default().accept_block();
     }
 
     pub fn add_cost(&mut self, peer: PeerAddr, share: f64, fair_share: f64) {
-        if let Some(mut v) = self.peers.get_mut(&peer) {
-            v.add_cost(share, fair_share);
-            return;
-        }
-
-        let mut v = SlotTime::default();
-        v.add_cost(share, fair_share);
-        self.peers.insert(peer, v);
+        self.peers
+            .entry(peer)
+            .or_default()
+            .add_cost(share, fair_share);
     }
 }
 
@@ -120,31 +109,6 @@ impl SlotTime {
         (
             self.st.old_time + self.st.new_time,
             self.fair.old_time + self.fair.new_time,
-        )
-    }
-}
-
-impl std::cmp::Ord for SlotTime {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.partial_cmp(other).unwrap()
-    }
-}
-
-impl std::cmp::Eq for SlotTime {}
-
-impl std::cmp::PartialEq for SlotTime {
-    fn eq(&self, other: &Self) -> bool {
-        self.per_block().blocker.unwrap_or(0.0) == other.per_block().blocker.unwrap_or(0.0)
-    }
-}
-
-impl std::cmp::PartialOrd for SlotTime {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(
-            self.per_block()
-                .blocker
-                .unwrap_or(0.0)
-                .total_cmp(&other.per_block().blocker.unwrap_or(0.0)),
         )
     }
 }
