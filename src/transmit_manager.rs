@@ -3337,7 +3337,7 @@ impl TransmitWorker {
 
         let Downloading { block_picker, .. } = match &mut self.torrent_state {
             TorrentState::Metadata(downloading) => downloading,
-            TorrentState::Fetching(fetching_metadata) => return,
+            TorrentState::Fetching(_) => return,
         };
 
         let now = time::Instant::now();
@@ -3413,7 +3413,7 @@ impl TransmitWorker {
         // Owned, so the kicks below may borrow self mutably.
         let mut long_peers: HashMap<PeerAddr, InfoHash> =
             long_peers.into_iter().map(|(a, _, id)| (a, id)).collect();
-        const LIMIT: usize = 8;
+        const LIMIT: usize = 20;
 
         for a in no_response
             .into_iter()

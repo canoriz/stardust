@@ -15,7 +15,7 @@ const STARTUP_FULL_BW_GAIN: f32 = 1.25;
 const STARTUP_FULL_BW_ROUNDS: u32 = 2;
 
 fn compute_probe_bdp_rtt(min_rtt: time::Duration) -> time::Duration {
-    min_rtt + time::Duration::from_millis(50)
+    min_rtt.min(time::Duration::from_millis(50))
 }
 
 fn bw_look_back_window(probe_bdp_rtt: time::Duration) -> time::Duration {
@@ -107,7 +107,7 @@ impl BandwidthMode {
         cycle_index: usize,
         gain: usize,
     ) -> usize {
-        let base = ((min_rtt + time::Duration::from_millis(300))
+        let base = ((min_rtt + time::Duration::from_millis(150))
             .min(avg_rtt)
             .as_secs_f32()
             * max_bw.max(0.0)) as usize;
@@ -283,7 +283,7 @@ impl BandwidthMode {
                     let max_bw = inflight.max_bw();
 
                     *capacity = BandwidthMode::compute_probe_bw_capacity(
-                        probe_bw_cycle,
+                        *min_rtt,
                         rtt_for_capacity,
                         max_bw,
                         *cycle_index,
@@ -353,7 +353,7 @@ impl BandwidthMode {
                     if *inflight_target > 0 {
                         let max_bw = inflight.max_bw();
                         let cap = BandwidthMode::compute_probe_bw_capacity(
-                            probe_bw_cycle,
+                            *min_rtt,
                             rtt_for_capacity,
                             max_bw,
                             2,
@@ -427,7 +427,7 @@ impl BandwidthMode {
                     *min_rtt = inflight_min_rtt.unwrap_or(INIT_RTT_STARTUP);
                     *min_rtt_at = inflight_min_rtt_at.unwrap_or(now);
                     let cap = BandwidthMode::compute_probe_bw_capacity(
-                        probe_bw_cycle,
+                        *min_rtt,
                         rtt_for_capacity,
                         max_bw,
                         2,
@@ -490,7 +490,7 @@ impl BandwidthMode {
 
                 let rtt_for_capacity = bw.get_rtt() + bw.get_var();
                 let limit = BandwidthMode::compute_probe_bw_capacity(
-                    probe_bw_cycle,
+                    *min_rtt,
                     rtt_for_capacity,
                     max_bw,
                     *cycle_index,
