@@ -8,6 +8,8 @@ use crate::conn::{INIT_RTT_STARTUP, Inflight, PeerAddr, conn::Bandwidth};
 // fixed wall-clock interval (BBR RTpropFilterLen), never scaled by min_rtt:
 // a queue-inflated min_rtt would push this out of reach and lock in the bloat.
 const PROBE_RTT_INTERVAL: time::Duration = time::Duration::from_secs(10);
+// Transform to slowdown mode if avg rtt is larger than min rtt + threshold
+const AVG_RTT_THRESHOLD: time::Duration = time::Duration::from_millis(400);
 const MIN_IN_FLIGHT: usize = 5;
 const TEN_SECS: time::Duration = time::Duration::from_secs(10);
 const STARTUP_CWND_GAIN: f64 = 2.89;
@@ -107,7 +109,7 @@ impl BandwidthMode {
         cycle_index: usize,
         gain: usize,
     ) -> usize {
-        let base = ((min_rtt + time::Duration::from_millis(150))
+        let base = ((min_rtt + time::Duration::from_millis(200))
             .min(avg_rtt)
             .as_secs_f32()
             * max_bw.max(0.0)) as usize;
@@ -183,6 +185,23 @@ impl BandwidthMode {
         };
     }
 
+    fn should_slowdown_to(
+        min_rtt: time::Duration,
+        min_rtt_at: time::Instant,
+        avg_rtt: time::Duration,
+        max_bw: f32,
+    ) -> Option<usize> {
+        if min_rtt_at.elapsed() > PROBE_RTT_INTERVAL {
+            Some(0)
+        } else if avg_rtt > min_rtt + AVG_RTT_THRESHOLD {
+            Some(Self::compute_probe_bw_capacity(
+                avg_rtt, min_rtt, max_bw, 2, 4,
+            ))
+        } else {
+            None
+        }
+    }
+
     pub fn on_blocks_received(
         &mut self,
         peer: PeerAddr,
@@ -198,6 +217,8 @@ impl BandwidthMode {
         let look_back_duration = bw_look_back_window(probe_bw_cycle);
         let avg_bw_10s = bw.count_avg_bw_in(TEN_SECS);
         let avg_bw = bw.count_avg_bw_in(look_back_duration);
+        let avg_rtt = bw.get_rtt();
+        let max_bw = inflight.max_bw();
 
         match self {
             BandwidthMode::Startup {
@@ -209,14 +230,13 @@ impl BandwidthMode {
                 min_rtt_at,
             } => {
                 let round = inflight.round_count();
-                if min_rtt_at.elapsed() > PROBE_RTT_INTERVAL {
+                if let Some(n) = Self::should_slowdown_to(*min_rtt, *min_rtt_at, avg_rtt, max_bw) {
                     *self = BandwidthMode::SlowDown {
                         last_piece_time: now,
-                        inflight_target: 0,
+                        inflight_target: n,
                         min_rtt: *min_rtt,
                         min_rtt_at: *min_rtt_at,
                     };
-                    inflight.set_app_limited();
                 } else if round > *last_round {
                     let max_bw_in_rtt = inflight.max_bw();
                     let app_limited_at_round_start = inflight.app_limited_at_round_start();
@@ -280,7 +300,6 @@ impl BandwidthMode {
                 if since_cycle.elapsed() > probe_bw_cycle {
                     *cycle_index = (*cycle_index + 1) & 0x7;
                     *since_cycle = now;
-                    let max_bw = inflight.max_bw();
 
                     *capacity = BandwidthMode::compute_probe_bw_capacity(
                         *min_rtt,
@@ -303,14 +322,11 @@ impl BandwidthMode {
                 }
 
                 const SLOW_LIMIT: u32 = 2;
-                if min_rtt_at.elapsed() > PROBE_RTT_INTERVAL {
-                    info!(
-                        "{peer:?} change from ProbeBW to SlowDown mode because no smaller rtt after {:?}",
-                        PROBE_RTT_INTERVAL,
-                    );
+                if let Some(n) = Self::should_slowdown_to(*min_rtt, *min_rtt_at, avg_rtt, max_bw) {
+                    info!("{peer:?} change from ProbeBW to SlowDown({n})");
                     *self = BandwidthMode::SlowDown {
                         last_piece_time: *last_piece_time,
-                        inflight_target: 0,
+                        inflight_target: n,
                         min_rtt: *min_rtt,
                         min_rtt_at: *min_rtt_at,
                     };
@@ -422,7 +438,7 @@ impl BandwidthMode {
                 );
                 let max_bw = inflight.max_bw();
 
-                if *cnt > 4 {
+                if *cnt > 4 || since.elapsed() > time::Duration::from_secs(1) {
                     let (inflight_min_rtt, inflight_min_rtt_at) = inflight.min_rtt().unzip();
                     *min_rtt = inflight_min_rtt.unwrap_or(INIT_RTT_STARTUP);
                     *min_rtt_at = inflight_min_rtt_at.unwrap_or(now);
