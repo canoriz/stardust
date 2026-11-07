@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Stardust Trace Explorer</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand"><span class="brand-mark">✦</span><span>Stardust</span><span class="brand-divider"></span><span class="brand-sub">Trace Explorer</span></div>
+      <div class="dataset-controls">
+        <label for="dataset">Trace</label>
+        <select id="dataset" aria-label="选择 trace 数据库"></select>
+        <label class="upload-command" for="upload">导入 DB</label>
+        <input id="upload" type="file" accept=".db,application/x-sqlite3" aria-label="导入 SQLite trace 数据库">
+      </div>
+    </header>
+
+    <div class="layout">
+      <aside class="sidebar" aria-label="Peer 列表">
+        <div class="sidebar-head">
+          <div><h2>Peers</h2><span id="peerCount" class="muted">0</span></div>
+          <input id="peerSearch" type="search" placeholder="搜索 ID / 地址 / torrent" aria-label="搜索 peer">
+        </div>
+        <div class="peer-columns"><span>Peer</span><span>接收量</span></div>
+        <div id="peerList" class="peer-list"></div>
+      </aside>
+
+      <main class="main">
+        <div class="main-head">
+          <div>
+            <div class="eyebrow" id="torrentName">TORRENT</div>
+            <h1 id="peerTitle">选择一个 peer</h1>
+            <div class="peer-meta" id="peerMeta"></div>
+          </div>
+          <div class="totals">
+            <div><span>接收</span><strong id="received">—</strong></div>
+            <div><span>样本</span><strong id="sampleCount">—</strong></div>
+            <div><span>时长</span><strong id="duration">—</strong></div>
+          </div>
+        </div>
+
+        <section class="controls" aria-label="分析筛选">
+          <div class="control-group"><span class="control-label">模式</span><div class="segments" role="group" aria-label="模式"><button type="button" data-mode="all" aria-pressed="true">全部</button><button type="button" data-mode="probe" aria-pressed="false">ProbeBW</button></div></div>
+          <label class="check"><input id="excludeApp" type="checkbox"><span>排除 app-limited</span></label>
+          <div class="control-group"><span class="control-label">散点</span><div class="segments" role="group" aria-label="散点聚合"><button type="button" data-view="binned" aria-pressed="true">分箱</button><button type="button" data-view="raw" aria-pressed="false">原始点</button></div></div>
+          <label class="compact-field">采样上限<select id="sampleLimit"><option value="200">200</option><option value="600" selected>600</option><option value="1200">1200</option><option value="2000">2000</option></select></label>
+          <div class="range-controls"><label>起点 s<input id="startSec" type="number" min="0" step="0.1" value="0"></label><label>终点 s<input id="endSec" type="number" min="0" step="0.1"></label><button id="applyRange" type="button">应用</button></div>
+        </section>
+
+        <div id="message" class="message" role="status" aria-live="polite"></div>
+
+        <section class="chart-section">
+          <div class="section-title"><div><h2>In-flight / RTT</h2><p>按 inflight 比较延迟，颜色深度表示 avg_bw</p></div><span id="scatterCount" class="section-stat"></span></div>
+          <div class="chart-wrap scatter-wrap"><canvas id="scatter" role="img" aria-label="In-flight 对 RTT 散点图，点的深浅表示带宽"></canvas><div id="scatterTip" class="chart-tip" hidden></div></div>
+          <div class="scale-legend"><span id="bwLow">0 MiB/s</span><div class="shade-bar" aria-hidden="true"></div><span id="bwHigh">— MiB/s</span><span>avg_bw</span></div>
+        </section>
+
+        <section class="chart-section timeline-section">
+          <div class="section-title"><div><h2>时间变化</h2><p>同一时间轴，三条独立刻度</p></div><span id="timeCount" class="section-stat"></span></div>
+          <div class="chart-wrap time-wrap"><canvas id="timeline" role="img" aria-label="带宽、inflight 和 RTT 随时间变化的折线图"></canvas><div id="timeTip" class="chart-tip" hidden></div></div>
+          <div class="mode-legend" aria-label="背景 bw mode 图示"><span class="mode-key startup"><i class="mode-swatch"></i>Startup</span><span class="mode-key probe-bw"><i class="mode-swatch"></i>ProbeBW</span><span class="mode-key probe-bw-app"><i class="mode-swatch"></i>ProbeBW · app-limited</span><span class="mode-key slowdown"><i class="mode-swatch"></i>SlowDown</span><span class="mode-key probe-rtt"><i class="mode-swatch"></i>ProbeRTT</span><span class="mode-key choked"><i class="mode-swatch"></i>Choked</span></div>
+        </section>
+      </main>
+    </div>
+  </div>
+  <script src="/app.js" defer></script>
+</body>
+</html>
