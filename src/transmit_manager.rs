@@ -1407,6 +1407,9 @@ impl TransmitWorker {
             if underfill || matches!(h.bw_mode, BandwidthMode::ProbeRTT { .. }) {
                 h.inflight.set_app_limited();
             }
+            if reqs.len() > 0 {
+                h.bw_mode.on_picked();
+            }
             h.request_batch(addr, reqs);
         }
     }
@@ -1511,6 +1514,9 @@ impl TransmitWorker {
                     h.inflight.set_app_limited();
                 }
                 h.request_batch(*addr, reqs);
+                if picked_n > 0 {
+                    h.bw_mode.on_picked();
+                }
                 return picked_n;
             }
         }
@@ -2542,6 +2548,7 @@ impl TransmitWorker {
             &mut conn.inflight,
             &mut conn.bw,
             max_inflight,
+            n_blocks_received,
             #[cfg(feature = "blocktrace")]
             &mut need_sample,
         );
