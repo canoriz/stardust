@@ -199,10 +199,11 @@ impl BandwidthMode {
         avg_rtt: time::Duration,
         max_bw: f32,
         max_in_flight: usize,
+        n_received: usize,
     ) -> Option<usize> {
         if min_rtt_at.elapsed() > PROBE_RTT_INTERVAL {
             Some(0)
-        } else if avg_rtt > min_rtt + AVG_RTT_THRESHOLD {
+        } else if n_received > 0 && avg_rtt > min_rtt + AVG_RTT_THRESHOLD {
             Some(Self::compute_probe_bw_capacity(avg_rtt, min_rtt, max_bw, 2, 4).min(max_in_flight))
         } else {
             None
@@ -253,9 +254,14 @@ impl BandwidthMode {
                 min_rtt_at,
             } => {
                 let round = inflight.round_count();
-                if let Some(n) =
-                    Self::should_slowdown_to(*min_rtt, *min_rtt_at, avg_rtt, max_bw, max_in_flight)
-                {
+                if let Some(n) = Self::should_slowdown_to(
+                    *min_rtt,
+                    *min_rtt_at,
+                    avg_rtt,
+                    max_bw,
+                    max_in_flight,
+                    n_received,
+                ) {
                     *self = BandwidthMode::SlowDown {
                         last_piece_time: now,
                         n_recv: 0,
@@ -329,7 +335,24 @@ impl BandwidthMode {
                 min_rtt,
                 min_rtt_at,
             } => {
-                if since_cycle.elapsed() > probe_bw_cycle {
+                if min_rtt_at.elapsed() > PROBE_RTT_INTERVAL {
+                    info!("{peer:?} change from ProbeBW to SlowDown(0)");
+                    *self = BandwidthMode::SlowDown {
+                        last_piece_time: *last_piece_time,
+                        n_recv: 0,
+                        // TODO: should be a real last pick time
+                        last_pick_time: now,
+                        inflight_target: 0,
+                        min_rtt: *min_rtt,
+                        min_rtt_at: *min_rtt_at,
+                    };
+                    inflight.set_app_limited();
+
+                    #[cfg(feature = "blocktrace")]
+                    {
+                        *need_sample = true;
+                    }
+                } else if since_cycle.elapsed() > probe_bw_cycle {
                     *cycle_index = (*cycle_index + 1) & 0x7;
                     *since_cycle = now;
 
@@ -351,49 +374,36 @@ impl BandwidthMode {
                         probe_bw_cycle,
                         *capacity,
                     );
-                }
 
-                const SLOW_LIMIT: u32 = 2;
-                if let Some(n) =
-                    Self::should_slowdown_to(*min_rtt, *min_rtt_at, avg_rtt, max_bw, max_in_flight)
-                {
-                    info!("{peer:?} change from ProbeBW to SlowDown({n})");
-                    *self = BandwidthMode::SlowDown {
-                        last_piece_time: *last_piece_time,
-                        n_recv: 0,
-                        // TODO: should be a real last pick time
-                        last_pick_time: now,
-                        inflight_target: n,
-                        min_rtt: *min_rtt,
-                        min_rtt_at: *min_rtt_at,
-                    };
-                    inflight.set_app_limited();
+                    // only check rtt at cycle change, so a complete cycle is sent
+                    // we can probe a larger bandwidth
+                    // if slowdown happens at any time, we may not be able to probe
+                    // a higher bandwidth.
+                    if let Some(n) = Self::should_slowdown_to(
+                        *min_rtt,
+                        *min_rtt_at,
+                        avg_rtt,
+                        max_bw,
+                        max_in_flight,
+                        n_received,
+                    ) {
+                        info!("{peer:?} change from ProbeBW to SlowDown({n})");
+                        *self = BandwidthMode::SlowDown {
+                            last_piece_time: *last_piece_time,
+                            n_recv: 0,
+                            // TODO: should be a real last pick time
+                            last_pick_time: now,
+                            inflight_target: n,
+                            min_rtt: *min_rtt,
+                            min_rtt_at: *min_rtt_at,
+                        };
+                        inflight.set_app_limited();
 
-                    #[cfg(feature = "blocktrace")]
-                    {
-                        *need_sample = true;
+                        #[cfg(feature = "blocktrace")]
+                        {
+                            *need_sample = true;
+                        }
                     }
-                    // } else if *slow_count >= SLOW_LIMIT {
-                    //     info!("{peer:?} change from ProbeBW to Slowdown mode because {SLOW_LIMIT} times of slow rtt");
-                    //     conn.bw_mode = BandwidthMode::SlowDown {
-                    //         since_min_rtt,
-                    //         last_piece_time: *last_piece_time,
-                    //         min_rtt,
-                    //         inflight_target: n_req_in_flight / 2,
-                    //     };
-                    // } else if last_piece_time.elapsed() > likely_recv_next_within {
-                    //     // either it's a small probability event
-                    //     // or the peer is slowing the send rate
-                    //     info!(
-                    //         "{peer:?} change from ProbeBW to Slowdown mode because no packet in {:?}",
-                    //         likely_recv_next_within,
-                    //     );
-                    //     conn.bw_mode = BandwidthMode::SlowDown {
-                    //         since_min_rtt,
-                    //         last_piece_time: *last_piece_time,
-                    //         min_rtt,
-                    //         inflight_target: 0,
-                    //     };
                 }
             }
             BandwidthMode::SlowDown {
