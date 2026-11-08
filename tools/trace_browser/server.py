@@ -84,7 +84,8 @@ def sample_rows(path: Path, peer_id: int, start_us: int | None, end_us: int | No
             "SELECT min(ts_us), max(ts_us) FROM bw_sample WHERE peer_id=?", (peer_id,)
         ).fetchone()
         if extent[0] is None:
-            return [], {"first_us": None, "last_us": None, "count": 0}
+            return [], {"first_us": None, "last_us": None, "count": 0,
+                        "mode_segments": []}
         rows = db.execute(
             f"SELECT id, ts_us, inflight, rtt_us, min_rtt_us, avg_bw, max_bw, "
             f"app_limited, mode FROM bw_sample WHERE {where} ORDER BY ts_us,id", args
@@ -97,22 +98,75 @@ def sample_rows(path: Path, peer_id: int, start_us: int | None, end_us: int | No
              "max_bw_mib": round((r["max_bw"] or 0) / MIB, 5),
              "app_limited": bool(r["app_limited"]), "mode": MODES.get(r["mode"], "Unknown")}
             for r in rows]
-    return data, {"first_us": extent[0], "last_us": extent[1], "count": len(data)}
+    return data, {"first_us": extent[0], "last_us": extent[1], "count": len(data),
+                  "mode_segments": mode_segments(data)}
+
+
+def mode_key(row: dict) -> tuple[object, bool]:
+    mode = row.get("mode")
+    return mode, bool(row.get("app_limited")) if mode == "ProbeBW" else False
+
+
+def mode_segments(rows: list[dict]) -> list[dict]:
+    """Return every mode interval before metric samples are thinned."""
+    if not rows:
+        return []
+
+    segments: list[dict] = []
+    current = rows[0]
+    start = rows[0]["t"]
+    current_key = mode_key(current)
+    for row in rows[1:]:
+        row_key = mode_key(row)
+        if row_key == current_key:
+            continue
+        segments.append({"mode": current["mode"],
+                         "app_limited": mode_key(current)[1],
+                         "start": start, "end": row["t"]})
+        current = row
+        current_key = row_key
+        start = row["t"]
+    segments.append({"mode": current["mode"],
+                     "app_limited": mode_key(current)[1],
+                     "start": start, "end": rows[-1]["t"]})
+    return segments
 
 
 def thin_time(rows: list[dict], limit: int) -> list[dict]:
     if len(rows) <= limit:
         return rows
-    # First/last and each bucket's low/high RTT and bandwidth retain spikes.
-    bucket_count = max(1, (limit - 2) // 4)
+
+    # Keep mode transitions before metric extrema. A short-lived mode may have
+    # only one sample, and dropping that sample makes its timeline region
+    # disappear even though the state was present in the trace.
     picked = {0, len(rows) - 1}
+    transitions = [
+        index for index in range(1, len(rows))
+        if mode_key(rows[index - 1]) != mode_key(rows[index])
+    ]
+    transition_budget = max(0, limit - len(picked))
+    if len(transitions) <= transition_budget:
+        picked.update(transitions)
+    elif transition_budget:
+        for slot in range(transition_budget):
+            transition = round(slot * (len(transitions) - 1) / max(1, transition_budget - 1))
+            picked.add(transitions[transition])
+
+    # Fill the remaining budget with each bucket's low/high RTT and bandwidth
+    # so short-lived states stay visible without losing metric spikes.
+    bucket_count = max(1, (limit - 2) // 4)
     for bucket in range(bucket_count):
+        if len(picked) >= limit:
+            break
         lo = math.floor(bucket * len(rows) / bucket_count)
         hi = math.floor((bucket + 1) * len(rows) / bucket_count)
         part = range(lo, hi)
         for key in ("rtt_ms", "bw_mib"):
+            if len(picked) >= limit:
+                break
             picked.add(min(part, key=lambda i: rows[i][key]))
-            picked.add(max(part, key=lambda i: rows[i][key]))
+            if len(picked) < limit:
+                picked.add(max(part, key=lambda i: rows[i][key]))
     return [rows[i] for i in sorted(picked)]
 
 

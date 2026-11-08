@@ -1,7 +1,10 @@
 const $ = id => document.getElementById(id);
-const state = { db: null, peers: [], peer: null, rows: [], meta: null, mode: 'all', view: 'binned', request: 0 };
+const state = { db: null, peers: [], peer: null, rows: [], meta: null, mode: 'all', view: 'binned', request: 0, selectedModes: new Set() };
 const modeButtons = [...document.querySelectorAll('[data-mode]')];
 const viewButtons = [...document.querySelectorAll('[data-view]')];
+const timelineModeButtons = [...document.querySelectorAll('[data-timeline-mode]')];
+const timelineSelectAll = document.querySelector('[data-timeline-select-all]');
+const timelineModeKeys = timelineModeButtons.map(button => button.dataset.timelineMode);
 const fmt = (n, digits = 1) => Number.isFinite(n) ? n.toLocaleString('zh-CN', { maximumFractionDigits: digits }) : '—';
 const median = values => {
   const sorted = [...values].sort((a, b) => a - b);
@@ -88,6 +91,34 @@ async function loadSamples() {
 function setPressed(buttons, selected, attr) {
   buttons.forEach(b => b.setAttribute('aria-pressed', String(b.dataset[attr] === selected)));
 }
+function timelineModeKey(segment) {
+  return segment.mode === 'ProbeBW' && segment.app_limited ? 'ProbeBW:app_limited' : segment.mode;
+}
+function bandRect(sx, ex, minX, maxX) {
+  const rawLeft = Math.floor(Math.min(sx, ex));
+  const rawRight = Math.ceil(Math.max(sx, ex));
+  const x = Math.max(minX, Math.min(maxX - 1, rawLeft));
+  const right = Math.max(x + 1, Math.min(maxX, rawRight));
+  return { x, width: right - x };
+}
+function visibleModeSegments(segments, selectedModes) {
+  if (!selectedModes.size) return segments;
+  return segments.filter(segment => selectedModes.has(timelineModeKey(segment)));
+}
+function toggleModeSelection(selectedModes, key) {
+  if (!selectedModes.size || selectedModes.size === timelineModeKeys.length) return new Set([key]);
+  const next = new Set(selectedModes);
+  if (next.has(key)) next.delete(key);
+  else next.add(key);
+  return next.size === timelineModeKeys.length ? new Set() : next;
+}
+function updateTimelineModeButtons() {
+  const allSelected = state.selectedModes.size === 0;
+  timelineSelectAll?.setAttribute('aria-pressed', String(allSelected));
+  timelineModeButtons.forEach(button => {
+    button.setAttribute('aria-pressed', String(allSelected || state.selectedModes.has(button.dataset.timelineMode)));
+  });
+}
 
 function binScatter(rows) {
   const clean = rows.filter(r => r.inflight > 0 && r.bw_mib > 0 && r.rtt_ms > 0).sort((a, b) => a.inflight - b.inflight);
@@ -157,11 +188,11 @@ function buildModeSegments(rows, start, end) {
       current = createSegment(row, t, end);
     } else if (row.mode !== current.mode || (trackAppLimited && appLimited !== current.app_limited)) {
       current.end = t;
-      if (current.end > current.start) segments.push(current);
+      segments.push(current);
       current = createSegment(row, t, end);
     }
   }
-  if (current && current.end > current.start) segments.push(current);
+  if (current && current.end >= current.start) segments.push(current);
   return segments;
 }
 function drawScatter() {
@@ -206,14 +237,24 @@ function drawTimeline() {
     Choked: 'rgba(112, 128, 137, 0.16)',
     Unknown: 'rgba(170, 181, 185, 0.13)'
   };
-  const modeSegments = buildModeSegments(rows, start, start + span);
+  const modeSegments = state.meta?.mode_segments?.length
+    ? state.meta.mode_segments
+    : buildModeSegments(rows, start, start + span);
+  const selectedSegments = visibleModeSegments(modeSegments, state.selectedModes);
   ctx.save();
-  for (const segment of modeSegments) {
+  if (state.selectedModes.size) {
+    ctx.fillStyle = 'rgba(145, 155, 160, 0.12)';
+    ctx.fillRect(left, top, w - left - right, plotBottom - top);
+  }
+  for (const segment of selectedSegments) {
     const sx = left + (segment.start - start) / span * (w - left - right);
     const ex = left + (segment.end - start) / span * (w - left - right);
-    const colorKey = segment.mode === 'ProbeBW' && segment.app_limited ? 'ProbeBW:app_limited' : segment.mode;
+    const colorKey = timelineModeKey(segment);
     ctx.fillStyle = modeColors[colorKey] || modeColors.Unknown;
-    ctx.fillRect(sx, top, Math.max(0, ex - sx), plotBottom - top);
+    const actualWidth = Math.max(0, ex - sx);
+    const band = bandRect(sx, ex, left, w - right);
+    if (actualWidth < 1) band.x = Math.max(left, Math.min(w - right - band.width, Math.round(sx)));
+    ctx.fillRect(band.x, top, band.width, plotBottom - top);
   }
   ctx.restore();
   ctx.save();
@@ -300,6 +341,16 @@ function setupHover() {
 
 modeButtons.forEach(b => b.addEventListener('click', () => { state.mode = b.dataset.mode; setPressed(modeButtons, state.mode, 'mode'); loadSamples(); }));
 viewButtons.forEach(b => b.addEventListener('click', () => { state.view = b.dataset.view; setPressed(viewButtons, state.view, 'view'); drawScatter(); }));
+timelineSelectAll?.addEventListener('click', () => {
+  state.selectedModes.clear();
+  updateTimelineModeButtons();
+  if (state.rows.length) drawTimeline();
+});
+timelineModeButtons.forEach(button => button.addEventListener('click', () => {
+  state.selectedModes = toggleModeSelection(state.selectedModes, button.dataset.timelineMode);
+  updateTimelineModeButtons();
+  if (state.rows.length) drawTimeline();
+}));
 $('dataset').addEventListener('change', event => loadDataset(event.target.value));
 $('peerSearch').addEventListener('input', renderPeers);
 $('excludeApp').addEventListener('change', loadSamples);
@@ -315,6 +366,7 @@ $('upload').addEventListener('change', async event => {
   event.target.value = '';
 });
 setupHover();
+updateTimelineModeButtons();
 new ResizeObserver(() => { if (state.rows.length) renderCharts(); }).observe($('scatter').parentElement);
 new ResizeObserver(() => { if (state.rows.length) renderCharts(); }).observe($('timeline').parentElement);
 loadTraces().catch(err => status(err.message, true));

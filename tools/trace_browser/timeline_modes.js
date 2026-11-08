@@ -21,13 +21,36 @@
         current = createSegment(row, t, end);
       } else if (row.mode !== current.mode || (trackAppLimited && appLimited !== current.app_limited)) {
         current.end = t;
-        if (current.end > current.start) segments.push(current);
+        segments.push(current);
         current = createSegment(row, t, end);
       }
     }
-    if (current && current.end > current.start) segments.push(current);
+    if (current && current.end >= current.start) segments.push(current);
     return segments;
   }
 
-  return { modeSegments };
+  function bandRect(sx, ex, minX, maxX) {
+    const rawLeft = Math.floor(Math.min(sx, ex));
+    const rawRight = Math.ceil(Math.max(sx, ex));
+    const x = Math.max(minX, Math.min(maxX - 1, rawLeft));
+    const right = Math.max(x + 1, Math.min(maxX, rawRight));
+    return { x, width: right - x };
+  }
+
+  function visibleModeSegments(segments, selectedModes) {
+    if (!selectedModes.size) return segments;
+    return segments.filter(segment => selectedModes.has(
+      segment.mode === 'ProbeBW' && segment.app_limited ? 'ProbeBW:app_limited' : segment.mode
+    ));
+  }
+
+  function toggleModeSelection(selectedModes, key, allModes) {
+    if (!selectedModes.size || selectedModes.size === allModes.length) return new Set([key]);
+    const next = new Set(selectedModes);
+    if (next.has(key)) next.delete(key);
+    else next.add(key);
+    return next.size === allModes.length ? new Set() : next;
+  }
+
+  return { modeSegments, bandRect, visibleModeSegments, toggleModeSelection };
 });

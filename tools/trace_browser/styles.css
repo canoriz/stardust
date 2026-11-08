@@ -523,7 +523,30 @@ canvas {
 }
 
 .mode-key {
-    gap: 5px !important
+    display: flex;
+    align-items: center;
+    gap: 5px !important;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    padding: 3px 5px;
+    background: transparent;
+    color: inherit;
+    cursor: pointer;
+    font: inherit
+}
+
+.mode-key[aria-pressed=true] {
+    border-color: #c8deda;
+    background: #f0f8f6;
+    color: #356663
+}
+
+.mode-key[aria-pressed=false] {
+    color: #9aa5a9
+}
+
+.mode-key[aria-pressed=false] .mode-swatch {
+    background: #c2cacc !important
 }
 
 .mode-swatch {
