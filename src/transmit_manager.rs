@@ -3420,7 +3420,7 @@ impl TransmitWorker {
         // Owned, so the kicks below may borrow self mutably.
         let mut long_peers: HashMap<PeerAddr, InfoHash> =
             long_peers.into_iter().map(|(a, _, id)| (a, id)).collect();
-        const LIMIT: usize = 20;
+        const LIMIT: usize = 40;
 
         for a in no_response
             .into_iter()
@@ -3668,6 +3668,7 @@ async fn dht_get_peers(
     }
 }
 
+#[instrument(skip_all, fields(addr = ?addr))]
 async fn connect_peer(
     main_tx: TransmitManagerHandle,
     addr: SocketAddr,

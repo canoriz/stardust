@@ -9,7 +9,7 @@ use crate::conn::{INIT_RTT_STARTUP, Inflight, PeerAddr, conn::Bandwidth};
 // a queue-inflated min_rtt would push this out of reach and lock in the bloat.
 const PROBE_RTT_INTERVAL: time::Duration = time::Duration::from_secs(10);
 // Transform to slowdown mode if avg rtt is larger than min rtt + threshold
-const AVG_RTT_THRESHOLD: time::Duration = time::Duration::from_millis(400);
+const AVG_RTT_THRESHOLD: time::Duration = time::Duration::from_millis(2000);
 const MIN_IN_FLIGHT: usize = 5;
 const TEN_SECS: time::Duration = time::Duration::from_secs(10);
 const STARTUP_CWND_GAIN: f64 = 2.89;
@@ -117,7 +117,7 @@ impl BandwidthMode {
         cycle_index: usize,
         gain: usize,
     ) -> usize {
-        let base = ((min_rtt + time::Duration::from_millis(200))
+        let base = ((min_rtt + time::Duration::from_millis(500))
             .min(avg_rtt)
             .as_secs_f32()
             * max_bw.max(0.0)) as usize;
