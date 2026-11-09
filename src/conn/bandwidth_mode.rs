@@ -109,6 +109,15 @@ impl BandwidthMode {
     pub const PACING: [u32; 8] = [5, 3, 4, 4, 4, 4, 4, 4];
     pub const MIN_PROBE_BW_CAPACITY: usize = 4;
 
+    /// Probe around the measured inflight at which the BtlBw peak appeared.
+    /// The eight gains are 1.25, 0.75, then six 1.0 cycles.
+    pub fn compute_probe_bw_capacity_from_inflight(
+        max_bw_inflight: usize,
+        cycle_index: usize,
+    ) -> usize {
+        (max_bw_inflight * Self::PACING[cycle_index] as usize / 4).max(Self::MIN_PROBE_BW_CAPACITY)
+    }
+
     // gain: increase final result by (gain/4)
     pub fn compute_probe_bw_capacity(
         min_rtt: time::Duration,
@@ -234,7 +243,6 @@ impl BandwidthMode {
         n_received: usize,
         #[cfg(feature = "blocktrace")] need_sample: &mut bool,
     ) {
-        let rtt_for_capacity = bw.get_rtt() + bw.get_var();
         let now = time::Instant::now();
         let n_req_in_flight = inflight.inflight(bw.get_rtt_4var());
         let probe_bw_cycle = self.probe_bw_cycle();
@@ -356,13 +364,11 @@ impl BandwidthMode {
                     *cycle_index = (*cycle_index + 1) & 0x7;
                     *since_cycle = now;
 
-                    *capacity = BandwidthMode::compute_probe_bw_capacity(
-                        *min_rtt,
-                        rtt_for_capacity,
-                        max_bw,
+                    *capacity = BandwidthMode::compute_probe_bw_capacity_from_inflight(
+                        inflight.max_bw_inflight(),
                         *cycle_index,
-                        4, // 1.0
-                    );
+                    )
+                    .min(max_in_flight);
                     info!(
                         "{peer:?} ProbeBW cycle update {}, probe df {}, max bw {}, avg bw {}, avg_bw_10s {}, min rtt {:?}, probe rtt {:?} capacity {}",
                         *cycle_index,
@@ -416,13 +422,9 @@ impl BandwidthMode {
             } => {
                 if n_req_in_flight <= *inflight_target {
                     if *inflight_target > 0 {
-                        let max_bw = inflight.max_bw();
-                        let cap = BandwidthMode::compute_probe_bw_capacity(
-                            *min_rtt,
-                            rtt_for_capacity,
-                            max_bw,
+                        let cap = BandwidthMode::compute_probe_bw_capacity_from_inflight(
+                            inflight.max_bw_inflight(),
                             2,
-                            4,
                         )
                         .min(max_in_flight);
                         // info!(
@@ -435,7 +437,7 @@ impl BandwidthMode {
                             last_piece_time: *last_piece_time,
                             cycle_index: 0,
                             since_cycle: now,
-                            capacity: cap * 2,
+                            capacity: cap,
                             min_rtt: *min_rtt,
                             min_rtt_at: *min_rtt_at,
                         };
@@ -488,18 +490,13 @@ impl BandwidthMode {
                     "{peer:?} in ProbeRTT mode cnt {} normal count {} min rtt {:?} avg bw {} avg_bw_10s {} req in flight {}",
                     cnt, normal_count, *min_rtt, avg_bw, avg_bw_10s, n_req_in_flight
                 );
-                let max_bw = inflight.max_bw();
-
                 if *cnt > 4 || since.elapsed() > time::Duration::from_secs(1) {
                     let (inflight_min_rtt, inflight_min_rtt_at) = inflight.min_rtt().unzip();
                     *min_rtt = inflight_min_rtt.unwrap_or(INIT_RTT_STARTUP);
                     *min_rtt_at = inflight_min_rtt_at.unwrap_or(now);
-                    let cap = BandwidthMode::compute_probe_bw_capacity(
-                        *min_rtt,
-                        rtt_for_capacity,
-                        max_bw,
+                    let cap = BandwidthMode::compute_probe_bw_capacity_from_inflight(
+                        inflight.max_bw_inflight(),
                         2,
-                        4,
                     )
                     .min(max_in_flight);
                     // info!("{peer:?} change from ProbeRTT to ProbeBW mode");
@@ -510,7 +507,7 @@ impl BandwidthMode {
                         slow_down_to: 0,
                         last_piece_time: *last_piece_time,
                         cycle_index: 0,
-                        capacity: cap * 2,
+                        capacity: cap,
                         min_rtt: *min_rtt,
                         min_rtt_at: *min_rtt_at,
                     };
@@ -556,13 +553,9 @@ impl BandwidthMode {
                 // to avoid mark these blocks as in-flight and not requesting from other peers.
                 // preventing accumulating too much partial downloaded pieces.
 
-                let rtt_for_capacity = bw.get_rtt() + bw.get_var();
-                let limit = BandwidthMode::compute_probe_bw_capacity(
-                    *min_rtt,
-                    rtt_for_capacity,
-                    max_bw,
+                let limit = BandwidthMode::compute_probe_bw_capacity_from_inflight(
+                    inflight.max_bw_inflight(),
                     *cycle_index,
-                    4,
                 )
                 .min(max_in_flight)
                 .max(MIN_IN_FLIGHT);

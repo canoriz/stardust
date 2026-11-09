@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{cmp::Ordering, collections::HashMap};
 
 use crate::{
     protocol::Request,
@@ -12,6 +12,35 @@ const BTLBW_WIN_ROUNDS: u64 = 16;
 
 /// RTprop (min RTT) filter window, in wall-clock ms
 const MIN_RTT_WIN_MS: u64 = 10_000;
+
+/// Prefer higher delivery rates, then smaller inflight counts at equal rates.
+#[derive(Clone, Copy, Debug)]
+struct BtlBwSample {
+    rate: f32,
+    inflight: usize,
+}
+
+impl Ord for BtlBwSample {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.rate
+            .total_cmp(&other.rate)
+            .then_with(|| other.inflight.cmp(&self.inflight))
+    }
+}
+
+impl PartialOrd for BtlBwSample {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for BtlBwSample {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for BtlBwSample {}
 
 struct FlightReq {
     // BBR packet.sent_time; also the request's send instant used for RTT
@@ -75,7 +104,8 @@ pub struct Inflight {
     app_limited_at_round_start: bool,
 
     // BtlBw: windowed max of delivery-rate samples, keyed by round
-    btlbw: WindowTimeMax<f32>,
+    // Delivery rate and inflight at pick age as one window sample.
+    btlbw: WindowTimeMax<BtlBwSample>,
 
     // RTprop: windowed min of RTT, keyed by ms since `anchor`
     min_rtt: WindowMin<time::Duration>,
@@ -103,7 +133,13 @@ impl Inflight {
             next_round_delivered: 0,
             round_count: 0,
             app_limited_at_round_start: false,
-            btlbw: WindowTimeMax::new((time::Duration::from_secs(10), BTLBW_WIN_ROUNDS), 0.0),
+            btlbw: WindowTimeMax::new(
+                (time::Duration::from_secs(10), BTLBW_WIN_ROUNDS),
+                BtlBwSample {
+                    rate: 0.0,
+                    inflight: 0,
+                },
+            ),
             min_rtt: WindowMin::new(MIN_RTT_WIN_MS, time::Duration::from_secs(50)),
             anchor: now,
             has_rtt_sample: false,
@@ -232,9 +268,15 @@ impl Inflight {
 
         let rate = self.rate_sample(&fr);
         // app-limited samples may raise BtlBw but never lower it
-        if !rate.is_app_limited || rate.delivery_rate >= self.btlbw.get() {
-            self.btlbw
-                .update((self.delivered_time, self.round_count), rate.delivery_rate);
+        let max_bw = self.btlbw.get().rate;
+        if !rate.is_app_limited || rate.delivery_rate >= max_bw {
+            self.btlbw.update(
+                (self.delivered_time, self.round_count),
+                BtlBwSample {
+                    rate: rate.delivery_rate,
+                    inflight: fr.inflight_at_pick as usize,
+                },
+            );
         }
 
         // TODO: ideal app-limited recovery — on unchoke or a new `have` (peer was
@@ -263,7 +305,12 @@ impl Inflight {
 
     /// current BtlBw estimate (windowed max delivery rate, bytes/sec)
     pub fn max_bw(&self) -> f32 {
-        self.btlbw.get()
+        self.btlbw.get().rate
+    }
+
+    /// in-flight request count captured when the current max bandwidth appeared
+    pub fn max_bw_inflight(&self) -> usize {
+        self.btlbw.get().inflight
     }
 
     /// BBR round counter; advances ~once per RTT as acks cross the round bookmark
