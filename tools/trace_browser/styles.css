@@ -8,6 +8,7 @@
 
 @media(max-width:700px) {
     .peer-list .peer-row {
+        display: flex;
         min-width: 176px;
         min-height: 76px;
         flex-direction: column;
@@ -207,10 +208,11 @@ p {
 }
 
 .peer-row {
-    display: flex;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) max-content;
+    align-items: start;
     width: 100%;
     gap: 8px;
-    justify-content: space-between;
     text-align: left;
     border: 0;
     border-left: 3px solid transparent;
@@ -218,6 +220,11 @@ p {
     background: #fff;
     padding: 10px 14px 10px 13px;
     min-height: 59px
+}
+
+.peer-row > span:first-child {
+    min-width: 0;
+    flex: 1 1 auto
 }
 
 .peer-row:hover {
@@ -231,6 +238,9 @@ p {
 
 .peer-id {
     display: block;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
     font-weight: 600;
     font-size: 13px
 }
@@ -247,6 +257,7 @@ p {
 }
 
 .peer-value {
+    flex: 0 0 auto;
     font-size: 12px;
     color: #43545b;
     font-variant-numeric: tabular-nums;

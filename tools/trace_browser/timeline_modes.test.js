@@ -82,3 +82,12 @@ test('mode selection treats implicit and explicit all-selected states identicall
   assert.deepEqual(toggleModeSelection(new Set(allModes), 'Startup', allModes), new Set(['Startup']));
   assert.deepEqual(toggleModeSelection(new Set(['Startup']), 'Startup', allModes), new Set());
 });
+
+test('peer rows reserve space for download totals beside long torrent names', () => {
+  const styles = fs.readFileSync(require.resolve('./styles.css'), 'utf8');
+  assert.match(styles, /\.peer-row\s*\{[^}]*display:\s*grid/);
+  assert.match(styles, /grid-template-columns:\s*minmax\(0,\s*1fr\)\s+max-content/);
+  assert.match(styles, /\.peer-row\s*>\s*span:first-child\s*\{[^}]*min-width:\s*0/);
+  assert.match(styles, /\.peer-id\s*\{[^}]*overflow:\s*hidden/);
+  assert.match(styles, /\.peer-value\s*\{[^}]*flex:\s*0\s+0\s+auto/);
+});
