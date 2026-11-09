@@ -204,7 +204,7 @@ impl BandwidthMode {
         if min_rtt_at.elapsed() > PROBE_RTT_INTERVAL {
             Some(0)
         } else if n_received > 0 && avg_rtt > min_rtt + AVG_RTT_THRESHOLD {
-            Some(Self::compute_probe_bw_capacity(avg_rtt, min_rtt, max_bw, 2, 4).min(max_in_flight))
+            Some(Self::compute_probe_bw_capacity(min_rtt, avg_rtt, max_bw, 2, 4).min(max_in_flight))
         } else {
             None
         }
