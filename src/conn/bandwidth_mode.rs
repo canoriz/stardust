@@ -12,12 +12,13 @@ const PROBE_RTT_INTERVAL: time::Duration = time::Duration::from_secs(10);
 const AVG_RTT_THRESHOLD: time::Duration = time::Duration::from_millis(2000);
 const MIN_IN_FLIGHT: usize = 5;
 const TEN_SECS: time::Duration = time::Duration::from_secs(10);
+const RTT_DELTA: time::Duration = time::Duration::from_millis(500);
 const STARTUP_CWND_GAIN: f64 = 2.89;
 const STARTUP_FULL_BW_GAIN: f32 = 1.25;
 const STARTUP_FULL_BW_ROUNDS: u32 = 2;
 
 fn compute_probe_bdp_rtt(min_rtt: time::Duration) -> time::Duration {
-    min_rtt.min(time::Duration::from_millis(50))
+    min_rtt.max(time::Duration::from_millis(50))
 }
 
 fn bw_look_back_window(probe_bdp_rtt: time::Duration) -> time::Duration {
@@ -115,7 +116,12 @@ impl BandwidthMode {
         max_bw_inflight: usize,
         cycle_index: usize,
     ) -> usize {
-        (max_bw_inflight * Self::PACING[cycle_index] as usize / 4).max(Self::MIN_PROBE_BW_CAPACITY)
+        max_bw_inflight.max(Self::MIN_PROBE_BW_CAPACITY) * Self::PACING[cycle_index] as usize / 4
+    }
+
+    #[inline]
+    fn rtt_base(min_rtt: time::Duration, avg_rtt: time::Duration) -> time::Duration {
+        (min_rtt + RTT_DELTA).min(avg_rtt)
     }
 
     // gain: increase final result by (gain/4)
@@ -126,10 +132,7 @@ impl BandwidthMode {
         cycle_index: usize,
         gain: usize,
     ) -> usize {
-        let base = ((min_rtt + time::Duration::from_millis(500))
-            .min(avg_rtt)
-            .as_secs_f32()
-            * max_bw.max(0.0)) as usize;
+        let base = (Self::rtt_base(min_rtt, avg_rtt).as_secs_f32() * max_bw.max(0.0)) as usize;
         let capacity = base * Self::PACING[cycle_index] as usize * gain / 4 / 4 / 16384;
         capacity.max(Self::MIN_PROBE_BW_CAPACITY)
     }
@@ -149,17 +152,25 @@ impl BandwidthMode {
         }
     }
 
-    fn startup_cwnd_limit(inflight: &Inflight) -> usize {
+    fn startup_cwnd_limit(inflight: &Inflight, avg_rtt: time::Duration) -> usize {
         inflight
             .min_rtt()
-            .map_or(4, |(rtt, _)| {
-                (STARTUP_CWND_GAIN * f64::from(inflight.max_bw()) * rtt.as_secs_f64() / 16384.0)
+            .map_or(4, |(min_rtt, _)| {
+                let rtt_base = Self::rtt_base(min_rtt, avg_rtt);
+                (STARTUP_CWND_GAIN * f64::from(inflight.max_bw()) * rtt_base.as_secs_f64()
+                    / 16384.0)
                     .ceil() as usize
             })
             .max(4)
     }
 
-    pub fn receive(&mut self, rtt: time::Duration, acknowledged_bytes: usize, inflight: &Inflight) {
+    pub fn receive(
+        &mut self,
+        rtt: time::Duration,
+        avg_rtt: time::Duration,
+        acknowledged_bytes: usize,
+        inflight: &Inflight,
+    ) {
         if matches!(self, BandwidthMode::Choked) {
             return;
         }
@@ -175,7 +186,7 @@ impl BandwidthMode {
             BandwidthMode::Startup { cwnd, .. } => {
                 *cwnd = cwnd
                     .saturating_add(acknowledged_bytes.div_ceil(16384))
-                    .min(Self::startup_cwnd_limit(inflight));
+                    .min(Self::startup_cwnd_limit(inflight, avg_rtt));
             }
             BandwidthMode::ProbeBW {
                 last_piece_time,
@@ -536,10 +547,11 @@ impl BandwidthMode {
         let look_back_duration = bw_look_back_window(probe_bw_cycle);
         let avg_bw_10s = bw.count_avg_bw_in(TEN_SECS);
         let avg_bw = bw.count_avg_bw_in(look_back_duration);
+        let avg_rtt = bw.get_rtt();
 
         match self {
             BandwidthMode::Startup { cwnd, .. } => (*cwnd)
-                .min(Self::startup_cwnd_limit(inflight))
+                .min(Self::startup_cwnd_limit(inflight, bw.get_rtt()))
                 .min(max_in_flight)
                 .saturating_sub(n_req_in_flight),
             BandwidthMode::ProbeBW {
@@ -557,6 +569,13 @@ impl BandwidthMode {
                     inflight.max_bw_inflight(),
                     *cycle_index,
                 )
+                .max(Self::compute_probe_bw_capacity(
+                    *min_rtt,
+                    avg_rtt,
+                    max_bw,
+                    *cycle_index,
+                    4,
+                ))
                 .min(max_in_flight)
                 .max(MIN_IN_FLIGHT);
 
