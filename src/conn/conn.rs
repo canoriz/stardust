@@ -147,12 +147,16 @@ impl PeerConn {
 
     pub fn choke(&mut self) {
         self.state.peer_choke_status = Some(true);
+        let max_bw_bounded = self.bw_mode.max_bw_bounded;
         self.bw_mode = BandwidthMode::new(BandwidthModeKind::Choked);
+        self.bw_mode.max_bw_bounded = max_bw_bounded;
     }
 
     pub fn unchoke(&mut self) {
         self.state.peer_choke_status = Some(false);
+        let max_bw_bounded = self.bw_mode.max_bw_bounded;
         self.bw_mode = BandwidthMode::new(BandwidthModeKind::Startup);
+        self.bw_mode.max_bw_bounded = max_bw_bounded;
     }
 
     pub fn is_choked(&self) -> ChokeStatus {

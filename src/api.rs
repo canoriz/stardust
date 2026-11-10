@@ -77,18 +77,32 @@ pub enum RpcRequest {
         announce_list: Vec<Vec<String>>,
     },
     /// Pause an active download (stops sending requests to peers).
-    PauseTorrent { info_hash: String },
+    PauseTorrent {
+        info_hash: String,
+    },
     /// Resume a paused download.
-    ResumeTorrent { info_hash: String },
+    ResumeTorrent {
+        info_hash: String,
+    },
+    SetBwBound {
+        info_hash: String,
+        enabled: bool,
+    },
     /// Trigger a full hash-check of all downloaded data.  Returns immediately;
     /// the check runs in the background.
-    RecheckTorrent { info_hash: String },
+    RecheckTorrent {
+        info_hash: String,
+    },
     /// Remove a torrent from the session.  In-flight data is discarded.
-    RemoveTorrent { info_hash: String },
+    RemoveTorrent {
+        info_hash: String,
+    },
     /// List all torrent info-hashes currently in this session.
     ListTorrents,
     /// Get process and bandwidth status for one torrent.
-    GetTorrentStatus { info_hash: String },
+    GetTorrentStatus {
+        info_hash: String,
+    },
     /// Get global cache statistics (rates and occupancy ratios).
     GetCacheStats,
     /// Get session-level block buffer pool occupancy.
@@ -110,12 +124,15 @@ pub enum RpcResponse {
     PauseTorrentAccepted,
     /// HTTP accepted ResumeTorrent and queued it for async processing.
     ResumeTorrentAccepted,
+    SetBwBoundAccepted,
     /// HTTP accepted RecheckTorrent and queued it for async processing.
     RecheckTorrentAccepted,
     /// HTTP accepted RemoveTorrent and queued it for async processing.
     RemoveTorrentAccepted,
     /// List of all current torrents.
-    ListTorrents { torrents: Vec<String> },
+    ListTorrents {
+        torrents: Vec<String>,
+    },
     /// Runtime status of a torrent.
     TorrentStatus {
         info_hash: String,
@@ -126,6 +143,8 @@ pub enum RpcResponse {
         selected: Vec<u32>,
         have: Vec<u32>,
         state: RunningStateDump,
+        #[serde(default)]
+        max_bw_bounded: bool,
     },
     /// HTTP accepted Shutdown and queued it for async processing.
     ShutdownAccepted,
@@ -134,7 +153,9 @@ pub enum RpcResponse {
     /// Session-level block buffer pool occupancy snapshot.
     BufferPoolStats(BufferPoolStats),
     /// Something went wrong.
-    Error { error: String },
+    Error {
+        error: String,
+    },
 }
 
 impl RpcResponse {
@@ -290,6 +311,20 @@ pub async fn handle_rpc(session: &Session, req: RpcRequest) -> (RpcResponse, boo
             (rsp, false)
         }
 
+        RpcRequest::SetBwBound { info_hash, enabled } => {
+            let rsp = match parse_info_hash(&info_hash) {
+                Err(e) => RpcResponse::err(e),
+                Ok(ih) => match session.transmit_handle_of(&ih).await {
+                    None => RpcResponse::err("torrent not found"),
+                    Some(mut sender) => match sender.set_bw_bound(enabled).await {
+                        Ok(()) => RpcResponse::SetBwBoundAccepted,
+                        Err(e) => RpcResponse::err(e),
+                    },
+                },
+            };
+            (rsp, false)
+        }
+
         // ── recheck (fire-and-forget) ────────────────────────────────────────
         RpcRequest::RecheckTorrent { info_hash } => {
             let rsp = match parse_info_hash(&info_hash) {
@@ -337,6 +372,7 @@ pub async fn handle_rpc(session: &Session, req: RpcRequest) -> (RpcResponse, boo
                         selected: st.selected,
                         have: st.have,
                         state: st.state,
+                        max_bw_bounded: st.max_bw_bounded,
                     },
                     Err(e) => RpcResponse::err(e),
                 },
@@ -470,11 +506,12 @@ mod tests {
             selected: vec![0, 2],
             have: vec![0],
             state: RunningStateDump::Downloading,
+            max_bw_bounded: false,
         })
         .expect("serialize torrent status");
         assert_eq!(
             status,
-            r#"{"torrent_status":{"info_hash":"001122","process":0.42,"bandwidth_bps":12345.0,"selected":[0,2],"have":[0],"state":"Downloading"}}"#
+            r#"{"torrent_status":{"info_hash":"001122","process":0.42,"bandwidth_bps":12345.0,"selected":[0,2],"have":[0],"state":"Downloading","max_bw_bounded":false}}"#
         );
     }
 

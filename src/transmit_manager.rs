@@ -176,6 +176,7 @@ pub(crate) enum Msg {
     QueryStatus(oneshot::Sender<TorrentRuntimeStatus>),
     CheckFile(oneshot::Sender<CheckOutcome>),
     ChangeState(RunningCmd, oneshot::Sender<()>),
+    SetBwBound(bool, oneshot::Sender<()>),
     WaitDownloaded(oneshot::Sender<FinishDownload>),
 
     FileOpDone {
@@ -200,6 +201,7 @@ pub struct TorrentRuntimeStatus {
     pub selected: Vec<u32>,
     pub have: Vec<u32>,
     pub state: RunningStateDump,
+    pub max_bw_bounded: bool,
 }
 
 #[derive(Clone)]
@@ -852,6 +854,7 @@ pub struct TransmitWorker {
 
     /// The running state
     running_state: RunningState,
+    max_bw_bounded: bool,
 
     /// receives various events
     receiver: mpsc::UnboundedReceiver<Msg>,
@@ -948,6 +951,8 @@ pub struct TransmitDump {
     pub announce_urls: Vec<String>,
     /// The running state at the time of the dump (Resume/Pause/Stop).
     pub running_state: RunningStateDump,
+    #[serde(default)]
+    pub max_bw_bounded: bool,
 }
 
 impl TransmitDump {
@@ -978,6 +983,7 @@ impl TransmitWorker {
             state,
             announce_urls: self.announce_urls.clone(),
             running_state: self.running_state.into(),
+            max_bw_bounded: self.max_bw_bounded,
         }
     }
 }
@@ -1192,6 +1198,7 @@ impl TransmitWorker {
             pending_renames: HashMap::new(),
             pending_flushes,
             running_state: dump.running_state.into(),
+            max_bw_bounded: dump.max_bw_bounded,
             cache_handle,
             block_pool,
             #[cfg(feature = "blocktrace")]
@@ -1278,6 +1285,7 @@ impl TransmitWorker {
             pending_renames: HashMap::new(),
             pending_flushes,
             running_state: RunningState::Stopped,
+            max_bw_bounded: false,
             cache_handle,
             block_pool,
             #[cfg(feature = "blocktrace")]
@@ -1615,6 +1623,7 @@ impl TransmitWorker {
             | Msg::QueryStatus(_)
             | Msg::CheckFile(_)
             | Msg::ChangeState(_, _)
+            | Msg::SetBwBound(_, _)
             | Msg::FlushComplete(_)
             | Msg::WaitDownloaded(_)
             | Msg::RequestMetadata(_) => self.handle_msg_normal(m).await,
@@ -1651,6 +1660,7 @@ impl TransmitWorker {
             Msg::QueryStatus(_)
             | Msg::CheckFile(_)
             | Msg::ChangeState(_, _)
+            | Msg::SetBwBound(_, _)
             | Msg::FlushComplete(_)
             | Msg::WaitDownloaded(_)
             | Msg::RequestMetadata(_) => self.handle_msg_normal(m).await,
@@ -1791,20 +1801,20 @@ impl TransmitWorker {
                         None => None,
                     };
 
-                    self.connected_peers.insert(
-                        PeerAddr(peer_addr, conn_id),
-                        PeerConn::new(
-                            cm,
-                            conn_id,
-                            peer_bt_id,
-                            #[cfg(feature = "metrics")]
-                            self.info_hash,
-                            #[cfg(feature = "metrics")]
-                            peer_addr,
-                            #[cfg(feature = "blocktrace")]
-                            blocktrace_peer_id,
-                        ),
+                    let mut peer_conn = PeerConn::new(
+                        cm,
+                        conn_id,
+                        peer_bt_id,
+                        #[cfg(feature = "metrics")]
+                        self.info_hash,
+                        #[cfg(feature = "metrics")]
+                        peer_addr,
+                        #[cfg(feature = "blocktrace")]
+                        blocktrace_peer_id,
                     );
+                    peer_conn.bw_mode.max_bw_bounded = self.max_bw_bounded;
+                    self.connected_peers
+                        .insert(PeerAddr(peer_addr, conn_id), peer_conn);
 
                     #[cfg(feature = "blocktrace")]
                     if let Some(pid) = blocktrace_peer_id {
@@ -1898,6 +1908,17 @@ impl TransmitWorker {
                 Ok(())
             }
             Msg::CheckFile(sender) => self.handle_check_file(sender).await,
+            Msg::SetBwBound(enabled, sender) => {
+                self.max_bw_bounded = enabled;
+                info!("set bw bound to {enabled}");
+                for conn in self.connected_peers.values_mut() {
+                    conn.bw_mode.set_max_bw_bounded(enabled);
+                    conn.inflight.set_app_limited();
+                    conn.conn.recv_stream_cmd(CtrlOfRecv::GetBlocks);
+                }
+                let _ = sender.send(());
+                Ok(())
+            }
             Msg::ChangeState(cmd, sender) => {
                 match cmd {
                     RunningCmd::Resume => {
@@ -1984,6 +2005,7 @@ impl TransmitWorker {
             selected,
             have,
             state: self.running_state.dump(),
+            max_bw_bounded: self.max_bw_bounded,
         }
     }
 
@@ -3760,6 +3782,7 @@ mod tests {
             )],
             announce_urls: vec![],
             running_state: RunningStateDump::Downloading,
+            max_bw_bounded: false,
         };
 
         let ser = serde_json::to_string(&dump).expect("serialize dump");

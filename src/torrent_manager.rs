@@ -151,6 +151,15 @@ impl TransmitManagerSender {
         Ok(ForceCheck { rx })
     }
 
+    pub async fn set_bw_bound(&mut self, enabled: bool) -> io::Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.0
+            .send(transmit_manager::Msg::SetBwBound(enabled, tx))
+            .map_err(|e| io::Error::other(format!("set bw bound send msg error: {e}")))?;
+        rx.await
+            .map_err(|e| io::Error::other(format!("set bw bound oneshot recv error: {e}")))
+    }
+
     pub async fn query_status(&mut self) -> io::Result<transmit_manager::TorrentRuntimeStatus> {
         let (tx, rx) = oneshot::channel();
         self.0

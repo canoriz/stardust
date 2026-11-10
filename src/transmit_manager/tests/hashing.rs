@@ -76,6 +76,7 @@ fn restore_worker(
         },
         peers: vec![],
         announce_urls: vec![],
+        max_bw_bounded: false,
         running_state: match running {
             StableState::Downloading => RunningStateDump::Downloading,
             StableState::Seeding => RunningStateDump::Seeding,

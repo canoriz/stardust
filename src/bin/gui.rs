@@ -124,6 +124,7 @@ struct TorrentRow {
     progress: f64, // 0.0 … 1.0
     speed_bps: f64,
     state: RunningStateDump,
+    max_bw_bounded: bool,
 }
 
 impl Default for TorrentRow {
@@ -134,6 +135,7 @@ impl Default for TorrentRow {
             progress: 0.0,
             speed_bps: 0.0,
             state: RunningStateDump::Stopped,
+            max_bw_bounded: false,
         }
     }
 }
@@ -566,6 +568,35 @@ impl eframe::App for GuiApp {
                                         info_hash: row.info_hash.clone(),
                                     });
                                 }
+                                ui.push_id(&row.info_hash, |ui| {
+                                    let mode = if row.max_bw_bounded {
+                                        "BW bound"
+                                    } else {
+                                        "RTT bound"
+                                    };
+                                    ui.menu_button(mode, |ui| {
+                                        for (enabled, label) in
+                                            [(true, "BW bound"), (false, "RTT bound")]
+                                        {
+                                            if ui
+                                                .selectable_label(
+                                                    row.max_bw_bounded == enabled,
+                                                    label,
+                                                )
+                                                .clicked()
+                                            {
+                                                if enabled != row.max_bw_bounded {
+                                                    let _ =
+                                                        self.cmd_tx.send(RpcRequest::SetBwBound {
+                                                            info_hash: row.info_hash.clone(),
+                                                            enabled,
+                                                        });
+                                                }
+                                                ui.close();
+                                            }
+                                        }
+                                    });
+                                });
                                 if ui.small_button("✕ Remove").clicked() {
                                     let _ = self.cmd_tx.send(RpcRequest::RemoveTorrent {
                                         info_hash: row.info_hash.clone(),
@@ -812,6 +843,7 @@ async fn refresh_rows(
             process,
             bandwidth_bps,
             state,
+            max_bw_bounded,
             ..
         } = rsp
         {
@@ -821,6 +853,7 @@ async fn refresh_rows(
                 name,
                 progress: process,
                 speed_bps: bandwidth_bps,
+                max_bw_bounded,
             });
         }
     }

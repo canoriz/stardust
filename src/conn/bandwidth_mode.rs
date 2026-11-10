@@ -228,6 +228,15 @@ impl BandwidthMode {
         }
     }
 
+    pub fn set_max_bw_bounded(&mut self, enabled: bool) {
+        self.max_bw_bounded = enabled;
+        self.phase = BandwidthPhase::SlowDown {
+            n_recv: 0,
+            last_pick_time: time::Instant::now(),
+            inflight_target: 0,
+        };
+    }
+
     fn startup_cwnd_limit(inflight: &Inflight, avg_rtt: time::Duration) -> usize {
         inflight
             .min_rtt()
