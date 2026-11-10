@@ -131,15 +131,17 @@ pub enum BwMode {
     SlowDown = 3,
     ProbeRtt = 4,
     Choked = 5,
+    ProbeDown = 6,
 }
 
 impl BwMode {
-    const ALL: [BwMode; 5] = [
+    const ALL: [BwMode; 6] = [
         Self::Startup,
         Self::ProbeBw,
         Self::SlowDown,
         Self::ProbeRtt,
         Self::Choked,
+        Self::ProbeDown,
     ];
 
     pub fn id(self) -> i64 {
@@ -153,6 +155,7 @@ impl BwMode {
             Self::SlowDown => "SlowDown",
             Self::ProbeRtt => "ProbeRtt",
             Self::Choked => "Choked",
+            Self::ProbeDown => "ProbeDown",
         }
     }
 }

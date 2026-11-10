@@ -199,7 +199,7 @@ impl PeerConn {
         self.metrics.record_response(rtt.as_secs_f64());
 
         self.bw_mode
-            .receive(rtt, self.bw.get_rtt(), req.len as usize, &self.inflight);
+            .receive(&recv, &self.bw, &self.inflight, req.len as usize);
 
         // let mean = self.bw.get_rtt();
         // let sigma = self.bw.get_var();
