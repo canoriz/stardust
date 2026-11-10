@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[2]
 STATIC = Path(__file__).resolve().parent
 MIB = 1 << 20
 MAX_UPLOAD = 1024 * 1024 * 1024
-MODES = {1: "Startup", 2: "ProbeBW", 3: "SlowDown", 4: "ProbeRTT", 5: "Choked"}
+MODES = {1: "Startup", 2: "ProbeBW", 3: "SlowDown", 4: "ProbeRTT", 5: "Choked", 6: "ProbeDown"}
 
 
 def open_db(path: Path) -> sqlite3.Connection:
@@ -65,7 +65,8 @@ def peer_rows(path: Path) -> list[dict]:
 
 
 def sample_rows(path: Path, peer_id: int, start_us: int | None, end_us: int | None,
-                probe_only: bool, exclude_app_limited: bool) -> tuple[list[dict], dict]:
+                probe_only: bool, exclude_app_limited: bool,
+                mode_id: int | None = None) -> tuple[list[dict], dict]:
     clauses = ["peer_id=?", "inflight IS NOT NULL", "rtt_us IS NOT NULL", "rtt_us>0"]
     args: list[int] = [peer_id]
     if start_us is not None:
@@ -75,7 +76,10 @@ def sample_rows(path: Path, peer_id: int, start_us: int | None, end_us: int | No
         clauses.append("ts_us<=?")
         args.append(end_us)
     if probe_only:
-        clauses.append("mode=2")
+        mode_id = 2
+    if mode_id is not None:
+        clauses.append("mode=?")
+        args.append(mode_id)
     if exclude_app_limited:
         clauses.append("app_limited=0")
     where = " AND ".join(clauses)
@@ -254,7 +258,8 @@ class Handler(BaseHTTPRequestHandler):
                 limit = min(2000, max(80, int(query.get("limit", ["600"])[0])))
                 data, meta = sample_rows(path, peer, start, end,
                                          query.get("probe", ["0"])[0] == "1",
-                                         query.get("exclude_app", ["0"])[0] == "1")
+                                         query.get("exclude_app", ["0"])[0] == "1",
+                                         6 if query.get("mode", [""])[0] == "probe-down" else None)
                 return self.json_reply({"samples": thin_time(data, limit), "meta": meta})
             self.send_error(404)
         except (ValueError, sqlite3.Error) as exc:

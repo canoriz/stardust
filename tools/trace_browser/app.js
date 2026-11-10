@@ -79,7 +79,7 @@ async function loadSamples() {
   const begin = Number($('startSec').value), end = Number($('endSec').value);
   if (!Number.isFinite(begin) || !Number.isFinite(end) || begin < 0 || end <= begin) { status('时间范围需要满足 0 ≤ 起点 < 终点。', true); return; }
   status('正在读取采样…');
-  const params = new URLSearchParams({ db: state.db, peer: state.peer.id, start_us: Math.round(state.peer.first_us + begin * 1e6), end_us: Math.round(state.peer.first_us + end * 1e6), probe: state.mode === 'probe' ? 1 : 0, exclude_app: $('excludeApp').checked ? 1 : 0, limit: $('sampleLimit').value });
+  const params = new URLSearchParams({ db: state.db, peer: state.peer.id, start_us: Math.round(state.peer.first_us + begin * 1e6), end_us: Math.round(state.peer.first_us + end * 1e6), probe: state.mode === 'probe' ? 1 : 0, mode: state.mode, exclude_app: $('excludeApp').checked ? 1 : 0, limit: $('sampleLimit').value });
   try {
     const data = await api(`/api/samples?${params}`);
     if (request !== state.request) return;
@@ -230,6 +230,7 @@ function drawTimeline() {
   const plotBottom = top + 3 * laneH + 2 * laneGap;
   const modeColors = {
     Startup: 'rgba(226, 177, 55, 0.16)',
+    ProbeDown: 'rgba(61, 121, 180, 0.16)',
     ProbeBW: 'rgba(34, 151, 145, 0.16)',
     'ProbeBW:app_limited': 'rgba(89, 162, 37, 0.16)',
     SlowDown: 'rgba(224, 133, 45, 0.16)',

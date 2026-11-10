@@ -576,6 +576,10 @@ canvas {
     background: #229791
 }
 
+.mode-key.probe-down .mode-swatch {
+    background: #3d79b4
+}
+
 .mode-key.probe-bw-app .mode-swatch {
     background: #59a225
 }
