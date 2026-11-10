@@ -8,7 +8,7 @@ use crate::metrics;
 
 use crate::{
     api::InfoHash,
-    conn::{BandwidthMode, Inflight, PeerAddr, inflight::Rejected},
+    conn::{BandwidthMode, BandwidthModeKind, Inflight, PeerAddr, inflight::Rejected},
     connection_manager::{ConnectionManagerHandle, CtrlOfSend},
     picker::{BlockRequests, PieceState},
     protocol::{PexFlag, Request},
@@ -124,7 +124,7 @@ impl PeerConn {
             },
             bitmap: None,
             bw: Bandwidth::new(),
-            bw_mode: BandwidthMode::new_choked(),
+            bw_mode: BandwidthMode::new(BandwidthModeKind::Choked),
             inflight: Inflight::new(time::Duration::from_secs(90)),
             stat: Default::default(),
             peer_bt_id,
@@ -147,12 +147,12 @@ impl PeerConn {
 
     pub fn choke(&mut self) {
         self.state.peer_choke_status = Some(true);
-        self.bw_mode = BandwidthMode::Choked;
+        self.bw_mode = BandwidthMode::new(BandwidthModeKind::Choked);
     }
 
     pub fn unchoke(&mut self) {
         self.state.peer_choke_status = Some(false);
-        self.bw_mode = BandwidthMode::new_auto();
+        self.bw_mode = BandwidthMode::new(BandwidthModeKind::Startup);
     }
 
     pub fn is_choked(&self) -> ChokeStatus {

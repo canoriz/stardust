@@ -2,7 +2,7 @@ mod bandwidth_mode;
 mod conn;
 mod inflight;
 
-pub use bandwidth_mode::BandwidthMode;
+pub use bandwidth_mode::{BandwidthMode, BandwidthModeKind};
 use conn::INIT_RTT_STARTUP;
 pub use conn::{PeerConn, Stat, Version};
 

@@ -7,7 +7,7 @@ use crate::{
         cache_manager::{CacheManagerHandle, FileOpID, Fop, GlobalPieceKey, PieceLease},
         simple_buffer::{FlushErr, JointIndex, SUB_PIECE_SIZE},
     },
-    conn::{self, BandwidthMode, PeerAddr, PeerConn},
+    conn::{self, BandwidthModeKind, PeerAddr, PeerConn},
     connection_manager::{
         ConnectionManagerHandle, CtrlOfRecv, CtrlOfSend, CtrlOfSend as ConnMsg, ReceivedBlocks,
     },
@@ -1404,7 +1404,7 @@ impl TransmitWorker {
         for (addr, reqs, underfill) in requests {
             let h = self.connected_peers.get_mut(&addr).unwrap();
             // ProbeRTT deliberately limits supply even when the picker fills its budget.
-            if underfill || matches!(h.bw_mode, BandwidthMode::ProbeRTT { .. }) {
+            if underfill || h.bw_mode.mode() == BandwidthModeKind::ProbeRTT {
                 h.inflight.set_app_limited();
             }
             if reqs.len() > 0 {
@@ -1510,7 +1510,7 @@ impl TransmitWorker {
                 if pick_n > 0 {
                     trace!("really picked {picked_n} blocks");
                 }
-                if picked_n < pick_n || matches!(h.bw_mode, BandwidthMode::ProbeRTT { .. }) {
+                if picked_n < pick_n || h.bw_mode.mode() == BandwidthModeKind::ProbeRTT {
                     h.inflight.set_app_limited();
                 }
                 h.request_batch(*addr, reqs);

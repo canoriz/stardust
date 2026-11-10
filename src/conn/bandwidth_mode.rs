@@ -25,10 +25,30 @@ fn bw_look_back_window(probe_bdp_rtt: time::Duration) -> time::Duration {
     (10 * probe_bdp_rtt).max(time::Duration::from_millis(1500))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BandwidthModeKind {
+    Choked,
+    Startup,
+    ProbeBW,
+    SlowDown,
+    ProbeRTT,
+}
+
 /// modes for bandwidth control
 /// we want a balanced max-bandwidth and min rtt
 #[derive(Debug)]
-pub enum BandwidthMode {
+pub struct BandwidthMode {
+    min_rtt: time::Duration,
+    min_rtt_at: time::Instant,
+
+    // timestamp of last piece receive
+    last_piece_time: time::Instant,
+
+    phase: BandwidthPhase,
+}
+
+#[derive(Debug)]
+enum BandwidthPhase {
     Choked,
 
     Startup {
@@ -39,9 +59,6 @@ pub enum BandwidthMode {
         // Plateau baseline; updated only after a significant bandwidth gain.
         full_bw: f32,
         limit_count: u32,
-
-        min_rtt: time::Duration,
-        min_rtt_at: time::Instant,
     },
 
     /// adaptively increase requests
@@ -50,26 +67,19 @@ pub enum BandwidthMode {
 
         // how many consecutive response which have rtt greater than (mean + sigma)
         slow_count: u32,
+
         // degrees of freedom for one-tail t critical value in current ProbeBW phase
         probe_df: usize,
         slow_down_to: usize,
 
-        // timestamp of last piece receive
-        last_piece_time: time::Instant,
         // slow_down_to: usize,
         cycle_index: usize,
 
         capacity: usize,
-
-        min_rtt: time::Duration,
-        min_rtt_at: time::Instant,
     },
 
     /// slow down to this in-flight
     SlowDown {
-        // timestamp of last piece receive
-        last_piece_time: time::Instant,
-
         // n received since last pick
         n_recv: u32,
 
@@ -80,9 +90,6 @@ pub enum BandwidthMode {
 
         // slow down to target inflight
         inflight_target: usize,
-
-        min_rtt: time::Duration,
-        min_rtt_at: time::Instant,
     },
 
     /// probe rtt
@@ -92,17 +99,11 @@ pub enum BandwidthMode {
 
         since: time::Instant,
 
-        // timestamp of last piece receive
-        last_piece_time: time::Instant,
-
         inflight_target: usize,
         from_clear: bool,
 
         normal_count: u32,
         slow_count: u32,
-
-        min_rtt: time::Duration,
-        min_rtt_at: time::Instant,
     },
 }
 
@@ -137,18 +138,57 @@ impl BandwidthMode {
         capacity.max(Self::MIN_PROBE_BW_CAPACITY)
     }
 
-    pub fn new_choked() -> Self {
-        BandwidthMode::Choked
+    pub fn new(kind: BandwidthModeKind) -> Self {
+        let now = time::Instant::now();
+        let phase = match kind {
+            BandwidthModeKind::Choked => BandwidthPhase::Choked,
+            BandwidthModeKind::Startup => BandwidthPhase::Startup {
+                last_round: 0,
+                cwnd: 4,
+                full_bw: 0.0,
+                limit_count: 0,
+            },
+            BandwidthModeKind::ProbeBW => BandwidthPhase::ProbeBW {
+                since_cycle: now,
+                slow_count: 0,
+                probe_df: 1,
+                slow_down_to: 0,
+                cycle_index: 0,
+                capacity: Self::MIN_PROBE_BW_CAPACITY,
+            },
+            BandwidthModeKind::SlowDown => BandwidthPhase::SlowDown {
+                n_recv: 0,
+                last_pick_time: now,
+                inflight_target: 0,
+            },
+            BandwidthModeKind::ProbeRTT => BandwidthPhase::ProbeRTT {
+                cnt: 0,
+                since: now,
+                inflight_target: 4,
+                from_clear: true,
+                normal_count: 0,
+                slow_count: 0,
+            },
+        };
+        Self {
+            min_rtt: if kind == BandwidthModeKind::Choked {
+                time::Duration::from_millis(100)
+            } else {
+                INIT_RTT_STARTUP
+            },
+            min_rtt_at: now,
+            last_piece_time: now,
+            phase,
+        }
     }
 
-    pub fn new_auto() -> Self {
-        BandwidthMode::Startup {
-            last_round: 0,
-            cwnd: 4,
-            full_bw: 0.0,
-            limit_count: 0,
-            min_rtt: INIT_RTT_STARTUP,
-            min_rtt_at: time::Instant::now(),
+    pub fn mode(&self) -> BandwidthModeKind {
+        match &self.phase {
+            BandwidthPhase::Choked => BandwidthModeKind::Choked,
+            BandwidthPhase::Startup { .. } => BandwidthModeKind::Startup,
+            BandwidthPhase::ProbeBW { .. } => BandwidthModeKind::ProbeBW,
+            BandwidthPhase::SlowDown { .. } => BandwidthModeKind::SlowDown,
+            BandwidthPhase::ProbeRTT { .. } => BandwidthModeKind::ProbeRTT,
         }
     }
 
@@ -163,7 +203,6 @@ impl BandwidthMode {
             })
             .max(4)
     }
-
     pub fn receive(
         &mut self,
         rtt: time::Duration,
@@ -171,45 +210,28 @@ impl BandwidthMode {
         acknowledged_bytes: usize,
         inflight: &Inflight,
     ) {
-        if matches!(self, BandwidthMode::Choked) {
+        let now = time::Instant::now();
+        self.last_piece_time = now;
+
+        if matches!(self.phase, BandwidthPhase::Choked) {
             return;
         }
 
-        let now = time::Instant::now();
-        let (min_rtt, min_rtt_at) = self.min_rtt_mut();
-        if rtt < *min_rtt {
-            *min_rtt = rtt;
-            *min_rtt_at = now;
+        if rtt < self.min_rtt {
+            self.min_rtt = rtt;
+            self.min_rtt_at = now;
         }
 
-        match self {
-            BandwidthMode::Startup { cwnd, .. } => {
+        match &mut self.phase {
+            BandwidthPhase::Startup { cwnd, .. } => {
                 *cwnd = cwnd
                     .saturating_add(acknowledged_bytes.div_ceil(16384))
                     .min(Self::startup_cwnd_limit(inflight, avg_rtt));
             }
-            BandwidthMode::ProbeBW {
-                last_piece_time,
-                slow_count,
-                probe_df,
-                ..
-            } => {
-                *last_piece_time = now;
-            }
-            BandwidthMode::SlowDown {
-                last_piece_time, ..
-            } => {
-                *last_piece_time = now;
-            }
-            BandwidthMode::ProbeRTT {
-                cnt,
-                last_piece_time,
-                ..
-            } => {
+            BandwidthPhase::ProbeRTT { cnt, .. } => {
                 *cnt += 1;
-                *last_piece_time = now;
             }
-            BandwidthMode::Choked => {}
+            _ => {}
         };
     }
 
@@ -232,8 +254,8 @@ impl BandwidthMode {
 
     pub fn on_picked(&mut self) {
         let now = time::Instant::now();
-        match self {
-            Self::SlowDown {
+        match &mut self.phase {
+            BandwidthPhase::SlowDown {
                 last_pick_time,
                 n_recv,
                 ..
@@ -263,14 +285,18 @@ impl BandwidthMode {
         let avg_rtt = bw.get_rtt();
         let max_bw = inflight.max_bw();
 
-        match self {
-            BandwidthMode::Startup {
+        let Self {
+            min_rtt,
+            min_rtt_at,
+            last_piece_time,
+            phase,
+        } = self;
+        match phase {
+            BandwidthPhase::Startup {
                 cwnd,
                 full_bw,
                 last_round,
                 limit_count,
-                min_rtt,
-                min_rtt_at,
             } => {
                 let round = inflight.round_count();
                 if let Some(n) = Self::should_slowdown_to(
@@ -281,14 +307,12 @@ impl BandwidthMode {
                     max_in_flight,
                     n_received,
                 ) {
-                    *self = BandwidthMode::SlowDown {
-                        last_piece_time: now,
+                    *last_piece_time = now;
+                    *phase = BandwidthPhase::SlowDown {
                         n_recv: 0,
                         // TODO: should be a real last pick time
                         last_pick_time: now,
                         inflight_target: n,
-                        min_rtt: *min_rtt,
-                        min_rtt_at: *min_rtt_at,
                     };
                     inflight.set_app_limited();
                 } else if round > *last_round {
@@ -324,14 +348,12 @@ impl BandwidthMode {
                         if *limit_count >= STARTUP_FULL_BW_ROUNDS {
                             let optimum =
                                 (max_bw_in_rtt * (*min_rtt).as_secs_f32() / 16384.0) as usize;
-                            *self = BandwidthMode::SlowDown {
-                                last_piece_time: now,
+                            *last_piece_time = now;
+                            *phase = BandwidthPhase::SlowDown {
                                 n_recv: 0,
                                 // TODO: should be a real last pick time
                                 last_pick_time: now,
                                 inflight_target: optimum / 2,
-                                min_rtt: *min_rtt,
-                                min_rtt_at: *min_rtt_at,
                             };
                             inflight.set_app_limited();
 
@@ -343,27 +365,21 @@ impl BandwidthMode {
                     }
                 }
             }
-            BandwidthMode::ProbeBW {
+            BandwidthPhase::ProbeBW {
                 since_cycle,
-                last_piece_time,
                 slow_down_to,
-                slow_count,
                 probe_df,
                 cycle_index,
                 capacity,
-                min_rtt,
-                min_rtt_at,
+                ..
             } => {
                 if min_rtt_at.elapsed() > PROBE_RTT_INTERVAL {
                     info!("{peer:?} change from ProbeBW to SlowDown(0)");
-                    *self = BandwidthMode::SlowDown {
-                        last_piece_time: *last_piece_time,
+                    *phase = BandwidthPhase::SlowDown {
                         n_recv: 0,
                         // TODO: should be a real last pick time
                         last_pick_time: now,
                         inflight_target: 0,
-                        min_rtt: *min_rtt,
-                        min_rtt_at: *min_rtt_at,
                     };
                     inflight.set_app_limited();
 
@@ -405,14 +421,11 @@ impl BandwidthMode {
                         n_received,
                     ) {
                         info!("{peer:?} change from ProbeBW to SlowDown({n})");
-                        *self = BandwidthMode::SlowDown {
-                            last_piece_time: *last_piece_time,
+                        *phase = BandwidthPhase::SlowDown {
                             n_recv: 0,
                             // TODO: should be a real last pick time
                             last_pick_time: now,
                             inflight_target: n,
-                            min_rtt: *min_rtt,
-                            min_rtt_at: *min_rtt_at,
                         };
                         inflight.set_app_limited();
 
@@ -423,12 +436,9 @@ impl BandwidthMode {
                     }
                 }
             }
-            BandwidthMode::SlowDown {
-                last_piece_time,
+            BandwidthPhase::SlowDown {
                 n_recv,
                 inflight_target,
-                min_rtt,
-                min_rtt_at,
                 ..
             } => {
                 if n_req_in_flight <= *inflight_target {
@@ -441,16 +451,13 @@ impl BandwidthMode {
                         // info!(
                         //     "{peer:?} change from Slowdown to ProbeBW mode, because inflight target {inflight_target} > 0"
                         // );
-                        *self = BandwidthMode::ProbeBW {
+                        *phase = BandwidthPhase::ProbeBW {
                             slow_count: 0,
                             probe_df: 1,
                             slow_down_to: 0,
-                            last_piece_time: *last_piece_time,
                             cycle_index: 0,
                             since_cycle: now,
                             capacity: cap,
-                            min_rtt: *min_rtt,
-                            min_rtt_at: *min_rtt_at,
                         };
 
                         #[cfg(feature = "blocktrace")]
@@ -463,16 +470,13 @@ impl BandwidthMode {
                         let (inflight_min_rtt, inflight_min_rtt_at) = inflight.min_rtt().unzip();
                         *min_rtt = inflight_min_rtt.unwrap_or(INIT_RTT_STARTUP);
                         *min_rtt_at = inflight_min_rtt_at.unwrap_or(now);
-                        *self = BandwidthMode::ProbeRTT {
+                        *phase = BandwidthPhase::ProbeRTT {
+                            slow_count: 0,
                             since: now,
                             cnt: 0,
-                            last_piece_time: *last_piece_time,
                             inflight_target: 4,
                             from_clear: *inflight_target == 0,
                             normal_count: 0,
-                            slow_count: 0,
-                            min_rtt: *min_rtt,
-                            min_rtt_at: *min_rtt_at,
                         };
                         inflight.set_app_limited();
 
@@ -486,16 +490,12 @@ impl BandwidthMode {
                     *last_piece_time = now;
                 }
             }
-            BandwidthMode::ProbeRTT {
+            BandwidthPhase::ProbeRTT {
                 since,
-                last_piece_time,
                 normal_count,
-                slow_count,
                 from_clear,
-                inflight_target,
                 cnt,
-                min_rtt,
-                min_rtt_at,
+                ..
             } => {
                 info!(
                     "{peer:?} in ProbeRTT mode cnt {} normal count {} min rtt {:?} avg bw {} avg_bw_10s {} req in flight {}",
@@ -511,16 +511,13 @@ impl BandwidthMode {
                     )
                     .min(max_in_flight);
                     // info!("{peer:?} change from ProbeRTT to ProbeBW mode");
-                    *self = BandwidthMode::ProbeBW {
-                        since_cycle: now,
+                    *phase = BandwidthPhase::ProbeBW {
                         slow_count: 0,
+                        since_cycle: now,
                         probe_df: 1,
                         slow_down_to: 0,
-                        last_piece_time: *last_piece_time,
                         cycle_index: 0,
                         capacity: cap,
-                        min_rtt: *min_rtt,
-                        min_rtt_at: *min_rtt_at,
                     };
 
                     #[cfg(feature = "blocktrace")]
@@ -529,7 +526,7 @@ impl BandwidthMode {
                     }
                 }
             }
-            BandwidthMode::Choked => {}
+            BandwidthPhase::Choked => {}
         };
     }
 
@@ -549,15 +546,15 @@ impl BandwidthMode {
         let avg_bw = bw.count_avg_bw_in(look_back_duration);
         let avg_rtt = bw.get_rtt();
 
-        match self {
-            BandwidthMode::Startup { cwnd, .. } => (*cwnd)
+        let Self { min_rtt, phase, .. } = self;
+        match phase {
+            BandwidthPhase::Startup { cwnd, .. } => (*cwnd)
                 .min(Self::startup_cwnd_limit(inflight, bw.get_rtt()))
                 .min(max_in_flight)
                 .saturating_sub(n_req_in_flight),
-            BandwidthMode::ProbeBW {
+            BandwidthPhase::ProbeBW {
                 cycle_index,
                 capacity,
-                min_rtt,
                 ..
             } => {
                 // Only can pick more blocks if we received some or no requests in flight.
@@ -598,13 +595,10 @@ impl BandwidthMode {
                 );
                 n_to_pick
             }
-            BandwidthMode::SlowDown {
+            BandwidthPhase::SlowDown {
                 last_pick_time,
                 n_recv,
-                last_piece_time,
                 inflight_target,
-                min_rtt,
-                ..
             } => {
                 info!(
                     "{peer:?} slow down mode {} to recv",
@@ -625,10 +619,8 @@ impl BandwidthMode {
                     0
                 }
             }
-            BandwidthMode::ProbeRTT {
-                inflight_target,
-                min_rtt,
-                ..
+            BandwidthPhase::ProbeRTT {
+                inflight_target, ..
             } => {
                 info!(
                     "{peer:?} ProbeRTT mode min rtt {:?} avg bw {} avg_bw_10s {} inflight_target {} req in flight {}",
@@ -636,44 +628,12 @@ impl BandwidthMode {
                 );
                 inflight_target.saturating_sub(n_req_in_flight)
             }
-            BandwidthMode::Choked => 0,
+            BandwidthPhase::Choked => 0,
         }
     }
 
     pub fn min_rtt(&self) -> time::Duration {
-        match self {
-            BandwidthMode::Choked => time::Duration::from_millis(100),
-            BandwidthMode::Startup { min_rtt, .. } => *min_rtt,
-            BandwidthMode::ProbeBW { min_rtt, .. } => *min_rtt,
-            BandwidthMode::SlowDown { min_rtt, .. } => *min_rtt,
-            BandwidthMode::ProbeRTT { min_rtt, .. } => *min_rtt,
-        }
-    }
-
-    fn min_rtt_mut(&mut self) -> (&mut time::Duration, &mut time::Instant) {
-        match self {
-            BandwidthMode::Choked => unreachable!(),
-            BandwidthMode::Startup {
-                min_rtt,
-                min_rtt_at,
-                ..
-            } => (min_rtt, min_rtt_at),
-            BandwidthMode::ProbeBW {
-                min_rtt,
-                min_rtt_at,
-                ..
-            } => (min_rtt, min_rtt_at),
-            BandwidthMode::SlowDown {
-                min_rtt,
-                min_rtt_at,
-                ..
-            } => (min_rtt, min_rtt_at),
-            BandwidthMode::ProbeRTT {
-                min_rtt,
-                min_rtt_at,
-                ..
-            } => (min_rtt, min_rtt_at),
-        }
+        self.min_rtt
     }
 
     fn probe_bw_cycle(&self) -> time::Duration {
@@ -688,11 +648,11 @@ impl BandwidthMode {
 #[cfg(feature = "blocktrace")]
 #[inline]
 pub fn bt_bw_mode(m: &BandwidthMode) -> blocktrace::BwMode {
-    match m {
-        BandwidthMode::Startup { .. } => blocktrace::BwMode::Startup,
-        BandwidthMode::ProbeBW { .. } => blocktrace::BwMode::ProbeBw,
-        BandwidthMode::SlowDown { .. } => blocktrace::BwMode::SlowDown,
-        BandwidthMode::ProbeRTT { .. } => blocktrace::BwMode::ProbeRtt,
-        BandwidthMode::Choked => blocktrace::BwMode::Choked,
+    match m.mode() {
+        BandwidthModeKind::Startup => blocktrace::BwMode::Startup,
+        BandwidthModeKind::ProbeBW => blocktrace::BwMode::ProbeBw,
+        BandwidthModeKind::SlowDown => blocktrace::BwMode::SlowDown,
+        BandwidthModeKind::ProbeRTT => blocktrace::BwMode::ProbeRtt,
+        BandwidthModeKind::Choked => blocktrace::BwMode::Choked,
     }
 }
