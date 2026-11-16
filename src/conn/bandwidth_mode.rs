@@ -69,9 +69,13 @@ enum BandwidthPhase {
     },
 
     ProbeDown {
-        last_round: u64,
         inflight_target: usize,
         bw_reached_max: bool,
+        // Round in which the active inflight first reached the target;
+        // u64::MAX means that the crossing has not happened yet.
+        target_reached: u64,
+        // Smallest inflight that has produced a qualifying sample. This is
+        // seeded from Startup and retained across ProbeDown rounds.
         min_inflight: usize,
     },
 
@@ -176,9 +180,9 @@ impl BandwidthMode {
                 limit_count: 0,
             },
             BandwidthModeKind::ProbeDown => BandwidthPhase::ProbeDown {
-                last_round: 0,
                 inflight_target: MIN_IN_FLIGHT,
                 bw_reached_max: false,
+                target_reached: u64::MAX,
                 min_inflight: usize::MAX,
             },
             BandwidthModeKind::ProbeBW => BandwidthPhase::ProbeBW {
@@ -237,17 +241,17 @@ impl BandwidthMode {
         };
     }
 
-    fn startup_cwnd_limit(inflight: &Inflight, avg_rtt: time::Duration) -> usize {
+    fn startup_cwnd_limit(inflight: &Inflight, avg_rtt: time::Duration, max_bw: f32) -> usize {
         inflight
             .min_rtt()
             .map_or(4, |(min_rtt, _)| {
                 let rtt_base = Self::rtt_base(min_rtt, avg_rtt);
-                (STARTUP_CWND_GAIN * f64::from(inflight.max_bw()) * rtt_base.as_secs_f64()
-                    / 16384.0)
-                    .ceil() as usize
+                (STARTUP_CWND_GAIN * f64::from(max_bw) * rtt_base.as_secs_f64() / 16384.0).ceil()
+                    as usize
             })
             .max(4)
     }
+
     pub fn receive(
         &mut self,
         recv: &Received,
@@ -272,18 +276,36 @@ impl BandwidthMode {
             self.max_bw_at = now;
         }
 
+        let startup_max_bw = self.max_bw.0;
+        let probe_max_bw = self.max_bw.0;
+
         match &mut self.phase {
             BandwidthPhase::Startup { cwnd, .. } => {
-                *cwnd = cwnd
-                    .saturating_add(acknowledged_bytes.div_ceil(16384))
-                    .min(Self::startup_cwnd_limit(inflight, bw.get_rtt()));
+                *cwnd = cwnd.saturating_add(acknowledged_bytes.div_ceil(16384)).min(
+                    Self::startup_cwnd_limit(inflight, bw.get_rtt(), startup_max_bw),
+                );
             }
             BandwidthPhase::ProbeDown {
+                inflight_target,
                 bw_reached_max,
+                target_reached,
                 min_inflight,
                 ..
             } => {
-                if recv.rate.delivery_rate >= self.max_bw.0 * PROBE_DOWN_BW_RATIO {
+                let n_req_in_flight = inflight.inflight(bw.get_rtt_4var());
+                let current_round = inflight.round_count();
+                let target_round = *target_reached;
+                if target_round == u64::MAX && n_req_in_flight <= *inflight_target {
+                    // This is the exact crossing point: Inflight has already
+                    // removed the acknowledged request, so start the next
+                    // delivery-round measurement from this response onward.
+                    *target_reached = current_round;
+                } else if target_round != u64::MAX
+                    && current_round > target_round
+                    && recv.rate.delivery_rate >= probe_max_bw * PROBE_DOWN_BW_RATIO
+                {
+                    // Samples from the crossing round belong to the old queue;
+                    // only later delivery rounds validate the target.
                     *bw_reached_max = true;
                     *min_inflight = (*min_inflight).min(recv.inflight_at_pick as usize);
                 }
@@ -379,13 +401,9 @@ impl BandwidthMode {
                 limit_count,
             } => {
                 let round = inflight.round_count();
-                if let Some(n) = Self::should_slowdown_to(
-                    *min_rtt,
-                    avg_rtt,
-                    inflight.max_bw(),
-                    max_in_flight,
-                    n_received,
-                ) {
+                if let Some(n) =
+                    Self::should_slowdown_to(*min_rtt, avg_rtt, *max_bw, max_in_flight, n_received)
+                {
                     *phase = BandwidthPhase::SlowDown {
                         n_recv: 0,
                         last_pick_time: now,
@@ -398,7 +416,7 @@ impl BandwidthMode {
                         *need_sample = true;
                     }
                 } else if round > *last_round {
-                    let max_bw_in_rtt = inflight.max_bw();
+                    let max_bw_in_rtt = *max_bw;
                     let app_limited_at_round_start = inflight.app_limited_at_round_start();
                     info!(
                         "{peer:?} in Startup mode, cwnd {}, inflight {} full bw {}, avg-bw {} avg_bw_10s {} new max bw {}, limit count {} app limited at round start {} current_app_limited {}",
@@ -430,13 +448,16 @@ impl BandwidthMode {
                         if *limit_count >= STARTUP_FULL_BW_ROUNDS {
                             *phase = if *max_bw_bounded {
                                 BandwidthPhase::ProbeDown {
-                                    last_round: round,
                                     inflight_target: ((*inflight_at_max_bw as f32
                                         * PROBE_DOWN_BW_RATIO)
                                         as usize)
                                         .max(MIN_IN_FLIGHT)
                                         .min(max_in_flight),
                                     bw_reached_max: false,
+                                    target_reached: u64::MAX,
+                                    // Keep the last valid candidate across
+                                    // ProbeDown rounds, starting from Startup's
+                                    // measured peak inflight.
                                     min_inflight: *inflight_at_max_bw,
                                 }
                             } else {
@@ -460,28 +481,31 @@ impl BandwidthMode {
                 }
             }
             BandwidthPhase::ProbeDown {
-                last_round,
                 inflight_target,
                 bw_reached_max,
+                target_reached,
                 min_inflight,
             } => {
                 let round = inflight.round_count();
-                if round <= *last_round {
+                if *target_reached == u64::MAX {
                     return;
                 }
-                *last_round = round;
+
+                // receive() records the round in which the target was first
+                // reached. Samples become eligible in the next round, while
+                // the next ProbeDown step waits one additional round.
+                if round <= (*target_reached).saturating_add(1) {
+                    return;
+                }
                 let bw_reached = *bw_reached_max;
                 *bw_reached_max = false;
-
-                if n_req_in_flight > *inflight_target {
-                    return;
-                }
 
                 let floor = MIN_IN_FLIGHT.min(max_in_flight);
                 if bw_reached && *inflight_target > floor {
                     *inflight_target = inflight_target
                         .saturating_sub(inflight_target.div_ceil(20))
                         .max(floor);
+                    *target_reached = u64::MAX;
                     inflight.set_app_limited();
                     return;
                 }
@@ -564,9 +588,12 @@ impl BandwidthMode {
                         bw.reset_var();
                         *min_rtt = INIT_RTT_STARTUP;
                         *min_rtt_at = now;
-                        *max_bw = inflight.max_bw();
+                        // Start a fresh bandwidth-bound Startup epoch. The
+                        // Inflight BtlBw window remains available for long-term
+                        // history, but must not decide this Startup plateau.
+                        *max_bw = 0.0;
                         *max_bw_at = now;
-                        *inflight_at_max_bw = inflight.max_bw_inflight();
+                        *inflight_at_max_bw = 0;
                         *phase = BandwidthPhase::Startup {
                             last_round: inflight.round_count(),
                             cwnd: 4,
@@ -656,13 +683,17 @@ impl BandwidthMode {
         let Self {
             max_bw_bounded,
             min_rtt,
-            max_bw: (_, inflight_at_max_bw),
+            max_bw: (mode_max_bw, inflight_at_max_bw),
             phase,
             ..
         } = self;
         match phase {
             BandwidthPhase::Startup { cwnd, .. } => (*cwnd)
-                .min(Self::startup_cwnd_limit(inflight, bw.get_rtt()))
+                .min(Self::startup_cwnd_limit(
+                    inflight,
+                    bw.get_rtt(),
+                    *mode_max_bw,
+                ))
                 .min(max_in_flight)
                 .saturating_sub(n_req_in_flight),
             BandwidthPhase::ProbeDown {
