@@ -3,6 +3,7 @@ use bt_bencode::RawValue;
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use std::io;
+use std::path::{Component, Path};
 
 mod magnet;
 pub use crate::protocol::InfoHash;
@@ -97,6 +98,24 @@ pub struct Info {
     pub raw: Vec<u8>,
 }
 
+/// Reject files whose joined path (as `backfile` builds it) is not purely `a/b/c`:
+/// `..`, `.` prefix, root or drive prefix could write outside the download directory.
+fn check_files_within_dir(files: &[File]) -> io::Result<()> {
+    for f in files {
+        let joined = f.path.join("/");
+        if !Path::new(&joined)
+            .components()
+            .all(|c| matches!(c, Component::Normal(_)))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsafe path in torrent: {joined:?}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn serialize_raw_only<S>(i: &InfoWithRaw, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
@@ -124,7 +143,7 @@ impl TryFrom<RawValue> for InfoWithRaw {
 }
 
 impl InfoWithRaw {
-    pub fn to_metadata(self, info_hash: InfoHash) -> Metadata {
+    pub fn to_metadata(self, info_hash: InfoHash) -> io::Result<Metadata> {
         let info = &self.info;
         let (len, files) = match &info.len_or_files {
             LenFiles::Length(l) => (
@@ -148,7 +167,8 @@ impl InfoWithRaw {
                     .collect(),
             ),
         };
-        Metadata {
+        check_files_within_dir(&files)?;
+        Ok(Metadata {
             info: self.info,
             raw_info: self.raw,
             info_hash,
@@ -157,7 +177,7 @@ impl InfoWithRaw {
             creation_date: None,
             len,
             files,
-        }
+        })
     }
 }
 
@@ -180,9 +200,9 @@ impl FileMetadata {
     }
 
     /// convert FileMetadata to Metadata and announce list
-    pub fn to_metadata(self) -> (Metadata, Vec<Vec<String>>) {
-        let m = self.info.to_metadata(self.info_hash);
-        (
+    pub fn to_metadata(self) -> io::Result<(Metadata, Vec<Vec<String>>)> {
+        let m = self.info.to_metadata(self.info_hash)?;
+        Ok((
             Metadata {
                 comment: self.comment,
                 created_by: self.created_by,
@@ -196,7 +216,7 @@ impl FileMetadata {
             } else {
                 vec![vec![]]
             },
-        )
+        ))
     }
 }
 
@@ -211,4 +231,30 @@ pub struct File {
     // TODO: many sub path are same, e.g. a sub directory containing many files
     // use a more effeicient structure
     pub path: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file(path: &[&str]) -> File {
+        File {
+            length: 1,
+            path: path.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn rejects_traversal() {
+        for p in [
+            &["..", "x"][..],
+            &["dir", "..", "x"],
+            &["dir", "../x"],
+            &["/abs"],
+            &["."],
+        ] {
+            assert!(check_files_within_dir(&[file(p)]).is_err(), "{p:?}");
+        }
+        assert!(check_files_within_dir(&[file(&["dir", "a"]), file(&["dir", "b"])]).is_ok());
+    }
 }

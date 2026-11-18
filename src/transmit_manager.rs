@@ -3499,7 +3499,7 @@ fn check_received_metadata(
             return Err(io::Error::new(io::ErrorKind::Other, e));
         }
     };
-    let meta = info.to_metadata(info_hash);
+    let meta = info.to_metadata(info_hash)?;
     if let Ok(true) = meta.verify_info_hash() {
         Ok(meta)
     } else {

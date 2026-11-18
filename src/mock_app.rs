@@ -55,7 +55,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // let torrent_f = include_bytes!("../31.torrent");
     let torrent = metadata::FileMetadata::load(torrent_f).unwrap();
 
-    let (metadata, announce_list) = torrent.to_metadata();
+    let (metadata, announce_list) = torrent.to_metadata().unwrap();
     let metadata_clone = metadata.clone();
     info!("{:?}", &announce_list);
 

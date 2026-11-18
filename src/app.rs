@@ -11,7 +11,7 @@ pub async fn add_mock_torrent(session: &crate::session::Session) -> InfoHash {
 
     let torrent_f = include_bytes!("../test-large.torrent");
     let torrent = metadata::FileMetadata::load(torrent_f).unwrap();
-    let (metadata, _announce_list) = torrent.to_metadata();
+    let (metadata, _announce_list) = torrent.to_metadata().unwrap();
     let info_hash = metadata.info_hash;
     match session.transmit_handle_of(&info_hash).await {
         Some(mut t) => {

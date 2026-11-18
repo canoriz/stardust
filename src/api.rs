@@ -278,11 +278,8 @@ pub async fn handle_rpc(session: &Session, req: RpcRequest) -> (RpcResponse, boo
                             );
                         }
                     };
-                    match FileMetadata::load(&bytes) {
-                        Ok(fm) => {
-                            let (metadata, _announce) = fm.to_metadata();
-                            TorrentTask::Torrent(metadata)
-                        }
+                    match FileMetadata::load(&bytes).and_then(|fm| fm.to_metadata()) {
+                        Ok((metadata, _announce)) => TorrentTask::Torrent(metadata),
                         Err(e) => {
                             return (RpcResponse::err(format!("parse torrent file: {e}")), false);
                         }
