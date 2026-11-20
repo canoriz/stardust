@@ -65,6 +65,17 @@ async fn peer(worker: &mut TransmitWorker, fast: bool) -> (PeerAddr, DuplexStrea
     (addr, remote)
 }
 
+// A pulled io batch carrying just `requests`, as a recv stream would hand it over.
+fn io_msg(peer: PeerAddr, requests: &[Request]) -> Msg {
+    Msg::PeerMsg(PeerMsg::IoMsg(
+        peer,
+        IoMsg {
+            requests: requests.iter().copied().map(UploadReq::Request).collect(),
+            ..Default::default()
+        },
+    ))
+}
+
 async fn response(remote: &mut DuplexStream) -> Vec<u8> {
     time::timeout(time::Duration::from_secs(2), async {
         loop {
@@ -138,14 +149,15 @@ async fn upload_wire_requests_share_cache_wait_and_return_exact_bytes() {
             .await
             .unwrap()
             .unwrap();
-        if let Msg::PeerMsg(PeerMsg::Request(p, r)) = msg {
-            assert_eq!(p, addr);
-            worker
-                .handle_msg(Msg::PeerMsg(PeerMsg::Request(p, r)))
-                .await;
-            count += 1;
-        } else {
-            saved.push(msg);
+        match msg {
+            // EventReady is what makes the worker pull the buffered io.
+            Msg::PeerMsg(PeerMsg::EventReady { .. }) => worker.handle_msg(msg).await,
+            Msg::PeerMsg(PeerMsg::IoMsg(p, io)) => {
+                assert_eq!(p, addr);
+                count += io.requests.len();
+                worker.handle_msg(Msg::PeerMsg(PeerMsg::IoMsg(p, io))).await;
+            }
+            msg => saved.push(msg),
         }
     }
     worker.upload_tick();
@@ -189,8 +201,8 @@ async fn upload_unverified_or_invalid_requests_reject_fast_and_ignore_legacy() {
         begin: 0,
         len: BLOCK,
     };
-    worker.handle_upload_request(fast, request);
-    worker.handle_upload_request(legacy, request);
+    worker.handle_upload_requests(fast, &[UploadReq::Request(request)]);
+    worker.handle_upload_requests(legacy, &[UploadReq::Request(request)]);
     assert_eq!(response(&mut fast_wire).await, reject(request));
     assert!(
         time::timeout(time::Duration::from_millis(100), response(&mut legacy_wire))
@@ -222,7 +234,7 @@ async fn upload_unverified_or_invalid_requests_reject_fast_and_ignore_legacy() {
             ..request
         },
     ] {
-        worker.handle_upload_request(fast, bad);
+        worker.handle_upload_requests(fast, &[UploadReq::Request(bad)]);
         assert_eq!(response(&mut fast_wire).await, reject(bad));
         assert!(worker.waiting_for_piecebuf.is_empty());
     }
@@ -246,7 +258,7 @@ async fn upload_restored_seed_reads_final_bytes_from_disk() {
         begin: 2 * SUB_PIECE_SIZE - BLOCK,
         len: BLOCK,
     };
-    worker.handle_upload_request(addr, request);
+    worker.handle_upload_requests(addr, &[UploadReq::Request(request)]);
     worker.upload_tick();
     pump(&mut worker).await;
     assert_piece(
@@ -272,9 +284,7 @@ async fn upload_inactive_states_reject_or_defer_requests_by_phase() {
         RunningState::Fatal("test".into()),
     ] {
         worker.running_state = state;
-        worker
-            .handle_msg(Msg::PeerMsg(PeerMsg::Request(addr, request)))
-            .await;
+        worker.handle_msg(io_msg(addr, &[request])).await;
         assert_eq!(response(&mut remote).await, reject(request));
         assert!(worker.waiting_for_piecebuf.is_empty());
     }
@@ -285,9 +295,7 @@ async fn upload_inactive_states_reject_or_defer_requests_by_phase() {
         worker.running_state,
         RunningState::Draining { .. }
     ));
-    worker
-        .handle_msg(Msg::PeerMsg(PeerMsg::Request(addr, request)))
-        .await;
+    worker.handle_msg(io_msg(addr, &[request])).await;
     assert!(
         time::timeout(time::Duration::from_millis(100), response(&mut remote))
             .await
@@ -297,7 +305,7 @@ async fn upload_inactive_states_reject_or_defer_requests_by_phase() {
     assert!(matches!(
         &worker.running_state,
         RunningState::Draining { deferred, .. }
-            if deferred.iter().any(|m| matches!(m, Msg::PeerMsg(PeerMsg::Request(_, r)) if *r == request))
+            if deferred.iter().any(|m| matches!(m, Msg::PeerMsg(PeerMsg::IoMsg(_, io)) if io.requests.contains(&UploadReq::Request(request))))
     ));
     loop {
         let msg = time::timeout(time::Duration::from_secs(2), worker.receiver.recv())
@@ -310,9 +318,7 @@ async fn upload_inactive_states_reject_or_defer_requests_by_phase() {
         }
     }
     let waiting = worker.waiting_for_piecebuf.len();
-    worker
-        .handle_msg(Msg::PeerMsg(PeerMsg::Request(addr, request)))
-        .await;
+    worker.handle_msg(io_msg(addr, &[request])).await;
     assert!(
         time::timeout(time::Duration::from_millis(100), response(&mut remote))
             .await
@@ -320,11 +326,9 @@ async fn upload_inactive_states_reject_or_defer_requests_by_phase() {
     );
     assert_eq!(worker.waiting_for_piecebuf.len(), waiting);
     if let RunningState::Checking { deferred, .. } = &worker.running_state {
-        assert!(
-            deferred
-                .iter()
-                .any(|m| matches!(m, Msg::PeerMsg(PeerMsg::Request(_, r)) if *r == request))
-        );
+        assert!(deferred.iter().any(
+            |m| matches!(m, Msg::PeerMsg(PeerMsg::IoMsg(_, io)) if io.requests.contains(&UploadReq::Request(request)))
+        ));
     }
     pump(&mut worker).await;
     cleanup(worker, cache).await;
@@ -348,15 +352,15 @@ async fn upload_shutdown_discards_pending_reads_and_new_requests() {
     worker
         .self_handle
         .sender
-        .send(Msg::PeerMsg(PeerMsg::Request(addr, new_request)))
+        .send(io_msg(addr, &[new_request]))
         .unwrap();
     worker
         .self_handle
         .sender
-        .send(Msg::PeerMsg(PeerMsg::Request(legacy, new_request)))
+        .send(io_msg(legacy, &[new_request]))
         .unwrap();
-    worker.handle_upload_request(addr, existing);
-    worker.handle_upload_request(legacy, new_request);
+    worker.handle_upload_requests(addr, &[UploadReq::Request(existing)]);
+    worker.handle_upload_requests(legacy, &[UploadReq::Request(new_request)]);
     worker.upload_tick();
     assert_eq!(worker.waiting_for_piecebuf.len(), 2);
     time::timeout(time::Duration::from_secs(2), worker.cleanup_before_stop())

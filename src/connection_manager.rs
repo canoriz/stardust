@@ -53,14 +53,25 @@ pub struct ReceivedPiece {
     pub recv_time: std::time::Instant,
 }
 
-#[derive(Debug)]
-pub struct ReceivedBlocks {
-    pub blocks: Vec<ReceivedPiece>,
+/// A block request or cancel from the peer, kept in arrival order.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum UploadReq {
+    Request(Request),
+    Cancel(Request),
 }
 
-impl ReceivedBlocks {
-    pub fn new() -> Self {
-        Self { blocks: Vec::new() }
+/// Inbound peer IO buffered by a recv stream until the transmit manager pulls it.
+#[derive(Debug, Default)]
+pub struct IoMsg {
+    /// Requests and cancels the peer sent, in arrival order.
+    pub requests: Vec<UploadReq>,
+    /// Blocks the peer sent.
+    pub pieces: Vec<ReceivedPiece>,
+}
+
+impl IoMsg {
+    fn is_empty(&self) -> bool {
+        self.requests.is_empty() && self.pieces.is_empty()
     }
 }
 
@@ -68,7 +79,8 @@ impl ReceivedBlocks {
 pub(crate) enum CtrlOfRecv {
     /// force recv stream to report statistics
     ReportStat,
-    GetBlocks,
+    /// handover the buffered `IoMsg` to the transmit manager
+    GetIoMsg,
 }
 
 pub(crate) struct ConnectionManagerHandle {
@@ -146,7 +158,7 @@ impl ConnectionManagerHandle {
             conn_id,
             _drop_guard: conn_break_guard.clone(),
             current_buf: None,
-            received_blocks: None,
+            io: IoMsg::default(),
             block_pool,
         };
 
@@ -331,8 +343,8 @@ struct RecvStream<T> {
     /// Set back to `None` after the body is fully received.
     current_buf: Option<PooledBuf<BytesMut>>,
 
-    /// Received blocks are stored here until transmit manager asks for
-    received_blocks: Option<ReceivedBlocks>,
+    /// Requests/pieces buffered here until transmit manager asks for them
+    io: IoMsg,
 
     /// Session-level pool that piece-body buffers are drawn from.
     block_pool: Arc<BufferPool<BytesMut>>,
@@ -404,7 +416,7 @@ async fn run_recv_stream<T>(
             }
             _ = ticker.tick() => {
                 debug!("{addr} recv stream ticker tick");
-                conn.handle_report_tick();
+                conn.notify_event_ready();
             }
             r = RecvStream::recv_next(
                 &mut conn.read_stream,
@@ -439,18 +451,29 @@ impl<T> RecvStream<T>
 where
     T: AsyncRead + Unpin,
 {
-    fn handle_report_tick(&mut self) {
+    fn notify_event_ready(&mut self) {
         let peer = PeerAddr(
             to_canonical_addr(self.read_stream.peer_addr()),
             self.conn_id,
         );
-        trace!("{peer:?} handle report tick");
+        trace!("{peer:?} notify event ready");
         if let Err(e) = self
             .transmit_handle
             .sender
-            .send(TransmitMsg::PeerMsg(PeerMsg::BlockReceived { peer }))
+            .send(TransmitMsg::PeerMsg(PeerMsg::EventReady { peer }))
         {
-            info!("{peer:?} handle report tick error {e:?}");
+            info!("{peer:?} notify event ready error {e:?}");
+        }
+    }
+
+    /// Push an IO msg to buffer
+    /// notify the transmit manager to pull only when it changes
+    /// from empty to non-empty.
+    fn buffer_io(&mut self, push: impl FnOnce(&mut IoMsg)) {
+        let was_empty = self.io.is_empty();
+        push(&mut self.io);
+        if was_empty {
+            self.notify_event_ready();
         }
     }
 
@@ -504,22 +527,22 @@ where
         match cmd {
             CtrlOfRecv::ReportStat => {
                 debug!("{} received report stat cmd", self.read_stream.peer_addr());
-                self.handle_report_tick();
+                self.notify_event_ready();
             }
-            CtrlOfRecv::GetBlocks => {
-                debug!("{} received get blocks cmd", self.read_stream.peer_addr());
-                let blks = self.received_blocks.take();
+            CtrlOfRecv::GetIoMsg => {
+                debug!("{} received get io cmd", self.read_stream.peer_addr());
+                // TODO: optimize: maybe use ring buffer to reduce allocations
+                let io = std::mem::take(&mut self.io);
                 self.transmit_handle
                     .sender
-                    .send(TransmitMsg::PeerMsg(PeerMsg::Pieces(
+                    .send(TransmitMsg::PeerMsg(PeerMsg::IoMsg(
                         PeerAddr(
                             to_canonical_addr(self.read_stream.peer_addr()),
                             self.conn_id,
                         ),
-                        blks,
+                        io,
                     )))
                     .unwrap(); // TODO: this panics
-                // TODO: handle get blocks command
             }
         }
     }
@@ -574,32 +597,19 @@ where
                 )));
             }
             Message::Request(req) => {
-                tmh.sender
-                    .send(TransmitMsg::PeerMsg(PeerMsg::Request(peer, req)));
+                self.buffer_io(|io| io.requests.push(UploadReq::Request(req)));
             }
             Message::Piece(piece) => {
-                let new = if self.received_blocks.is_none() {
-                    self.received_blocks = Some(ReceivedBlocks::new());
-                    true
-                } else {
-                    false
-                };
-                self.received_blocks
-                    .as_mut()
-                    .unwrap()
-                    .blocks
-                    .push(ReceivedPiece {
+                self.buffer_io(|io| {
+                    io.pieces.push(ReceivedPiece {
                         piece,
                         buf: block_buf.expect("Piece message must carry a block buffer"),
                         recv_time: std::time::Instant::now(),
-                    });
-                if new {
-                    self.handle_report_tick();
-                }
+                    })
+                });
             }
             Message::Cancel(req) => {
-                tmh.sender
-                    .send(TransmitMsg::PeerMsg(PeerMsg::Cancel(peer, req)));
+                self.buffer_io(|io| io.requests.push(UploadReq::Cancel(req)));
             }
             Message::Port(port) => {
                 tmh.sender

@@ -9,7 +9,7 @@ use crate::{
     },
     conn::{self, BandwidthModeKind, PeerAddr, PeerConn},
     connection_manager::{
-        ConnectionManagerHandle, CtrlOfRecv, CtrlOfSend, CtrlOfSend as ConnMsg, ReceivedBlocks,
+        ConnectionManagerHandle, CtrlOfRecv, CtrlOfSend, CtrlOfSend as ConnMsg, IoMsg, UploadReq,
     },
     dht::DHT,
     hasher::HashState,
@@ -120,18 +120,18 @@ pub enum PeerMsg {
     Uninterested(PeerAddr),
     PieceState(PeerAddr, PieceState),
     Have(PeerAddr, u32),
-    Pieces(PeerAddr, Option<ReceivedBlocks>),
     DhtPort(PeerAddr, u16),
     SuggestPiece(PeerAddr, u32),
     AllowedFast(PeerAddr, u32),
-    Cancel(PeerAddr, Request),
     Reject(PeerAddr, Request),
-    Request(PeerAddr, Request),
     ExtendMetadata(PeerAddr, ExtendedMetadata),
     ExtendPex(PeerAddr, ExtendedPex),
-    BlockReceived {
+    /// New IO msg come from that peer and is ready to be pulled.
+    EventReady {
         peer: PeerAddr,
     },
+    /// IO msgs comes pulled from a peer
+    IoMsg(PeerAddr, IoMsg),
     /// Peer is stalled waiting for a block buffer from the pool; mark app_limited.
     BufferWaiting {
         peer: PeerAddr,
@@ -1641,8 +1641,11 @@ impl TransmitWorker {
                 }
                 _ => self.handle_msg_normal(Msg::FileOpDone { id, result }).await,
             },
-            Msg::PeerMsg(PeerMsg::Pieces(..))
-            | Msg::QueryStatus(_)
+            Msg::PeerMsg(PeerMsg::IoMsg(peer, io)) => {
+                self.defer_io_msg(peer, io);
+                Ok(())
+            }
+            Msg::QueryStatus(_)
             | Msg::CheckFile(_)
             | Msg::ChangeState(_, _)
             | Msg::SetBwBound(_, _)
@@ -1664,8 +1667,9 @@ impl TransmitWorker {
             Msg::PieceBufReady { index, buf } => {
                 self.handle_piecebuf_ready_checking(index, buf).await
             }
-            Msg::PeerMsg(PeerMsg::Pieces(peer, blks)) => {
-                self.handle_pieces_while_checking(peer, blks)
+            Msg::PeerMsg(PeerMsg::IoMsg(peer, io)) => {
+                self.defer_io_msg(peer, io);
+                Ok(())
             }
             Msg::FileOpDone { id, result } => match self.maybe_recheck_rename_ack(id) {
                 // While restoring file names, absorb the per-file rename acks;
@@ -1693,6 +1697,23 @@ impl TransmitWorker {
                 Ok(())
             }
         }
+    }
+
+    /// Park `io` in the current phase's deferred queue, copying blocks out of the
+    /// shared pool so a long drain/check does not starve other torrents of buffers.
+    fn defer_io_msg(&mut self, peer: PeerAddr, mut io: IoMsg) {
+        let deferred = match &mut self.running_state {
+            RunningState::Draining { deferred, .. } | RunningState::Checking { deferred, .. } => {
+                deferred
+            }
+            _ => return,
+        };
+        for p in &mut io.pieces {
+            if matches!(p.buf, BlockBuf::Pooled(_)) {
+                p.buf = BlockBuf::Owned(BytesMut::from(&p.buf[..]));
+            }
+        }
+        deferred.push(Msg::PeerMsg(PeerMsg::IoMsg(peer, io)));
     }
 
     /// Submit the FlushAndClose barrier for the whole torrent; returns its op id.
@@ -1939,7 +1960,7 @@ impl TransmitWorker {
                 for conn in self.connected_peers.values_mut() {
                     conn.bw_mode.set_max_bw_bounded(enabled);
                     conn.inflight.set_app_limited();
-                    conn.conn.recv_stream_cmd(CtrlOfRecv::GetBlocks);
+                    conn.conn.recv_stream_cmd(CtrlOfRecv::GetIoMsg);
                 }
                 let _ = sender.send(());
                 Ok(())
@@ -2122,12 +2143,12 @@ impl TransmitWorker {
                 });
                 Ok(())
             }
-            PeerMsg::BlockReceived { peer } => {
+            PeerMsg::EventReady { peer } => {
                 // TODO: FIXME: add backlog:
                 // if waiting_for_piece has too many pending pieces, slow down picking
                 // and mark app_limited
                 if let Some(pc) = self.connected_peers.get_mut(&peer) {
-                    pc.conn.recv_stream_cmd(CtrlOfRecv::GetBlocks);
+                    pc.conn.recv_stream_cmd(CtrlOfRecv::GetIoMsg);
                 }
                 Ok(())
             }
@@ -2140,17 +2161,7 @@ impl TransmitWorker {
                 }
                 Ok(())
             }
-            PeerMsg::Pieces(peer, receive_blks) => {
-                let mut count = 0;
-                if let Some(blks) = receive_blks {
-                    for piece in blks.blocks {
-                        count += 1;
-                        self.handle_piece_msg(&peer, piece.piece, piece.buf, piece.recv_time)?;
-                    }
-                }
-                debug!("handled {count} piece messages");
-                self.handle_blocks_received(peer, count)
-            }
+            PeerMsg::IoMsg(peer, io) => self.handle_io_msg(peer, io),
             PeerMsg::DhtPort(addr, port) => self.handle_dht_port_msg(addr.0, port),
             PeerMsg::ExtendMetadata(pa, m) => {
                 self.handle_extend_metadata(pa, m);
@@ -2168,25 +2179,24 @@ impl TransmitWorker {
                 info!("{addr:?} allowed fast {index}");
                 Ok(())
             }
-            PeerMsg::Cancel(addr, req) => {
-                info!("{addr:?} cancel {req:?}");
-                if let Some(pc) = self.connected_peers.get_mut(&addr) {
-                    pc.upload_reqs.remove(&req);
-                }
-                Ok(())
-            }
             PeerMsg::Reject(addr, req) => {
                 self.handle_reject_msg(addr, req);
                 Ok(())
             }
-            PeerMsg::Request(addr, req) => {
-                // TODO: peer requests also in blocksreceived, e.g. NAPI mode
-                // notify only once
-                // TODO: optimize: handle can be passed so avoid map search overhead
-                self.handle_upload_request(addr, req);
-                Ok(())
-            }
         }
+    }
+
+    /// Apply one pulled batch: pieces go through download accounting, requests and
+    /// cancels go through upload admission in arrival order.
+    fn handle_io_msg(&mut self, peer: PeerAddr, io: IoMsg) -> io::Result<()> {
+        let mut n_pieces = 0;
+        for piece in io.pieces {
+            n_pieces += 1;
+            self.handle_piece_msg(&peer, piece.piece, piece.buf, piece.recv_time)?;
+        }
+        debug!("handled {n_pieces} piece messages");
+        self.handle_upload_requests(peer, &io.requests);
+        self.handle_blocks_received(peer, n_pieces)
     }
 
     fn maybe_reject_piece_request(&self, peer: PeerAddr, request: Request) {
@@ -2207,27 +2217,36 @@ impl TransmitWorker {
         )
     }
 
-    fn handle_upload_request(&mut self, peer: PeerAddr, request: Request) {
+    fn handle_upload_requests(&mut self, peer: PeerAddr, requests: &[UploadReq]) {
         if !self.connected_peers.contains_key(&peer) {
             return;
         }
 
         // servable only if that piece is valid and we have(verified) that piece
-        let servable = match &self.torrent_state {
-            TorrentState::Metadata(Downloading { block_picker, .. }) => {
-                block_picker.is_valid(&request) && block_picker.have(request.index)
+        let uploading = self.upload_enabled();
+        for &req in requests {
+            match req {
+                UploadReq::Request(request) => {
+                    let have = match &self.torrent_state {
+                        TorrentState::Metadata(Downloading { block_picker, .. }) => {
+                            block_picker.is_valid(&request) && block_picker.have(request.index)
+                        }
+                        _ => false,
+                    };
+                    if !uploading || !have || !self.enqueue_upload_requests(peer, &[request]) {
+                        self.maybe_reject_piece_request(peer, request);
+                    }
+                }
+                UploadReq::Cancel(request) => {
+                    // only cancel pending reqs, approved reqs are not cancelled
+                    // TODO: cancel approved reqs, can use req to get sub-piece id
+                    // and cancel that request directly
+                    info!("{peer:?} cancel {request:?}");
+                    if let Some(pc) = self.connected_peers.get_mut(&peer) {
+                        pc.upload_reqs.remove(&request);
+                    }
+                }
             }
-            _ => false,
-        };
-
-        if !self.upload_enabled() || !servable {
-            self.maybe_reject_piece_request(peer, request);
-            return;
-        }
-
-        if !self.enqueue_upload_requests(peer, &[request]) {
-            self.maybe_reject_piece_request(peer, request);
-            return;
         }
         self.approve_upload(peer);
     }
@@ -2636,7 +2655,7 @@ impl TransmitWorker {
         peer: PeerAddr,
         n_blocks_received: usize,
     ) -> io::Result<()> {
-        info!("get BlockReceived from {peer:?}");
+        info!("get io msg from {peer:?}");
         let Some(conn) = self.connected_peers.get_mut(&peer) else {
             return Ok(());
         };
@@ -3110,27 +3129,6 @@ impl TransmitWorker {
                 blocktrace::record_block_event(ev);
             }
         }
-    }
-
-    /// Reject every PIECE block arriving during the Checking phase: checking
-    /// only reads from disk, so incoming blocks are rolled back in the picker +
-    /// inflight and their buffers dropped, admitting no new writes.
-    fn handle_pieces_while_checking(
-        &mut self,
-        peer: PeerAddr,
-        receive_blks: Option<ReceivedBlocks>,
-    ) -> io::Result<()> {
-        if !matches!(self.torrent_state, TorrentState::Metadata(_)) {
-            return Ok(());
-        }
-        let Some(blks) = receive_blks else {
-            return Ok(());
-        };
-        for p in blks.blocks {
-            let req = p.piece.to_request();
-            self.handle_reject_msg(peer, req);
-        }
-        Ok(())
     }
 
     fn handle_request_metadata(&mut self, sender: oneshot::Sender<Option<Arc<Metadata>>>) {
