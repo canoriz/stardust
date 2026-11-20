@@ -1549,9 +1549,24 @@ impl TransmitWorker {
         };
         if let Err(e) = r {
             warn!("handle_msg error, fatal: {e}");
-            self.running_state = RunningState::Fatal(format!("{e}"));
-            self.reject_all_pending_piece_upload();
+            self.enter_fatal(format!("{e}"));
         }
+    }
+
+    /// Halt the torrent: refuse uploads, drop every peer and stop announcing.
+    fn enter_fatal(&mut self, reason: String) {
+        self.running_state = RunningState::Fatal(reason);
+        // Reject first, the peers must still be connected to receive it.
+        self.reject_all_pending_piece_upload();
+        let peers: Vec<_> = self.connected_peers.keys().copied().collect();
+        for peer in peers {
+            let _ = self.handle_peer_leave(
+                peer,
+                #[cfg(feature = "blocktrace")]
+                false,
+            );
+        }
+        self.announce_manager.send(announce_manager::Msg::Pause);
     }
 
     #[instrument(skip_all, fields(hash = crate::helper::to_hex(&self.info_hash)))]
@@ -1730,6 +1745,10 @@ impl TransmitWorker {
                 );
                 let peer_addr = to_canonical_addr(bt_conn.peer_addr());
                 let peer_bt_id = bt_conn.peer_id();
+                if matches!(self.running_state, RunningState::Fatal(_)) {
+                    self.candidates.insert(peer_addr, PeerState::Candidate);
+                    return Ok(());
+                }
                 if let Some(until) = self.kicked_peers.get(&peer_bt_id).copied()
                     && time::Instant::now() < until
                 {
@@ -1741,8 +1760,7 @@ impl TransmitWorker {
                     }
                     return Ok(());
                 }
-                // An outward dial is only valid while its address is still Connecting.
-                // An inward connection loses to one already live, or to a kick cooldown.
+
                 let accept = if is_income {
                     match self.candidates.get(&peer_addr) {
                         Some(PeerState::Connected(_)) => false,
@@ -3067,8 +3085,7 @@ impl TransmitWorker {
                 {
                     self.invalidate_piece(ji.index());
                 }
-                self.running_state = RunningState::Fatal(format!("{e}"));
-                self.reject_all_pending_piece_upload();
+                self.enter_fatal(format!("{e}"));
                 Ok(())
             }
         }
@@ -3149,6 +3166,9 @@ impl TransmitWorker {
     }
 
     fn handle_new_discovered_peer(&mut self, addr: SocketAddr) {
+        if matches!(self.running_state, RunningState::Fatal(_)) {
+            return;
+        }
         // Dial only a fresh address, one waiting as a candidate, or one whose
         // kick cooldown has elapsed. Connecting and Connected stay untouched.
         let dialable = match self.candidates.get(&addr) {

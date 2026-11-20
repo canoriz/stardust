@@ -1109,6 +1109,7 @@ impl CacheManager {
         self.trace_flush_end(key, result.is_ok(), origin, dst_us, buf_id);
 
         if let Err(e) = result {
+            // TODO: a failed flush leaves the piece dirty, so it holds its slot until a retry succeeds.
             warn!("cache flush error for {key:?}: {e}");
         }
         self.stats.current.flushes += 1;
