@@ -1,8 +1,10 @@
 mod bandwidth_mode;
 mod conn;
 mod inflight;
+mod upload_queue;
 
 pub use bandwidth_mode::{BandwidthMode, BandwidthModeKind};
+pub use upload_queue::UploadQueue;
 use conn::INIT_RTT_STARTUP;
 pub use conn::{PeerConn, Stat, Version};
 

@@ -8,7 +8,7 @@ use crate::metrics;
 
 use crate::{
     api::InfoHash,
-    conn::{BandwidthMode, BandwidthModeKind, Inflight, PeerAddr, inflight::Rejected},
+    conn::{BandwidthMode, BandwidthModeKind, Inflight, PeerAddr, UploadQueue, inflight::Rejected},
     connection_manager::{ConnectionManagerHandle, CtrlOfSend},
     picker::{BlockRequests, PieceState},
     protocol::{PexFlag, Request},
@@ -85,6 +85,9 @@ pub struct PeerConn {
 
     pub stat: Stat,
 
+    /// Requests this peer asked us, waiting for upload quota.
+    pub upload_reqs: UploadQueue,
+
     #[cfg(feature = "metrics")]
     pub metrics: metrics::PeerMetrics,
 
@@ -127,6 +130,7 @@ impl PeerConn {
             bw_mode: BandwidthMode::new(BandwidthModeKind::Choked),
             inflight: Inflight::new(time::Duration::from_secs(90)),
             stat: Default::default(),
+            upload_reqs: UploadQueue::default(),
             peer_bt_id,
 
             #[cfg(feature = "metrics")]
@@ -161,6 +165,11 @@ impl PeerConn {
 
     pub fn is_choked(&self) -> ChokeStatus {
         self.state.peer_choke_status
+    }
+
+    /// We have unchoked this peer, so it may be served.
+    pub fn upload_enabled(&self) -> bool {
+        self.state.our_choke_status == Some(false)
     }
 
     pub fn is_interested(&self) -> InterestStatus {

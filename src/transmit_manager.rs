@@ -44,6 +44,8 @@ use tracing::{debug, info, instrument, trace, warn};
 
 pub use crate::protocol::InfoHash;
 
+mod upload;
+
 #[cfg(feature = "blocktrace")]
 use crate::blocktrace;
 #[cfg(feature = "metrics")]
@@ -1557,7 +1559,7 @@ impl TransmitWorker {
     fn enter_fatal(&mut self, reason: String) {
         self.running_state = RunningState::Fatal(reason);
         // Reject first, the peers must still be connected to receive it.
-        self.reject_all_pending_piece_upload();
+        self.reject_all_upload_req();
         let peers: Vec<_> = self.connected_peers.keys().copied().collect();
         for peer in peers {
             let _ = self.handle_peer_leave(
@@ -1957,12 +1959,12 @@ impl TransmitWorker {
                     }
                     RunningCmd::Pause => {
                         self.running_state = RunningState::Paused;
-                        self.reject_all_pending_piece_upload();
+                        self.reject_all_upload_req();
                         self.announce_manager.send(announce_manager::Msg::Pause);
                     }
                     RunningCmd::Stop => {
                         self.running_state = RunningState::Stopped;
-                        self.reject_all_pending_piece_upload();
+                        self.reject_all_upload_req();
                         self.announce_manager.send(announce_manager::Msg::Pause);
                     }
                     RunningCmd::Check => todo!(),
@@ -2168,6 +2170,9 @@ impl TransmitWorker {
             }
             PeerMsg::Cancel(addr, req) => {
                 info!("{addr:?} cancel {req:?}");
+                if let Some(pc) = self.connected_peers.get_mut(&addr) {
+                    pc.upload_reqs.remove(&req);
+                }
                 Ok(())
             }
             PeerMsg::Reject(addr, req) => {
@@ -2175,6 +2180,8 @@ impl TransmitWorker {
                 Ok(())
             }
             PeerMsg::Request(addr, req) => {
+                // TODO: peer requests also in blocksreceived, e.g. NAPI mode
+                // notify only once
                 // TODO: optimize: handle can be passed so avoid map search overhead
                 self.handle_upload_request(addr, req);
                 Ok(())
@@ -2218,24 +2225,11 @@ impl TransmitWorker {
             return;
         }
 
-        let ji = JointIndex::from(request);
-        self.request_piecebuf(ji, false);
-        self.waiting_for_piecebuf
-            .get_mut(&ji)
-            .expect("just requested")
-            .reads
-            .push(PendingBlockRead { peer, request });
-    }
-
-    fn reject_all_pending_piece_upload(&mut self) {
-        let reads: Vec<_> = self
-            .waiting_for_piecebuf
-            .values_mut()
-            .flat_map(|pending| std::mem::take(&mut pending.reads))
-            .collect();
-        for PendingBlockRead { peer, request } in reads {
+        if !self.enqueue_upload_requests(peer, &[request]) {
             self.maybe_reject_piece_request(peer, request);
+            return;
         }
+        self.approve_upload(peer);
     }
 
     // Send a block to peer through wire.
@@ -2243,9 +2237,10 @@ impl TransmitWorker {
         let Some(conn) = self.connected_peers.get(&peer) else {
             return;
         };
-
+        if !conn.upload_enabled() {
+            return;
+        }
         if !self.upload_enabled() {
-            self.maybe_reject_piece_request(peer, request);
             return;
         }
 
@@ -3644,6 +3639,8 @@ pub(crate) async fn run_transmit_worker(
     let mut ticker = tokio::time::interval(time::Duration::from_millis(1000));
     let mut dht_ticker = tokio::time::interval(time::Duration::from_secs(60));
     let mut pex_ticker = tokio::time::interval(time::Duration::from_secs(30));
+    let mut upload_ticker = tokio::time::interval(upload::UPLOAD_TICK);
+    let mut rechoke_ticker = tokio::time::interval(upload::RECHOKE_INTERVAL);
 
     loop {
         // TODO: lets use notify?
@@ -3651,6 +3648,12 @@ pub(crate) async fn run_transmit_worker(
             Some(msg) = transmit.receiver.recv() => {
                 // debug!("transmit manager received msg {msg:?}");
                 transmit.handle_msg(msg).await;
+            }
+            _ = upload_ticker.tick() => {
+                transmit.upload_tick();
+            }
+            _ = rechoke_ticker.tick() => {
+                transmit.rechoke();
             }
             _ = dht_ticker.tick() => {
                 info!("dht ticker tick");

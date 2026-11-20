@@ -34,6 +34,8 @@ pub(crate) enum CtrlOfSend {
     Reject(Request),
     Cancel(Request),
     Interested,
+    Choke,
+    Unchoke,
 
     DHTPort(u16),
     BitField(BitField),
@@ -725,6 +727,12 @@ where
             }
             CtrlOfSend::Interested => {
                 self.write_stream.send_interested().await?;
+            }
+            CtrlOfSend::Choke => {
+                self.write_stream.send_choke().await?;
+            }
+            CtrlOfSend::Unchoke => {
+                self.write_stream.send_unchoke().await?;
             }
             CtrlOfSend::DHTPort(p) => {
                 self.write_stream.send_port(p).await?;

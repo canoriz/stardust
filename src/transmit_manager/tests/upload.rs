@@ -55,6 +55,13 @@ async fn peer(worker: &mut TransmitWorker, fast: bool) -> (PeerAddr, DuplexStrea
             None,
         ),
     );
+    // Upload slot peer; tests release its queued requests with `upload_tick`.
+    worker
+        .connected_peers
+        .get_mut(&addr)
+        .unwrap()
+        .state
+        .our_choke_status = Some(false);
     (addr, remote)
 }
 
@@ -141,6 +148,7 @@ async fn upload_wire_requests_share_cache_wait_and_return_exact_bytes() {
             saved.push(msg);
         }
     }
+    worker.upload_tick();
     assert_eq!(worker.waiting_for_piecebuf.len(), 1);
     assert_eq!(
         worker.waiting_for_piecebuf[&JointIndex::new(0, 0)]
@@ -239,6 +247,7 @@ async fn upload_restored_seed_reads_final_bytes_from_disk() {
         len: BLOCK,
     };
     worker.handle_upload_request(addr, request);
+    worker.upload_tick();
     pump(&mut worker).await;
     assert_piece(
         &response(&mut remote).await,
@@ -348,6 +357,7 @@ async fn upload_shutdown_discards_pending_reads_and_new_requests() {
         .unwrap();
     worker.handle_upload_request(addr, existing);
     worker.handle_upload_request(legacy, new_request);
+    worker.upload_tick();
     assert_eq!(worker.waiting_for_piecebuf.len(), 2);
     time::timeout(time::Duration::from_secs(2), worker.cleanup_before_stop())
         .await
