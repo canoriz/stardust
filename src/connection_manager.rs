@@ -28,6 +28,7 @@ use crate::{
 #[derive(Debug)]
 pub(crate) enum CtrlOfSend {
     RequestBlocks(BlockRequests),
+    Piece { request: Request, data: BlockBuf },
     Have(u32),
     Extend(ExtendedMsg),
     Reject(Request),
@@ -681,6 +682,11 @@ where
     // TODO: FIXME: this async write need to be cancel safe also
     async fn handle_cmd(&mut self, msg: CtrlOfSend) -> io::Result<()> {
         match msg {
+            CtrlOfSend::Piece { request, data } => {
+                self.write_stream
+                    .send_piece(request.index, request.begin, &data)
+                    .await?;
+            }
             CtrlOfSend::RequestBlocks(reqs) => {
                 let piece_size = reqs.piece_size;
                 let mut bw = self.write_stream.buf_write();

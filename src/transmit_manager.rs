@@ -732,6 +732,10 @@ impl FetchingMetadata {
 
         if probably_tot_size > 0 && mbuf.not_have.len() == 0 {
             // received full metadata
+            // TODO: check_received_metadata runs to_metadata (and its unsafe-path
+            // check) before verify_info_hash, so a genuine torrent with unsafe
+            // paths is treated as corrupt and re-fetched forever. Verify the hash
+            // on the raw bytes first, then go Fatal on an unusable info.
             match check_received_metadata(mbuf, probably_tot_size, self.magnet.info_hash) {
                 Ok(m) => Some(m),
                 Err(e) => {
@@ -881,8 +885,7 @@ pub struct TransmitWorker {
     /// Announce URLs that have been registered with the announce manager.
     announce_urls: Vec<String>,
 
-    /// received blocks waiting writing to piece buf once
-    /// piece buf is ready
+    /// Pending block writes/reads waiting for piece buffer being ready.
     waiting_for_piecebuf: HashMap<JointIndex, PieceWaitState>,
 
     /// Renames submitted to the cache but not yet acked by FileOpDone.
@@ -929,17 +932,21 @@ pub struct TransmitWorker {
 //     }
 // }
 
-struct BlockWaitingBuf {
+/// Pending writes to write received blocks to PieceBuf
+struct PendingBlockWrite {
     piece: Piece,
     buf: BlockBuf,
 }
 
+/// Pending reads to read requested blocks from PieceBuf
+struct PendingBlockRead {
+    peer: PeerAddr,
+    request: Request,
+}
+
 struct PieceWaitState {
-    blocks: Vec<BlockWaitingBuf>,
-    /// Whether GetPiece has already been sent to CacheManager for this sub-piece.
-    requested: bool,
-    /// Whether the sub-piece is complete (all blocks received).
-    sub_piece_complete: bool,
+    writes: Vec<PendingBlockWrite>,
+    reads: Vec<PendingBlockRead>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1000,18 +1007,13 @@ impl TransmitWorker {
     /// Request a piece buffer, ensuring at most one GetPiece is outstanding
     /// per key. The entry also collects blocks that arrive before PieceBufReady.
     fn request_piecebuf(&mut self, ji: JointIndex, skip_read: bool) {
-        let state = self
-            .waiting_for_piecebuf
-            .entry(ji)
-            .or_insert_with(|| PieceWaitState {
-                blocks: Vec::new(),
-                requested: false,
-                sub_piece_complete: false,
-            });
-        if state.requested {
+        let hash_map::Entry::Vacant(e) = self.waiting_for_piecebuf.entry(ji) else {
             return;
-        }
-        state.requested = true;
+        };
+        e.insert(PieceWaitState {
+            writes: Vec::new(),
+            reads: Vec::new(),
+        });
         self.cache_handle.send_get_piece(
             GlobalPieceKey {
                 info_hash: self.info_hash,
@@ -1127,8 +1129,7 @@ impl TransmitWorker {
         // requests until their replies arrive so GetPiece stays deduplicated.
         for (ji, pending) in &mut self.waiting_for_piecebuf {
             if ji.index() == index {
-                pending.blocks.clear();
-                pending.sub_piece_complete = false;
+                pending.writes.clear();
             }
         }
     }
@@ -1154,6 +1155,9 @@ impl TransmitWorker {
         };
         let (info_hash, torrent_state) = match dump.state {
             TorrentStateDump::Metadata { metadata, picker } => {
+                // TODO: restored metadata skips check_files_within_dir; a dump
+                // written before that check, or a tampered one, may carry paths
+                // escaping the download dir.
                 let info_hash = metadata.info_hash;
                 let downloading = Self::metadata_into_downloading(
                     metadata,
@@ -1546,6 +1550,7 @@ impl TransmitWorker {
         if let Err(e) = r {
             warn!("handle_msg error, fatal: {e}");
             self.running_state = RunningState::Fatal(format!("{e}"));
+            self.reject_all_pending_piece_upload();
         }
     }
 
@@ -1934,10 +1939,12 @@ impl TransmitWorker {
                     }
                     RunningCmd::Pause => {
                         self.running_state = RunningState::Paused;
+                        self.reject_all_pending_piece_upload();
                         self.announce_manager.send(announce_manager::Msg::Pause);
                     }
                     RunningCmd::Stop => {
                         self.running_state = RunningState::Stopped;
+                        self.reject_all_pending_piece_upload();
                         self.announce_manager.send(announce_manager::Msg::Pause);
                     }
                     RunningCmd::Check => todo!(),
@@ -2151,14 +2158,87 @@ impl TransmitWorker {
             }
             PeerMsg::Request(addr, req) => {
                 // TODO: optimize: handle can be passed so avoid map search overhead
-                if let Some(conn) = self.connected_peers.get_mut(&addr) {
-                    if conn.conn.capability().have(protocol::Capability::FAST) {
-                        conn.conn.send_stream_cmd(ConnMsg::Reject(req));
-                    }
-                }
+                self.handle_upload_request(addr, req);
                 Ok(())
             }
         }
+    }
+
+    fn maybe_reject_piece_request(&self, peer: PeerAddr, request: Request) {
+        if let Some(conn) = self.connected_peers.get(&peer)
+            && conn.conn.capability().have(Capability::FAST)
+        {
+            conn.conn.send_stream_cmd(ConnMsg::Reject(request));
+        }
+    }
+
+    #[inline]
+    fn upload_enabled(&self) -> bool {
+        matches!(
+            self.running_state,
+            RunningState::Downloading { .. }
+                | RunningState::Seeding
+                | RunningState::Draining { .. }
+        )
+    }
+
+    fn handle_upload_request(&mut self, peer: PeerAddr, request: Request) {
+        if !self.connected_peers.contains_key(&peer) {
+            return;
+        }
+
+        // servable only if that piece is valid and we have(verified) that piece
+        let servable = match &self.torrent_state {
+            TorrentState::Metadata(Downloading { block_picker, .. }) => {
+                block_picker.is_valid(&request) && block_picker.have(request.index)
+            }
+            _ => false,
+        };
+
+        if !self.upload_enabled() || !servable {
+            self.maybe_reject_piece_request(peer, request);
+            return;
+        }
+
+        let ji = JointIndex::from(request);
+        self.request_piecebuf(ji, false);
+        self.waiting_for_piecebuf
+            .get_mut(&ji)
+            .expect("just requested")
+            .reads
+            .push(PendingBlockRead { peer, request });
+    }
+
+    fn reject_all_pending_piece_upload(&mut self) {
+        let reads: Vec<_> = self
+            .waiting_for_piecebuf
+            .values_mut()
+            .flat_map(|pending| std::mem::take(&mut pending.reads))
+            .collect();
+        for PendingBlockRead { peer, request } in reads {
+            self.maybe_reject_piece_request(peer, request);
+        }
+    }
+
+    // Send a block to peer through wire.
+    fn send_block(&self, peer: PeerAddr, request: Request, piecebuf: &[u8]) {
+        let Some(conn) = self.connected_peers.get(&peer) else {
+            return;
+        };
+
+        if !self.upload_enabled() {
+            self.maybe_reject_piece_request(peer, request);
+            return;
+        }
+
+        let begin = request.begin as usize % SUB_PIECE_SIZE as usize;
+        let end = begin + request.len as usize;
+        // TODO: this copies into a heap-owned BytesMut per block instead of a
+        // pooled BlockBuf from block_pool.
+        conn.conn.send_stream_cmd(ConnMsg::Piece {
+            request,
+            data: BlockBuf::Owned(BytesMut::from(&piecebuf[begin..end])),
+        });
     }
 
     /// Drop the connection `conn_id` at `addr`. A leave whose id does not match the
@@ -2762,10 +2842,7 @@ impl TransmitWorker {
             .waiting_for_piecebuf
             .get_mut(&ji)
             .expect("just requested, should exist");
-        state.blocks.push(BlockWaitingBuf { piece, buf });
-        if complete.sub_piece {
-            state.sub_piece_complete = true;
-        }
+        state.writes.push(PendingBlockWrite { piece, buf });
         Ok(())
     }
 
@@ -2901,8 +2978,8 @@ impl TransmitWorker {
         ji: JointIndex,
         buf: io::Result<PieceLease>,
     ) -> io::Result<()> {
-        // Checking does not accumulate blocks in these entries, but each
-        // requested sub-piece leaves a `requested=true` entry behind.
+        // Checking does not accumulate blocks or reads in these entries.
+        // Each requested sub-piece leaves an entry behind.
         self.waiting_for_piecebuf.remove(&ji);
         match buf {
             Ok(mut lease) => {
@@ -2945,10 +3022,13 @@ impl TransmitWorker {
                 if let Some(ps) = pending {
                     info!(
                         "piecebuf {ji:?} now ready, flushing {} blocks into it",
-                        ps.blocks.len()
+                        ps.writes.len()
                     );
-                    for p in ps.blocks {
+                    for p in ps.writes {
                         copy_to_piecebuf(&p.piece, &p.buf, &mut lease);
+                    }
+                    for r in ps.reads {
+                        self.send_block(r.peer, r.request, &lease);
                     }
                 }
 
@@ -2971,18 +3051,24 @@ impl TransmitWorker {
                 Ok(())
             }
             Err(e) => {
-                // This sub-piece may already contain blocks marked Received
-                // in BlockPicker, but the bytes were not copied into PieceBuf.
-                // Roll back the entire piece in the picker so that blocks are
-                // re-requested on resume.
+                // An unverified piece may have pending writes or a hash
+                // continuation; roll it back so its blocks are re-requested on
+                // resume. A verified piece only carries upload reads.
                 warn!("piecebuf ready error for {ji:?}: {e}");
-
+                if let Some(ps) = pending {
+                    for r in ps.reads {
+                        self.maybe_reject_piece_request(r.peer, r.request);
+                    }
+                }
                 // TODO: FIXME: only abandon that sub-piece and preserve other
                 // existing sub-pieces, so that no need to remove hasher and re-
                 // download entire piece.
-
-                self.invalidate_piece(ji.index());
+                if !matches!(&self.torrent_state, TorrentState::Metadata(d) if d.block_picker.have(ji.index()))
+                {
+                    self.invalidate_piece(ji.index());
+                }
                 self.running_state = RunningState::Fatal(format!("{e}"));
+                self.reject_all_pending_piece_upload();
                 Ok(())
             }
         }
@@ -3313,14 +3399,10 @@ impl TransmitWorker {
 
     // Flush buffered data and finish outstanding renames before shutdown.
     async fn cleanup_before_stop(&mut self) {
-        let to_request: Vec<_> = self
-            .waiting_for_piecebuf
-            .iter()
-            .filter_map(|(ji, state)| (!state.requested).then_some(*ji))
-            .collect();
-        for ji in to_request {
-            self.request_piecebuf(ji, false);
+        for w in self.waiting_for_piecebuf.values_mut() {
+            w.reads.clear();
         }
+
         while !self.waiting_for_piecebuf.is_empty()
             || !self.pending_renames.is_empty()
             || self.recheck_renames_pending()
@@ -3746,6 +3828,7 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     mod hashing;
+    mod upload;
 
     #[test]
     fn test_peer_lift() {

@@ -1379,7 +1379,7 @@ impl BlockPicker {
     }
 
     pub fn get_block_status(&self, req: &Request) -> Option<&BlockStatus> {
-        if !self.check_block_validity(req) {
+        if !self.is_valid(req) {
             return None;
         }
         self.piece(req.index)
@@ -2003,7 +2003,7 @@ impl BlockPicker {
     /// Call when some block request is rejected, and request for that block
     /// should be send to other peers again.
     pub fn peer_reject_block(&mut self, peer: &PeerAddr, req: Request) {
-        if !self.check_block_validity(&req) {
+        if !self.is_valid(&req) {
             return;
         }
         let block = req.begin as usize / BLOCK_SIZE;
@@ -2022,7 +2022,7 @@ impl BlockPicker {
         self.update_piece_state_and_order(req.index);
     }
 
-    fn check_block_validity(&self, req: &Request) -> bool {
+    pub fn is_valid(&self, req: &Request) -> bool {
         let index = req.index;
         if index >= (self.n as u32) {
             info!("invalid req index {index} > {}", self.n);
@@ -2058,7 +2058,7 @@ impl BlockPicker {
     /// )
     pub fn receive_block(&mut self, req: Request) -> (PieceComplete, Vec<PeerAddr>) {
         let ji = JointIndex::from(req);
-        if !self.check_block_validity(&req) {
+        if !self.is_valid(&req) {
             return (
                 PieceComplete {
                     piece: false,
@@ -2203,7 +2203,7 @@ impl BlockPicker {
 
     /// check if we want this block
     pub fn want_block(&mut self, req: Request) -> bool {
-        if !self.check_block_validity(&req) {
+        if !self.is_valid(&req) {
             info!("unwant because invalid {req:?}");
             return false;
         }
@@ -3318,7 +3318,7 @@ mod test {
         // b.peer_new_have(addr, index);
         // b.piece_verified();
         // b.piece_verified();
-        // b.check_block_validity(req)
+        // b.is_valid(req)
         // b.have(index);
         // b.is_finished();
     }

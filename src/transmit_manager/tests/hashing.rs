@@ -98,7 +98,7 @@ fn restore_worker(
 }
 
 // Create a new downloading worker and start its cache manager task.
-fn new_downloading_worker() -> (TransmitWorker, tokio::task::JoinHandle<()>) {
+pub(super) fn new_downloading_worker() -> (TransmitWorker, tokio::task::JoinHandle<()>) {
     let meta = metadata();
     let (cache, handle) = CacheManager::new();
     let task = tokio::spawn(cache.run());
@@ -123,7 +123,7 @@ fn new_downloading_worker() -> (TransmitWorker, tokio::task::JoinHandle<()>) {
 }
 
 // Return the worker's metadata-backed downloading state for assertions.
-fn downloading_state(worker: &mut TransmitWorker) -> &mut Downloading {
+pub(super) fn downloading_state(worker: &mut TransmitWorker) -> &mut Downloading {
     match &mut worker.torrent_state {
         TorrentState::Metadata(d) => d,
         _ => unreachable!(),
@@ -131,13 +131,13 @@ fn downloading_state(worker: &mut TransmitWorker) -> &mut Downloading {
 }
 
 // Queue all blocks of one sub-piece with deterministic test bytes.
-fn queue_received_subpiece(worker: &mut TransmitWorker, sub: u32, byte: u8) {
+pub(super) fn queue_received_subpiece(worker: &mut TransmitWorker, sub: u32, byte: u8) {
     mark_subpiece_received(&mut downloading_state(worker).block_picker, sub);
     let ji = JointIndex::new(0, sub * SUB_PIECE_SIZE);
     worker.request_piecebuf(ji, false);
     let pending = worker.waiting_for_piecebuf.get_mut(&ji).unwrap();
     for i in 0..(SUB_PIECE_SIZE / 16384) {
-        pending.blocks.push(BlockWaitingBuf {
+        pending.writes.push(PendingBlockWrite {
             piece: Piece {
                 index: 0,
                 begin: sub * SUB_PIECE_SIZE + i * 16384,
@@ -150,7 +150,7 @@ fn queue_received_subpiece(worker: &mut TransmitWorker, sub: u32, byte: u8) {
 }
 
 // Drain worker messages until the test queue becomes idle.
-async fn pump(worker: &mut TransmitWorker) {
+pub(super) async fn pump(worker: &mut TransmitWorker) {
     while let Ok(Some(msg)) =
         tokio::time::timeout(Duration::from_millis(100), worker.receiver.recv()).await
     {
@@ -166,7 +166,7 @@ async fn change_state(worker: &mut TransmitWorker, cmd: RunningCmd) {
 }
 
 // Drain pending buffers, unregister the torrent, stop the cache task, and remove the temp file.
-async fn cleanup(mut worker: TransmitWorker, cache: tokio::task::JoinHandle<()>) {
+pub(super) async fn cleanup(mut worker: TransmitWorker, cache: tokio::task::JoinHandle<()>) {
     let path = downloading_state(&mut worker).metadata.files[0].path[0].clone();
     worker.cleanup_before_stop().await;
     cache.abort();
@@ -326,8 +326,8 @@ async fn write_error_clears_hasher_and_waiting_buffers() {
         .waiting_for_piecebuf
         .get_mut(&ji)
         .unwrap()
-        .blocks
-        .push(BlockWaitingBuf {
+        .writes
+        .push(PendingBlockWrite {
             piece: Piece {
                 index: 0,
                 begin: SUB_PIECE_SIZE,
@@ -357,8 +357,7 @@ async fn write_error_clears_hasher_and_waiting_buffers() {
             .have_sub(JointIndex::new(0, 0))
     );
     assert_eq!(pool.available(), 1);
-    let pending = &worker.waiting_for_piecebuf[&ji];
-    assert!(pending.requested && pending.blocks.is_empty());
+    assert!(worker.waiting_for_piecebuf[&ji].writes.is_empty());
     assert!(matches!(worker.running_state, RunningState::Fatal(_)));
 
     // Resume and redownload the piece with deliberately corrupt data in
@@ -392,8 +391,8 @@ async fn read_error_clears_hasher_and_waiting_data() {
         .waiting_for_piecebuf
         .get_mut(&JointIndex::new(0, 0))
         .unwrap()
-        .blocks
-        .push(BlockWaitingBuf {
+        .writes
+        .push(PendingBlockWrite {
             piece: Piece {
                 index: 0,
                 begin: 0,
@@ -410,8 +409,8 @@ async fn read_error_clears_hasher_and_waiting_data() {
         .waiting_for_piecebuf
         .get_mut(&failed_ji)
         .unwrap()
-        .blocks
-        .push(BlockWaitingBuf {
+        .writes
+        .push(PendingBlockWrite {
             piece: Piece {
                 index: 0,
                 begin: SUB_PIECE_SIZE,
@@ -432,10 +431,14 @@ async fn read_error_clears_hasher_and_waiting_data() {
     assert!(!worker.waiting_for_piecebuf.contains_key(&failed_ji));
     assert!(
         worker.waiting_for_piecebuf[&JointIndex::new(0, 0)]
-            .blocks
+            .writes
             .is_empty()
     );
-    assert!(worker.waiting_for_piecebuf[&JointIndex::new(0, 0)].requested);
+    assert!(
+        worker
+            .waiting_for_piecebuf
+            .contains_key(&JointIndex::new(0, 0))
+    );
     assert!(matches!(worker.running_state, RunningState::Fatal(_)));
     cleanup(worker, cache).await;
 }
