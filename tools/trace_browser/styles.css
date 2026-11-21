@@ -596,6 +596,15 @@ canvas {
     background: #708089
 }
 
+.upload-wrap {
+    height: 240px;
+}
+
+.mode-key.our-unchoke .mode-swatch { background: #16837e; }
+.mode-key.our-choke .mode-swatch { background: #d07927; }
+.mode-key.our-unknown .mode-swatch { background: #85939b; }
+
+
 @media(max-width:1000px) {
     .layout {
         grid-template-columns: 210px minmax(0, 1fr)

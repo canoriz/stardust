@@ -8,7 +8,7 @@ import math
 import sqlite3
 import tempfile
 import threading
-from collections import defaultdict
+from collections import defaultdict, deque
 from contextlib import closing
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -19,6 +19,14 @@ STATIC = Path(__file__).resolve().parent
 MIB = 1 << 20
 MAX_UPLOAD = 1024 * 1024 * 1024
 MODES = {1: "Startup", 2: "ProbeBW", 3: "SlowDown", 4: "ProbeRTT", 5: "Choked", 6: "ProbeDown"}
+UPLOAD_WINDOW_US = 2_000_000
+OUR_STATES = {1: "Unknown", 2: "Unknown", 7: "OurChoke", 8: "OurUnchoke"}
+# Both charts use one peer-relative clock, including peers that only upload.
+ACTIVITY = """
+    SELECT peer_id, ts_us FROM bw_sample
+    UNION ALL SELECT peer_id, ts_us FROM block_event WHERE kind=10
+    UNION ALL SELECT peer_id, ts_us FROM peer_state_event WHERE kind IN (1,2,7,8)
+"""
 
 
 def open_db(path: Path) -> sqlite3.Connection:
@@ -38,7 +46,7 @@ def open_db(path: Path) -> sqlite3.Connection:
 def trace_info(path: Path) -> dict:
     with closing(open_db(path)) as db:
         count, start, end = db.execute(
-            "SELECT count(*), min(ts_us), max(ts_us) FROM bw_sample"
+            f"SELECT (SELECT count(*) FROM bw_sample), min(ts_us), max(ts_us) FROM ({ACTIVITY})"
         ).fetchone()
         return {"samples": count, "start_us": start, "end_us": end,
                 "duration_s": round((end - start) / 1e6, 3) if start is not None else 0}
@@ -46,22 +54,35 @@ def trace_info(path: Path) -> dict:
 
 def peer_rows(path: Path) -> list[dict]:
     with closing(open_db(path)) as db:
-        rows = db.execute("""
+        rows = db.execute(f"""
+            WITH activity AS ({ACTIVITY})
             SELECT p.id, p.torrent_id, p.addr, coalesce(t.name, '') torrent_name,
                    coalesce(r.bytes, 0) received_bytes, coalesce(r.blocks, 0) blocks,
-                   coalesce(s.samples, 0) samples, s.first_us, s.last_us,
+                   coalesce(u.bytes, 0) sent_bytes, coalesce(u.blocks, 0) sent_blocks,
+                   coalesce(s.samples, 0) samples, a.first_us, a.last_us,
                    coalesce(conn.connections, 0) connections
               FROM peer p JOIN torrent t ON t.id=p.torrent_id
               LEFT JOIN (SELECT peer_id, sum(coalesce(bytes,16384)) bytes, count(*) blocks
                            FROM block_event WHERE kind=3 GROUP BY peer_id) r ON r.peer_id=p.id
               LEFT JOIN (SELECT peer_id, count(*) samples, min(ts_us) first_us,
                                 max(ts_us) last_us FROM bw_sample GROUP BY peer_id) s ON s.peer_id=p.id
+              LEFT JOIN (SELECT peer_id, sum(coalesce(bytes,16384)) bytes, count(*) blocks
+                           FROM block_event WHERE kind=10 GROUP BY peer_id) u ON u.peer_id=p.id
+              LEFT JOIN (SELECT peer_id, min(ts_us) first_us, max(ts_us) last_us
+                           FROM activity GROUP BY peer_id) a ON a.peer_id=p.id
               LEFT JOIN (SELECT peer_id, count(*) connections FROM peer_state_event
                           WHERE kind=1 GROUP BY peer_id) conn ON conn.peer_id=p.id
-             WHERE s.samples>0
-             ORDER BY r.bytes DESC, s.samples DESC, p.id
+             WHERE s.samples>0 OR u.blocks>0
+             ORDER BY coalesce(r.bytes,0)+coalesce(u.bytes,0) DESC, s.samples DESC, p.id
         """).fetchall()
-        return [{**dict(r), "received_mib": round(r["received_bytes"] / MIB, 3)} for r in rows]
+        return [{**dict(r), "received_mib": round(r["received_bytes"] / MIB, 3),
+                 "sent_mib": round(r["sent_bytes"] / MIB, 3)} for r in rows]
+
+
+def peer_extent(db: sqlite3.Connection, peer_id: int):
+    return db.execute(
+        f"SELECT min(ts_us), max(ts_us) FROM ({ACTIVITY}) WHERE peer_id=?", (peer_id,)
+    ).fetchone()
 
 
 def sample_rows(path: Path, peer_id: int, start_us: int | None, end_us: int | None,
@@ -84,9 +105,7 @@ def sample_rows(path: Path, peer_id: int, start_us: int | None, end_us: int | No
         clauses.append("app_limited=0")
     where = " AND ".join(clauses)
     with closing(open_db(path)) as db:
-        extent = db.execute(
-            "SELECT min(ts_us), max(ts_us) FROM bw_sample WHERE peer_id=?", (peer_id,)
-        ).fetchone()
+        extent = peer_extent(db, peer_id)
         if extent[0] is None:
             return [], {"first_us": None, "last_us": None, "count": 0,
                         "mode_segments": []}
@@ -104,6 +123,57 @@ def sample_rows(path: Path, peer_id: int, start_us: int | None, end_us: int | No
             for r in rows]
     return data, {"first_us": extent[0], "last_us": extent[1], "count": len(data),
                   "mode_segments": mode_segments(data)}
+
+
+def upload_rows(path: Path, peer_id: int, start_us: int | None,
+                end_us: int | None) -> tuple[list[dict], dict]:
+    """Two-second rate of blocks handed to peer IO, with exact our-state transitions."""
+    with closing(open_db(path)) as db:
+        first, last = peer_extent(db, peer_id)
+        if first is None:
+            return [], {"count": 0, "mode_segments": []}
+        start = max(first, start_us if start_us is not None else first)
+        end = min(last, end_us if end_us is not None else last)
+        if end < start:
+            return [], {"count": 0, "mode_segments": []}
+        blocks = db.execute(
+            "SELECT ts_us, coalesce(bytes,16384) bytes FROM block_event "
+            "WHERE peer_id=? AND kind=10 AND ts_us>? AND ts_us<=? ORDER BY ts_us,id",
+            (peer_id, start - UPLOAD_WINDOW_US, end),
+        ).fetchall()
+        # Include state history before the range so a cropped view inherits it.
+        states = db.execute(
+            "SELECT ts_us, kind FROM peer_state_event WHERE peer_id=? "
+            "AND kind IN (1,2,7,8) AND ts_us<=? ORDER BY ts_us,id", (peer_id, end),
+        ).fetchall()
+
+    times = {start, end}
+    for block in blocks:
+        for timestamp in (block["ts_us"], block["ts_us"] + UPLOAD_WINDOW_US):
+            if start <= timestamp <= end:
+                times.add(timestamp)
+    times.update(row["ts_us"] for row in states if start <= row["ts_us"] <= end)
+    pending = deque()
+    total = block_index = state_index = 0
+    our_state = "Unknown"
+    rows = []
+    for timestamp in sorted(times):
+        while block_index < len(blocks) and blocks[block_index]["ts_us"] <= timestamp:
+            block = blocks[block_index]
+            pending.append(block)
+            total += block["bytes"]
+            block_index += 1
+        while pending and pending[0]["ts_us"] <= timestamp - UPLOAD_WINDOW_US:
+            total -= pending.popleft()["bytes"]
+        while state_index < len(states) and states[state_index]["ts_us"] <= timestamp:
+            our_state = OUR_STATES[states[state_index]["kind"]]
+            state_index += 1
+        rows.append({"ts_us": timestamp, "t": (timestamp - first) / 1e6,
+                     "upload_bw_mib": total / (UPLOAD_WINDOW_US / 1e6) / MIB,
+                     "mode": our_state})
+    return rows, {"count": len(rows), "mode_segments": mode_segments(rows),
+                  "start_s": (start - first) / 1e6, "end_s": (end - first) / 1e6,
+                  "window_s": UPLOAD_WINDOW_US / 1e6}
 
 
 def mode_key(row: dict) -> tuple[object, bool]:
@@ -136,7 +206,8 @@ def mode_segments(rows: list[dict]) -> list[dict]:
     return segments
 
 
-def thin_time(rows: list[dict], limit: int) -> list[dict]:
+def thin_time(rows: list[dict], limit: int,
+              metric_keys=("rtt_ms", "bw_mib")) -> list[dict]:
     if len(rows) <= limit:
         return rows
 
@@ -165,7 +236,7 @@ def thin_time(rows: list[dict], limit: int) -> list[dict]:
         lo = math.floor(bucket * len(rows) / bucket_count)
         hi = math.floor((bucket + 1) * len(rows) / bucket_count)
         part = range(lo, hi)
-        for key in ("rtt_ms", "bw_mib"):
+        for key in metric_keys:
             if len(picked) >= limit:
                 break
             picked.add(min(part, key=lambda i: rows[i][key]))
@@ -260,7 +331,10 @@ class Handler(BaseHTTPRequestHandler):
                                          query.get("probe", ["0"])[0] == "1",
                                          query.get("exclude_app", ["0"])[0] == "1",
                                          6 if query.get("mode", [""])[0] == "probe-down" else None)
-                return self.json_reply({"samples": thin_time(data, limit), "meta": meta})
+                uploads, upload_meta = upload_rows(path, peer, start, end)
+                return self.json_reply({"samples": thin_time(data, limit), "meta": meta,
+                                        "upload_samples": thin_time(uploads, limit, ("upload_bw_mib",)),
+                                        "upload_meta": upload_meta})
             self.send_error(404)
         except (ValueError, sqlite3.Error) as exc:
             self.json_reply({"error": str(exc)}, 400)

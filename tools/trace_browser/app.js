@@ -1,10 +1,13 @@
 const $ = id => document.getElementById(id);
-const state = { db: null, peers: [], peer: null, rows: [], meta: null, mode: 'all', view: 'binned', request: 0, selectedModes: new Set() };
+const state = { db: null, peers: [], peer: null, rows: [], meta: null, uploadRows: [], uploadMeta: null, mode: 'all', view: 'binned', request: 0, selectedModes: new Set(), selectedUploadModes: new Set() };
 const modeButtons = [...document.querySelectorAll('[data-mode]')];
 const viewButtons = [...document.querySelectorAll('[data-view]')];
 const timelineModeButtons = [...document.querySelectorAll('[data-timeline-mode]')];
 const timelineSelectAll = document.querySelector('[data-timeline-select-all]');
 const timelineModeKeys = timelineModeButtons.map(button => button.dataset.timelineMode);
+const uploadStateButtons = [...document.querySelectorAll('[data-upload-state]')];
+const uploadSelectAll = document.querySelector('[data-upload-select-all]');
+const uploadColors = { OurUnchoke: '#16837e', OurChoke: '#d07927', Unknown: '#85939b' };
 const fmt = (n, digits = 1) => Number.isFinite(n) ? n.toLocaleString('zh-CN', { maximumFractionDigits: digits }) : '—';
 const median = values => {
   const sorted = [...values].sort((a, b) => a - b);
@@ -35,21 +38,23 @@ async function loadTraces(selectName) {
   await loadDataset(preferred);
 }
 async function loadDataset(name) {
-  state.db = name; state.peer = null; state.rows = [];
+  state.db = name; state.peer = null; state.rows = []; state.meta = null;
+  state.uploadRows = []; state.uploadMeta = null;
+  renderCharts();
   status('正在读取 peer 列表…');
   try {
     state.peers = await api(`/api/peers?db=${encodeURIComponent(name)}`);
     renderPeers();
     if (state.peers.length) await choosePeer(state.peers[0]);
-    else status('这份 trace 没有带宽采样。');
+    else status('这份 trace 没有下载采样或上传记录。');
   } catch (err) { status(err.message, true); }
 }
 function renderPeers() {
   const q = $('peerSearch').value.trim().toLowerCase();
   const matched = state.peers.filter(p => q
     ? `${p.id} ${p.addr} ${p.torrent_name}`.toLowerCase().includes(q)
-    : p.received_bytes > 0);
-  $('peerCount').textContent = q ? `${matched.length} / ${state.peers.length}` : `${matched.length} 有接收`;
+    : p.received_bytes > 0 || p.sent_bytes > 0);
+  $('peerCount').textContent = q ? `${matched.length} / ${state.peers.length}` : `${matched.length} 有传输`;
   const visible = matched.slice(0, 160);
   $('peerList').replaceChildren(...visible.map(peer => {
     const b = document.createElement('button'); b.type = 'button'; b.className = 'peer-row';
@@ -63,6 +68,8 @@ function renderPeers() {
 }
 async function choosePeer(peer) {
   state.peer = peer;
+  state.rows = []; state.meta = null; state.uploadRows = []; state.uploadMeta = null;
+  renderCharts();
   $('peerTitle').textContent = `Peer #${peer.id}`;
   $('torrentName').textContent = peer.torrent_name || `Torrent ${peer.torrent_id}`;
   $('peerMeta').textContent = `${peer.addr} · Torrent ${peer.torrent_id}${peer.connections > 1 ? ` · ${peer.connections} 次连接` : ''}`;
@@ -70,7 +77,7 @@ async function choosePeer(peer) {
   $('sampleCount').textContent = fmt(peer.samples, 0);
   const duration = Math.max(0, (peer.last_us - peer.first_us) / 1e6);
   $('duration').textContent = `${fmt(duration, 1)} s`;
-  $('startSec').value = '0'; $('endSec').value = (Math.ceil(duration * 10) / 10).toFixed(1);
+  $('startSec').value = '0'; $('endSec').value = Math.max(0.1, Math.ceil(duration * 10) / 10).toFixed(1);
   renderPeers(); await loadSamples();
 }
 async function loadSamples() {
@@ -83,9 +90,11 @@ async function loadSamples() {
   try {
     const data = await api(`/api/samples?${params}`);
     if (request !== state.request) return;
-    state.rows = data.samples; state.meta = data.meta; renderCharts();
+    state.rows = data.samples; state.meta = data.meta;
+    state.uploadRows = data.upload_samples || []; state.uploadMeta = data.upload_meta;
+    renderCharts();
     const note = data.meta.count > data.samples.length ? `显示 ${data.samples.length} / ${fmt(data.meta.count, 0)} 个时间采样（保留每段的带宽和RTT极值）` : `${data.samples.length} 个采样`;
-    status(note);
+    status(`${note} · ${state.uploadRows.length} 个上传采样`);
   } catch (err) { if (request === state.request) status(err.message, true); }
 }
 function setPressed(buttons, selected, attr) {
@@ -105,18 +114,19 @@ function visibleModeSegments(segments, selectedModes) {
   if (!selectedModes.size) return segments;
   return segments.filter(segment => selectedModes.has(timelineModeKey(segment)));
 }
-function toggleModeSelection(selectedModes, key) {
-  if (!selectedModes.size || selectedModes.size === timelineModeKeys.length) return new Set([key]);
+function toggleModeSelection(selectedModes, key, keys = timelineModeKeys) {
+  if (!selectedModes.size || selectedModes.size === keys.length) return new Set([key]);
   const next = new Set(selectedModes);
   if (next.has(key)) next.delete(key);
   else next.add(key);
-  return next.size === timelineModeKeys.length ? new Set() : next;
+  return next.size === keys.length ? new Set() : next;
 }
-function updateTimelineModeButtons() {
-  const allSelected = state.selectedModes.size === 0;
-  timelineSelectAll?.setAttribute('aria-pressed', String(allSelected));
-  timelineModeButtons.forEach(button => {
-    button.setAttribute('aria-pressed', String(allSelected || state.selectedModes.has(button.dataset.timelineMode)));
+function updateTimelineModeButtons(buttons = timelineModeButtons, selectAll = timelineSelectAll,
+                                  selected = state.selectedModes, attr = 'timelineMode') {
+  const allSelected = selected.size === 0;
+  selectAll?.setAttribute('aria-pressed', String(allSelected));
+  buttons.forEach(button => {
+    button.setAttribute('aria-pressed', String(allSelected || selected.has(button.dataset[attr])));
   });
 }
 
@@ -218,16 +228,28 @@ function drawScatter() {
   }
 }
 function emptyChart(ctx, w, h) { ctx.fillStyle = '#87969c'; ctx.font = '13px system-ui'; ctx.textAlign = 'center'; ctx.fillText('当前筛选范围没有采样', w / 2, h / 2); }
-function drawTimeline() {
-  const canvas = $('timeline'), { ctx, w, h } = canvasSetup(canvas), rows = state.rows;
-  $('timeCount').textContent = `${rows.length} 点`;
+function drawTimeline(kind = 'download') {
+  const upload = kind === 'upload';
+  const rows = upload ? state.uploadRows : state.rows;
+  const meta = upload ? state.uploadMeta : state.meta;
+  const selected = upload ? state.selectedUploadModes : state.selectedModes;
+  const canvas = $(upload ? 'uploadTimeline' : 'timeline'), { ctx, w, h } = canvasSetup(canvas);
+  canvas._time = null; $(upload ? 'uploadTip' : 'timeTip').hidden = true;
+  $(upload ? 'uploadCount' : 'timeCount').textContent = `${rows.length} 点`;
   if (!rows.length) { emptyChart(ctx, w, h); return; }
+  const lanes = upload ? [
+    { label: 'Upload · MiB/s', key: 'upload_bw_mib', color: '#16837e', max: niceMax(Math.max(...rows.map(r => r.upload_bw_mib))) }
+  ] : [
+    { label: 'BW · MiB/s', key: 'bw_mib', secondary: 'max_bw_mib', color: '#16837e', max: niceMax(Math.max(...rows.map(r => r.max_bw_mib))) },
+    { label: 'In-flight · requests', key: 'inflight', color: '#db8a35', max: niceMax(Math.max(...rows.map(r => r.inflight))) },
+    { label: 'RTT · ms', key: 'rtt_ms', secondary: 'min_rtt_ms', color: '#3d79b4', max: niceMax(Math.max(...rows.map(r => r.rtt_ms))) }
+  ];
   const left = 64, right = 22, top = 30, bottom = 42, laneGap = 24;
-  const laneH = (h - top - bottom - 2 * laneGap) / 3;
-  const start = rows[0].t, end = rows[rows.length - 1].t, span = Math.max(1, end - start);
+  const laneH = (h - top - bottom - (lanes.length - 1) * laneGap) / lanes.length;
+  const start = state.uploadMeta?.start_s ?? rows[0].t, end = state.uploadMeta?.end_s ?? rows[rows.length - 1].t, span = Math.max(0.1, end - start);
   const maxContinuousGap = Math.max(2.5, span / Math.max(1, rows.length - 1) * 3);
   const x = r => left + (r.t - start) / span * (w - left - right);
-  const plotBottom = top + 3 * laneH + 2 * laneGap;
+  const plotBottom = h - bottom;
   const modeColors = {
     Startup: 'rgba(226, 177, 55, 0.16)',
     ProbeDown: 'rgba(61, 121, 180, 0.16)',
@@ -236,14 +258,16 @@ function drawTimeline() {
     SlowDown: 'rgba(224, 133, 45, 0.16)',
     ProbeRTT: 'rgba(125, 104, 185, 0.16)',
     Choked: 'rgba(112, 128, 137, 0.16)',
+    OurUnchoke: 'rgba(22, 131, 126, 0.16)',
+    OurChoke: 'rgba(208, 121, 39, 0.16)',
     Unknown: 'rgba(170, 181, 185, 0.13)'
   };
-  const modeSegments = state.meta?.mode_segments?.length
-    ? state.meta.mode_segments
+  const modeSegments = meta?.mode_segments?.length
+    ? meta.mode_segments
     : buildModeSegments(rows, start, start + span);
-  const selectedSegments = visibleModeSegments(modeSegments, state.selectedModes);
+  const selectedSegments = visibleModeSegments(modeSegments, selected);
   ctx.save();
-  if (state.selectedModes.size) {
+  if (selected.size) {
     ctx.fillStyle = 'rgba(145, 155, 160, 0.12)';
     ctx.fillRect(left, top, w - left - right, plotBottom - top);
   }
@@ -261,22 +285,17 @@ function drawTimeline() {
   ctx.save();
   ctx.strokeStyle = 'rgba(129, 146, 153, 0.72)';
   ctx.lineWidth = 1;
-  for (let i = 1; i < 3; i++) {
+  for (let i = 1; i < lanes.length; i++) {
     const dividerY = top + i * laneH + (i - 0.5) * laneGap;
     ctx.beginPath(); ctx.moveTo(left, dividerY); ctx.lineTo(w - right, dividerY); ctx.stroke();
   }
   ctx.restore();
-  const lanes = [
-    { label: 'BW · MiB/s', key: 'bw_mib', secondary: 'max_bw_mib', color: '#16837e', max: niceMax(Math.max(...rows.map(r => r.max_bw_mib))) },
-    { label: 'In-flight · requests', key: 'inflight', color: '#db8a35', max: niceMax(Math.max(...rows.map(r => r.inflight))) },
-    { label: 'RTT · ms', key: 'rtt_ms', secondary: 'min_rtt_ms', color: '#3d79b4', max: niceMax(Math.max(...rows.map(r => r.rtt_ms))) }
-  ];
   lanes.forEach((lane, i) => {
     const y0 = top + i * (laneH + laneGap), bottom = y0 + laneH;
     ctx.fillStyle = 'rgba(255, 255, 255, 0.94)';
     ctx.fillRect(left, y0 - 19, w - left - right, 22);
     ctx.fillStyle = '#6b7d84'; ctx.font = '11px system-ui'; ctx.textAlign = 'left'; ctx.fillText(lane.label, left, y0 - 7);
-    const legendText = lane.key === 'bw_mib' ? 'avg_bw / max_bw' : lane.key === 'rtt_ms' ? 'RTT / min RTT' : 'inflight';
+    const legendText = lane.key === 'bw_mib' ? 'avg_bw / max_bw' : lane.key === 'rtt_ms' ? 'RTT / min RTT' : upload ? 'upload' : 'inflight';
     ctx.font = '10px system-ui';
     const markerWidth = lane.secondary ? 28 : 14;
     const legendWidth = markerWidth + 6 + ctx.measureText(legendText).width;
@@ -296,8 +315,8 @@ function drawTimeline() {
       ctx.beginPath(); ctx.moveTo(left, yy); ctx.lineTo(w - right, yy); ctx.stroke();
       ctx.textAlign = 'right'; ctx.fillText(fmt(lane.max * (2 - j) / 2, lane.max < 10 ? 1 : 0), left - 8, yy + 4);
     }
-    const drawLine = (key, dashed) => {
-      ctx.beginPath(); ctx.strokeStyle = lane.color; ctx.lineWidth = dashed ? 1 : 2; ctx.globalAlpha = dashed ? 0.48 : 1; ctx.setLineDash(dashed ? [4, 4] : []);
+    const drawLine = (key, dashed, color = lane.color) => {
+      ctx.beginPath(); ctx.strokeStyle = color; ctx.lineWidth = dashed ? 1 : 2; ctx.globalAlpha = dashed ? 0.48 : 1; ctx.setLineDash(dashed ? [4, 4] : []);
       let started = false, previous = null;
       for (const r of rows) {
         if (r[key] === null || r[key] === undefined) { started = false; continue; }
@@ -309,13 +328,22 @@ function drawTimeline() {
       ctx.stroke(); ctx.setLineDash([]); ctx.globalAlpha = 1;
     };
     if (lane.secondary) drawLine(lane.secondary, true);
-    drawLine(lane.key, false);
+    if (upload) {
+      // Reuse the line renderer, clipped to the selected intervals of each color.
+      for (const [mode, color] of Object.entries(uploadColors)) {
+        ctx.save(); ctx.beginPath();
+        for (const segment of selectedSegments.filter(s => s.mode === mode)) {
+          ctx.rect(x({ t: segment.start }), y0, (segment.end - segment.start) / span * (w - left - right), laneH);
+        }
+        ctx.clip(); drawLine(lane.key, false, color); ctx.restore();
+      }
+    } else drawLine(lane.key, false);
   });
   ctx.fillStyle = '#708189'; ctx.font = '11px system-ui'; ctx.textAlign = 'center';
   for (let i = 0; i <= 4; i++) ctx.fillText(`${fmt(start + span * i / 4, 1)}s`, left + (w - left - right) * i / 4, h - 8);
-  canvas._time = { left, right, x, rows, top, laneH, laneGap, h, w, modeSegments };
+  canvas._time = { left, right, x, rows, top, laneH, laneGap, h, w, modeSegments, selectedSegments, start, span };
 }
-function renderCharts() { drawScatter(); drawTimeline(); }
+function renderCharts() { drawScatter(); drawTimeline(); drawTimeline('upload'); }
 function setupHover() {
   const scatter = $('scatter'), tip = $('scatterTip');
   scatter.addEventListener('pointermove', event => {
@@ -327,31 +355,41 @@ function setupHover() {
     showTip(scatter, tip, event, `inflight <b>${fmt(p.inflight, 1)}</b><br>RTT <b>${fmt(p.rtt_ms, 2)} ms</b><br>avg_bw <b>${fmt(p.bw_mib, 3)} MiB/s</b>${p.count > 1 ? `<br>${p.count} 个采样的中位值` : `<br>t = ${fmt(p.t, 2)} s · ${p.mode}`}`);
   });
   scatter.addEventListener('pointerleave', () => { tip.hidden = true; });
-  const canvas = $('timeline'), timeTip = $('timeTip');
-  canvas.addEventListener('pointermove', event => {
-    const state = canvas._time; if (!state) return;
-    const rect = canvas.getBoundingClientRect(), px = event.clientX - rect.left;
-    let lo = 0, hi = state.rows.length - 1;
-    while (lo < hi) { const mid = (lo + hi) >> 1; if (state.x(state.rows[mid]) < px) lo = mid + 1; else hi = mid; }
-    const idx = lo > 0 && Math.abs(state.x(state.rows[lo - 1]) - px) < Math.abs(state.x(state.rows[lo]) - px) ? lo - 1 : lo;
-    const r = state.rows[idx];
-    showTip(canvas, timeTip, event, `<b>t = ${fmt(r.t, 2)} s</b> · ${r.mode}${r.app_limited ? ' · app-limited' : ''}<br>avg_bw ${fmt(r.bw_mib, 3)} / max_bw ${fmt(r.max_bw_mib, 3)} MiB/s<br>inflight ${fmt(r.inflight, 0)} · RTT ${fmt(r.rtt_ms, 2)} ms`);
-  });
-  canvas.addEventListener('pointerleave', () => { timeTip.hidden = true; });
+  for (const upload of [false, true]) {
+    const canvas = $(upload ? 'uploadTimeline' : 'timeline'), tip = $(upload ? 'uploadTip' : 'timeTip');
+    canvas.addEventListener('pointermove', event => {
+      const chart = canvas._time; if (!chart) return;
+      const rect = canvas.getBoundingClientRect(), px = event.clientX - rect.left;
+      const t = chart.start + (px - chart.left) / (chart.w - chart.left - chart.right) * chart.span;
+      const segment = chart.selectedSegments.find(s => s.start <= t && t <= s.end);
+      if (upload && !segment) { tip.hidden = true; return; }
+      let lo = 0, hi = chart.rows.length - 1;
+      while (lo < hi) { const mid = (lo + hi) >> 1; if (chart.x(chart.rows[mid]) < px) lo = mid + 1; else hi = mid; }
+      const idx = lo > 0 && Math.abs(chart.x(chart.rows[lo - 1]) - px) < Math.abs(chart.x(chart.rows[lo]) - px) ? lo - 1 : lo;
+      const r = chart.rows[idx];
+      const html = upload
+        ? `<b>t = ${fmt(r.t, 2)} s</b> · ${segment.mode}<br>上传 <b>${fmt(r.upload_bw_mib, 3)} MiB/s</b>`
+        : `<b>t = ${fmt(r.t, 2)} s</b> · ${r.mode}${r.app_limited ? ' · app-limited' : ''}<br>avg_bw ${fmt(r.bw_mib, 3)} / max_bw ${fmt(r.max_bw_mib, 3)} MiB/s<br>inflight ${fmt(r.inflight, 0)} · RTT ${fmt(r.rtt_ms, 2)} ms`;
+      showTip(canvas, tip, event, html);
+    });
+    canvas.addEventListener('pointerleave', () => { tip.hidden = true; });
+  }
 }
 
 modeButtons.forEach(b => b.addEventListener('click', () => { state.mode = b.dataset.mode; setPressed(modeButtons, state.mode, 'mode'); loadSamples(); }));
 viewButtons.forEach(b => b.addEventListener('click', () => { state.view = b.dataset.view; setPressed(viewButtons, state.view, 'view'); drawScatter(); }));
-timelineSelectAll?.addEventListener('click', () => {
-  state.selectedModes.clear();
-  updateTimelineModeButtons();
-  if (state.rows.length) drawTimeline();
-});
-timelineModeButtons.forEach(button => button.addEventListener('click', () => {
-  state.selectedModes = toggleModeSelection(state.selectedModes, button.dataset.timelineMode);
-  updateTimelineModeButtons();
-  if (state.rows.length) drawTimeline();
-}));
+function bindTimelineModeButtons(buttons, selectAll, attr, field, kind) {
+  const update = () => updateTimelineModeButtons(buttons, selectAll, state[field], attr);
+  selectAll.addEventListener('click', () => { state[field].clear(); update(); drawTimeline(kind); });
+  const keys = buttons.map(button => button.dataset[attr]);
+  buttons.forEach(button => button.addEventListener('click', () => {
+    state[field] = toggleModeSelection(state[field], button.dataset[attr], keys);
+    update(); drawTimeline(kind);
+  }));
+  update();
+}
+bindTimelineModeButtons(timelineModeButtons, timelineSelectAll, 'timelineMode', 'selectedModes', 'download');
+bindTimelineModeButtons(uploadStateButtons, uploadSelectAll, 'uploadState', 'selectedUploadModes', 'upload');
 $('dataset').addEventListener('change', event => loadDataset(event.target.value));
 $('peerSearch').addEventListener('input', renderPeers);
 $('excludeApp').addEventListener('change', loadSamples);
@@ -367,7 +405,7 @@ $('upload').addEventListener('change', async event => {
   event.target.value = '';
 });
 setupHover();
-updateTimelineModeButtons();
-new ResizeObserver(() => { if (state.rows.length) renderCharts(); }).observe($('scatter').parentElement);
-new ResizeObserver(() => { if (state.rows.length) renderCharts(); }).observe($('timeline').parentElement);
+new ResizeObserver(renderCharts).observe($('scatter').parentElement);
+new ResizeObserver(renderCharts).observe($('timeline').parentElement);
+new ResizeObserver(renderCharts).observe($('uploadTimeline').parentElement);
 loadTraces().catch(err => status(err.message, true));
