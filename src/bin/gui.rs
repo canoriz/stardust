@@ -123,6 +123,7 @@ struct TorrentRow {
     name: Option<String>,
     progress: f64, // 0.0 … 1.0
     speed_bps: f64,
+    upload_speed_bps: f64,
     state: RunningStateDump,
     max_bw_bounded: bool,
 }
@@ -134,6 +135,7 @@ impl Default for TorrentRow {
             name: None,
             progress: 0.0,
             speed_bps: 0.0,
+            upload_speed_bps: 0.0,
             state: RunningStateDump::Stopped,
             max_bw_bounded: false,
         }
@@ -448,13 +450,14 @@ impl eframe::App for GuiApp {
                         // ── header row ──
                         ui.strong("Name");
                         ui.strong("Progress");
-                        ui.strong("Speed");
+                        ui.strong("Download");
+                        ui.strong("Upload");
                         ui.strong("Status");
                         ui.strong("Actions");
                         ui.end_row();
 
                         // ── separator via a full-width label trick ──
-                        for _ in 0..5 {
+                        for _ in 0..6 {
                             ui.separator();
                         }
                         ui.end_row();
@@ -492,8 +495,11 @@ impl eframe::App for GuiApp {
                                     .text(pct_label),
                             );
 
-                            // Speed
+                            // Download / upload speed
                             ui.label(egui::RichText::new(fmt_speed(row.speed_bps)).monospace());
+                            ui.label(
+                                egui::RichText::new(fmt_speed(row.upload_speed_bps)).monospace(),
+                            );
 
                             // Status label
                             match &row.state {
@@ -842,6 +848,7 @@ async fn refresh_rows(
             name,
             process,
             bandwidth_bps,
+            upload_bandwidth_bps,
             state,
             max_bw_bounded,
             ..
@@ -853,6 +860,7 @@ async fn refresh_rows(
                 name,
                 progress: process,
                 speed_bps: bandwidth_bps,
+                upload_speed_bps: upload_bandwidth_bps,
                 max_bw_bounded,
             });
         }

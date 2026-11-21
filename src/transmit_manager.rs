@@ -200,6 +200,7 @@ pub struct TorrentRuntimeStatus {
     pub name: Option<String>,
     pub process: f64,
     pub bandwidth_bps: f64,
+    pub upload_bandwidth_bps: f64,
     pub selected: Vec<u32>,
     pub have: Vec<u32>,
     pub state: RunningStateDump,
@@ -2037,12 +2038,18 @@ impl TransmitWorker {
             .values()
             .map(|p| p.bw.count_avg_bw_in(time::Duration::from_secs(2)) as f64)
             .sum();
+        let upload_bandwidth_bps = self
+            .connected_peers
+            .values()
+            .map(|p| p.upload_bw.count_avg_bw_in(time::Duration::from_secs(2)) as f64)
+            .sum();
 
         TorrentRuntimeStatus {
             info_hash: self.info_hash,
             name,
             process,
             bandwidth_bps,
+            upload_bandwidth_bps,
             selected,
             have,
             state: self.running_state.dump(),

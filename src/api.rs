@@ -27,7 +27,7 @@
 //! | remove_torrent   | `info_hash`                        | `"remove_torrent_accepted"` |
 //! | shutdown         | —                                  | `"shutdown_accepted"` |
 //! | list_torrents    | —                                  | `{"list_torrents":{"torrents":["<hex>", ...]}}` |
-//! | get_torrent_status | `info_hash`                      | `{"torrent_status":{"info_hash":"<hex>","process":0.42,"bandwidth_bps":12345.0,"selected":[0,1],"have":[0]}}` |
+//! | get_torrent_status | `info_hash`                      | `{"torrent_status":{"info_hash":"<hex>","process":0.42,"bandwidth_bps":12345.0,"upload_bandwidth_bps":6789.0,"selected":[0,1],"have":[0]}}` |
 //! | get_cache_stats  | —                                  | `{"cache_stats":{"capacity":60,"request_rate":12.0,"clear_ratio":0.5, ...}}` |
 //!
 //! On error: `{"error":{"error":"<message>"}}`
@@ -139,7 +139,10 @@ pub enum RpcResponse {
         #[serde(skip_serializing_if = "Option::is_none")]
         name: Option<String>,
         process: f64,
+        /// download bytes per second
         bandwidth_bps: f64,
+        /// upload bytes per second
+        upload_bandwidth_bps: f64,
         selected: Vec<u32>,
         have: Vec<u32>,
         state: RunningStateDump,
@@ -366,6 +369,7 @@ pub async fn handle_rpc(session: &Session, req: RpcRequest) -> (RpcResponse, boo
                         name: st.name,
                         process: st.process,
                         bandwidth_bps: st.bandwidth_bps,
+                        upload_bandwidth_bps: st.upload_bandwidth_bps,
                         selected: st.selected,
                         have: st.have,
                         state: st.state,
@@ -500,6 +504,7 @@ mod tests {
             name: None,
             process: 0.42,
             bandwidth_bps: 12345.0,
+            upload_bandwidth_bps: 6789.0,
             selected: vec![0, 2],
             have: vec![0],
             state: RunningStateDump::Downloading,
@@ -508,7 +513,7 @@ mod tests {
         .expect("serialize torrent status");
         assert_eq!(
             status,
-            r#"{"torrent_status":{"info_hash":"001122","process":0.42,"bandwidth_bps":12345.0,"selected":[0,2],"have":[0],"state":"Downloading","max_bw_bounded":false}}"#
+            r#"{"torrent_status":{"info_hash":"001122","process":0.42,"bandwidth_bps":12345.0,"upload_bandwidth_bps":6789.0,"selected":[0,2],"have":[0],"state":"Downloading","max_bw_bounded":false}}"#
         );
     }
 
