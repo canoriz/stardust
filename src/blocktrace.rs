@@ -31,11 +31,16 @@ pub enum EventKind {
     Cancel = 5,
     Reject = 6,
     Timeout = 7,
+    RecvReq = 8,
+    ApproveReq = 9,
+    SendBlock = 10,
+    SendReject = 11,
+    RecvCancel = 12,
 }
 
 impl EventKind {
     /// Variant list, used only to seed the `event_kind` lookup table.
-    const ALL: [EventKind; 7] = [
+    const ALL: [EventKind; 12] = [
         Self::Pick,
         Self::Repick,
         Self::Receive,
@@ -43,6 +48,11 @@ impl EventKind {
         Self::Cancel,
         Self::Reject,
         Self::Timeout,
+        Self::RecvReq,
+        Self::ApproveReq,
+        Self::SendBlock,
+        Self::RecvCancel,
+        Self::SendReject,
     ];
     pub fn id(self) -> i64 {
         self as i64
@@ -56,6 +66,11 @@ impl EventKind {
             Self::Cancel => "cancel",
             Self::Reject => "reject",
             Self::Timeout => "timeout",
+            Self::RecvReq => "recv_req",
+            Self::ApproveReq => "approve_req",
+            Self::SendBlock => "send_block",
+            Self::SendReject => "send_reject",
+            Self::RecvCancel => "recv_cancel",
         }
     }
 }
@@ -103,9 +118,6 @@ impl RepickReason {
 /// `peer_state_event.kind` (no lookup table; the set is tiny and fixed).
 ///
 /// Records connection lifecycle, bandwidth-mode and picker-class transitions.
-/// Choke/unchoke and interested/uninterested are orthogonal
-/// dimensions (not one mutually-exclusive state), and the stalled/choked case
-/// is already expressed by a `BwMode` event carrying `BwMode::Choked`.
 #[derive(Clone, Copy, Debug)]
 pub enum PeerStateKind {
     Connect = 1,
@@ -114,6 +126,10 @@ pub enum PeerStateKind {
     Kicked = 4,
     SlowToFast = 5,
     FastToSlow = 6,
+    OurChoke = 7,
+    OurUnchoke = 8,
+    PeerChoke = 9,
+    PeerUnchoke = 10,
 }
 
 impl PeerStateKind {

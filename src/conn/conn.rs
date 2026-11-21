@@ -3,6 +3,8 @@ use std::{collections::HashMap, net::SocketAddr};
 use tokio::time;
 use tracing::{debug, trace};
 
+#[cfg(feature = "blocktrace")]
+use crate::blocktrace;
 #[cfg(feature = "metrics")]
 use crate::metrics;
 
@@ -110,6 +112,36 @@ pub struct PeerConn {
 }
 
 impl PeerConn {
+    /// Build a block trace event when both trace IDs are available.
+    /// Event-specific fields are left unset for the caller to fill.
+    #[cfg(feature = "blocktrace")]
+    pub fn block_event(
+        &self,
+        torrent_id: Option<i64>,
+        request: Request,
+        kind: blocktrace::EventKind,
+    ) -> Option<blocktrace::BlockEvent> {
+        Some(blocktrace::BlockEvent::at(
+            torrent_id?,
+            self.blocktrace_peer_id?,
+            request.index as i64,
+            (request.begin >> 14) as i64,
+            kind,
+        ))
+    }
+
+    #[cfg(feature = "blocktrace")]
+    pub fn trace_choke_state(&self, kind: blocktrace::PeerStateKind) {
+        if let Some(peer_id) = self.blocktrace_peer_id {
+            blocktrace::record_peer_state(blocktrace::PeerStateEvent {
+                peer_id,
+                ts_us: blocktrace::now_us(),
+                kind,
+                mode: None,
+            });
+        }
+    }
+
     pub fn new(
         cm: ConnectionManagerHandle,
         conn_id: Version,

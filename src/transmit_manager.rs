@@ -1448,25 +1448,18 @@ impl TransmitWorker {
                 #[cfg(feature = "metrics")]
                 conn.metrics.record_cancel();
                 #[cfg(feature = "blocktrace")]
-                if let (Some(tid), Some(pid)) =
-                    (self.blocktrace_torrent_id, conn.blocktrace_peer_id)
                 {
                     let kind = match revoke {
                         Revoke::Timeout(_) => blocktrace::EventKind::Timeout,
                         Revoke::SlowTakeover(_) => blocktrace::EventKind::Cancel,
                     };
-                    let mut ev = blocktrace::BlockEvent::at(
-                        tid,
-                        pid,
-                        req.index as i64,
-                        (req.begin >> 14) as i64,
-                        kind,
-                    );
-                    if matches!(revoke, Revoke::SlowTakeover(_)) {
-                        ev.reason = Some(blocktrace::RepickReason::SlowTakeover);
+                    if let Some(mut ev) = conn.block_event(self.blocktrace_torrent_id, req, kind) {
+                        if matches!(revoke, Revoke::SlowTakeover(_)) {
+                            ev.reason = Some(blocktrace::RepickReason::SlowTakeover);
+                        }
+                        ev.n_inflight = Some(conn.inflight.inflight(conn.bw.get_rtt_4var()) as i64);
+                        blocktrace::record_block_event(ev);
                     }
-                    ev.n_inflight = Some(conn.inflight.inflight(conn.bw.get_rtt_4var()) as i64);
-                    blocktrace::record_block_event(ev);
                 }
             }
         }
@@ -2098,9 +2091,11 @@ impl TransmitWorker {
             }
             PeerMsg::Choke(peer) => {
                 warn!("{} choked us", peer.0);
-                if self.connected_peers.get(&peer).is_none() {
+                let Some(_conn) = self.connected_peers.get(&peer) else {
                     return Ok(());
-                }
+                };
+                #[cfg(feature = "blocktrace")]
+                _conn.trace_choke_state(blocktrace::PeerStateKind::PeerChoke);
                 let piece_picker = match &mut self.torrent_state {
                     TorrentState::Metadata(d) => &mut d.block_picker,
                     TorrentState::Fetching(_) => {
@@ -2123,6 +2118,8 @@ impl TransmitWorker {
                 warn!("{} unchoked us", peer.0);
                 if let Some(st) = self.connected_peers.get_mut(&peer) {
                     st.unchoke();
+                    #[cfg(feature = "blocktrace")]
+                    st.trace_choke_state(blocktrace::PeerStateKind::PeerUnchoke);
                     if let TorrentState::Metadata(downloading) = &mut self.torrent_state {
                         downloading.block_picker.peer_unchoke(&peer);
                     }
@@ -2204,6 +2201,8 @@ impl TransmitWorker {
             && conn.conn.capability().have(Capability::FAST)
         {
             conn.conn.send_stream_cmd(ConnMsg::Reject(request));
+            #[cfg(feature = "blocktrace")]
+            self.trace_upload_request(peer, request, blocktrace::EventKind::SendReject, None);
         }
     }
 
@@ -2227,6 +2226,8 @@ impl TransmitWorker {
         for &req in requests {
             match req {
                 UploadReq::Request(request) => {
+                    #[cfg(feature = "blocktrace")]
+                    self.trace_upload_request(peer, request, blocktrace::EventKind::RecvReq, None);
                     let have = match &self.torrent_state {
                         TorrentState::Metadata(Downloading { block_picker, .. }) => {
                             block_picker.is_valid(&request) && block_picker.have(request.index)
@@ -2245,6 +2246,13 @@ impl TransmitWorker {
                     if let Some(pc) = self.connected_peers.get_mut(&peer) {
                         pc.upload_reqs.remove(&request);
                     }
+                    #[cfg(feature = "blocktrace")]
+                    self.trace_upload_request(
+                        peer,
+                        request,
+                        blocktrace::EventKind::RecvCancel,
+                        None,
+                    );
                 }
             }
         }
@@ -2271,6 +2279,8 @@ impl TransmitWorker {
             request,
             data: BlockBuf::Owned(BytesMut::from(&piecebuf[begin..end])),
         });
+        #[cfg(feature = "blocktrace")]
+        self.trace_upload_request(peer, request, blocktrace::EventKind::SendBlock, None);
     }
 
     /// Drop the connection `conn_id` at `addr`. A leave whose id does not match the
@@ -2767,16 +2777,11 @@ impl TransmitWorker {
                         .set_inflight(conn.inflight.inflight(conn.bw.get_rtt_4var()) as f64);
                 }
                 #[cfg(feature = "blocktrace")]
-                if let (Some(tid), Some(pid)) =
-                    (self.blocktrace_torrent_id, conn.blocktrace_peer_id)
-                {
-                    let mut ev = blocktrace::BlockEvent::at(
-                        tid,
-                        pid,
-                        req.index as i64,
-                        (req.begin >> 14) as i64,
-                        blocktrace::EventKind::Duplicate,
-                    );
+                if let Some(mut ev) = conn.block_event(
+                    self.blocktrace_torrent_id,
+                    req,
+                    blocktrace::EventKind::Duplicate,
+                ) {
                     ev.rtt_us = rtt.map(|d| d.as_micros() as i64);
                     ev.n_inflight = Some(conn.inflight.inflight(conn.bw.get_rtt_4var()) as i64);
                     ev.bytes = Some(piece.len as i64);
@@ -2808,14 +2813,11 @@ impl TransmitWorker {
                     .set_inflight(conn.inflight.inflight(conn.bw.get_rtt_4var()) as f64);
             }
             #[cfg(feature = "blocktrace")]
-            if let (Some(tid), Some(pid)) = (self.blocktrace_torrent_id, conn.blocktrace_peer_id) {
-                let mut ev = blocktrace::BlockEvent::at(
-                    tid,
-                    pid,
-                    req.index as i64,
-                    (req.begin >> 14) as i64,
-                    blocktrace::EventKind::Receive,
-                );
+            if let Some(mut ev) = conn.block_event(
+                self.blocktrace_torrent_id,
+                req,
+                blocktrace::EventKind::Receive,
+            ) {
                 ev.rtt_us = rtt.map(|d| d.as_micros() as i64);
                 ev.n_inflight = Some(conn.inflight.inflight(conn.bw.get_rtt_4var()) as i64);
                 ev.bytes = Some(piece.len as i64);
@@ -2852,16 +2854,11 @@ impl TransmitWorker {
                         conn.metrics.record_cancel();
                     }
                     #[cfg(feature = "blocktrace")]
-                    if let (Some(tid), Some(pid)) =
-                        (self.blocktrace_torrent_id, conn.blocktrace_peer_id)
-                    {
-                        let mut ev = blocktrace::BlockEvent::at(
-                            tid,
-                            pid,
-                            req.index as i64,
-                            (req.begin >> 14) as i64,
-                            blocktrace::EventKind::Cancel,
-                        );
+                    if let Some(mut ev) = conn.block_event(
+                        self.blocktrace_torrent_id,
+                        req,
+                        blocktrace::EventKind::Cancel,
+                    ) {
                         ev.n_inflight = Some(conn.inflight.inflight(conn.bw.get_rtt_4var()) as i64);
                         blocktrace::record_block_event(ev);
                     }
@@ -3116,14 +3113,11 @@ impl TransmitWorker {
         if let Some(h) = self.connected_peers.get_mut(&peer) {
             let _rtt = h.reject(req).map(|r| r.rtt);
             #[cfg(feature = "blocktrace")]
-            if let (Some(tid), Some(pid)) = (self.blocktrace_torrent_id, h.blocktrace_peer_id) {
-                let mut ev = blocktrace::BlockEvent::at(
-                    tid,
-                    pid,
-                    req.index as i64,
-                    (req.begin >> 14) as i64,
-                    blocktrace::EventKind::Reject,
-                );
+            if let Some(mut ev) = h.block_event(
+                self.blocktrace_torrent_id,
+                req,
+                blocktrace::EventKind::Reject,
+            ) {
                 ev.rtt_us = _rtt.map(|d| d.as_micros() as i64);
                 ev.n_inflight = Some(h.inflight.inflight(h.bw.get_rtt_4var()) as i64);
                 blocktrace::record_block_event(ev);

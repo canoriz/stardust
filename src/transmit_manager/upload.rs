@@ -21,6 +21,24 @@ fn alloc_quota(budget: u64, queued: u64, total: u64) -> u64 {
 }
 
 impl TransmitWorker {
+    #[cfg(feature = "blocktrace")]
+    pub(super) fn trace_upload_request(
+        &self,
+        peer: PeerAddr,
+        request: Request,
+        kind: blocktrace::EventKind,
+        rtt: Option<time::Duration>,
+    ) {
+        let Some(conn) = self.connected_peers.get(&peer) else {
+            return;
+        };
+        if let Some(mut ev) = conn.block_event(self.blocktrace_torrent_id, request, kind) {
+            ev.bytes = Some(request.len as i64);
+            ev.rtt_us = rtt.map(|d| d.as_micros() as i64);
+            blocktrace::record_block_event(ev);
+        }
+    }
+
     /// Queue a request from an upload slot peer; false if it is not a slot or its queue is full.
     pub(super) fn enqueue_upload_requests(&mut self, peer: PeerAddr, request: &[Request]) -> bool {
         let Some(pc) = self.connected_peers.get_mut(&peer) else {
@@ -64,15 +82,9 @@ impl TransmitWorker {
                 .expect("just requested")
                 .reads
                 .push(PendingBlockRead { peer, request });
+            #[cfg(feature = "blocktrace")]
+            self.trace_upload_request(peer, request, blocktrace::EventKind::ApproveReq, Some(rtt));
         }
-
-        let conn = self.connected_peers.get(&peer).expect("connected peer");
-        debug!(
-            ?peer,
-            upload_bps = conn.upload_bw.count_avg_bw_in(time::Duration::from_secs(2)),
-            upload_rtt = ?conn.upload_bw.get_rtt(),
-            "peer upload bandwidth"
-        );
     }
 
     /// Split this tick's budget among slot peers by queued bytes and release what it covers.
@@ -142,6 +154,8 @@ impl TransmitWorker {
             {
                 pc.state.our_choke_status = Some(false);
                 pc.conn.send_stream_cmd(ConnMsg::Unchoke);
+                #[cfg(feature = "blocktrace")]
+                pc.trace_choke_state(blocktrace::PeerStateKind::OurUnchoke);
             }
         }
     }
@@ -154,6 +168,8 @@ impl TransmitWorker {
         };
         pc.state.our_choke_status = Some(true);
         pc.conn.send_stream_cmd(ConnMsg::Choke);
+        #[cfg(feature = "blocktrace")]
+        pc.trace_choke_state(blocktrace::PeerStateKind::OurChoke);
     }
 
     /// Drop and reject all not yet approved requests from `peer`
@@ -226,7 +242,7 @@ mod tests {
     }
 
     #[test]
-    fn queue_releases_only_what_quota_covers_and_keeps_remainder() {
+    fn queue_approve_only_what_quota_covers_and_keeps_remainder() {
         let mut q = UploadQueue::default();
         q.push(req(10));
         q.push(req(10));
