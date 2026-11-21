@@ -46,15 +46,33 @@ impl TransmitWorker {
         }
 
         let reqs: Vec<_> = std::iter::from_fn(|| conn.upload_reqs.pop_next_request()).collect();
-        for request in reqs {
+        if reqs.is_empty() {
+            return;
+        }
+        for queued in reqs {
+            let request = queued.req;
             let ji = JointIndex::from(request);
+            // Upload RTT ends at cache handoff, excluding cache reads and wire IO.
+            let rtt = queued.recv_at.elapsed();
             self.request_piecebuf(ji, false);
+            let conn = self.connected_peers.get_mut(&peer).expect("connected peer");
+            conn.upload_bw
+                .add_sample(request.len as usize, Some(rtt), None);
+            conn.upload_bw.add_rtt(rtt);
             self.waiting_for_piecebuf
                 .get_mut(&ji)
                 .expect("just requested")
                 .reads
                 .push(PendingBlockRead { peer, request });
         }
+
+        let conn = self.connected_peers.get(&peer).expect("connected peer");
+        debug!(
+            ?peer,
+            upload_bps = conn.upload_bw.count_avg_bw_in(time::Duration::from_secs(2)),
+            upload_rtt = ?conn.upload_bw.get_rtt(),
+            "peer upload bandwidth"
+        );
     }
 
     /// Split this tick's budget among slot peers by queued bytes and release what it covers.

@@ -78,7 +78,9 @@ pub struct PeerConn {
     pub pex_known_peers: HashMap<SocketAddr, Option<PexFlag>>,
     pub state: PeerStatus,
     pub bitmap: Option<PieceState>,
+
     pub bw: Bandwidth,
+    pub upload_bw: Bandwidth,
 
     pub inflight: Inflight,
     pub bw_mode: BandwidthMode,
@@ -127,6 +129,7 @@ impl PeerConn {
             },
             bitmap: None,
             bw: Bandwidth::new(),
+            upload_bw: Bandwidth::new(),
             bw_mode: BandwidthMode::new(BandwidthModeKind::Choked),
             inflight: Inflight::new(time::Duration::from_secs(90)),
             stat: Default::default(),
