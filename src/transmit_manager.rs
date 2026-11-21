@@ -1701,9 +1701,9 @@ impl TransmitWorker {
             }
             _ => return,
         };
-        for p in &mut io.pieces {
-            if matches!(p.buf, BlockBuf::Pooled(_)) {
-                p.buf = BlockBuf::Owned(BytesMut::from(&p.buf[..]));
+        for (piece, _) in &mut io.pieces {
+            if matches!(piece.buf, BlockBuf::Pooled(_)) {
+                piece.buf = BlockBuf::Owned(BytesMut::from(&piece.buf[..]));
             }
         }
         deferred.push(Msg::PeerMsg(PeerMsg::IoMsg(peer, io)));
@@ -2187,9 +2187,9 @@ impl TransmitWorker {
     /// cancels go through upload admission in arrival order.
     fn handle_io_msg(&mut self, peer: PeerAddr, io: IoMsg) -> io::Result<()> {
         let mut n_pieces = 0;
-        for piece in io.pieces {
+        for (piece, recv_at) in io.pieces {
             n_pieces += 1;
-            self.handle_piece_msg(&peer, piece.piece, piece.buf, piece.recv_time)?;
+            self.handle_piece_msg(&peer, piece.piece, piece.buf, recv_at)?;
         }
         debug!("handled {n_pieces} piece messages");
         self.handle_upload_requests(peer, &io.requests);
@@ -2216,14 +2216,14 @@ impl TransmitWorker {
         )
     }
 
-    fn handle_upload_requests(&mut self, peer: PeerAddr, requests: &[UploadReq]) {
+    fn handle_upload_requests(&mut self, peer: PeerAddr, requests: &[(UploadReq, time::Instant)]) {
         if !self.connected_peers.contains_key(&peer) {
             return;
         }
 
         // servable only if that piece is valid and we have(verified) that piece
         let uploading = self.upload_enabled();
-        for &req in requests {
+        for &(req, recv_at) in requests {
             match req {
                 UploadReq::Request(request) => {
                     #[cfg(feature = "blocktrace")]
@@ -2234,7 +2234,10 @@ impl TransmitWorker {
                         }
                         _ => false,
                     };
-                    if !uploading || !have || !self.enqueue_upload_requests(peer, &[request]) {
+                    if !uploading
+                        || !have
+                        || !self.enqueue_upload_requests(peer, &[request], recv_at)
+                    {
                         self.maybe_reject_piece_request(peer, request);
                     }
                 }
@@ -2715,15 +2718,15 @@ impl TransmitWorker {
 
     /// handle PIECE message
     // TODO: fix the return type
-    #[instrument(skip(self, buf, recv_time), fields(delay = ?recv_time.elapsed()))]
+    #[instrument(skip(self, buf, recv_at), fields(delay = ?recv_at.elapsed()))]
     fn handle_piece_msg(
         &mut self,
         peer: &PeerAddr,
         piece: protocol::Piece,
         buf: BlockBuf,
-        recv_time: std::time::Instant,
+        recv_at: time::Instant,
     ) -> io::Result<()> {
-        let queue_delay = recv_time.elapsed();
+        let queue_delay = recv_at.elapsed();
         debug!("recv {piece:?} from {peer:?}, queue_delay {queue_delay:?}");
 
         let req = Request {

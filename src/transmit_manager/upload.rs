@@ -40,7 +40,12 @@ impl TransmitWorker {
     }
 
     /// Queue a request from an upload slot peer; false if it is not a slot or its queue is full.
-    pub(super) fn enqueue_upload_requests(&mut self, peer: PeerAddr, request: &[Request]) -> bool {
+    pub(super) fn enqueue_upload_requests(
+        &mut self,
+        peer: PeerAddr,
+        request: &[Request],
+        recv_at: time::Instant,
+    ) -> bool {
         let Some(pc) = self.connected_peers.get_mut(&peer) else {
             return false;
         };
@@ -49,7 +54,7 @@ impl TransmitWorker {
             return false;
         }
         for req in request {
-            pc.upload_reqs.push(*req);
+            pc.upload_reqs.push(*req, recv_at);
         }
         true
     }
@@ -244,8 +249,8 @@ mod tests {
     #[test]
     fn queue_approve_only_what_quota_covers_and_keeps_remainder() {
         let mut q = UploadQueue::default();
-        q.push(req(10));
-        q.push(req(10));
+        q.push(req(10), time::Instant::now());
+        q.push(req(10), time::Instant::now());
         q.add_quota(15);
         assert!(UploadQueue::pop_next_request(&mut q).is_some());
         assert!(UploadQueue::pop_next_request(&mut q).is_none());

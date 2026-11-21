@@ -49,8 +49,6 @@ pub struct ReceivedPiece {
     pub piece: Piece,
     /// piece data
     pub buf: BlockBuf,
-    /// timestamp when the piece is received
-    pub recv_time: std::time::Instant,
 }
 
 /// A block request or cancel from the peer, kept in arrival order.
@@ -63,10 +61,10 @@ pub enum UploadReq {
 /// Inbound peer IO buffered by a recv stream until the transmit manager pulls it.
 #[derive(Debug, Default)]
 pub struct IoMsg {
-    /// Requests and cancels the peer sent, in arrival order.
-    pub requests: Vec<UploadReq>,
-    /// Blocks the peer sent.
-    pub pieces: Vec<ReceivedPiece>,
+    /// Requests and cancels in arrival order, each with its receive time.
+    pub requests: Vec<(UploadReq, time::Instant)>,
+    /// Blocks the peer sent, each with its receive time.
+    pub pieces: Vec<(ReceivedPiece, time::Instant)>,
 }
 
 impl IoMsg {
@@ -597,19 +595,24 @@ where
                 )));
             }
             Message::Request(req) => {
-                self.buffer_io(|io| io.requests.push(UploadReq::Request(req)));
+                let recv_at = time::Instant::now();
+                self.buffer_io(|io| io.requests.push((UploadReq::Request(req), recv_at)));
             }
             Message::Piece(piece) => {
+                let recv_at = time::Instant::now();
                 self.buffer_io(|io| {
-                    io.pieces.push(ReceivedPiece {
-                        piece,
-                        buf: block_buf.expect("Piece message must carry a block buffer"),
-                        recv_time: std::time::Instant::now(),
-                    })
+                    io.pieces.push((
+                        ReceivedPiece {
+                            piece,
+                            buf: block_buf.expect("Piece message must carry a block buffer"),
+                        },
+                        recv_at,
+                    ))
                 });
             }
             Message::Cancel(req) => {
-                self.buffer_io(|io| io.requests.push(UploadReq::Cancel(req)));
+                let recv_at = time::Instant::now();
+                self.buffer_io(|io| io.requests.push((UploadReq::Cancel(req), recv_at)));
             }
             Message::Port(port) => {
                 tmh.sender

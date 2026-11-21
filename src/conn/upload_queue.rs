@@ -4,7 +4,7 @@ use tokio::time::Instant;
 
 use crate::protocol::Request;
 
-/// A peer request plus when the transmit manager received it; the difference to
+/// A peer request plus when the connection manager received it; the difference to
 /// the moment it is handed to the cache manager is that peer's upload RTT sample.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueuedRequest {
@@ -31,12 +31,9 @@ impl UploadQueue {
         self.queue.len()
     }
 
-    pub fn push(&mut self, req: Request) {
+    pub fn push(&mut self, req: Request, recv_at: Instant) {
         self.queued_bytes += req.len as u64;
-        self.queue.push_back(QueuedRequest {
-            req,
-            recv_at: Instant::now(),
-        });
+        self.queue.push_back(QueuedRequest { req, recv_at });
     }
 
     /// Remove a queued request, e.g. on the peer's Cancel.

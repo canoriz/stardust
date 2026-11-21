@@ -67,10 +67,15 @@ async fn peer(worker: &mut TransmitWorker, fast: bool) -> (PeerAddr, DuplexStrea
 
 // A pulled io batch carrying just `requests`, as a recv stream would hand it over.
 fn io_msg(peer: PeerAddr, requests: &[Request]) -> Msg {
+    let recv_at = time::Instant::now();
     Msg::PeerMsg(PeerMsg::IoMsg(
         peer,
         IoMsg {
-            requests: requests.iter().copied().map(UploadReq::Request).collect(),
+            requests: requests
+                .iter()
+                .copied()
+                .map(|req| (UploadReq::Request(req), recv_at))
+                .collect(),
             ..Default::default()
         },
     ))
@@ -201,8 +206,11 @@ async fn upload_unverified_or_invalid_requests_reject_fast_and_ignore_legacy() {
         begin: 0,
         len: BLOCK,
     };
-    worker.handle_upload_requests(fast, &[UploadReq::Request(request)]);
-    worker.handle_upload_requests(legacy, &[UploadReq::Request(request)]);
+    worker.handle_upload_requests(fast, &[(UploadReq::Request(request), time::Instant::now())]);
+    worker.handle_upload_requests(
+        legacy,
+        &[(UploadReq::Request(request), time::Instant::now())],
+    );
     assert_eq!(response(&mut fast_wire).await, reject(request));
     assert!(
         time::timeout(time::Duration::from_millis(100), response(&mut legacy_wire))
@@ -234,7 +242,7 @@ async fn upload_unverified_or_invalid_requests_reject_fast_and_ignore_legacy() {
             ..request
         },
     ] {
-        worker.handle_upload_requests(fast, &[UploadReq::Request(bad)]);
+        worker.handle_upload_requests(fast, &[(UploadReq::Request(bad), time::Instant::now())]);
         assert_eq!(response(&mut fast_wire).await, reject(bad));
         assert!(worker.waiting_for_piecebuf.is_empty());
     }
@@ -258,7 +266,7 @@ async fn upload_restored_seed_reads_final_bytes_from_disk() {
         begin: 2 * SUB_PIECE_SIZE - BLOCK,
         len: BLOCK,
     };
-    worker.handle_upload_requests(addr, &[UploadReq::Request(request)]);
+    worker.handle_upload_requests(addr, &[(UploadReq::Request(request), time::Instant::now())]);
     worker.upload_tick();
     pump(&mut worker).await;
     assert_piece(
@@ -305,7 +313,7 @@ async fn upload_inactive_states_reject_or_defer_requests_by_phase() {
     assert!(matches!(
         &worker.running_state,
         RunningState::Draining { deferred, .. }
-            if deferred.iter().any(|m| matches!(m, Msg::PeerMsg(PeerMsg::IoMsg(_, io)) if io.requests.contains(&UploadReq::Request(request))))
+            if deferred.iter().any(|m| matches!(m, Msg::PeerMsg(PeerMsg::IoMsg(_, io)) if io.requests.iter().any(|(msg, _)| *msg == UploadReq::Request(request))))
     ));
     loop {
         let msg = time::timeout(time::Duration::from_secs(2), worker.receiver.recv())
@@ -327,7 +335,7 @@ async fn upload_inactive_states_reject_or_defer_requests_by_phase() {
     assert_eq!(worker.waiting_for_piecebuf.len(), waiting);
     if let RunningState::Checking { deferred, .. } = &worker.running_state {
         assert!(deferred.iter().any(
-            |m| matches!(m, Msg::PeerMsg(PeerMsg::IoMsg(_, io)) if io.requests.contains(&UploadReq::Request(request)))
+            |m| matches!(m, Msg::PeerMsg(PeerMsg::IoMsg(_, io)) if io.requests.iter().any(|(msg, _)| *msg == UploadReq::Request(request)))
         ));
     }
     pump(&mut worker).await;
@@ -359,8 +367,14 @@ async fn upload_shutdown_discards_pending_reads_and_new_requests() {
         .sender
         .send(io_msg(legacy, &[new_request]))
         .unwrap();
-    worker.handle_upload_requests(addr, &[UploadReq::Request(existing)]);
-    worker.handle_upload_requests(legacy, &[UploadReq::Request(new_request)]);
+    worker.handle_upload_requests(
+        addr,
+        &[(UploadReq::Request(existing), time::Instant::now())],
+    );
+    worker.handle_upload_requests(
+        legacy,
+        &[(UploadReq::Request(new_request), time::Instant::now())],
+    );
     worker.upload_tick();
     assert_eq!(worker.waiting_for_piecebuf.len(), 2);
     time::timeout(time::Duration::from_secs(2), worker.cleanup_before_stop())
