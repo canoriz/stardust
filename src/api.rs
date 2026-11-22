@@ -29,6 +29,7 @@
 //! | list_torrents    | —                                  | `{"list_torrents":{"torrents":["<hex>", ...]}}` |
 //! | get_torrent_status | `info_hash`                      | `{"torrent_status":{"info_hash":"<hex>","process":0.42,"bandwidth_bps":12345.0,"upload_bandwidth_bps":6789.0,"selected":[0,1],"have":[0]}}` |
 //! | get_cache_stats  | —                                  | `{"cache_stats":{"capacity":60,"request_rate":12.0,"clear_ratio":0.5, ...}}` |
+//! | get_dht_stats    | —                                  | `{"dht_stats":{"nodes":123,"peers":456}}` |
 //!
 //! On error: `{"error":{"error":"<message>"}}`
 //!
@@ -48,6 +49,7 @@ use tracing::info;
 
 pub use crate::buffer_pool::BufferPoolStats;
 pub use crate::cache::cache_manager::CacheStats;
+pub use crate::dht::DhtStats;
 pub use crate::protocol::InfoHash;
 pub use crate::transmit_manager::{CheckState, RunningStateDump, StableState};
 
@@ -107,6 +109,8 @@ pub enum RpcRequest {
     GetCacheStats,
     /// Get session-level block buffer pool occupancy.
     GetBufferPoolStats,
+    /// Get DHT routing-table and peer-storage statistics
+    GetDhtStats,
     /// Ask the server to shut down gracefully.
     Shutdown,
 }
@@ -155,6 +159,8 @@ pub enum RpcResponse {
     CacheStats(CacheStats),
     /// Session-level block buffer pool occupancy snapshot.
     BufferPoolStats(BufferPoolStats),
+    /// DHT statistics snapshot; `None` if DHT is disabled.
+    DhtStats(Option<DhtStats>),
     /// Something went wrong.
     Error {
         error: String,
@@ -399,6 +405,8 @@ pub async fn handle_rpc(session: &Session, req: RpcRequest) -> (RpcResponse, boo
             RpcResponse::BufferPoolStats(session.buffer_pool_stats()),
             false,
         ),
+
+        RpcRequest::GetDhtStats => (RpcResponse::DhtStats(session.dht_stats().await), false),
     }
 }
 

@@ -14,7 +14,7 @@ use tracing::{info, warn};
 
 use crate::buffer_pool::{BufferPool, BufferPoolStats};
 use crate::cache::cache_manager::{CacheManager, CacheManagerHandle, CacheStats};
-use crate::dht::{DHT, DHTOption, DhtDump};
+use crate::dht::{DHT, DHTOption, DhtDump, DhtStats};
 use crate::metadata::Magnet;
 use crate::protocol::{AcceptOpt, BTStream, HandshakeOption, InfoHash};
 use crate::torrent_manager::{TorrentManagerHandle, TransmitManagerSender};
@@ -173,6 +173,14 @@ impl Session {
     /// Snapshot of the session-level block buffer pool occupancy.
     pub fn buffer_pool_stats(&self) -> BufferPoolStats {
         self.block_pool.stats()
+    }
+
+    /// Routing table and storage statistics, `None` if DHT is disabled.
+    pub async fn dht_stats(&self) -> Option<DhtStats> {
+        match &self.dht_client {
+            Some(dht) => Some(dht.stats().await),
+            None => None,
+        }
     }
 
     /// Dump progress of every active torrent task.

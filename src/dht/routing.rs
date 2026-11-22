@@ -87,7 +87,16 @@ impl RoutingTable {
         out
     }
 
-    /// `false`.
+    /// Nodes in routing table.
+    pub fn inuse_count(&self) -> usize {
+        self.bucket.iter().map(|b| b.inuse.len()).sum()
+    }
+
+    /// Backup nodes in routing table.
+    pub fn backup_count(&self) -> usize {
+        self.bucket.iter().map(|b| b.reachable_backup.len()).sum()
+    }
+
     pub fn add_route(&mut self, addr: NodeAddr, reachable: bool) {
         let prefix = common_bits(&self.id, &addr.id) as usize;
         let bucket = &mut self.bucket[prefix];

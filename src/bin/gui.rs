@@ -36,7 +36,7 @@ use tokio_util::sync::CancellationToken;
 use tracing_subscriber::fmt::format::FmtSpan;
 
 use stardust::api::{
-    ApiCommand, BufferPoolStats, CacheStats, RpcRequest, RpcResponse, RunningStateDump,
+    ApiCommand, BufferPoolStats, CacheStats, DhtStats, RpcRequest, RpcResponse, RunningStateDump,
     TorrentSource, handle_rpc,
 };
 use stardust::{Session, SessionDump, SessionOpt, protocol::InfoHash};
@@ -151,6 +151,8 @@ struct GuiApp {
     cache_shared: Arc<Mutex<Option<CacheStats>>>,
     /// Latest block buffer pool snapshot, refreshed by the backend.
     pool_shared: Arc<Mutex<Option<BufferPoolStats>>>,
+    /// Latest DHT statistics snapshot, refreshed by the backend.
+    dht_shared: Arc<Mutex<Option<DhtStats>>>,
     /// Live connection status to the current server.
     status_shared: Arc<Mutex<ConnStatus>>,
     /// Target the frontend loop should talk to; `Target::None` = disconnected.
@@ -178,6 +180,7 @@ impl GuiApp {
         shared: Arc<Mutex<Vec<TorrentRow>>>,
         cache_shared: Arc<Mutex<Option<CacheStats>>>,
         pool_shared: Arc<Mutex<Option<BufferPoolStats>>>,
+        dht_shared: Arc<Mutex<Option<DhtStats>>>,
         status_shared: Arc<Mutex<ConnStatus>>,
         target_shared: Arc<Mutex<Target>>,
         has_local: bool,
@@ -189,6 +192,7 @@ impl GuiApp {
             shared,
             cache_shared,
             pool_shared,
+            dht_shared,
             status_shared,
             target_shared,
             has_local,
@@ -420,6 +424,17 @@ impl eframe::App for GuiApp {
                         });
                 }
             }
+            let dht = *self.dht_shared.lock().unwrap();
+            ui.horizontal_wrapped(|ui| match dht {
+                Some(d) => ui.label(
+                    egui::RichText::new(format!(
+                        "DHT nodes {}  backup {}  peer entries {}",
+                        d.inuse, d.backup, d.peers
+                    ))
+                    .monospace(),
+                ),
+                None => ui.weak("DHT: no data yet"),
+            });
         });
 
         // ── torrent list ──────────────────────────────────────────────────────
@@ -758,6 +773,7 @@ async fn frontend_main(
     shared: Arc<Mutex<Vec<TorrentRow>>>,
     cache_shared: Arc<Mutex<Option<CacheStats>>>,
     pool_shared: Arc<Mutex<Option<BufferPoolStats>>>,
+    dht_shared: Arc<Mutex<Option<DhtStats>>>,
     status_shared: Arc<Mutex<ConnStatus>>,
     target_shared: Arc<Mutex<Target>>,
     local_tx: Option<async_mpsc::UnboundedSender<ApiCommand>>,
@@ -809,6 +825,11 @@ async fn frontend_main(
                     transport.call(RpcRequest::GetBufferPoolStats).await
                 {
                     *pool_shared.lock().unwrap() = Some(stats);
+                }
+                if let Ok(RpcResponse::DhtStats(stats)) =
+                    transport.call(RpcRequest::GetDhtStats).await
+                {
+                    *dht_shared.lock().unwrap() = stats;
                 }
             }
             Some(cmd) = cmd_rx.recv() => {
@@ -903,6 +924,7 @@ fn main() {
     let shared: Arc<Mutex<Vec<TorrentRow>>> = Arc::new(Mutex::new(Vec::new()));
     let cache_shared: Arc<Mutex<Option<CacheStats>>> = Arc::new(Mutex::new(None));
     let pool_shared: Arc<Mutex<Option<BufferPoolStats>>> = Arc::new(Mutex::new(None));
+    let dht_shared: Arc<Mutex<Option<DhtStats>>> = Arc::new(Mutex::new(None));
     let (cmd_tx, cmd_rx) = async_mpsc::unbounded_channel::<RpcRequest>();
     let shutdown = CancellationToken::new();
     // Channel for the ctrl-c task to signal the GUI to close its viewport.
@@ -926,6 +948,7 @@ fn main() {
         let shared = shared.clone();
         let cache_shared = cache_shared.clone();
         let pool_shared = pool_shared.clone();
+        let dht_shared = dht_shared.clone();
         let status_shared = status_shared.clone();
         let target_shared = target_shared.clone();
         let shutdown = shutdown.clone();
@@ -969,6 +992,7 @@ fn main() {
                     shared,
                     cache_shared,
                     pool_shared,
+                    dht_shared,
                     status_shared,
                     target_shared,
                     local_tx,
@@ -1023,6 +1047,7 @@ fn main() {
                 shared,
                 cache_shared,
                 pool_shared,
+                dht_shared,
                 status_shared,
                 target_shared,
                 args.backend,

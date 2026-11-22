@@ -1,33 +1,31 @@
 use bon::Builder;
-use bt_bencode::ByteString;
-use bt_bencode::Value as BtValue;
+use bt_bencode::{ByteString, Value as BtValue};
 use derivative::Derivative;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
-use std::collections::HashMap;
-use std::io;
-use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6, ToSocketAddrs};
-use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering;
-use std::time;
-use tokio::net::UdpSocket;
-use tokio::net::lookup_host;
-use tokio::sync::{mpsc, oneshot};
+use std::{
+    collections::{BTreeSet, HashMap},
+    io,
+    net::{SocketAddr, SocketAddrV4, SocketAddrV6, ToSocketAddrs},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time,
+};
+use tokio::{
+    net::{UdpSocket, lookup_host},
+    sync::{mpsc, oneshot},
+};
 use tokio_util::sync::{CancellationToken, DropGuard};
-use tracing::instrument;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, instrument, warn};
 
 pub use crate::protocol::InfoHash;
 
 mod routing;
 mod wire;
 mod wire_serde;
-use routing::RoutingTable;
+use routing::{RoutingTable, dist};
 use wire::WireKRPC;
-
-use routing::dist;
 
 pub type NodeID = [u8; 20];
 
@@ -37,6 +35,17 @@ pub type NodeID = [u8; 20];
 pub struct DhtDump {
     /// (node_id, addr) pairs from the IPv4/IPv6 routing table.
     pub nodes: Vec<(NodeID, SocketAddr)>,
+}
+
+/// DHT statistics
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+pub struct DhtStats {
+    /// Nodes in routing table.
+    pub inuse: usize,
+    /// Backup nodes in routing table.
+    pub backup: usize,
+    /// Peer entries stored on us.
+    pub peers: usize,
 }
 
 /// Per-bootstrap-node tracking state for on-demand ping logic.
@@ -313,6 +322,15 @@ impl DHT {
         let (tx, rx) = oneshot::channel();
         if self.tx.send(Req::DumpNodes { tx }).await.is_err() {
             return DhtDump::default();
+        }
+        rx.await.unwrap_or_default()
+    }
+
+    /// Routing table and storage statistics
+    pub async fn stats(&self) -> DhtStats {
+        let (tx, rx) = oneshot::channel();
+        if self.tx.send(Req::Stats { tx }).await.is_err() {
+            return DhtStats::default();
         }
         rx.await.unwrap_or_default()
     }
@@ -919,6 +937,9 @@ enum Req {
     DumpNodes {
         tx: oneshot::Sender<DhtDump>,
     },
+    Stats {
+        tx: oneshot::Sender<DhtStats>,
+    },
 }
 
 type TransactionMap = HashMap<Vec<u8>, oneshot::Sender<io::Result<Resp>>>;
@@ -1013,6 +1034,16 @@ impl Server {
                 nodes.extend(self.route6.all_nodes());
                 let dump = DhtDump { nodes };
                 _ = tx.send(dump);
+            }
+            Req::Stats { tx } => {
+                let inuse = self.route4.inuse_count() + self.route6.inuse_count();
+                let backup = self.route4.backup_count() + self.route6.backup_count();
+                let peers = self.storage.peer_count();
+                _ = tx.send(DhtStats {
+                    inuse,
+                    backup,
+                    peers,
+                });
             }
         }
     }
@@ -1355,5 +1386,11 @@ impl Storage {
         } else {
             vec![]
         }
+    }
+
+    /// Total peer entries on ipv4 and ipv6
+    fn peer_count(&self) -> usize {
+        self.peers4.values().map(Vec::len).sum::<usize>()
+            + self.peers6.values().map(Vec::len).sum::<usize>()
     }
 }
