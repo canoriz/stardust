@@ -467,7 +467,7 @@ where
     /// Push an IO msg to buffer
     /// notify the transmit manager to pull only when it changes
     /// from empty to non-empty.
-    fn buffer_io(&mut self, push: impl FnOnce(&mut IoMsg)) {
+    fn buffer_msg(&mut self, push: impl FnOnce(&mut IoMsg)) {
         let was_empty = self.io.is_empty();
         push(&mut self.io);
         if was_empty {
@@ -596,11 +596,11 @@ where
             }
             Message::Request(req) => {
                 let recv_at = time::Instant::now();
-                self.buffer_io(|io| io.requests.push((UploadReq::Request(req), recv_at)));
+                self.buffer_msg(|io| io.requests.push((UploadReq::Request(req), recv_at)));
             }
             Message::Piece(piece) => {
                 let recv_at = time::Instant::now();
-                self.buffer_io(|io| {
+                self.buffer_msg(|io| {
                     io.pieces.push((
                         ReceivedPiece {
                             piece,
@@ -612,7 +612,7 @@ where
             }
             Message::Cancel(req) => {
                 let recv_at = time::Instant::now();
-                self.buffer_io(|io| io.requests.push((UploadReq::Cancel(req), recv_at)));
+                self.buffer_msg(|io| io.requests.push((UploadReq::Cancel(req), recv_at)));
             }
             Message::Port(port) => {
                 tmh.sender

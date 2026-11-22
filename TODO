@@ -2,8 +2,9 @@
 
 ## 1
 - [ ] randomized self ID at fresh start
-- [ ] fix DHT subtlties (unlimited accounce, verify token)
-- [ ] seed
+- [ ] connection limit(inward and outward), accept and pick policy
+- [ ] fix DHT subtlties (verify token)
+- [ ] unchoke policy and optimistic unchoke
 - [x] announce ourself downloading to dht
 - [ ] file implementation (mmap)
 - [ ] udp announce
@@ -21,6 +22,7 @@
 - [ ] uTP (micro transmission protocol)
 
 ## 5
+- [ ] smart ban
 - [ ] unified trait for file and cache manager: windows use copy, linux use move BlockBuf and flush by writev, reduce copy by one
 - [x] stop_wait/remove_torrent guarantees data will be written (PieceBuf marked dirty, flush
   scheduled via spawn_blocking), and now waits for the in-flight flushes to complete before

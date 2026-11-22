@@ -27,8 +27,8 @@ fn to_hex(bs: &[u8]) -> String {
 }
 
 const DEFAULT_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0);
-const READBUF_CAP: usize = 16 * 16384;
-const WRITEBUF_CAP: usize = 16 * 16384;
+const READ_BUF_SIZE: usize = 8 * 16384;
+const WRITE_BUF_SIZE: usize = 8 * 16384;
 
 pub type InfoHash = [u8; 20];
 
@@ -549,7 +549,7 @@ where
         let (read_end, write_end) = self.inner.split();
         (
             ReadStream {
-                inner: BufReader::with_capacity(READBUF_CAP, read_end),
+                inner: BufReader::with_capacity(READ_BUF_SIZE, read_end),
                 peer_addr,
                 partial_read: self.partial_read,
                 peer_id: self.peer_id,
@@ -560,7 +560,7 @@ where
                 is_income: self.is_income,
             },
             WriteStream {
-                inner: BufWriter::with_capacity(WRITEBUF_CAP, write_end),
+                inner: BufWriter::with_capacity(WRITE_BUF_SIZE, write_end),
                 peer_addr,
                 extension_id: self.extension_id,
                 peer_id: self.peer_id,
