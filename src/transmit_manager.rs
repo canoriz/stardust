@@ -1971,6 +1971,9 @@ impl TransmitWorker {
                         }
                         self.pick_blocks_for_all_peers(10);
                         self.announce_manager.send(announce_manager::Msg::Resume);
+                        // tracker re-announces immediately on Resume; do the same for DHT
+                        // TODO: skip if quickly resume after pause
+                        run_dht(self);
                     }
                     RunningCmd::Pause => {
                         self.running_state = RunningState::Paused;
@@ -3704,6 +3707,13 @@ fn copy_to_piecebuf(piece: &Piece, data: &[u8], piecebuf: &mut [u8]) {
 }
 
 fn run_dht(transmit: &mut TransmitWorker) {
+    if matches!(
+        transmit.running_state,
+        RunningState::Paused | RunningState::Stopped | RunningState::Fatal(_)
+    ) {
+        return;
+    }
+
     if let Some(c) = &transmit.dht_client {
         let cl = c.clone();
         // TODO: why port field is an option

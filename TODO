@@ -1,14 +1,16 @@
 # TODO
 
 ## 1
+- [ ] randomized self ID at fresh start
+- [ ] fix DHT subtlties (unlimited accounce, verify token)
 - [ ] seed
-- [ ] announce ourself downloading to dht
+- [x] announce ourself downloading to dht
 - [ ] file implementation (mmap)
 - [ ] udp announce
 - [ ] only select a part of files of a torrent (and handle only chosen a part of block)
-- [ ] gui filename font size not equal
-- [ ] gui filename utf8
-- [ ] dht nodes returns 0.0.0.0:0 from libtorrent
+- [x] gui filename font size not equal
+- [x] gui filename utf8
+- [x] dht nodes returns 0.0.0.0:0 from libtorrent
 
 ## 2
 - [ ] fast_extension (allowed fast)
@@ -20,7 +22,6 @@
 
 ## 5
 - [ ] unified trait for file and cache manager: windows use copy, linux use move BlockBuf and flush by writev, reduce copy by one
-- [ ] stop_wait/remove_torrent guarantees data will be written (PieceBuf marked dirty, flush
-  scheduled via spawn_blocking), but does NOT guarantee writes are complete when returning.
-  To ensure all data is in kernel buffer at return time, need to await the spawn_blocking
-  flush tasks before unregister, or use a synchronous flush path in CacheManager.
+- [x] stop_wait/remove_torrent guarantees data will be written (PieceBuf marked dirty, flush
+  scheduled via spawn_blocking), and now waits for the in-flight flushes to complete before
+  returning: `unregister_torrent` acts as the barrier, then `pending_flushes` is drained to 0.

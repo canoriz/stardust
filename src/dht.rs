@@ -1097,6 +1097,8 @@ impl Server {
                     id: a.id,
                     addr: SocketAddr::new(from_addr.ip(), port),
                 };
+                // TODO: dedupe by ip:port; every time an existing peer re-announce
+                // a new entry is appended.
                 self.storage.add(a.info_hash, naddr);
                 let resp = KRPC {
                     t: krpc.t,
@@ -1110,7 +1112,6 @@ impl Server {
                     }),
                 };
                 _ = self.send_response(from_addr, &resp).await;
-                // TODO:("remove old peer entries");
             }
             KRPCInner::Request(Arg::FindNode(f)) => {
                 debug!("receive find_node from {}", from_addr);
@@ -1285,9 +1286,17 @@ impl Server {
 }
 
 type ContactInfo = (NodeAddr, time::Instant);
+
+/// Minimum gap between announce-table sweeps; `Storage::add` triggers the next one.
+const SWEEP_INTERVAL: time::Duration = time::Duration::from_mins(5);
+/// Announced peers older than this are dropped by a sweep.
+const PEER_TTL: time::Duration = time::Duration::from_mins(15);
+
 struct Storage {
     peers4: HashMap<NodeID, Vec<ContactInfo>>,
     peers6: HashMap<NodeID, Vec<ContactInfo>>,
+    /// When the last sweep ran.
+    last_sweep: time::Instant,
 }
 
 impl Storage {
@@ -1295,10 +1304,16 @@ impl Storage {
         Self {
             peers4: HashMap::new(),
             peers6: HashMap::new(),
+            last_sweep: time::Instant::now(),
         }
     }
 
     fn add(&mut self, id: NodeID, naddr: NodeAddr) {
+        let now = time::Instant::now();
+        if now.saturating_duration_since(self.last_sweep) >= SWEEP_INTERVAL {
+            self.sweep(now);
+        }
+
         let ipv6 = is_ipv6(naddr.addr);
 
         // the ipv4/v6 aware representation
@@ -1312,13 +1327,24 @@ impl Storage {
         if ipv6 {
             self.peers6
                 .entry(id)
-                .and_modify(|v| v.push((naddr, time::Instant::now())))
-                .or_insert(vec![(naddr, time::Instant::now())]);
+                .and_modify(|v| v.push((naddr, now)))
+                .or_insert_with(|| vec![(naddr, now)]);
         } else {
             self.peers4
                 .entry(id)
-                .and_modify(|v| v.push((naddr, time::Instant::now())))
-                .or_insert(vec![(naddr, time::Instant::now())]);
+                .and_modify(|v| v.push((naddr, now)))
+                .or_insert_with(|| vec![(naddr, now)]);
+        }
+    }
+
+    /// Drop outdated peer entries
+    fn sweep(&mut self, now: time::Instant) {
+        self.last_sweep = now;
+        for map in [&mut self.peers4, &mut self.peers6] {
+            map.retain(|_, peers| {
+                peers.retain(|(_, seen)| now.saturating_duration_since(*seen) < PEER_TTL);
+                !peers.is_empty()
+            });
         }
     }
 
