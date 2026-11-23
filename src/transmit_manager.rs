@@ -205,6 +205,12 @@ pub struct TorrentRuntimeStatus {
     pub have: Vec<u32>,
     pub state: RunningStateDump,
     pub max_bw_bounded: bool,
+    /// Number of peers currently connected to this torrent.
+    pub connected_peers: usize,
+    /// Number of peer addresses with an in-progress outbound dial.
+    pub connecting_peers: usize,
+    /// Number of discovered peer addresses waiting to be dialed.
+    pub candidate_peers: usize,
 }
 
 #[derive(Clone)]
@@ -2047,6 +2053,17 @@ impl TransmitWorker {
             .map(|p| p.upload_bw.count_avg_bw_in(time::Duration::from_secs(2)) as f64)
             .sum();
 
+        let connecting_peers = self
+            .candidates
+            .values()
+            .filter(|state| matches!(state, PeerState::Connecting))
+            .count();
+        let candidate_peers = self
+            .candidates
+            .values()
+            .filter(|state| matches!(state, PeerState::Candidate))
+            .count();
+
         TorrentRuntimeStatus {
             info_hash: self.info_hash,
             name,
@@ -2057,6 +2074,9 @@ impl TransmitWorker {
             have,
             state: self.running_state.dump(),
             max_bw_bounded: self.max_bw_bounded,
+            connected_peers: self.connected_peers.len(),
+            connecting_peers,
+            candidate_peers,
         }
     }
 

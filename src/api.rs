@@ -152,6 +152,12 @@ pub enum RpcResponse {
         state: RunningStateDump,
         #[serde(default)]
         max_bw_bounded: bool,
+        #[serde(default)]
+        connected_peers: usize,
+        #[serde(default)]
+        connecting_peers: usize,
+        #[serde(default)]
+        candidate_peers: usize,
     },
     /// HTTP accepted Shutdown and queued it for async processing.
     ShutdownAccepted,
@@ -380,6 +386,9 @@ pub async fn handle_rpc(session: &Session, req: RpcRequest) -> (RpcResponse, boo
                         have: st.have,
                         state: st.state,
                         max_bw_bounded: st.max_bw_bounded,
+                        connected_peers: st.connected_peers,
+                        connecting_peers: st.connecting_peers,
+                        candidate_peers: st.candidate_peers,
                     },
                     Err(e) => RpcResponse::err(e),
                 },
@@ -517,11 +526,14 @@ mod tests {
             have: vec![0],
             state: RunningStateDump::Downloading,
             max_bw_bounded: false,
+            connected_peers: 0,
+            connecting_peers: 0,
+            candidate_peers: 0,
         })
         .expect("serialize torrent status");
         assert_eq!(
             status,
-            r#"{"torrent_status":{"info_hash":"001122","process":0.42,"bandwidth_bps":12345.0,"upload_bandwidth_bps":6789.0,"selected":[0,2],"have":[0],"state":"Downloading","max_bw_bounded":false}}"#
+            r#"{"torrent_status":{"info_hash":"001122","process":0.42,"bandwidth_bps":12345.0,"upload_bandwidth_bps":6789.0,"selected":[0,2],"have":[0],"state":"Downloading","max_bw_bounded":false,"connected_peers":0,"connecting_peers":0,"candidate_peers":0}}"#
         );
     }
 

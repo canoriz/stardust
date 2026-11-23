@@ -126,6 +126,9 @@ struct TorrentRow {
     upload_speed_bps: f64,
     state: RunningStateDump,
     max_bw_bounded: bool,
+    connected_peers: usize,
+    connecting_peers: usize,
+    candidate_peers: usize,
 }
 
 impl Default for TorrentRow {
@@ -138,6 +141,9 @@ impl Default for TorrentRow {
             upload_speed_bps: 0.0,
             state: RunningStateDump::Stopped,
             max_bw_bounded: false,
+            connected_peers: 0,
+            connecting_peers: 0,
+            candidate_peers: 0,
         }
     }
 }
@@ -425,16 +431,26 @@ impl eframe::App for GuiApp {
                 }
             }
             let dht = *self.dht_shared.lock().unwrap();
-            ui.horizontal_wrapped(|ui| match dht {
-                Some(d) => ui.label(
-                    egui::RichText::new(format!(
-                        "DHT nodes {}  backup {}  peer entries {}",
-                        d.inuse, d.backup, d.peers
-                    ))
-                    .monospace(),
-                ),
-                None => ui.weak("DHT: no data yet"),
-            });
+            match dht {
+                Some(d) => {
+                    egui::CollapsingHeader::new("DHT statistics")
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(egui::RichText::new(format!(
+                                    "nodes {}  backup {}  peer entries {}",
+                                    d.inuse, d.backup, d.peers
+                                ))
+                                .monospace());
+                            });
+                        });
+                }
+                None => {
+                    egui::CollapsingHeader::new("DHT statistics")
+                        .default_open(true)
+                        .show(ui, |ui| ui.weak("DHT: no data yet"));
+                }
+            }
         });
 
         // ── torrent list ──────────────────────────────────────────────────────
@@ -467,12 +483,15 @@ impl eframe::App for GuiApp {
                         ui.strong("Progress");
                         ui.strong("Download");
                         ui.strong("Upload");
+                        ui.strong("Connected");
+                        ui.strong("Connecting");
+                        ui.strong("Candidate");
                         ui.strong("Status");
                         ui.strong("Actions");
                         ui.end_row();
 
                         // ── separator via a full-width label trick ──
-                        for _ in 0..6 {
+                        for _ in 0..9 {
                             ui.separator();
                         }
                         ui.end_row();
@@ -514,6 +533,16 @@ impl eframe::App for GuiApp {
                             ui.label(egui::RichText::new(fmt_speed(row.speed_bps)).monospace());
                             ui.label(
                                 egui::RichText::new(fmt_speed(row.upload_speed_bps)).monospace(),
+                            );
+
+                            ui.label(
+                                egui::RichText::new(row.connected_peers.to_string()).monospace(),
+                            );
+                            ui.label(
+                                egui::RichText::new(row.connecting_peers.to_string()).monospace(),
+                            );
+                            ui.label(
+                                egui::RichText::new(row.candidate_peers.to_string()).monospace(),
                             );
 
                             // Status label
@@ -872,6 +901,9 @@ async fn refresh_rows(
             upload_bandwidth_bps,
             state,
             max_bw_bounded,
+            connected_peers,
+            connecting_peers,
+            candidate_peers,
             ..
         } = rsp
         {
@@ -883,6 +915,9 @@ async fn refresh_rows(
                 speed_bps: bandwidth_bps,
                 upload_speed_bps: upload_bandwidth_bps,
                 max_bw_bounded,
+                connected_peers,
+                connecting_peers,
+                candidate_peers,
             });
         }
     }

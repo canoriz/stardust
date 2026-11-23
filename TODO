@@ -17,6 +17,7 @@
 - [ ] fast_extension (allowed fast)
 - [ ] obfuscation (encryption)
 - [ ] upnp and nat-pmp
+- [ ] add connect/accept timeout (TCP, BT, extend handshake)
 
 ## 3
 - [ ] uTP (micro transmission protocol)
